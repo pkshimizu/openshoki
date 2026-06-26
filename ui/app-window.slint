@@ -1,0 +1,28 @@
+import { VerticalBox } from "std-widgets.slint";
+
+// 常駐アプリのウィンドウ（最小の枠）。
+// トレイメニューから表示/非表示する土台で、設定 UI などは後続でここに載せる。
+export component AppWindow inherits Window {
+    title: "openshoki";
+    // preferred だけだと中身の最小高さ（≒0）に引っ張られて潰れるため、
+    // min も指定してコンテンツ領域が必ず確保されるようにする。
+    min-width: 360px;
+    min-height: 220px;
+    preferred-width: 360px;
+    preferred-height: 220px;
+
+    VerticalBox {
+        alignment: center;
+        spacing: 8px;
+
+        Text {
+            text: "openshoki";
+            font-size: 22px;
+            horizontal-alignment: center;
+        }
+        Text {
+            text: "メニューバーに常駐しています";
+            horizontal-alignment: center;
+        }
+    }
+}
