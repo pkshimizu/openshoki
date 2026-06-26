@@ -17,10 +17,12 @@ slint::include_modules!();
 /// 出ない程度の値にする。
 const MENU_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// ウィンドウの初期サイズ。イベントループ稼働中に初めて show() すると .slint の
-/// preferred/min が初期サイズに反映されず高さ 0 で出るため、表示時に明示的に設定する。
+/// ウィンドウの初期ジオメトリ。イベントループ稼働中に初めて show() すると、位置・サイズが
+/// 確定されないまま高さ 0 で表示される。初回表示時にこの値を明示してジオメトリを確定させる。
 const WINDOW_WIDTH: f32 = 360.0;
 const WINDOW_HEIGHT: f32 = 220.0;
+const WINDOW_X: f32 = 240.0;
+const WINDOW_Y: f32 = 160.0;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 常駐アプリとして Dock にアイコンを出さない（macOS）。
@@ -61,6 +63,8 @@ fn menu_event_handler(ui: slint::Weak<AppWindow>, tray: &Tray) -> impl FnMut() +
     let toggle_id = tray.toggle_item.id().clone();
     let quit_id = tray.quit_item.id().clone();
     let menu_channel = MenuEvent::receiver();
+    // 初回表示でジオメトリを確定させたか。2 回目以降は位置・サイズを動かさない。
+    let mut geometry_committed = false;
 
     move || {
         while let Ok(event) = menu_channel.try_recv() {
@@ -73,7 +77,13 @@ fn menu_event_handler(ui: slint::Weak<AppWindow>, tray: &Tray) -> impl FnMut() +
                     }
                     toggle_item.set_text("ウィンドウを表示");
                 } else {
-                    window.set_size(slint::LogicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT));
+                    if !geometry_committed {
+                        // 初回 show() でジオメトリが確定されず高さ 0 になるのを防ぐため、
+                        // 位置とサイズを明示してから表示する。set_position が無いと高さ 0 になる。
+                        window.set_position(slint::LogicalPosition::new(WINDOW_X, WINDOW_Y));
+                        window.set_size(slint::LogicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT));
+                        geometry_committed = true;
+                    }
                     if let Err(err) = window.show() {
                         eprintln!("ウィンドウの表示に失敗した: {err}");
                     }
