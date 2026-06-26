@@ -7,6 +7,11 @@
 use tray_icon::menu::{Menu, MenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
+/// トグル項目のラベル。ウィンドウの可視状態と表示文言が食い違わないよう、
+/// 文字列を直書きで散らさず、初期値・更新の双方からこの定数を参照する。
+pub const TOGGLE_LABEL_SHOW: &str = "ウィンドウを表示";
+pub const TOGGLE_LABEL_HIDE: &str = "ウィンドウを隠す";
+
 /// 構築したトレイ一式。`TrayIcon` はドロップするとアイコンが消えるため、
 /// アプリが生きている間は保持し続ける必要がある。
 pub struct Tray {
@@ -23,7 +28,7 @@ impl Tray {
     ///
     /// macOS では NSApplication の初期化後（= Slint バックエンド初期化後）に呼ぶ必要がある。
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let toggle_item = MenuItem::new("ウィンドウを表示", true, None);
+        let toggle_item = MenuItem::new(TOGGLE_LABEL_SHOW, true, None);
         let quit_item = MenuItem::new("終了", true, None);
 
         let menu = Menu::new();

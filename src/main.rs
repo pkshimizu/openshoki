@@ -7,9 +7,9 @@ mod tray;
 
 use std::time::Duration;
 
-use tray_icon::menu::MenuEvent;
+use tray_icon::menu::{MenuEvent, MenuItem};
 
-use crate::tray::Tray;
+use crate::tray::{TOGGLE_LABEL_HIDE, TOGGLE_LABEL_SHOW, Tray};
 
 slint::include_modules!();
 
@@ -19,8 +19,10 @@ const MENU_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// ウィンドウの初期ジオメトリ。イベントループ稼働中に初めて show() すると、位置・サイズが
 /// 確定されないまま高さ 0 で表示される。初回表示時にこの値を明示してジオメトリを確定させる。
+/// 幅・高さは `ui/app-window.slint` の min/preferred と一致させること（片方だけ変えない）。
 const WINDOW_WIDTH: f32 = 360.0;
 const WINDOW_HEIGHT: f32 = 220.0;
+/// 初回表示位置（画面左上からの暫定値）。中央寄せ等の調整は後続に回す。
 const WINDOW_X: f32 = 240.0;
 const WINDOW_Y: f32 = 160.0;
 
@@ -39,7 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // メニューの表示状態と整合させるため、トグル項目のラベルも戻す。
     let toggle_on_close = tray.toggle_item.clone();
     ui.window().on_close_requested(move || {
-        toggle_on_close.set_text("ウィンドウを表示");
+        toggle_on_close.set_text(TOGGLE_LABEL_SHOW);
         slint::CloseRequestResponse::HideWindow
     });
 
@@ -49,7 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     timer.start(
         slint::TimerMode::Repeated,
         MENU_POLL_INTERVAL,
-        menu_event_handler(ui.as_weak(), &tray),
+        build_menu_event_handler(ui.as_weak(), &tray),
     );
 
     // run_event_loop() は「最後のウィンドウが閉じ、かつ最後の Slint の SystemTrayIcon が
@@ -68,7 +70,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// 表示/非表示トグルはウィンドウの現在の可視状態から判断し、別途フラグを持たない
 /// （「ありえない状態」を作らないため）。
-fn menu_event_handler(ui: slint::Weak<AppWindow>, tray: &Tray) -> impl FnMut() + 'static {
+fn build_menu_event_handler(ui: slint::Weak<AppWindow>, tray: &Tray) -> impl FnMut() + 'static {
     // クロージャは 'static のため &Tray を借用できない。必要な要素（トグル項目と
     // 各項目の ID）だけを複製して所有する。
     let toggle_item = tray.toggle_item.clone();
@@ -84,22 +86,9 @@ fn menu_event_handler(ui: slint::Weak<AppWindow>, tray: &Tray) -> impl FnMut() +
                 let Some(ui) = ui.upgrade() else { continue };
                 let window = ui.window();
                 if window.is_visible() {
-                    if let Err(err) = window.hide() {
-                        eprintln!("ウィンドウの非表示に失敗した: {err}");
-                    }
-                    toggle_item.set_text("ウィンドウを表示");
+                    hide_window(window, &toggle_item);
                 } else {
-                    if !geometry_committed {
-                        // 初回 show() でジオメトリが確定されず高さ 0 になるのを防ぐため、
-                        // 位置とサイズを明示してから表示する。set_position が無いと高さ 0 になる。
-                        window.set_position(slint::LogicalPosition::new(WINDOW_X, WINDOW_Y));
-                        window.set_size(slint::LogicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT));
-                        geometry_committed = true;
-                    }
-                    if let Err(err) = window.show() {
-                        eprintln!("ウィンドウの表示に失敗した: {err}");
-                    }
-                    toggle_item.set_text("ウィンドウを隠す");
+                    show_window(window, &toggle_item, &mut geometry_committed);
                 }
             } else if event.id == quit_id
                 && let Err(err) = slint::quit_event_loop()
@@ -108,6 +97,30 @@ fn menu_event_handler(ui: slint::Weak<AppWindow>, tray: &Tray) -> impl FnMut() +
             }
         }
     }
+}
+
+/// ウィンドウを表示し、トグル項目のラベルを「隠す」に切り替える。
+///
+/// 初回表示時のみジオメトリを明示する（`geometry_committed` で一度きりに保つ）。
+/// 詳細は `WINDOW_WIDTH` などの定義コメントを参照。
+fn show_window(window: &slint::Window, toggle_item: &MenuItem, geometry_committed: &mut bool) {
+    if !*geometry_committed {
+        window.set_position(slint::LogicalPosition::new(WINDOW_X, WINDOW_Y));
+        window.set_size(slint::LogicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT));
+        *geometry_committed = true;
+    }
+    if let Err(err) = window.show() {
+        eprintln!("ウィンドウの表示に失敗した: {err}");
+    }
+    toggle_item.set_text(TOGGLE_LABEL_HIDE);
+}
+
+/// ウィンドウを非表示にし、トグル項目のラベルを「表示」に戻す。
+fn hide_window(window: &slint::Window, toggle_item: &MenuItem) {
+    if let Err(err) = window.hide() {
+        eprintln!("ウィンドウの非表示に失敗した: {err}");
+    }
+    toggle_item.set_text(TOGGLE_LABEL_SHOW);
 }
 
 /// macOS で Dock アイコンを隠し、メニューバー常駐アプリとして振る舞わせる。
