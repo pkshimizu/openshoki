@@ -17,6 +17,11 @@ slint::include_modules!();
 /// 出ない程度の値にする。
 const MENU_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+/// ウィンドウの初期サイズ。イベントループ稼働中に初めて show() すると .slint の
+/// preferred/min が初期サイズに反映されず高さ 0 で出るため、表示時に明示的に設定する。
+const WINDOW_WIDTH: f32 = 360.0;
+const WINDOW_HEIGHT: f32 = 220.0;
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 常駐アプリとして Dock にアイコンを出さない（macOS）。
     #[cfg(target_os = "macos")]
@@ -68,6 +73,7 @@ fn menu_event_handler(ui: slint::Weak<AppWindow>, tray: &Tray) -> impl FnMut() +
                     }
                     toggle_item.set_text("ウィンドウを表示");
                 } else {
+                    window.set_size(slint::LogicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT));
                     if let Err(err) = window.show() {
                         eprintln!("ウィンドウの表示に失敗した: {err}");
                     }
