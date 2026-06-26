@@ -50,6 +50,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// 表示/非表示トグルはウィンドウの現在の可視状態から判断し、別途フラグを持たない
 /// （「ありえない状態」を作らないため）。
 fn menu_event_handler(ui: slint::Weak<AppWindow>, tray: &Tray) -> impl FnMut() + 'static {
+    // クロージャは 'static のため &Tray を借用できない。必要な要素（トグル項目と
+    // 各項目の ID）だけを複製して所有する。
     let toggle_item = tray.toggle_item.clone();
     let toggle_id = tray.toggle_item.id().clone();
     let quit_id = tray.quit_item.id().clone();
@@ -61,14 +63,20 @@ fn menu_event_handler(ui: slint::Weak<AppWindow>, tray: &Tray) -> impl FnMut() +
                 let Some(ui) = ui.upgrade() else { continue };
                 let window = ui.window();
                 if window.is_visible() {
-                    let _ = window.hide();
+                    if let Err(err) = window.hide() {
+                        eprintln!("ウィンドウの非表示に失敗した: {err}");
+                    }
                     toggle_item.set_text("ウィンドウを表示");
                 } else {
-                    let _ = window.show();
+                    if let Err(err) = window.show() {
+                        eprintln!("ウィンドウの表示に失敗した: {err}");
+                    }
                     toggle_item.set_text("ウィンドウを隠す");
                 }
-            } else if event.id == quit_id {
-                let _ = slint::quit_event_loop();
+            } else if event.id == quit_id
+                && let Err(err) = slint::quit_event_loop()
+            {
+                eprintln!("イベントループの終了に失敗した: {err}");
             }
         }
     }
@@ -83,7 +91,7 @@ fn hide_dock_icon() {
     use objc2::MainThreadMarker;
     use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 
-    let mtm = MainThreadMarker::new().expect("main スレッドで実行する必要がある");
+    let mtm = MainThreadMarker::new().expect("main は常にメインスレッドで動くため成功する");
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 }
