@@ -52,7 +52,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         menu_event_handler(ui.as_weak(), &tray),
     );
 
-    slint::run_event_loop()?;
+    // run_event_loop() は「最後のウィンドウが閉じ、かつ最後の Slint の SystemTrayIcon が
+    // 隠れた」時点で return する。本アプリのトレイは tray-icon クレート製で Slint からは
+    // 見えないため、ウィンドウを隠すと「表示物ゼロ」と判定されてループが終了し、プロセスが
+    // 落ちてしまう。常駐を保つため until_quit 版を使い、終了は quit_event_loop() だけに限る。
+    slint::run_event_loop_until_quit()?;
 
     // イベントループ終了後、トレイを明示的に解放してアイコンを残さない。
     drop(timer);

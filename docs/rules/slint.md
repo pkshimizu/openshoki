@@ -22,3 +22,18 @@ let _ = window.show();
 - 毎回呼ぶとウィンドウが動く／ユーザーのリサイズを戻してしまうため、初回だけにする。
 - 検証は `examples/` に確認用バイナリを置き、`screencapture` で目視確認するのが速い
   （ループ開始**前**に show すると再現しないので、実アプリと同じ「ループ稼働中の show」を再現すること）。
+
+## トレイ常駐アプリは `run_event_loop_until_quit()` を使う
+
+`slint::run_event_loop()` は「最後のウィンドウが閉じられ、かつ最後の **Slint の**
+`SystemTrayIcon` が隠れた」時点で return する。`tray-icon` クレートなど **Slint 製でない**
+トレイは Slint から見えないため、ウィンドウを隠した（`hide()` / `on_close_requested` →
+`HideWindow`）瞬間に「表示物ゼロ」と判定され、ループが終了してプロセスが落ちる。
+
+対策: 常駐させたいなら `slint::run_event_loop_until_quit()` を使う。これは
+`quit_on_last_window_closed(false)` 相当で、表示物が無くても回り続け、終了は
+`slint::quit_event_loop()`（＝「終了」メニュー）だけがトリガーになる。
+
+- 検証は「閉じる→非表示でプロセスが生きているか」を見る。クリック座標は環境依存で不安定
+  なので、`window.hide()` をタイマーから呼んで pid の生死を見るのが確実
+  （`run_event_loop` 版は hide 直後に DEAD、`until_quit` 版は ALIVE になる）。
