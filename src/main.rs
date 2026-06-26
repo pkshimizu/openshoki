@@ -35,6 +35,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Slint バックエンドの初期化後にトレイを常駐させる（macOS の NSApplication 初期化後）。
     let tray = Tray::new()?;
 
+    // ウィンドウを閉じても終了させず、非表示にして常駐を保つ。
+    // メニューの表示状態と整合させるため、トグル項目のラベルも戻す。
+    let toggle_on_close = tray.toggle_item.clone();
+    ui.window().on_close_requested(move || {
+        toggle_on_close.set_text("ウィンドウを表示");
+        slint::CloseRequestResponse::HideWindow
+    });
+
     // トレイのメニューイベントを Slint のイベントループ上でポーリングし、
     // ウィンドウ操作・終了へ橋渡しする。
     let timer = slint::Timer::default();
