@@ -7,17 +7,17 @@
 use tray_icon::menu::{Menu, MenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
-/// トグル項目のラベル。ウィンドウの可視状態と表示文言が食い違わないよう、
+/// トグル項目のラベル。ウィンドウ（設定画面）の可視状態と表示文言が食い違わないよう、
 /// 文字列を直書きで散らさず、初期値・更新の双方からこの定数を参照する。
-pub const TOGGLE_LABEL_SHOW: &str = "ウィンドウを表示";
-pub const TOGGLE_LABEL_HIDE: &str = "ウィンドウを隠す";
+pub const TOGGLE_LABEL_SHOW: &str = "設定を開く";
+pub const TOGGLE_LABEL_HIDE: &str = "設定を閉じる";
 
 /// 構築したトレイ一式。`TrayIcon` はドロップするとアイコンが消えるため、
 /// アプリが生きている間は保持し続ける必要がある。
 pub struct Tray {
     // 保持専用。明示的に参照しないが、ドロップさせないために持っておく。
     _icon: TrayIcon,
-    /// ウィンドウの表示/非表示を切り替える項目。表示状態に応じてラベルを更新する。
+    /// 設定画面（ウィンドウ）の表示/非表示を切り替える項目。表示状態に応じてラベルを更新する。
     pub toggle_item: MenuItem,
     /// アプリを終了する項目。
     pub quit_item: MenuItem,
