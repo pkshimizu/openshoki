@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# 同一参照で古い実行が走っていればキャンセルする（無駄な実行を避ける）。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    name: cargo audit（依存の脆弱性検査）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # cargo-audit はビルド不要で Cargo.lock を RUSTSEC アドバイザリ DB と照合するだけなので、
+      # OS 依存のシステムライブラリは要らない。prebuilt をインストールして高速に回す。
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      # 既知脆弱性が見つかると cargo audit は非ゼロ終了し、このジョブが失敗する。
+      # 運用方針: 誤検知や未対応アドバイザリを一時的に無視する場合は、レビューのうえ
+      # この行を `cargo audit --ignore RUSTSEC-XXXX-XXXX` の形に変更し、無視する理由を
+      # コミットメッセージに残す（恒久的な無視は安易に増やさない）。
+      - run: cargo audit
+
+  check:
+    name: build / fmt / clippy / test
+    # macOS 優先のアプリで objc2 等の macOS 依存を含むため、macOS ランナーで検証する。
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: cargo fmt --check
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: build
+        run: cargo build --verbose
+      - name: test
+        run: cargo test --verbose
