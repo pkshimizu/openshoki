@@ -4,7 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+chrono = "0.4.45"
+cpal = "0.18.1"
 directories = "6.0.0"
+mp3lame-encoder = { version = "0.2.4", features = ["std"] }
 rfd = "0.17.2"
 serde = { version = "1.0.228", features = ["derive"] }
 slint = "1.17.0"
