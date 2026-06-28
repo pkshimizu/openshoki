@@ -4,6 +4,7 @@
 //! 表示/非表示とアプリ終了を行う。録音機能は後続の issue で実装する。
 
 mod config;
+mod recorder;
 mod tray;
 
 use std::cell::RefCell;
@@ -13,7 +14,10 @@ use std::time::Duration;
 use tray_icon::menu::{MenuEvent, MenuItem};
 
 use crate::config::Config;
-use crate::tray::{SETTINGS_LABEL_CLOSE, SETTINGS_LABEL_OPEN, Tray};
+use crate::recorder::Recorder;
+use crate::tray::{
+    RECORD_LABEL_START, RECORD_LABEL_STOP, SETTINGS_LABEL_CLOSE, SETTINGS_LABEL_OPEN, Tray,
+};
 
 slint::include_modules!();
 
@@ -87,7 +91,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     timer.start(
         slint::TimerMode::Repeated,
         MENU_POLL_INTERVAL,
-        build_menu_event_handler(ui.as_weak(), &tray),
+        build_menu_event_handler(ui.as_weak(), &tray, Rc::clone(&config)),
     );
 
     // run_event_loop() は「最後のウィンドウが閉じ、かつ最後の Slint の SystemTrayIcon が
@@ -104,17 +108,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// メニューイベントを処理するクロージャを作る。
 ///
-/// 表示/非表示トグルはウィンドウの現在の可視状態から判断し、別途フラグを持たない
-/// （「ありえない状態」を作らないため）。
-fn build_menu_event_handler(ui: slint::Weak<AppWindow>, tray: &Tray) -> impl FnMut() + 'static {
-    // クロージャは 'static のため &Tray を借用できない。必要な要素（トグル項目と
-    // 各項目の ID）だけを複製して所有する。
+/// 表示/非表示トグルや録音トグルは現在の状態（ウィンドウの可視状態・録音セッションの有無）から
+/// 判断し、別途フラグを持たない（「ありえない状態」を作らないため）。
+///
+/// 録音セッション（`Option<Recorder>`）と `cpal::Stream`(`!Send`) はこのクロージャ内で所有する。
+/// クロージャはメインスレッド（Slint イベントループ）上でのみ実行されるため問題ない。
+fn build_menu_event_handler(
+    ui: slint::Weak<AppWindow>,
+    tray: &Tray,
+    config: Rc<RefCell<Config>>,
+) -> impl FnMut() + 'static {
+    // クロージャは 'static のため &Tray を借用できない。必要な要素（各項目・ID・アイコン）
+    // だけを複製して所有する。
     let toggle_item = tray.toggle_item.clone();
     let toggle_id = tray.toggle_item.id().clone();
+    let record_item = tray.record_item.clone();
+    let record_id = tray.record_item.id().clone();
     let quit_id = tray.quit_item.id().clone();
+    let tray_icon = Rc::clone(&tray.icon);
     let menu_channel = MenuEvent::receiver();
     // 初回表示でジオメトリを確定させたか。2 回目以降は位置・サイズを動かさない。
     let mut geometry_committed = false;
+    // 実行中の録音セッション。None=待機中、Some=録音中。
+    let mut recorder: Option<Recorder> = None;
 
     move || {
         while let Ok(event) = menu_channel.try_recv() {
@@ -126,12 +142,46 @@ fn build_menu_event_handler(ui: slint::Weak<AppWindow>, tray: &Tray) -> impl FnM
                 } else {
                     show_window(window, &toggle_item, &mut geometry_committed);
                 }
+            } else if event.id == record_id {
+                toggle_recording(&mut recorder, &record_item, &tray_icon, &config);
             } else if event.id == quit_id
                 && let Err(err) = slint::quit_event_loop()
             {
                 eprintln!("イベントループの終了に失敗した: {err}");
             }
         }
+    }
+}
+
+/// 録音セッションの有無に応じて、録音の開始／停止を切り替える。
+///
+/// 失敗してもアプリ（常駐）は落とさず、状態は変えずにログを残す。
+fn toggle_recording(
+    recorder: &mut Option<Recorder>,
+    record_item: &MenuItem,
+    tray_icon: &tray_icon::TrayIcon,
+    config: &Rc<RefCell<Config>>,
+) {
+    if recorder.is_none() {
+        // 開始。保存先は設定の現在値を使う。タイムスタンプはローカル時刻で衝突を避ける。
+        let dir = config.borrow().recording_dir.clone();
+        let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+        match Recorder::start(&dir, &timestamp) {
+            Ok(session) => {
+                *recorder = Some(session);
+                record_item.set_text(RECORD_LABEL_STOP);
+                tray::set_recording_state(tray_icon, true);
+            }
+            Err(err) => eprintln!("録音の開始に失敗した: {err}"),
+        }
+    } else if let Some(session) = recorder.take() {
+        // 停止。stop() がストリーム停止→flush→ファイル確定まで行う。
+        match session.stop() {
+            Ok(path) => println!("録音を保存した: {}", path.display()),
+            Err(err) => eprintln!("録音の停止・保存に失敗した: {err}"),
+        }
+        record_item.set_text(RECORD_LABEL_START);
+        tray::set_recording_state(tray_icon, false);
     }
 }
 
