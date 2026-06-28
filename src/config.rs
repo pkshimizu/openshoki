@@ -25,6 +25,8 @@ const DEFAULT_DIR_NAME: &str = "openshoki";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// 録音ファイルの保存先ディレクトリ。
+    /// 設定 TOML は手編集されうるため信頼境界の外。録音機能で書き込む際は、存在・書き込み可否を
+    /// 検証してから使う（本 issue のスコープは設定値の保持まで）。
     pub recording_dir: PathBuf,
 }
 
@@ -95,6 +97,9 @@ fn default_recording_dir() -> PathBuf {
             .unwrap_or_else(|| user_dirs.home_dir())
             .join(DEFAULT_DIR_NAME);
     }
+    // ホームディレクトリすら取得できない異例環境。黙って縮退させず、相対パスへ
+    // フォールバックする旨をログに残す。
+    eprintln!("ユーザーディレクトリを取得できないため、保存先を相対パスにフォールバックする");
     PathBuf::from(DEFAULT_DIR_NAME)
 }
 

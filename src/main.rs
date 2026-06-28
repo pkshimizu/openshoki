@@ -13,7 +13,7 @@ use std::time::Duration;
 use tray_icon::menu::{MenuEvent, MenuItem};
 
 use crate::config::Config;
-use crate::tray::{TOGGLE_LABEL_HIDE, TOGGLE_LABEL_SHOW, Tray};
+use crate::tray::{SETTINGS_LABEL_CLOSE, SETTINGS_LABEL_OPEN, Tray};
 
 slint::include_modules!();
 
@@ -40,7 +40,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 設定を読み込み、現在の保存先を画面へ反映する。失敗時は load() がデフォルトを返す。
     let config = Rc::new(RefCell::new(Config::load()));
-    ui.set_recording_dir(recording_dir_text(&config.borrow()));
+    ui.set_recording_dir(recording_dir_text(&config.borrow().recording_dir));
 
     // 「フォルダを選択」: ネイティブのフォルダ選択ダイアログで保存先を選び直し、保存・表示更新する。
     // コールバックはメインスレッド（Slint イベントループ）上で動くため、同期 API を使う。
@@ -50,19 +50,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let Some(ui) = ui_for_pick.upgrade() else {
             return;
         };
-        let current = config_for_pick.borrow().recording_dir.clone();
+        // 現在の設定を複製し、選択結果を反映した候補を作る。
+        let mut candidate = config_for_pick.borrow().clone();
         let mut dialog = rfd::FileDialog::new();
-        if current.is_dir() {
-            dialog = dialog.set_directory(&current);
+        if candidate.recording_dir.is_dir() {
+            dialog = dialog.set_directory(&candidate.recording_dir);
         }
         let Some(folder) = dialog.pick_folder() else {
             return; // キャンセル時は何もしない。
         };
-        config_for_pick.borrow_mut().recording_dir = folder;
-        if let Err(err) = config_for_pick.borrow().save() {
-            eprintln!("設定の保存に失敗した: {err}");
+        candidate.recording_dir = folder;
+        // 永続化に成功してからメモリ上の設定と画面表示を更新する。
+        // 先に更新すると、保存失敗時に「表示は変わったのに保存されていない」不整合になる。
+        if let Err(err) = candidate.save() {
+            eprintln!("設定の保存に失敗したため、保存先は変更しない: {err}");
+            return;
         }
-        ui.set_recording_dir(recording_dir_text(&config_for_pick.borrow()));
+        ui.set_recording_dir(recording_dir_text(&candidate.recording_dir));
+        *config_for_pick.borrow_mut() = candidate;
     });
 
     // Slint バックエンドの初期化後にトレイを常駐させる（macOS の NSApplication 初期化後）。
@@ -72,7 +77,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // メニューの表示状態と整合させるため、トグル項目のラベルも戻す。
     let toggle_on_close = tray.toggle_item.clone();
     ui.window().on_close_requested(move || {
-        toggle_on_close.set_text(TOGGLE_LABEL_SHOW);
+        toggle_on_close.set_text(SETTINGS_LABEL_OPEN);
         slint::CloseRequestResponse::HideWindow
     });
 
@@ -143,12 +148,12 @@ fn show_window(window: &slint::Window, toggle_item: &MenuItem, geometry_committe
     if let Err(err) = window.show() {
         eprintln!("ウィンドウの表示に失敗した: {err}");
     }
-    toggle_item.set_text(TOGGLE_LABEL_HIDE);
+    toggle_item.set_text(SETTINGS_LABEL_CLOSE);
 }
 
 /// 保存先パスを画面表示用の文字列に変換する。
-fn recording_dir_text(config: &Config) -> slint::SharedString {
-    config.recording_dir.display().to_string().into()
+fn recording_dir_text(dir: &std::path::Path) -> slint::SharedString {
+    dir.display().to_string().into()
 }
 
 /// ウィンドウを非表示にし、トグル項目のラベルを「表示」に戻す。
@@ -156,7 +161,7 @@ fn hide_window(window: &slint::Window, toggle_item: &MenuItem) {
     if let Err(err) = window.hide() {
         eprintln!("ウィンドウの非表示に失敗した: {err}");
     }
-    toggle_item.set_text(TOGGLE_LABEL_SHOW);
+    toggle_item.set_text(SETTINGS_LABEL_OPEN);
 }
 
 /// macOS で Dock アイコンを隠し、メニューバー常駐アプリとして振る舞わせる。
