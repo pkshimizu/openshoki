@@ -30,8 +30,17 @@
 - **GUI は Slint、トレイ常駐は tray-icon**: Slint 単体にトレイ常駐 API は無いため、
   `tray-icon` で常駐とメニューを担い、Slint でウィンドウ UI を担う。両者を winit ベースの
   Slint イベントループ上で協調させる（トレイのメニューイベントをポーリングで Slint 側へ橋渡し）。
-- **録音まわりのクレート選定は保留**: マイク取得・録音（例: `cpal` 等）の具体的な選定は、
-  録音機能のプランの段階で決める。
+- **録音は cpal + mp3lame-encoder で MP3 出力**: マイク取得は `cpal`（既定入力デバイス）、
+  エンコードは `mp3lame-encoder`（libmp3lame）で `.mp3` に書き出す。形式は互換性重視で MP3。
+- **マイク音声とシステム音声は別ファイルに保存**: 将来の文字起こしのため、マイク（発話）と
+  スピーカー等のシステム音声（再生音）は混ぜず、音源ごとに別の MP3 に保存する。1 回の録音
+  セッションが音源ごとの複数ファイル（`-mic` / `-system`）を生む。
+- **システム音声の取得は OS 依存、macOS 先行で ScreenCaptureKit**: スピーカー出力の
+  ループバック取得は共通 API が無く、macOS は `screencapturekit`（ScreenCaptureKit）で行う。
+  Windows（WASAPI loopback）/ Linux（monitor source）は後続。マイク録音は全 OS 共通（`cpal`）。
+- **設定は OS 標準ディレクトリに TOML で永続化**: ユーザー設定（録音ファイルの保存先など）は
+  `directories` で得る OS 標準の設定ディレクトリに、`serde` + `toml` で保存・復元する。
+  読み込み失敗時はデフォルトへフォールバックしてアプリは落とさない。
 
 ## Language（用語）
 

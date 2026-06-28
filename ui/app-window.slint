@@ -1,28 +1,45 @@
-import { VerticalBox } from "std-widgets.slint";
+import { VerticalBox, Button } from "std-widgets.slint";
 
-// 常駐アプリのウィンドウ（最小の枠）。
-// トレイメニューから表示/非表示する土台で、設定 UI などは後続でここに載せる。
+// 常駐アプリの設定画面。トレイメニューから表示/非表示する。
+// 現状は「録音ファイルの保存先」を表示・変更できる。設定項目は後続でここに増やす。
 export component AppWindow inherits Window {
     title: "openshoki";
-    // preferred だけだと中身の最小高さ（≒0）に引っ張られて潰れるため、
-    // min も指定してコンテンツ領域が必ず確保されるようにする。
-    min-width: 360px;
-    min-height: 220px;
-    preferred-width: 360px;
-    preferred-height: 220px;
+    // preferred だけだと中身の最小高さ（≒0）に引っ張られて潰れるため、min も指定する。
+    // 幅・高さは src/main.rs の WINDOW_WIDTH/HEIGHT と一致させること（片方だけ変えない）。
+    min-width: 420px;
+    min-height: 240px;
+    preferred-width: 420px;
+    preferred-height: 240px;
+
+    // 現在の録音ファイル保存先（表示用）。Rust 側から設定する。
+    in property <string> recording-dir;
+    // 「フォルダを選択」押下。Rust 側でネイティブのフォルダ選択ダイアログを開く。
+    callback choose-folder();
 
     VerticalBox {
-        alignment: center;
-        spacing: 8px;
+        alignment: start;
+        spacing: 12px;
+        padding: 20px;
 
         Text {
-            text: "openshoki";
-            font-size: 22px;
+            text: "openshoki 設定";
+            font-size: 20px;
             horizontal-alignment: center;
         }
         Text {
-            text: "メニューバーに常駐しています";
-            horizontal-alignment: center;
+            text: "録音ファイルの保存先";
+            font-size: 14px;
+        }
+        Text {
+            text: root.recording-dir;
+            wrap: word-wrap;
+            color: #aaaaaa;
+        }
+        Button {
+            text: "フォルダを選択";
+            clicked => {
+                root.choose-folder();
+            }
         }
     }
 }

@@ -4,7 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+directories = "6.0.0"
+rfd = "0.17.2"
+serde = { version = "1.0.228", features = ["derive"] }
 slint = "1.17.0"
+toml = "1.1.2"
 tray-icon = "0.24.1"
 
 [build-dependencies]
