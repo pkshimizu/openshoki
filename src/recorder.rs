@@ -44,6 +44,8 @@ impl Recorder {
     /// 既定の入力デバイスからマイク録音を開始する。`recording_dir` 配下にタイムスタンプ名の
     /// `-mic.mp3` を作る（ディレクトリが無ければ作成する）。
     pub fn start(recording_dir: &Path, timestamp: &str) -> Result<Self, RecordError> {
+        // recording_dir は設定由来（手編集されうる信頼境界外）だが、ユーザー自身が選んだ保存先
+        // であり、ここではそのまま使う（パスの正当性は設定 UI 側の責務）。
         std::fs::create_dir_all(recording_dir)?;
 
         let host = cpal::default_host();
@@ -70,22 +72,40 @@ impl Recorder {
         }
 
         let path = recording_dir.join(format!("openshoki-{timestamp}-{MIC_SUFFIX}.mp3"));
-        let file = File::create(&path)?;
+        // 録音は機微データのため、所有者のみ読み書き可で作成する（Unix）。
+        let file = create_recording_file(&path)?;
 
-        // 音声コールバック → writer スレッドへ PCM を渡すチャネル。
+        // 音声コールバック → writer スレッドへ PCM を渡す無制限チャネル。コールバックを
+        // ブロックさせないため上限を設けない。通常 writer は入力レートに追いつくが、ディスク
+        // 滞留時はメモリが増える。問題が出たら上限付き＋超過時ドロップへ見直す（TODO）。
         let (tx, rx) = std::sync::mpsc::channel::<Vec<i16>>();
         let writer = std::thread::Builder::new()
             .name("openshoki-mp3-writer".to_owned())
             .spawn(move || run_writer(rx, sample_rate, channels, file))?;
 
-        let stream = match sample_format {
+        // ストリームを構築して再生開始する。冒頭で対応形式に絞っているため match は網羅済み。
+        let built = match sample_format {
             SampleFormat::F32 => build_input_stream::<f32>(&device, config, tx),
             SampleFormat::I16 => build_input_stream::<i16>(&device, config, tx),
             SampleFormat::U16 => build_input_stream::<u16>(&device, config, tx),
-            // 上で対応形式に絞っているため到達しない。
-            other => Err(format!("未対応のサンプル形式: {other:?}").into()),
-        }?;
-        stream.play()?;
+            other => unreachable!("start() の冒頭で対応形式に絞り済み: {other:?}"),
+        };
+        // 構築・再生に失敗したら副作用を残さない（作成済みの空ファイルを消し、writer を終了・join）。
+        // stream を先に drop して tx を落とさないと、writer の recv が閉じず join が返らない。
+        let stream = match built {
+            Ok(stream) => stream,
+            Err(err) => {
+                let _ = std::fs::remove_file(&path);
+                let _ = writer.join();
+                return Err(err);
+            }
+        };
+        if let Err(err) = stream.play() {
+            drop(stream);
+            let _ = std::fs::remove_file(&path);
+            let _ = writer.join();
+            return Err(err.into());
+        }
 
         Ok(Self {
             stream,
@@ -128,11 +148,11 @@ where
     let stream = device.build_input_stream(
         config,
         move |data: &[T], _: &cpal::InputCallbackInfo| {
+            // LAME 入力に合わせて i16 へ変換し、エンコードは writer スレッドに任せる。
             let pcm: Vec<i16> = data.iter().map(|&s| i16::from_sample(s)).collect();
-            if tx.send(pcm).is_err() {
-                // writer スレッドが終了済み（エラー等）。その原因は stop() の join() で
-                // 受け取るため、ここでは送れなかったサンプルを捨ててよい。
-            }
+            // writer 終了済み（エラー等）なら送信は失敗するが、その原因は stop() の join() で
+            // 受け取るため、取りこぼしたサンプルはここでは捨てる。
+            let _ = tx.send(pcm);
         },
         err_fn,
         None,
@@ -175,11 +195,24 @@ fn run_writer(
         writer.write_all(&mp3)?;
     }
 
-    // 末尾フレームを書き出してファイルを確定する。flush は最低 7200 バイト必要。
+    // 末尾フレームを書き出してファイルを確定する。flush 用に LAME が要求する下限
+    // （max_required_buffer_size(0) が内部的に約 7200 バイトを返す）を確保する。
     mp3.clear();
     mp3.reserve(mp3lame_encoder::max_required_buffer_size(0));
     encoder.flush_to_vec::<FlushNoGap>(&mut mp3)?;
     writer.write_all(&mp3)?;
     writer.flush()?;
     Ok(())
+}
+
+/// 録音ファイルを作成する。録音は機微データのため、Unix では所有者のみ読み書き可(0600)で作る。
+fn create_recording_file(path: &Path) -> std::io::Result<File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
 }
