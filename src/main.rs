@@ -3,12 +3,16 @@
 //! 起動時はウィンドウを表示せずトレイに常駐し、トレイメニューから Slint ウィンドウの
 //! 表示/非表示とアプリ終了を行う。録音機能は後続の issue で実装する。
 
+mod config;
 mod tray;
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::time::Duration;
 
 use tray_icon::menu::{MenuEvent, MenuItem};
 
+use crate::config::Config;
 use crate::tray::{TOGGLE_LABEL_HIDE, TOGGLE_LABEL_SHOW, Tray};
 
 slint::include_modules!();
@@ -20,8 +24,8 @@ const MENU_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// ウィンドウの初期ジオメトリ。イベントループ稼働中に初めて show() すると、位置・サイズが
 /// 確定されないまま高さ 0 で表示される。初回表示時にこの値を明示してジオメトリを確定させる。
 /// 幅・高さは `ui/app-window.slint` の min/preferred と一致させること（片方だけ変えない）。
-const WINDOW_WIDTH: f32 = 360.0;
-const WINDOW_HEIGHT: f32 = 220.0;
+const WINDOW_WIDTH: f32 = 420.0;
+const WINDOW_HEIGHT: f32 = 240.0;
 /// 初回表示位置（画面左上からの暫定値）。中央寄せ等の調整は後続に回す。
 const WINDOW_X: f32 = 240.0;
 const WINDOW_Y: f32 = 160.0;
@@ -33,6 +37,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ウィンドウは生成するが表示はしない（起動時はトレイのみ）。
     let ui = AppWindow::new()?;
+
+    // 設定を読み込み、現在の保存先を画面へ反映する。失敗時は load() がデフォルトを返す。
+    let config = Rc::new(RefCell::new(Config::load()));
+    ui.set_recording_dir(recording_dir_text(&config.borrow()));
+
+    // 「フォルダを選択」: ネイティブのフォルダ選択ダイアログで保存先を選び直し、保存・表示更新する。
+    // コールバックはメインスレッド（Slint イベントループ）上で動くため、同期 API を使う。
+    let config_for_pick = Rc::clone(&config);
+    let ui_for_pick = ui.as_weak();
+    ui.on_choose_folder(move || {
+        let Some(ui) = ui_for_pick.upgrade() else {
+            return;
+        };
+        let current = config_for_pick.borrow().recording_dir.clone();
+        let mut dialog = rfd::FileDialog::new();
+        if current.is_dir() {
+            dialog = dialog.set_directory(&current);
+        }
+        let Some(folder) = dialog.pick_folder() else {
+            return; // キャンセル時は何もしない。
+        };
+        config_for_pick.borrow_mut().recording_dir = folder;
+        if let Err(err) = config_for_pick.borrow().save() {
+            eprintln!("設定の保存に失敗した: {err}");
+        }
+        ui.set_recording_dir(recording_dir_text(&config_for_pick.borrow()));
+    });
 
     // Slint バックエンドの初期化後にトレイを常駐させる（macOS の NSApplication 初期化後）。
     let tray = Tray::new()?;
@@ -113,6 +144,11 @@ fn show_window(window: &slint::Window, toggle_item: &MenuItem, geometry_committe
         eprintln!("ウィンドウの表示に失敗した: {err}");
     }
     toggle_item.set_text(TOGGLE_LABEL_HIDE);
+}
+
+/// 保存先パスを画面表示用の文字列に変換する。
+fn recording_dir_text(config: &Config) -> slint::SharedString {
+    config.recording_dir.display().to_string().into()
 }
 
 /// ウィンドウを非表示にし、トグル項目のラベルを「表示」に戻す。
