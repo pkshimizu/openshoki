@@ -17,7 +17,7 @@ use screencapturekit::cm::AudioBufferList;
 use screencapturekit::prelude::*;
 use screencapturekit::stream::configuration::audio::{AudioChannelCount, AudioSampleRate};
 
-use crate::recorder::{RecordError, create_recording_file, run_writer};
+use crate::recorder::{RecordError, create_recording_file, discard_partial_recording, run_writer};
 
 /// システム音源の出力ファイル名（セッションディレクトリ内に固定名で置く）。
 const SYSTEM_FILENAME: &str = "system.mp3";
@@ -148,9 +148,7 @@ impl SystemAudioSource {
             eprintln!("システム音声のキャプチャ停止に失敗した: {err}");
         }
         // 送信側を落としてチャネルを閉じる（ハンドラ保持に依存せず writer を終わらせる）。
-        if let Ok(mut guard) = sender.lock() {
-            *guard = None;
-        }
+        close_sender(&sender);
         drop(stream);
         writer
             .join()
@@ -161,11 +159,18 @@ impl SystemAudioSource {
 
 /// 開始失敗時の後始末。送信側を落として writer を終わらせ、作成済みの空ファイルを消す。
 fn abort(sender: &SharedSender, writer: JoinHandle<Result<(), RecordError>>, path: &Path) {
-    if let Ok(mut guard) = sender.lock() {
-        *guard = None;
-    }
-    let _ = writer.join();
-    let _ = std::fs::remove_file(path);
+    close_sender(sender);
+    discard_partial_recording(writer, path);
+}
+
+/// 送信側を落としてチャネルを閉じる。Mutex が poison していてもガードを取り出して必ず閉じる
+/// （閉じないと writer の `recv` が終わらず `join`／後始末がハングするため）。
+fn close_sender(sender: &SharedSender) {
+    let mut guard = match sender.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = None;
 }
 
 /// `AudioBufferList` を i16 インターリーブ PCM に変換する。ScreenCaptureKit は Float32 で渡す。
@@ -177,6 +182,7 @@ fn to_interleaved_i16(list: &AudioBufferList, channels: usize) -> Vec<i16> {
         return Vec::new();
     }
     if planes.len() == channels && channels > 1 {
+        // プレーナ。全チャンネルで揃う最小フレーム数までをインターリーブする（取りこぼし防止）。
         let frames = planes.iter().map(Vec::len).min().unwrap_or(0);
         let mut out = Vec::with_capacity(frames * channels);
         for f in 0..frames {
@@ -200,4 +206,33 @@ fn bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
 
 fn f32_to_i16(sample: f32) -> i16 {
     (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bytes_to_f32, f32_to_i16};
+
+    #[test]
+    fn f32_to_i16_saturates_out_of_range() {
+        assert_eq!(f32_to_i16(0.0), 0);
+        assert_eq!(f32_to_i16(1.0), i16::MAX);
+        assert_eq!(f32_to_i16(-1.0), -i16::MAX);
+        // 範囲外は ±1.0 にクランプしてから変換する（i16 の上下限を超えない）。
+        assert_eq!(f32_to_i16(2.0), i16::MAX);
+        assert_eq!(f32_to_i16(-2.0), -i16::MAX);
+    }
+
+    #[test]
+    fn bytes_to_f32_reads_little_endian() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1.0_f32.to_le_bytes());
+        bytes.extend_from_slice(&(-0.5_f32).to_le_bytes());
+        assert_eq!(bytes_to_f32(&bytes), vec![1.0, -0.5]);
+    }
+
+    #[test]
+    fn bytes_to_f32_ignores_partial_trailing_bytes() {
+        // 4 バイト境界に満たない端数は無視する（f32 は常に 4 バイトのため実際には発生しない）。
+        assert!(bytes_to_f32(&[0, 0, 0]).is_empty());
+    }
 }

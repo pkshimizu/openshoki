@@ -163,20 +163,20 @@ impl MicSource {
             SampleFormat::U16 => build_input_stream::<u16>(&device, config, tx),
             other => unreachable!("start() の冒頭で対応形式に絞り済み: {other:?}"),
         };
-        // 構築・再生に失敗したら副作用を残さない（作成済みの空ファイルを消し、writer を終了・join）。
-        // stream を先に drop して tx を落とさないと、writer の recv が閉じず join が返らない。
+        // 構築・再生に失敗したら副作用を残さない（writer を終了・回収し、作成済みの空ファイルを消す）。
+        // tx を落としてチャネルを閉じないと writer の recv が閉じず join が返らないため、先に
+        // tx を手放す（build 失敗時は build_input_stream 内で tx が drop 済み、play 失敗時は
+        // stream を drop して tx を落とす）。
         let stream = match built {
             Ok(stream) => stream,
             Err(err) => {
-                let _ = std::fs::remove_file(&path);
-                let _ = writer.join();
+                discard_partial_recording(writer, &path);
                 return Err(err);
             }
         };
         if let Err(err) = stream.play() {
             drop(stream);
-            let _ = std::fs::remove_file(&path);
-            let _ = writer.join();
+            discard_partial_recording(writer, &path);
             return Err(err.into());
         }
 
@@ -304,4 +304,18 @@ pub(crate) fn create_recording_file(path: &Path) -> std::io::Result<File> {
         options.mode(0o600);
     }
     options.open(path)
+}
+
+/// 開始失敗時の後始末: writer スレッドを終了・回収し、作成済みの空ファイルを消す。
+/// いずれの失敗も握りつぶさずログに残す。呼び出し側は **先にチャネルを閉じてから** 呼ぶこと
+/// （でないと writer の `recv` が終わらず `join` が返らない）。マイク・システム両音源で共用する。
+pub(crate) fn discard_partial_recording(writer: JoinHandle<Result<(), RecordError>>, path: &Path) {
+    match writer.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => eprintln!("録音開始失敗時の writer 終了処理でエラー: {err}"),
+        Err(_) => eprintln!("録音書き込みスレッドがパニックした（開始失敗時）"),
+    }
+    if let Err(err) = std::fs::remove_file(path) {
+        eprintln!("開始失敗時の空ファイル削除に失敗した: {err}");
+    }
 }
