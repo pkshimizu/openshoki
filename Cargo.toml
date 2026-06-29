@@ -20,3 +20,5 @@ slint-build = "1.17.0"
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.4"
 objc2-app-kit = "0.3.2"
+# macos_13_0 feature でシステム音声キャプチャ API（captures_audio 等）が有効になる。
+screencapturekit = { version = "8.0.0", features = ["macos_13_0"] }
