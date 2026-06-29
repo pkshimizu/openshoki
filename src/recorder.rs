@@ -12,6 +12,7 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SampleFormat, SizedSample};
@@ -39,6 +40,8 @@ pub struct Recorder {
     writer: JoinHandle<Result<(), RecordError>>,
     /// 出力先 MP3 ファイルのパス。
     path: PathBuf,
+    /// 録音開始時刻。経過時間表示の基準。システム時計の変更に影響されないよう `Instant` を使う。
+    started_at: Instant,
 }
 
 impl Recorder {
@@ -109,11 +112,18 @@ impl Recorder {
             return Err(err.into());
         }
 
+        // 再生開始の直後に開始時刻を記録する（経過時間の基準）。
         Ok(Self {
             stream,
             writer,
             path,
+            started_at: Instant::now(),
         })
+    }
+
+    /// 録音開始からの経過時間。表示更新側がメニューバーの経過時間表示に使う。
+    pub fn elapsed(&self) -> Duration {
+        self.started_at.elapsed()
     }
 
     /// 録音を停止し、ファイルを確定して保存先パスを返す。
@@ -125,6 +135,7 @@ impl Recorder {
             stream,
             writer,
             path,
+            started_at: _,
         } = self;
         // ストリームを止める → コールバックが止まり、tx が drop されてチャネルが閉じる。
         drop(stream);
