@@ -1,11 +1,13 @@
 //! 録音セッションの開始・停止と MP3 ファイルへの書き出し。
 //!
-//! トレイ／UI から独立した録音モジュール。`cpal` で既定の入力デバイスからマイク音声 (PCM) を
-//! 取得し、専用スレッドで `mp3lame-encoder` を使って MP3 にエンコードしてファイルへ書き出す。
+//! トレイ／UI から独立した録音モジュール。1 回の録音セッションは複数の音源を持ちうる:
+//!   - マイク音源（全 OS 共通）: `cpal` で既定入力デバイスから PCM を取得し、`mic.mp3` に書く。
+//!   - システム音源（macOS のみ）: ScreenCaptureKit でスピーカー出力を取得し、`system.mp3` に書く
+//!     （`crate::system_audio`）。
 //!
-//! 音声コールバック内ではエンコードせず、サンプルをチャネルへ送るだけにして、エンコードと
-//! ファイル書き込みは writer スレッドで行う（リアルタイムコールバックを軽く保ち、音飛びを避ける）。
-//! 将来システム音声を 2 つ目の音源として足せるよう、音源 1 つ = 1 ファイルの単位で組む。
+//! いずれの音源も、音声コールバック内ではエンコードせず PCM をチャネルへ送るだけにし、エンコードと
+//! ファイル書き込みは writer スレッド（`run_writer`）で行う（リアルタイムコールバックを軽く保ち
+//! 音飛びを避ける）。音源 1 つ = 1 ファイルの単位で、同じセッションディレクトリへ書き出す。
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -19,36 +21,102 @@ use cpal::{FromSample, Sample, SampleFormat, SizedSample};
 use mp3lame_encoder::{Bitrate, Builder, FlushNoGap, InterleavedPcm, MonoPcm, Quality};
 
 /// スレッドを跨ぐためのエラー型（`Send + Sync` が必要）。
-type RecordError = Box<dyn std::error::Error + Send + Sync>;
+pub(crate) type RecordError = Box<dyn std::error::Error + Send + Sync>;
 
 /// エンコードのビットレート。音声録音として十分な品質と容量のバランスで 128 kbps。
 const BITRATE: Bitrate = Bitrate::Kbps128;
 /// エンコード品質（0=最良〜9=最低）。速度と品質のバランスで Good。
 const QUALITY: Quality = Quality::Good;
 /// マイク音源の出力ファイル名。録音セッションのディレクトリ内に固定名で置く
-/// （後でシステム音声は `system.mp3`、文字起こし結果なども同じディレクトリへ）。
+/// （システム音声は `system.mp3`、文字起こし結果なども同じディレクトリへ）。
 const MIC_FILENAME: &str = "mic.mp3";
 
-/// 実行中の録音セッション（マイク音源 1 つ）。
+/// 実行中の録音セッション。マイク音源は必須、システム音源（macOS）は任意。
 ///
-/// `cpal::Stream` は `Send` でないため、メインスレッド上でのみ保持する。`stop()` で
-/// ストリームを止め、writer スレッドの flush 完了を待ってファイルを確定する。
+/// `cpal::Stream`（マイク）や `SCStream`（システム）は `Send` でないため、メインスレッド上でのみ
+/// 保持する。`stop()` で各音源を止め、writer スレッドの flush 完了を待ってファイルを確定する。
 pub struct Recorder {
-    /// 保持している間だけ録音が続く。drop でコールバックが止まり、サンプル送信側も閉じる。
+    /// マイク音源（必須）。開始に失敗するとセッション自体が始まらない。
+    mic: MicSource,
+    /// 録音開始時刻。経過時間表示の基準。システム時計の変更に影響されないよう `Instant` を使う。
+    started_at: Instant,
+    /// システム音声音源（macOS のみ・任意）。権限拒否や取得失敗時は `None`（マイクのみで続行）。
+    #[cfg(target_os = "macos")]
+    system: Option<crate::system_audio::SystemAudioSource>,
+}
+
+impl Recorder {
+    /// 録音セッションを開始する。`session_dir`（`<保存先>/<日時>`）配下に音源ごとのファイルを作る。
+    ///
+    /// マイクは必須で、失敗すればセッションを開始しない。システム音声（macOS）は任意で、開始に
+    /// 失敗してもログを残してマイクのみで続行する（アプリ・常駐は巻き込まない）。
+    pub fn start(session_dir: &Path) -> Result<Self, RecordError> {
+        let mic = MicSource::start(session_dir)?;
+        let started_at = Instant::now();
+
+        #[cfg(target_os = "macos")]
+        let system = match crate::system_audio::SystemAudioSource::start(session_dir) {
+            Ok(system) => Some(system),
+            Err(err) => {
+                eprintln!("システム音声の録音を開始できなかったため、マイクのみで続行する: {err}");
+                None
+            }
+        };
+
+        Ok(Self {
+            mic,
+            started_at,
+            #[cfg(target_os = "macos")]
+            system,
+        })
+    }
+
+    /// 録音開始からの経過時間。表示更新側がメニューバーの経過時間表示に使う。
+    pub fn elapsed(&self) -> Duration {
+        self.started_at.elapsed()
+    }
+
+    /// 録音を停止し、各音源のファイルを確定して、保存できたパスの一覧を返す。
+    ///
+    /// 1 音源の停止・保存が失敗しても他の音源は止め、握りつぶさずログに残す（常駐は継続）。
+    pub fn stop(self) -> Vec<PathBuf> {
+        let Self {
+            mic,
+            started_at: _,
+            #[cfg(target_os = "macos")]
+            system,
+        } = self;
+
+        let mut saved = Vec::new();
+        match mic.stop() {
+            Ok(path) => saved.push(path),
+            Err(err) => eprintln!("マイク録音の停止・保存に失敗した: {err}"),
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(system) = system {
+            match system.stop() {
+                Ok(path) => saved.push(path),
+                Err(err) => eprintln!("システム音声の停止・保存に失敗した: {err}"),
+            }
+        }
+        saved
+    }
+}
+
+/// マイク音源（`cpal` の既定入力デバイス）。保持している間だけ録音が続く。
+struct MicSource {
+    /// drop でコールバックが止まり、サンプル送信側も閉じる。
     stream: cpal::Stream,
     /// エンコード・書き込みを行う writer スレッド。
     writer: JoinHandle<Result<(), RecordError>>,
     /// 出力先 MP3 ファイルのパス。
     path: PathBuf,
-    /// 録音開始時刻。経過時間表示の基準。システム時計の変更に影響されないよう `Instant` を使う。
-    started_at: Instant,
 }
 
-impl Recorder {
-    /// 既定の入力デバイスからマイク録音を開始する。録音セッションのディレクトリ `session_dir`
-    /// の中に `mic.mp3` を作る（ディレクトリが無ければ作成する）。`session_dir` は呼び出し側が
-    /// `<保存先>/<日時>` で組み立てる（同じセッションの音源・文字起こしを一箇所にまとめるため）。
-    pub fn start(session_dir: &Path) -> Result<Self, RecordError> {
+impl MicSource {
+    /// 既定の入力デバイスからマイク録音を開始し、`session_dir` 内に `mic.mp3` を作る
+    /// （セッションディレクトリが無ければ作成する。同じセッションの他音源もここへ書く）。
+    fn start(session_dir: &Path) -> Result<Self, RecordError> {
         // session_dir は設定の保存先（手編集されうる信頼境界外）から組み立てた値だが、ユーザー
         // 自身が選んだ保存先配下であり、ここではそのまま使う（パスの正当性は設定 UI 側の責務）。
         create_session_dir(session_dir)?;
@@ -85,7 +153,7 @@ impl Recorder {
         // 滞留時はメモリが増える。問題が出たら上限付き＋超過時ドロップへ見直す（TODO）。
         let (tx, rx) = std::sync::mpsc::channel::<Vec<i16>>();
         let writer = std::thread::Builder::new()
-            .name("openshoki-mp3-writer".to_owned())
+            .name("openshoki-mic-writer".to_owned())
             .spawn(move || run_writer(rx, sample_rate, channels, file))?;
 
         // ストリームを構築して再生開始する。冒頭で対応形式に絞っているため match は網羅済み。
@@ -112,37 +180,29 @@ impl Recorder {
             return Err(err.into());
         }
 
-        // 再生開始の直後に開始時刻を記録する（経過時間の基準）。
         Ok(Self {
             stream,
             writer,
             path,
-            started_at: Instant::now(),
         })
     }
 
-    /// 録音開始からの経過時間。表示更新側がメニューバーの経過時間表示に使う。
-    pub fn elapsed(&self) -> Duration {
-        self.started_at.elapsed()
-    }
-
-    /// 録音を停止し、ファイルを確定して保存先パスを返す。
+    /// マイク録音を停止し、ファイルを確定して保存先パスを返す。
     ///
     /// ストリームを止めてコールバックとサンプル送信側を閉じてから、writer スレッドの
     /// flush 完了を待つ（末尾フレームを取りこぼさない順序）。
-    pub fn stop(self) -> Result<PathBuf, RecordError> {
+    fn stop(self) -> Result<PathBuf, RecordError> {
         let Self {
             stream,
             writer,
             path,
-            started_at: _,
         } = self;
         // ストリームを止める → コールバックが止まり、tx が drop されてチャネルが閉じる。
         drop(stream);
         // writer スレッドの完了（flush・ファイル確定）を待ち、結果を伝播する。
         writer
             .join()
-            .map_err(|_| "録音書き込みスレッドがパニックした")??;
+            .map_err(|_| "マイク録音書き込みスレッドがパニックした")??;
         Ok(path)
     }
 }
@@ -174,8 +234,8 @@ where
 }
 
 /// writer スレッド本体。チャネルから受け取った PCM を MP3 にエンコードして書き込み、
-/// チャネルが閉じたら flush してファイルを確定する。
-fn run_writer(
+/// チャネルが閉じたら flush してファイルを確定する。マイク・システム両音源で共用する。
+pub(crate) fn run_writer(
     rx: Receiver<Vec<i16>>,
     sample_rate: u32,
     channels: u16,
@@ -199,7 +259,7 @@ fn run_writer(
         // 出力に必要な分を先に確保しておく（不足すると LAME がバッファ外へ書きクラッシュする）。
         mp3.reserve(mp3lame_encoder::max_required_buffer_size(pcm.len()));
         // モノラルは MonoPcm、ステレオはインターリーブ。誤ると LAME 内部でバッファ不整合になる。
-        // channels は start() で 1/2 のみに絞っている。
+        // channels は呼び出し側で 1/2 のみに絞っている。
         if channels == 1 {
             encoder.encode_to_vec(MonoPcm(pcm.as_slice()), &mut mp3)?;
         } else {
@@ -234,7 +294,8 @@ fn create_session_dir(session_dir: &Path) -> std::io::Result<()> {
 }
 
 /// 録音ファイルを作成する。録音は機微データのため、Unix では所有者のみ読み書き可(0600)で作る。
-fn create_recording_file(path: &Path) -> std::io::Result<File> {
+/// マイク・システム両音源で共用する。
+pub(crate) fn create_recording_file(path: &Path) -> std::io::Result<File> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
