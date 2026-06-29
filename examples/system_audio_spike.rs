@@ -53,6 +53,8 @@ mod macos {
         mp3: Vec<u8>,
         callbacks: u64,
         frames: u64,
+        /// flush 済みフラグ。確定後に遅延コールバックが来てもエンコードしない。
+        finalized: bool,
     }
 
     struct AudioHandler {
@@ -86,6 +88,9 @@ mod macos {
 
     impl SpikeSink {
         fn encode(&mut self, pcm: &[i16]) -> Result<(), Box<dyn std::error::Error>> {
+            if self.finalized {
+                return Ok(());
+            }
             self.mp3.clear();
             self.mp3
                 .reserve(mp3lame_encoder::max_required_buffer_size(pcm.len()));
@@ -99,7 +104,13 @@ mod macos {
             Ok(())
         }
 
-        fn finalize(mut self) -> Result<(), Box<dyn std::error::Error>> {
+        /// 末尾フレームを書き出してファイルを確定する。`&mut self` で行い、`SCStream` が
+        /// ハンドラ参照を保持していてもロック経由で呼べるようにする（二重 flush は防ぐ）。
+        fn finalize(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+            if self.finalized {
+                return Ok(());
+            }
+            self.finalized = true;
             self.mp3.clear();
             self.mp3
                 .reserve(mp3lame_encoder::max_required_buffer_size(0));
@@ -163,6 +174,7 @@ mod macos {
             mp3: Vec::new(),
             callbacks: 0,
             frames: 0,
+            finalized: false,
         }));
 
         // (1) 共有可能コンテンツ → (2) コンテンツフィルタ（先頭ディスプレイ）。
@@ -198,29 +210,23 @@ mod macos {
         stream.start_capture()?;
         std::thread::sleep(Duration::from_secs(CAPTURE_SECS));
         stream.stop_capture()?;
+        // ストリームを drop してハンドラ参照を解放し、以降コールバックが来ないようにする。
+        drop(stream);
 
-        // 統計を表示してファイルを確定する。
-        let (callbacks, frames) = {
-            let sink = sink.lock().expect("SpikeSink のロックは毒化しない");
-            (sink.callbacks, sink.frames)
-        };
-        println!("受信コールバック数: {callbacks} / 合計フレーム数: {frames}");
-        if callbacks == 0 {
+        // 統計を表示し、ロック経由でファイルを確定する。
+        let mut sink = sink.lock().expect("SpikeSink のロックは毒化しない");
+        println!(
+            "受信コールバック数: {} / 合計フレーム数: {}",
+            sink.callbacks, sink.frames
+        );
+        if sink.callbacks == 0 {
             eprintln!(
                 "サンプルが 1 つも届かなかった。画面収録権限が無い可能性が高い\
                  （システム設定 > プライバシーとセキュリティ > 画面収録 を確認）。"
             );
         }
-
-        // Arc から SpikeSink を取り出して flush（他に参照が無ければ成功）。
-        match Arc::try_unwrap(sink) {
-            Ok(mutex) => {
-                let sink = mutex.into_inner().expect("SpikeSink のロックは毒化しない");
-                sink.finalize()?;
-                println!("system.mp3 を確定した: {}", output_path.display());
-            }
-            Err(_) => eprintln!("ハンドラの参照が残っており flush できなかった"),
-        }
+        sink.finalize()?;
+        println!("system.mp3 を確定した: {}", output_path.display());
         Ok(())
     }
 }
