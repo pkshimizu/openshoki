@@ -165,9 +165,8 @@ fn toggle_recording(
     if recorder.is_none() {
         // 開始。保存先は設定の現在値を使う。セッションごとに `<保存先>/<日時>` のディレクトリを
         // 作り、その中に音源（将来は文字起こしも）をまとめる。日時はローカル時刻で衝突を避ける。
-        let dir = config.borrow().recording_dir.clone();
         let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
-        let session_dir = dir.join(&timestamp);
+        let session_dir = config.borrow().recording_dir.join(&timestamp);
         match Recorder::start(&session_dir) {
             Ok(session) => {
                 *recorder = Some(session);

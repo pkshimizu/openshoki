@@ -48,7 +48,7 @@ impl Recorder {
     pub fn start(session_dir: &Path) -> Result<Self, RecordError> {
         // session_dir は設定の保存先（手編集されうる信頼境界外）から組み立てた値だが、ユーザー
         // 自身が選んだ保存先配下であり、ここではそのまま使う（パスの正当性は設定 UI 側の責務）。
-        std::fs::create_dir_all(session_dir)?;
+        create_session_dir(session_dir)?;
 
         let host = cpal::default_host();
         let device = host
@@ -205,6 +205,21 @@ fn run_writer(
     writer.write_all(&mp3)?;
     writer.flush()?;
     Ok(())
+}
+
+/// 録音セッションのディレクトリを作成する。録音は機微データのため、Unix では所有者のみ
+/// アクセス可(0700)で作る（ファイルを 0600 にしても、ディレクトリが緩いと中身の一覧が
+/// 他ユーザーに漏れる）。`mode` は新規作成するディレクトリにのみ効き、既存ディレクトリの
+/// 権限は変えない。親が無ければ再帰的に作る（`create_dir_all` 相当）。
+fn create_session_dir(session_dir: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(session_dir)
 }
 
 /// 録音ファイルを作成する。録音は機微データのため、Unix では所有者のみ読み書き可(0600)で作る。
