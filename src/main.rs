@@ -163,10 +163,12 @@ fn toggle_recording(
     config: &Rc<RefCell<Config>>,
 ) {
     if recorder.is_none() {
-        // 開始。保存先は設定の現在値を使う。タイムスタンプはローカル時刻で衝突を避ける。
+        // 開始。保存先は設定の現在値を使う。セッションごとに `<保存先>/<日時>` のディレクトリを
+        // 作り、その中に音源（将来は文字起こしも）をまとめる。日時はローカル時刻で衝突を避ける。
         let dir = config.borrow().recording_dir.clone();
         let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
-        match Recorder::start(&dir, &timestamp) {
+        let session_dir = dir.join(&timestamp);
+        match Recorder::start(&session_dir) {
             Ok(session) => {
                 *recorder = Some(session);
                 record_item.set_text(RECORD_LABEL_STOP);
