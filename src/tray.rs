@@ -5,6 +5,7 @@
 //! 呼び出し側（`main`）が Slint のイベントループ上でそれを拾ってウィンドウ操作・録音・終了を行う。
 
 use std::rc::Rc;
+use std::time::Duration;
 
 use tray_icon::menu::{Menu, MenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
@@ -66,36 +67,73 @@ impl Tray {
     }
 }
 
-/// 録音状態に応じてトレイのアイコンとツールチップを切り替える。
+/// 待機中の表示へ戻す。静的なグレーアイコン・経過時間テキストの消去・ツールチップを既定に戻す。
 /// `?` を使えない呼び出し元（イベントループのコールバック）から使うため、失敗はログに残す。
-pub fn set_recording_state(icon: &TrayIcon, recording: bool) {
-    let (color, tooltip) = if recording {
-        (DotColor::Recording, TOOLTIP_RECORDING)
-    } else {
-        (DotColor::Idle, TOOLTIP_IDLE)
-    };
-    if let Err(err) = icon.set_icon(Some(dot_icon(color))) {
+pub fn set_idle(icon: &TrayIcon) {
+    if let Err(err) = icon.set_icon(Some(dot_icon(DotColor::Idle))) {
         eprintln!("トレイアイコンの更新に失敗した: {err}");
     }
-    if let Err(err) = icon.set_tooltip(Some(tooltip)) {
+    // set_title は Result を返さない。None で経過時間テキストを消す。
+    icon.set_title(None::<&str>);
+    if let Err(err) = icon.set_tooltip(Some(TOOLTIP_IDLE)) {
         eprintln!("トレイのツールチップ更新に失敗した: {err}");
     }
 }
 
-/// ドットアイコンの色。待機中はグレー、録音中は赤。
+/// 録音中の表示を更新する。点滅フレーム（`blink_on`）で赤の濃淡を切り替え、メニューバーに
+/// 経過時間テキストを出す。呼び出し側が表示の変化時（秒の更新・点滅トグル）にだけ呼ぶ前提。
+/// `?` を使えない呼び出し元から使うため、失敗はログに残す。
+pub fn render_recording(icon: &TrayIcon, elapsed: Duration, blink_on: bool) {
+    let color = if blink_on {
+        DotColor::Recording
+    } else {
+        DotColor::RecordingDim
+    };
+    if let Err(err) = icon.set_icon(Some(dot_icon(color))) {
+        eprintln!("トレイアイコンの更新に失敗した: {err}");
+    }
+    // set_title は Result を返さない。macOS ではメニューバーにテキスト表示される
+    //（Windows/Linux では効き方が異なるが、アイコンの色・点滅を主表示にしているので許容）。
+    icon.set_title(Some(format_elapsed(elapsed)));
+    if let Err(err) = icon.set_tooltip(Some(TOOLTIP_RECORDING)) {
+        eprintln!("トレイのツールチップ更新に失敗した: {err}");
+    }
+}
+
+/// 経過時間を表示用文字列にする。既定は `mm:ss`、1 時間以上は `h:mm:ss`。
+fn format_elapsed(elapsed: Duration) -> String {
+    const SECS_PER_MINUTE: u64 = 60;
+    const SECS_PER_HOUR: u64 = 60 * SECS_PER_MINUTE;
+
+    let total = elapsed.as_secs();
+    let hours = total / SECS_PER_HOUR;
+    let minutes = (total % SECS_PER_HOUR) / SECS_PER_MINUTE;
+    let seconds = total % SECS_PER_MINUTE;
+
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes:02}:{seconds:02}")
+    }
+}
+
+/// ドットアイコンの色。待機中はグレー、録音中は赤（点滅の減光フレームは暗い赤）。
 #[derive(Clone, Copy)]
 enum DotColor {
     Idle,
     Recording,
+    RecordingDim,
 }
 
-/// トレイ用のドットアイコンを生成する。録音中は赤、待機中はグレーで状態を示す。
+/// トレイ用のドットアイコンを生成する。録音中は赤（点滅で濃淡）、待機中はグレーで状態を示す。
 ///
 /// 暫定アイコン。macOS のテンプレート画像化など見た目の調整は後続に回す。
 fn dot_icon(color: DotColor) -> Icon {
     const SIZE: u32 = 32;
-    // 不透明なドット色（RGBA）。
+    // 不透明なドット色（RGBA）。録音中は明るい赤と、点滅の減光フレーム用の暗い赤。
+    // 透明にはせず減光に留め、点滅で「消えた」ように見えないようにする。
     const RECORDING: [u8; 4] = [0xD0, 0x21, 0x1c, 0xff];
+    const RECORDING_DIM: [u8; 4] = [0x6a, 0x14, 0x10, 0xff];
     const IDLE: [u8; 4] = [0x8a, 0x8a, 0x8a, 0xff];
     // ドットの半径はアイコン一辺に対する割合で決める。
     const RADIUS_RATIO: f32 = 0.4;
@@ -103,6 +141,7 @@ fn dot_icon(color: DotColor) -> Icon {
     let dot = match color {
         DotColor::Idle => IDLE,
         DotColor::Recording => RECORDING,
+        DotColor::RecordingDim => RECORDING_DIM,
     };
 
     let mut rgba = vec![0u8; (SIZE * SIZE * 4) as usize];
@@ -122,4 +161,24 @@ fn dot_icon(color: DotColor) -> Icon {
     }
 
     Icon::from_rgba(rgba, SIZE, SIZE).expect("RGBA バッファ長 = SIZE*SIZE*4 を満たすため常に有効")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_elapsed;
+    use std::time::Duration;
+
+    #[test]
+    fn format_elapsed_under_hour_is_mm_ss() {
+        assert_eq!(format_elapsed(Duration::from_secs(0)), "00:00");
+        assert_eq!(format_elapsed(Duration::from_secs(65)), "01:05");
+        assert_eq!(format_elapsed(Duration::from_secs(599)), "09:59");
+    }
+
+    #[test]
+    fn format_elapsed_over_hour_includes_hours() {
+        assert_eq!(format_elapsed(Duration::from_secs(3661)), "1:01:01");
+        // 分は 2 桁ゼロ詰め、時は詰めない。
+        assert_eq!(format_elapsed(Duration::from_secs(3600)), "1:00:00");
+    }
 }

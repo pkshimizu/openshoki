@@ -22,8 +22,12 @@ use crate::tray::{
 slint::include_modules!();
 
 /// メニューイベントのポーリング周期。アイドル時の負荷を抑えつつ、操作の体感遅延が
-/// 出ない程度の値にする。
+/// 出ない程度の値にする。録音中のメニューバー表示更新（経過時間・点滅）もこの周期に相乗りする。
 const MENU_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// 録音中アイコンの点滅周期。`MENU_POLL_INTERVAL` 何 tick ごとに濃淡を切り替えるか。
+/// 6 tick ≈ 600ms で 1 フレーム（点灯/減光が約 600ms ずつ）。
+const BLINK_PERIOD_TICKS: u32 = 6;
 
 /// ウィンドウの初期ジオメトリ。イベントループ稼働中に初めて show() すると、位置・サイズが
 /// 確定されないまま高さ 0 で表示される。初回表示時にこの値を明示してジオメトリを確定させる。
@@ -131,6 +135,13 @@ fn build_menu_event_handler(
     let mut geometry_committed = false;
     // 実行中の録音セッション。None=待機中、Some=録音中。
     let mut recorder: Option<Recorder> = None;
+    // 録音中のメニューバー表示用の状態。表示が変わるとき（秒の更新・点滅トグル）だけ
+    // 描画を呼ぶための前回値を持つ。
+    let mut blink_ticks: u32 = 0;
+    let mut last_rendered_secs: Option<u64> = None;
+    let mut last_blink_on = false;
+    // 直前 tick で録音中だったか。録音中→待機の遷移を 1 度だけ拾って待機表示へ戻すのに使う。
+    let mut was_recording = false;
 
     move || {
         while let Ok(event) = menu_channel.try_recv() {
@@ -143,23 +154,46 @@ fn build_menu_event_handler(
                     show_window(window, &toggle_item, &mut geometry_committed);
                 }
             } else if event.id == record_id {
-                toggle_recording(&mut recorder, &record_item, &tray_icon, &config);
+                toggle_recording(&mut recorder, &record_item, &config);
             } else if event.id == quit_id
                 && let Err(err) = slint::quit_event_loop()
             {
                 eprintln!("イベントループの終了に失敗した: {err}");
             }
         }
+
+        // 録音中はメニューバーへ経過時間と点滅を反映する。100ms ポーリングに相乗りし、
+        // 表示が変わるとき（秒の更新・点滅トグル）だけ set_icon / set_title を呼んで間引く。
+        if let Some(session) = recorder.as_ref() {
+            blink_ticks = blink_ticks.wrapping_add(1);
+            let blink_on = (blink_ticks / BLINK_PERIOD_TICKS).is_multiple_of(2);
+            let elapsed = session.elapsed();
+            let secs = elapsed.as_secs();
+            if last_rendered_secs != Some(secs) || last_blink_on != blink_on {
+                tray::render_recording(&tray_icon, elapsed, blink_on);
+                last_rendered_secs = Some(secs);
+                last_blink_on = blink_on;
+            }
+            was_recording = true;
+        } else if was_recording {
+            // 録音中→待機へ移った最初の tick。待機表示へ戻し、表示状態をリセットする。
+            tray::set_idle(&tray_icon);
+            blink_ticks = 0;
+            last_rendered_secs = None;
+            last_blink_on = false;
+            was_recording = false;
+        }
     }
 }
 
-/// 録音セッションの有無に応じて、録音の開始／停止を切り替える。
+/// 録音セッションの有無に応じて、録音の開始／停止を切り替える。録音セッションの開始・停止と
+/// メニュー項目のラベル切替に専念する。トレイアイコン／経過時間の表示はタイマー closure が
+/// 録音状態（`Option<Recorder>`）を見て駆動するため、ここでは触らない。
 ///
 /// 失敗してもアプリ（常駐）は落とさず、状態は変えずにログを残す。
 fn toggle_recording(
     recorder: &mut Option<Recorder>,
     record_item: &MenuItem,
-    tray_icon: &tray_icon::TrayIcon,
     config: &Rc<RefCell<Config>>,
 ) {
     if recorder.is_none() {
@@ -171,7 +205,6 @@ fn toggle_recording(
             Ok(session) => {
                 *recorder = Some(session);
                 record_item.set_text(RECORD_LABEL_STOP);
-                tray::set_recording_state(tray_icon, true);
             }
             Err(err) => eprintln!("録音の開始に失敗した: {err}"),
         }
@@ -182,7 +215,6 @@ fn toggle_recording(
             Err(err) => eprintln!("録音の停止・保存に失敗した: {err}"),
         }
         record_item.set_text(RECORD_LABEL_START);
-        tray::set_recording_state(tray_icon, false);
     }
 }
 
