@@ -24,8 +24,9 @@ type RecordError = Box<dyn std::error::Error + Send + Sync>;
 const BITRATE: Bitrate = Bitrate::Kbps128;
 /// エンコード品質（0=最良〜9=最低）。速度と品質のバランスで Good。
 const QUALITY: Quality = Quality::Good;
-/// 音源を区別するためのファイル名接尾辞。マイクは `-mic`（後でシステム音声は `-system`）。
-const MIC_SUFFIX: &str = "mic";
+/// マイク音源の出力ファイル名。録音セッションのディレクトリ内に固定名で置く
+/// （後でシステム音声は `system.mp3`、文字起こし結果なども同じディレクトリへ）。
+const MIC_FILENAME: &str = "mic.mp3";
 
 /// 実行中の録音セッション（マイク音源 1 つ）。
 ///
@@ -41,12 +42,13 @@ pub struct Recorder {
 }
 
 impl Recorder {
-    /// 既定の入力デバイスからマイク録音を開始する。`recording_dir` 配下にタイムスタンプ名の
-    /// `-mic.mp3` を作る（ディレクトリが無ければ作成する）。
-    pub fn start(recording_dir: &Path, timestamp: &str) -> Result<Self, RecordError> {
-        // recording_dir は設定由来（手編集されうる信頼境界外）だが、ユーザー自身が選んだ保存先
-        // であり、ここではそのまま使う（パスの正当性は設定 UI 側の責務）。
-        std::fs::create_dir_all(recording_dir)?;
+    /// 既定の入力デバイスからマイク録音を開始する。録音セッションのディレクトリ `session_dir`
+    /// の中に `mic.mp3` を作る（ディレクトリが無ければ作成する）。`session_dir` は呼び出し側が
+    /// `<保存先>/<日時>` で組み立てる（同じセッションの音源・文字起こしを一箇所にまとめるため）。
+    pub fn start(session_dir: &Path) -> Result<Self, RecordError> {
+        // session_dir は設定の保存先（手編集されうる信頼境界外）から組み立てた値だが、ユーザー
+        // 自身が選んだ保存先配下であり、ここではそのまま使う（パスの正当性は設定 UI 側の責務）。
+        create_session_dir(session_dir)?;
 
         let host = cpal::default_host();
         let device = host
@@ -71,7 +73,7 @@ impl Recorder {
             return Err(format!("未対応のチャンネル数: {channels}").into());
         }
 
-        let path = recording_dir.join(format!("openshoki-{timestamp}-{MIC_SUFFIX}.mp3"));
+        let path = session_dir.join(MIC_FILENAME);
         // 録音は機微データのため、所有者のみ読み書き可で作成する（Unix）。
         let file = create_recording_file(&path)?;
 
@@ -203,6 +205,21 @@ fn run_writer(
     writer.write_all(&mp3)?;
     writer.flush()?;
     Ok(())
+}
+
+/// 録音セッションのディレクトリを作成する。録音は機微データのため、Unix では所有者のみ
+/// アクセス可(0700)で作る（ファイルを 0600 にしても、ディレクトリが緩いと中身の一覧が
+/// 他ユーザーに漏れる）。`mode` は新規作成するディレクトリにのみ効き、既存ディレクトリの
+/// 権限は変えない。親が無ければ再帰的に作る（`create_dir_all` 相当）。
+fn create_session_dir(session_dir: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(session_dir)
 }
 
 /// 録音ファイルを作成する。録音は機微データのため、Unix では所有者のみ読み書き可(0600)で作る。
