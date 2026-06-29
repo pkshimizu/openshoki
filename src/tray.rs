@@ -173,6 +173,8 @@ mod tests {
         assert_eq!(format_elapsed(Duration::from_secs(0)), "00:00");
         assert_eq!(format_elapsed(Duration::from_secs(65)), "01:05");
         assert_eq!(format_elapsed(Duration::from_secs(599)), "09:59");
+        // 1 時間未満の上限。ここまでは時を出さず mm:ss のまま（分は 60 以上になりうる）。
+        assert_eq!(format_elapsed(Duration::from_secs(3599)), "59:59");
     }
 
     #[test]
