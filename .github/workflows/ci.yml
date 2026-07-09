@@ -25,7 +25,14 @@ jobs:
       # 運用方針: 誤検知や未対応アドバイザリを一時的に無視する場合は、レビューのうえ
       # この行を `cargo audit --ignore RUSTSEC-XXXX-XXXX` の形に変更し、無視する理由を
       # コミットメッセージに残す（恒久的な無視は安易に増やさない）。
-      - run: cargo audit
+      #
+      # 無視理由:
+      # - RUSTSEC-2026-0194 / RUSTSEC-2026-0195（quick-xml の DoS）: quick-xml は
+      #   rfd → wayland-scanner 経由の Linux 専用・ビルド時依存で、macOS の出荷バイナリには
+      #   含まれない。入力はビルド時に読む信頼できる Wayland プロトコル XML のみ。修正版
+      #   0.41 は wayland-scanner ^0.39 に阻まれ現状取り込めないため一時的に無視する。
+      #   （wayland/rfd チェーンが 0.41 対応版に上がったら --ignore を外す）
+      - run: cargo audit --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195
 
   check:
     name: build / fmt / clippy / test
