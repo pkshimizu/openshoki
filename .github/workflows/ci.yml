@@ -33,6 +33,25 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+      # ランナー既定の Xcode がベータ版だと Swift 後方互換ライブラリ
+      # （libswiftCompatibilityConcurrency.a・libswiftCompatibility56.a）を含まないことがあり、
+      # screencapturekit / apple-* が Swift ブリッジに埋め込む force-load シンボルを
+      # リンクできず build が失敗する（ローカルの安定版 Xcode では通る）。既定に依存せず、
+      # 互換ライブラリを確実に含む安定版 Xcode 16 系を明示選択して決定的にする。
+      - name: 安定版 Xcode を選択（Swift 後方互換ライブラリ確保）
+        run: |
+          xcode="$(ls -d /Applications/Xcode_16.*.app 2>/dev/null | sort -V | tail -n1)"
+          if [ -z "$xcode" ]; then
+            echo "Xcode 16 系が見つからない。既定 Xcode を使用する。" >&2
+            xcode="/Applications/Xcode.app"
+          fi
+          echo "Selecting $xcode"
+          sudo xcode-select -switch "$xcode/Contents/Developer"
+          swiftlib="$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/macosx"
+          if [ ! -e "$swiftlib/libswiftCompatibilityConcurrency.a" ]; then
+            echo "Swift 後方互換ライブラリが見つからない: $swiftlib" >&2
+            exit 1
+          fi
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
