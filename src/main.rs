@@ -5,6 +5,8 @@
 
 mod config;
 mod recorder;
+#[cfg(target_os = "macos")]
+mod system_audio;
 mod tray;
 
 use std::cell::RefCell;
@@ -209,10 +211,14 @@ fn toggle_recording(
             Err(err) => eprintln!("録音の開始に失敗した: {err}"),
         }
     } else if let Some(session) = recorder.take() {
-        // 停止。stop() がストリーム停止→flush→ファイル確定まで行う。
-        match session.stop() {
-            Ok(path) => println!("録音を保存した: {}", path.display()),
-            Err(err) => eprintln!("録音の停止・保存に失敗した: {err}"),
+        // 停止。stop() が各音源のストリーム停止→flush→ファイル確定まで行い、保存できたパスを返す。
+        let saved = session.stop();
+        if saved.is_empty() {
+            eprintln!("録音の停止・保存に失敗した（保存できたファイルが無い）");
+        } else {
+            for path in &saved {
+                println!("録音を保存した: {}", path.display());
+            }
         }
         record_item.set_text(RECORD_LABEL_START);
     }

@@ -25,7 +25,14 @@ jobs:
       # 運用方針: 誤検知や未対応アドバイザリを一時的に無視する場合は、レビューのうえ
       # この行を `cargo audit --ignore RUSTSEC-XXXX-XXXX` の形に変更し、無視する理由を
       # コミットメッセージに残す（恒久的な無視は安易に増やさない）。
-      - run: cargo audit
+      #
+      # 無視理由:
+      # - RUSTSEC-2026-0194 / RUSTSEC-2026-0195（quick-xml の DoS）: quick-xml は
+      #   rfd → wayland-scanner 経由の Linux 専用・ビルド時依存で、macOS の出荷バイナリには
+      #   含まれない。入力はビルド時に読む信頼できる Wayland プロトコル XML のみ。修正版
+      #   0.41 は wayland-scanner ^0.39 に阻まれ現状取り込めないため一時的に無視する。
+      #   （wayland/rfd チェーンが 0.41 対応版に上がったら --ignore を外す）
+      - run: cargo audit --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195
 
   check:
     name: build / fmt / clippy / test
@@ -33,6 +40,25 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+      # ランナー既定の Xcode がベータ版だと Swift 後方互換ライブラリ
+      # （libswiftCompatibilityConcurrency.a・libswiftCompatibility56.a）を含まないことがあり、
+      # screencapturekit / apple-* が Swift ブリッジに埋め込む force-load シンボルを
+      # リンクできず build が失敗する（ローカルの安定版 Xcode では通る）。既定に依存せず、
+      # 互換ライブラリを確実に含む安定版 Xcode 16 系を明示選択して決定的にする。
+      - name: 安定版 Xcode を選択（Swift 後方互換ライブラリ確保）
+        run: |
+          xcode="$(ls -d /Applications/Xcode_16.*.app 2>/dev/null | sort -V | tail -n1)"
+          if [ -z "$xcode" ]; then
+            echo "Xcode 16 系が見つからない。既定 Xcode を使用する。" >&2
+            xcode="/Applications/Xcode.app"
+          fi
+          echo "Selecting $xcode"
+          sudo xcode-select -switch "$xcode/Contents/Developer"
+          swiftlib="$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/macosx"
+          if [ ! -e "$swiftlib/libswiftCompatibilityConcurrency.a" ]; then
+            echo "Swift 後方互換ライブラリが見つからない: $swiftlib" >&2
+            exit 1
+          fi
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
