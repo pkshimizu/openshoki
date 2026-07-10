@@ -55,7 +55,7 @@ impl Tray {
         let icon = TrayIconBuilder::new()
             .with_tooltip(TOOLTIP_IDLE)
             .with_menu(Box::new(menu))
-            .with_icon(dot_icon(DotColor::Idle))
+            .with_icon(dot_icon(IDLE_COLOR))
             .build()?;
 
         Ok(Self {
@@ -70,7 +70,7 @@ impl Tray {
 /// 待機中の表示へ戻す。静的なグレーアイコン・経過時間テキストの消去・ツールチップを既定に戻す。
 /// `?` を使えない呼び出し元（イベントループのコールバック）から使うため、失敗はログに残す。
 pub fn set_idle(icon: &TrayIcon) {
-    if let Err(err) = icon.set_icon(Some(dot_icon(DotColor::Idle))) {
+    if let Err(err) = icon.set_icon(Some(dot_icon(IDLE_COLOR))) {
         eprintln!("トレイアイコンの更新に失敗した: {err}");
     }
     // set_title は Result を返さない。tray-icon 0.24 の macOS 実装では set_title(None) は
@@ -82,24 +82,41 @@ pub fn set_idle(icon: &TrayIcon) {
     }
 }
 
-/// 録音中の表示を更新する。点滅フレーム（`blink_on`）で赤の濃淡を切り替え、メニューバーに
-/// 経過時間テキストを出す。呼び出し側が表示の変化時（秒の更新・点滅トグル）にだけ呼ぶ前提。
+/// 録音中の表示を更新する。アイコンは明度レベル（`level`, 0.0=暗〜1.0=明）で赤の濃淡を
+/// 補間し、滑らかな明滅（breathing）を表す。アイコンは滑らかさのため毎ティック更新する前提。
+/// 経過時間テキストとツールチップは毎ティック再設定すると無駄なので、`update_title` が真の
+/// ときだけ（＝呼び出し側で秒が変わったとき）更新する。
 /// `?` を使えない呼び出し元から使うため、失敗はログに残す。
-pub fn render_recording(icon: &TrayIcon, elapsed: Duration, blink_on: bool) {
-    let color = if blink_on {
-        DotColor::Recording
-    } else {
-        DotColor::RecordingDim
-    };
-    if let Err(err) = icon.set_icon(Some(dot_icon(color))) {
+pub fn render_recording(icon: &TrayIcon, elapsed: Duration, level: f32, update_title: bool) {
+    if let Err(err) = icon.set_icon(Some(dot_icon(recording_color(level)))) {
         eprintln!("トレイアイコンの更新に失敗した: {err}");
     }
-    // set_title は Result を返さない。macOS ではメニューバーにテキスト表示される
-    //（Windows/Linux では効き方が異なるが、アイコンの色・点滅を主表示にしているので許容）。
-    icon.set_title(Some(format_elapsed(elapsed)));
-    if let Err(err) = icon.set_tooltip(Some(TOOLTIP_RECORDING)) {
-        eprintln!("トレイのツールチップ更新に失敗した: {err}");
+    if update_title {
+        // set_title は Result を返さない。macOS ではメニューバーにテキスト表示される
+        //（Windows/Linux では効き方が異なるが、アイコンの色・明滅を主表示にしているので許容）。
+        icon.set_title(Some(format_elapsed(elapsed)));
+        if let Err(err) = icon.set_tooltip(Some(TOOLTIP_RECORDING)) {
+            eprintln!("トレイのツールチップ更新に失敗した: {err}");
+        }
     }
+}
+
+/// 録音中ドットの色を明度レベル（0.0=暗い赤, 1.0=明るい赤）で線形補間する。透明度（アルファ）は
+/// 使わず赤の濃淡だけで表すため、明滅しても「消えた」ようには見えない。
+fn recording_color(level: f32) -> [u8; 4] {
+    // 明滅の両端の赤。DIM を明るくしすぎない範囲で濃淡差を付ける（実機の見え方で微調整可）。
+    const RECORDING_BRIGHT: [u8; 4] = [0xD0, 0x21, 0x1c, 0xff];
+    const RECORDING_DIM: [u8; 4] = [0x6a, 0x14, 0x10, 0xff];
+
+    let level = level.clamp(0.0, 1.0);
+    let lerp =
+        |dim: u8, bright: u8| (dim as f32 + (bright as f32 - dim as f32) * level).round() as u8;
+    [
+        lerp(RECORDING_DIM[0], RECORDING_BRIGHT[0]),
+        lerp(RECORDING_DIM[1], RECORDING_BRIGHT[1]),
+        lerp(RECORDING_DIM[2], RECORDING_BRIGHT[2]),
+        0xff,
+    ]
 }
 
 /// 経過時間を表示用文字列にする。既定は `mm:ss`、1 時間以上は `h:mm:ss`。
@@ -119,32 +136,17 @@ fn format_elapsed(elapsed: Duration) -> String {
     }
 }
 
-/// ドットアイコンの色。待機中はグレー、録音中は赤（点滅の減光フレームは暗い赤）。
-#[derive(Clone, Copy)]
-enum DotColor {
-    Idle,
-    Recording,
-    RecordingDim,
-}
+/// 待機中ドットのグレー（不透明）。
+const IDLE_COLOR: [u8; 4] = [0x8a, 0x8a, 0x8a, 0xff];
 
-/// トレイ用のドットアイコンを生成する。録音中は赤（点滅で濃淡）、待機中はグレーで状態を示す。
+/// トレイ用のドットアイコンを、指定した RGBA 色で生成する。色（待機のグレー／録音中の赤の濃淡）は
+/// 呼び出し側が決め、ここは描画に専念して共通化する。
 ///
 /// 暫定アイコン。macOS のテンプレート画像化など見た目の調整は後続に回す。
-fn dot_icon(color: DotColor) -> Icon {
+fn dot_icon(dot: [u8; 4]) -> Icon {
     const SIZE: u32 = 32;
-    // 不透明なドット色（RGBA）。録音中は明るい赤と、点滅の減光フレーム用の暗い赤。
-    // 透明にはせず減光に留め、点滅で「消えた」ように見えないようにする。
-    const RECORDING: [u8; 4] = [0xD0, 0x21, 0x1c, 0xff];
-    const RECORDING_DIM: [u8; 4] = [0x6a, 0x14, 0x10, 0xff];
-    const IDLE: [u8; 4] = [0x8a, 0x8a, 0x8a, 0xff];
     // ドットの半径はアイコン一辺に対する割合で決める。
     const RADIUS_RATIO: f32 = 0.4;
-
-    let dot = match color {
-        DotColor::Idle => IDLE,
-        DotColor::Recording => RECORDING,
-        DotColor::RecordingDim => RECORDING_DIM,
-    };
 
     let mut rgba = vec![0u8; (SIZE * SIZE * 4) as usize];
     let center = (SIZE as f32 - 1.0) / 2.0;
@@ -167,8 +169,20 @@ fn dot_icon(color: DotColor) -> Icon {
 
 #[cfg(test)]
 mod tests {
-    use super::format_elapsed;
+    use super::{format_elapsed, recording_color};
     use std::time::Duration;
+
+    #[test]
+    fn recording_color_interpolates_by_level() {
+        // level 0.0=暗い赤、1.0=明るい赤、その間は線形補間。アルファは常に不透明。
+        assert_eq!(recording_color(0.0), [0x6a, 0x14, 0x10, 0xff]);
+        assert_eq!(recording_color(1.0), [0xD0, 0x21, 0x1c, 0xff]);
+        // 中点は両端の平均（四捨五入）。
+        assert_eq!(recording_color(0.5), [0x9d, 0x1b, 0x16, 0xff]);
+        // 範囲外はクランプされ、消えた（アルファ 0）ようにはならない。
+        assert_eq!(recording_color(-1.0), [0x6a, 0x14, 0x10, 0xff]);
+        assert_eq!(recording_color(2.0), [0xD0, 0x21, 0x1c, 0xff]);
+    }
 
     #[test]
     fn format_elapsed_under_hour_is_mm_ss() {

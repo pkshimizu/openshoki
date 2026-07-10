@@ -27,9 +27,9 @@ slint::include_modules!();
 /// 出ない程度の値にする。録音中のメニューバー表示更新（経過時間・点滅）もこの周期に相乗りする。
 const MENU_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// 録音中アイコンの点滅周期。`MENU_POLL_INTERVAL` 何 tick ごとに濃淡を切り替えるか。
-/// 6 tick ≈ 600ms で 1 フレーム（点灯/減光が約 600ms ずつ）。
-const BLINK_PERIOD_TICKS: u32 = 6;
+/// 録音中アイコンの明滅（breathing）の 1 サイクル（明→暗→明）の秒数。サイン波でゆったり
+/// 変化させる。実機の見え方で微調整しやすいよう定数化する。
+const BLINK_CYCLE_SECS: f32 = 2.0;
 
 /// ウィンドウの初期ジオメトリ。イベントループ稼働中に初めて show() すると、位置・サイズが
 /// 確定されないまま高さ 0 で表示される。初回表示時にこの値を明示してジオメトリを確定させる。
@@ -137,11 +137,9 @@ fn build_menu_event_handler(
     let mut geometry_committed = false;
     // 実行中の録音セッション。None=待機中、Some=録音中。
     let mut recorder: Option<Recorder> = None;
-    // 録音中のメニューバー表示用の状態。表示が変わるとき（秒の更新・点滅トグル）だけ
-    // 描画を呼ぶための前回値を持つ。
-    let mut blink_ticks: u32 = 0;
+    // 録音中の経過時間テキストを、秒が変わったときだけ更新するための前回値。
+    // アイコンの明滅は毎ティック更新するのでここでは持たない。
     let mut last_rendered_secs: Option<u64> = None;
-    let mut last_blink_on = false;
     // 直前 tick で録音中だったか。録音中→待機の遷移を 1 度だけ拾って待機表示へ戻すのに使う。
     let mut was_recording = false;
 
@@ -164,25 +162,21 @@ fn build_menu_event_handler(
             }
         }
 
-        // 録音中はメニューバーへ経過時間と点滅を反映する。100ms ポーリングに相乗りし、
-        // 表示が変わるとき（秒の更新・点滅トグル）だけ set_icon / set_title を呼んで間引く。
+        // 録音中はメニューバーへ経過時間と明滅を反映する。100ms ポーリング（≈10fps）に相乗りし、
+        // アイコンは毎ティック明度レベルを更新して滑らかに明滅させる。経過時間テキストは
+        // 秒が変わったときだけ更新して無駄な再設定を避ける。
         if let Some(session) = recorder.as_ref() {
-            blink_ticks = blink_ticks.wrapping_add(1);
-            let blink_on = (blink_ticks / BLINK_PERIOD_TICKS).is_multiple_of(2);
             let elapsed = session.elapsed();
+            let level = breathing_level(elapsed, BLINK_CYCLE_SECS);
             let secs = elapsed.as_secs();
-            if last_rendered_secs != Some(secs) || last_blink_on != blink_on {
-                tray::render_recording(&tray_icon, elapsed, blink_on);
-                last_rendered_secs = Some(secs);
-                last_blink_on = blink_on;
-            }
+            let update_title = last_rendered_secs != Some(secs);
+            tray::render_recording(&tray_icon, elapsed, level, update_title);
+            last_rendered_secs = Some(secs);
             was_recording = true;
         } else if was_recording {
             // 録音中→待機へ移った最初の tick。待機表示へ戻し、表示状態をリセットする。
             tray::set_idle(&tray_icon);
-            blink_ticks = 0;
             last_rendered_secs = None;
-            last_blink_on = false;
             was_recording = false;
         }
     }
@@ -240,6 +234,17 @@ fn show_window(window: &slint::Window, toggle_item: &MenuItem, geometry_committe
     toggle_item.set_text(SETTINGS_LABEL_CLOSE);
 }
 
+/// 録音中アイコンの明滅レベルを、録音経過時間からサイン波で算出する純粋関数。
+///
+/// `0.0`（最も暗い赤）〜`1.0`（最も明るい赤）を返す。位相はティック数ではなく経過時間
+/// （`Recorder::elapsed()`）基準なので、ポーリング tick の揺れに依存せず一定周期で明滅する。
+/// `cycle_secs` は 1 サイクル（明→暗→明）の秒数。位相 0 は中間（0.5）から始まる。
+fn breathing_level(elapsed: std::time::Duration, cycle_secs: f32) -> f32 {
+    use std::f32::consts::PI;
+    let t = elapsed.as_secs_f32();
+    ((2.0 * PI * t / cycle_secs).sin() + 1.0) / 2.0
+}
+
 /// 保存先パスを画面表示用の文字列に変換する。
 fn recording_dir_text(dir: &std::path::Path) -> slint::SharedString {
     dir.display().to_string().into()
@@ -265,4 +270,54 @@ fn hide_dock_icon() {
     let mtm = MainThreadMarker::new().expect("main は常にメインスレッドで動くため成功する");
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::breathing_level;
+    use std::time::Duration;
+
+    /// サイン波の代表的な位相で、期待どおりの明度レベルになることを確認する。
+    /// 2 秒周期なら 0s→0.5, 0.5s(1/4)→1.0, 1.0s(1/2)→0.5, 1.5s(3/4)→0.0, 2.0s(1周)→0.5。
+    #[test]
+    fn breathing_level_matches_sine_phases() {
+        const CYCLE: f32 = 2.0;
+        let approx = |a: f32, b: f32| (a - b).abs() < 1e-4;
+
+        assert!(approx(
+            breathing_level(Duration::from_secs_f32(0.0), CYCLE),
+            0.5
+        ));
+        assert!(approx(
+            breathing_level(Duration::from_secs_f32(0.5), CYCLE),
+            1.0
+        ));
+        assert!(approx(
+            breathing_level(Duration::from_secs_f32(1.0), CYCLE),
+            0.5
+        ));
+        assert!(approx(
+            breathing_level(Duration::from_secs_f32(1.5), CYCLE),
+            0.0
+        ));
+        // 1 周期後は位相が戻り、開始と同じ 0.5。
+        assert!(approx(
+            breathing_level(Duration::from_secs_f32(2.0), CYCLE),
+            0.5
+        ));
+    }
+
+    /// 返り値は常に 0.0〜1.0 の範囲に収まる（アルファ 0 に落ちる＝消えたようには見せない前提）。
+    #[test]
+    fn breathing_level_stays_within_unit_range() {
+        const CYCLE: f32 = 2.0;
+        for i in 0..=40 {
+            let t = i as f32 * 0.05; // 0.00〜2.00 秒を 0.05 刻みで
+            let level = breathing_level(Duration::from_secs_f32(t), CYCLE);
+            assert!(
+                (0.0..=1.0).contains(&level),
+                "level {level} が範囲外 (t={t})"
+            );
+        }
+    }
 }
