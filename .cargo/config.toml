@@ -1,0 +1,4 @@
+[alias]
+# 開発用ホットリロード: ソース変更を監視して自動で再ビルド＆再起動する。
+# 事前に `cargo install cargo-watch` が必要。
+dev = "watch -w src -w ui -w build.rs -w Cargo.toml -x run"
