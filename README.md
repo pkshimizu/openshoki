@@ -84,13 +84,11 @@ MP3 エンコードに `mp3lame-encoder`、設定の永続化に `directories` /
   - Windows（WASAPI loopback）／Linux（monitor source）のシステム音声録音（[#23](https://github.com/pkshimizu/openshoki/issues/23) / [#24](https://github.com/pkshimizu/openshoki/issues/24)）
   - macOS でマイク使用を検知して録音を自動開始・停止する機能（オプトイン）
   - 配布用 macOS `.app` バンドルの生成（[#20](https://github.com/pkshimizu/openshoki/issues/20)）
-  - 開発時のホットリロード（`cargo dev`、[#17](https://github.com/pkshimizu/openshoki/issues/17)）
+  - 開発時に cargo-watch で自動再ビルド・再起動できるようにする（[#17](https://github.com/pkshimizu/openshoki/issues/17)）
   - 録音した音声の文字起こし
 
 ## 開発
 
-- 設計方針・用語・ルールは `docs/` にまとめています（`CONTEXT.md`／`PLAN.md`／`ISSUE.md`／
-  `PR.md`／`COMMIT.md`、実装ルールは `docs/rules/`）。
 - コミット前の検証コマンド:
 
   ```sh
