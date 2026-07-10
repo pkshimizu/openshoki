@@ -73,8 +73,10 @@ pub fn set_idle(icon: &TrayIcon) {
     if let Err(err) = icon.set_icon(Some(dot_icon(DotColor::Idle))) {
         eprintln!("トレイアイコンの更新に失敗した: {err}");
     }
-    // set_title は Result を返さない。None で経過時間テキストを消す。
-    icon.set_title(None::<&str>);
+    // set_title は Result を返さない。tray-icon 0.24 の macOS 実装では set_title(None) は
+    // 既存タイトルを消さない no-op（button.setTitle を呼ぶ分岐をスキップする）ため、
+    // 空文字を渡して NSStatusItem ボタンの経過時間テキストを確実に消す。
+    icon.set_title(Some(""));
     if let Err(err) = icon.set_tooltip(Some(TOOLTIP_IDLE)) {
         eprintln!("トレイのツールチップ更新に失敗した: {err}");
     }
