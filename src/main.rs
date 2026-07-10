@@ -216,9 +216,9 @@ fn toggle_recording(
         if saved.is_empty() {
             eprintln!("録音の停止・保存に失敗した（保存できたファイルが無い）");
         } else {
-            for path in &saved {
-                println!("録音を保存した: {}", path.display());
-            }
+            // 保存先のフルパスは機微情報（録音データの所在・フォルダ構造がプライバシーに関わる）
+            // なので出さない。完了が分かるように、保存できたファイル数だけを知らせる。
+            println!("録音を保存した（{} ファイル）", saved.len());
         }
         record_item.set_text(RECORD_LABEL_START);
     }
