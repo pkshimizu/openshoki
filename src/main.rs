@@ -4,6 +4,8 @@
 //! 表示/非表示とアプリ終了を行う。録音機能は後続の issue で実装する。
 
 mod config;
+#[cfg(target_os = "macos")]
+mod mic_monitor;
 mod recorder;
 #[cfg(target_os = "macos")]
 mod system_audio;
@@ -35,7 +37,7 @@ const BLINK_CYCLE_SECS: f32 = 2.0;
 /// 確定されないまま高さ 0 で表示される。初回表示時にこの値を明示してジオメトリを確定させる。
 /// 幅・高さは `ui/app-window.slint` の min/preferred と一致させること（片方だけ変えない）。
 const WINDOW_WIDTH: f32 = 420.0;
-const WINDOW_HEIGHT: f32 = 240.0;
+const WINDOW_HEIGHT: f32 = 300.0;
 /// 初回表示位置（画面左上からの暫定値）。中央寄せ等の調整は後続に回す。
 const WINDOW_X: f32 = 240.0;
 const WINDOW_Y: f32 = 160.0;
@@ -48,9 +50,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ウィンドウは生成するが表示はしない（起動時はトレイのみ）。
     let ui = AppWindow::new()?;
 
-    // 設定を読み込み、現在の保存先を画面へ反映する。失敗時は load() がデフォルトを返す。
+    // 設定を読み込み、現在の保存先・自動録音トグルを画面へ反映する。失敗時は load() がデフォルトを返す。
     let config = Rc::new(RefCell::new(Config::load()));
     ui.set_recording_dir(recording_dir_text(&config.borrow().recording_dir));
+    ui.set_auto_record(config.borrow().auto_record_on_mic_active);
 
     // 「フォルダを選択」: ネイティブのフォルダ選択ダイアログで保存先を選び直し、保存・表示更新する。
     // コールバックはメインスレッド（Slint イベントループ）上で動くため、同期 API を使う。
@@ -80,8 +83,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         *config_for_pick.borrow_mut() = candidate;
     });
 
+    // 「マイク使用時に自動録音」トグル: 変更を設定へ永続化する。永続化に成功してから
+    // メモリ上の設定を更新する（先に更新すると保存失敗時に表示・メモリとディスクが食い違う）。
+    // UI 側のチェック状態は Slint が保持するため、ここでは Config への反映のみ行う。
+    let config_for_auto = Rc::clone(&config);
+    ui.on_toggle_auto_record(move |enabled| {
+        let mut candidate = config_for_auto.borrow().clone();
+        candidate.auto_record_on_mic_active = enabled;
+        if let Err(err) = candidate.save() {
+            eprintln!("設定の保存に失敗したため、自動録音の設定は変更しない: {err}");
+            return;
+        }
+        *config_for_auto.borrow_mut() = candidate;
+    });
+
     // Slint バックエンドの初期化後にトレイを常駐させる（macOS の NSApplication 初期化後）。
     let tray = Tray::new()?;
+
+    // マイク使用の監視を開始する（macOS のみ）。他アプリが既定入力デバイスを使い始めたことを
+    // 検知し、設定 ON かつ未録音なら自動録音を開始する。連携失敗時はモニタ無しで常駐を続ける。
+    #[cfg(target_os = "macos")]
+    let mic_monitor = match mic_monitor::MicMonitor::start() {
+        Ok(monitor) => Some(monitor),
+        Err(err) => {
+            eprintln!("マイク使用の監視を開始できないため、自動録音は無効で続行する: {err}");
+            None
+        }
+    };
 
     // ウィンドウを閉じても終了させず、非表示にして常駐を保つ。
     // メニューの表示状態と整合させるため、トグル項目のラベルも戻す。
@@ -97,7 +125,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     timer.start(
         slint::TimerMode::Repeated,
         MENU_POLL_INTERVAL,
-        build_menu_event_handler(ui.as_weak(), &tray, Rc::clone(&config)),
+        build_menu_event_handler(
+            ui.as_weak(),
+            &tray,
+            Rc::clone(&config),
+            #[cfg(target_os = "macos")]
+            mic_monitor,
+        ),
     );
 
     // run_event_loop() は「最後のウィンドウが閉じ、かつ最後の Slint の SystemTrayIcon が
@@ -123,6 +157,7 @@ fn build_menu_event_handler(
     ui: slint::Weak<AppWindow>,
     tray: &Tray,
     config: Rc<RefCell<Config>>,
+    #[cfg(target_os = "macos")] mic_monitor: Option<mic_monitor::MicMonitor>,
 ) -> impl FnMut() + 'static {
     // クロージャは 'static のため &Tray を借用できない。必要な要素（各項目・ID・アイコン）
     // だけを複製して所有する。
@@ -162,6 +197,17 @@ fn build_menu_event_handler(
             }
         }
 
+        // マイク使用の立ち上がり検知を毎ティック取り出し、設定 ON かつ未録音のときだけ自動開始する
+        // （macOS のみ）。フラグは検知の有無にかかわらず取り出してクリアし、設定 OFF 中や録音中に
+        // 起きた立ち上がりを溜め込んで後から誤発火させない（立ち上がりエッジだけを拾う）。
+        #[cfg(target_os = "macos")]
+        {
+            let activated = mic_monitor.as_ref().is_some_and(|m| m.take_activated());
+            if activated && recorder.is_none() && config.borrow().auto_record_on_mic_active {
+                start_recording(&mut recorder, &record_item, &config);
+            }
+        }
+
         // 録音中はメニューバーへ経過時間と明滅を反映する。100ms ポーリング（≈10fps）に相乗りし、
         // アイコンは毎ティック明度レベルを更新して滑らかに明滅させる。経過時間テキストは
         // 秒が変わったときだけ更新して無駄な再設定を避ける。
@@ -193,17 +239,7 @@ fn toggle_recording(
     config: &Rc<RefCell<Config>>,
 ) {
     if recorder.is_none() {
-        // 開始。保存先は設定の現在値を使う。セッションごとに `<保存先>/<日時>` のディレクトリを
-        // 作り、その中に音源（将来は文字起こしも）をまとめる。日時はローカル時刻で衝突を避ける。
-        let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
-        let session_dir = config.borrow().recording_dir.join(&timestamp);
-        match Recorder::start(&session_dir) {
-            Ok(session) => {
-                *recorder = Some(session);
-                record_item.set_text(RECORD_LABEL_STOP);
-            }
-            Err(err) => eprintln!("録音の開始に失敗した: {err}"),
-        }
+        start_recording(recorder, record_item, config);
     } else if let Some(session) = recorder.take() {
         // 停止。stop() が各音源のストリーム停止→flush→ファイル確定まで行い、保存できたパスを返す。
         let saved = session.stop();
@@ -215,6 +251,31 @@ fn toggle_recording(
             println!("録音を保存した（{} ファイル）", saved.len());
         }
         record_item.set_text(RECORD_LABEL_START);
+    }
+}
+
+/// 録音セッションを開始する。手動トグルと自動開始（マイク使用検知）で共用する。
+///
+/// 保存先は設定の現在値を使う。セッションごとに `<保存先>/<日時>` のディレクトリを作り、その中に
+/// 音源（将来は文字起こしも）をまとめる。日時はローカル時刻で衝突を避ける。既に録音中なら何もしない
+/// （多重開始を防ぐ）。失敗してもアプリ（常駐）は落とさず、状態は変えずにログを残す。
+/// トレイアイコン／経過時間の表示はタイマー closure が録音状態を見て駆動するため、ここでは触らない。
+fn start_recording(
+    recorder: &mut Option<Recorder>,
+    record_item: &MenuItem,
+    config: &Rc<RefCell<Config>>,
+) {
+    if recorder.is_some() {
+        return;
+    }
+    let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+    let session_dir = config.borrow().recording_dir.join(&timestamp);
+    match Recorder::start(&session_dir) {
+        Ok(session) => {
+            *recorder = Some(session);
+            record_item.set_text(RECORD_LABEL_STOP);
+        }
+        Err(err) => eprintln!("録音の開始に失敗した: {err}"),
     }
 }
 

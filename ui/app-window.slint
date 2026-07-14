@@ -1,20 +1,25 @@
-import { VerticalBox, Button } from "std-widgets.slint";
+import { VerticalBox, Button, CheckBox } from "std-widgets.slint";
 
 // 常駐アプリの設定画面。トレイメニューから表示/非表示する。
-// 現状は「録音ファイルの保存先」を表示・変更できる。設定項目は後続でここに増やす。
+// 「録音ファイルの保存先」と「マイク使用時に自動録音」を設定できる。設定項目は後続でここに増やす。
 export component AppWindow inherits Window {
     title: "openshoki";
     // preferred だけだと中身の最小高さ（≒0）に引っ張られて潰れるため、min も指定する。
     // 幅・高さは src/main.rs の WINDOW_WIDTH/HEIGHT と一致させること（片方だけ変えない）。
     min-width: 420px;
-    min-height: 240px;
+    min-height: 300px;
     preferred-width: 420px;
-    preferred-height: 240px;
+    preferred-height: 300px;
 
     // 現在の録音ファイル保存先（表示用）。Rust 側から設定する。
     in property <string> recording-dir;
+    // 「マイク使用時に自動録音」の ON/OFF。起動時に Rust 側が設定値で初期化し、以後はトグル操作で
+    // Slint が状態を保持する（in-out）。
+    in-out property <bool> auto-record;
     // 「フォルダを選択」押下。Rust 側でネイティブのフォルダ選択ダイアログを開く。
     callback choose-folder();
+    // 自動録音トグルの切り替え。新しい ON/OFF を渡し、Rust 側で設定へ永続化する。
+    callback toggle-auto-record(bool);
 
     VerticalBox {
         alignment: start;
@@ -39,6 +44,14 @@ export component AppWindow inherits Window {
             text: "フォルダを選択";
             clicked => {
                 root.choose-folder();
+            }
+        }
+        CheckBox {
+            text: "マイク使用時に自動録音（macOS）";
+            checked: root.auto-record;
+            toggled => {
+                root.auto-record = self.checked;
+                root.toggle-auto-record(self.checked);
             }
         }
     }

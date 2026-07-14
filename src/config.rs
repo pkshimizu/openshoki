@@ -28,12 +28,19 @@ pub struct Config {
     /// 設定 TOML は手編集されうるため信頼境界の外。録音機能で書き込む際は、存在・書き込み可否を
     /// 検証してから使う（本 issue のスコープは設定値の保持まで）。
     pub recording_dir: PathBuf,
+    /// 他アプリがマイクを使い始めたら録音を自動開始するか（macOS のみ有効に働く）。
+    /// プライバシーに関わるためオプトインの既定 OFF とする。
+    /// この項目を持たない旧 `config.toml` を読んでも失敗しないよう `#[serde(default)]` を付ける
+    /// （付けないとデシリアライズが失敗し、`recording_dir` ごとデフォルトへ落ちる）。
+    #[serde(default)]
+    pub auto_record_on_mic_active: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             recording_dir: default_recording_dir(),
+            auto_record_on_mic_active: false,
         }
     }
 }
@@ -108,13 +115,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn toml_roundtrip_preserves_recording_dir() {
+    fn toml_roundtrip_preserves_fields() {
         let config = Config {
             recording_dir: PathBuf::from("/tmp/openshoki-test"),
+            auto_record_on_mic_active: true,
         };
         let text = toml::to_string_pretty(&config).expect("シリアライズは成功するはず");
         let restored: Config = toml::from_str(&text).expect("デシリアライズは成功するはず");
         assert_eq!(restored.recording_dir, config.recording_dir);
+        assert_eq!(
+            restored.auto_record_on_mic_active,
+            config.auto_record_on_mic_active
+        );
+    }
+
+    #[test]
+    fn deserialize_old_config_without_new_field_defaults_false() {
+        // 新項目 auto_record_on_mic_active を持たない旧 config.toml を読んでも失敗せず、
+        // recording_dir は保持され、新項目は既定 false になる（#[serde(default)]）。
+        let text = "recording_dir = \"/tmp/openshoki-old\"\n";
+        let restored: Config = toml::from_str(text).expect("旧設定の読み込みは成功するはず");
+        assert_eq!(restored.recording_dir, PathBuf::from("/tmp/openshoki-old"));
+        assert!(!restored.auto_record_on_mic_active);
     }
 
     #[test]

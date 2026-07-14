@@ -20,5 +20,8 @@ slint-build = "1.17.0"
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.4"
 objc2-app-kit = "0.3.2"
+# 既定入力デバイスの稼働状態（IsRunningSomewhere）を CoreAudio のプロパティリスナーで監視する。
+# cpal が依存ツリーに持つ objc2 系の CoreAudio バインディングを直接使う（追加ビルドコストなし）。
+objc2-core-audio = { version = "0.3.2", default-features = false, features = ["std", "AudioHardware"] }
 # macos_13_0 feature でシステム音声キャプチャ API（captures_audio 等）が有効になる。
 screencapturekit = { version = "8.0.0", features = ["macos_13_0"] }
