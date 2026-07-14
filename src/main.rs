@@ -201,9 +201,10 @@ fn build_menu_event_handler(
             }
         }
 
-        // マイク使用の立ち上がり検知を毎ティック取り出し、設定 ON かつ未録音のときだけ自動開始する
-        // （macOS のみ）。フラグは検知の有無にかかわらず取り出してクリアし、設定 OFF 中や録音中に
-        // 起きた立ち上がりを溜め込んで後から誤発火させない（立ち上がりエッジだけを拾う）。
+        // マイク使用の立ち上がり検知を取り出し、設定 ON かつ未録音のときだけ自動開始する
+        // （macOS のみ）。take_activated は内部で一定間隔にポーリングを間引き、いずれかの入力
+        // デバイスが非稼働→稼働へ変化した立ち上がりだけを返す。録音中（recorder=Some）は自プロセスの
+        // 録音でデバイスが稼働するが、立ち上がり判定と recorder.is_none() のガードで再発火しない。
         #[cfg(target_os = "macos")]
         {
             let activated = mic_monitor.as_ref().is_some_and(|m| m.take_activated());

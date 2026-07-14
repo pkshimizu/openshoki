@@ -1,179 +1,138 @@
-//! 他アプリが既定入力デバイス（マイク）を使い始めたことを検知する監視モニタ（macOS）。
+//! 他アプリがマイク（入力デバイス）を使い始めたことを検知する監視モニタ（macOS）。
 //!
-//! CoreAudio の既定入力デバイスに `kAudioDevicePropertyDeviceIsRunningSomewhere`
-//! （いずれかのプロセスがそのデバイスを稼働させているか）のプロパティリスナーを登録し、
-//! **非稼働→稼働の立ち上がり**（＝会議アプリなどがマイクを使い始めた瞬間）を検知する。
-//! プロパティ監視自体は録音（マイク権限）を必要としない（デバイス状態の参照のため）。
+//! CoreAudio の各入力デバイスの `kAudioDevicePropertyDeviceIsRunningSomewhere`
+//! （いずれかのプロセスがそのデバイスを稼働させているか）を定期的にポーリングし、
+//! **どれかの入力デバイスが非稼働→稼働へ変化した立ち上がり**（＝会議アプリやブラウザが
+//! マイクを使い始めた瞬間）を検知する。プロパティの参照自体は録音（マイク権限）を必要としない。
 //!
-//! リスナーは CoreAudio 管理のスレッドから呼ばれるため、検知は共有フラグ（`AtomicBool`）に
-//! 記録するだけにし、実際の録音開始は呼び出し側が `take_activated()` を既存の 100ms タイマーで
-//! ポーリングしてメインスレッド上で行う（トレイイベントと同じ橋渡し方式）。
+//! ## 全入力デバイスを見る理由
 //!
-//! 既定入力デバイスの変更追随（差し替え時のリスナー付け替え）は初期実装では未対応で、
-//! 起動時に得た既定入力デバイスのみを監視する。CoreAudio 連携に失敗した場合はエラーを返し、
-//! 呼び出し側はモニタ無しで常駐を続ける（`docs/rules/error-handling.md`）。
+//! ブラウザや会議アプリは、システム既定の入力デバイスとは別のマイク（外付け・iPhone の
+//! Continuity マイク等）を使うことがある。既定デバイス 1 台だけを見ると、別デバイスでの
+//! マイク使用を取りこぼす。そこで既定に限らず全入力デバイスを対象にし、デバイスの追加/削除
+//! （差し替え・接続）にも毎回の列挙で追随する。
+//!
+//! ## リスナーではなくポーリングにした理由
+//!
+//! デバイスが動的に増減する中でプロパティリスナーを付け外しし続けるのは複雑で誤りやすい。
+//! 本アプリはもともとメニューイベント用に 100ms タイマーを常時回している（`main.rs`）。
+//! そこに相乗りして数台のデバイスの稼働状態を `POLL_INTERVAL` ごとに読むだけなら、実装は
+//! 単純で安全であり、会議開始から録音開始までの遅延も 1 秒未満に収まる。CoreAudio 連携に
+//! 失敗しても呼び出し側はモニタ無しで常駐を続ける（`docs/rules/error-handling.md`）。
 
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::error::Error;
-use std::ffi::c_void;
 use std::mem::size_of;
 use std::ptr::NonNull;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use objc2_core_audio::{
-    AudioObjectAddPropertyListener, AudioObjectGetPropertyData, AudioObjectID,
-    AudioObjectPropertyAddress, AudioObjectRemovePropertyListener,
-    kAudioDevicePropertyDeviceIsRunningSomewhere, kAudioHardwarePropertyDefaultInputDevice,
-    kAudioObjectPropertyElementMain, kAudioObjectPropertyScopeGlobal, kAudioObjectSystemObject,
+    AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize, AudioObjectID,
+    AudioObjectPropertyAddress, kAudioDevicePropertyDeviceIsRunningSomewhere,
+    kAudioDevicePropertyStreams, kAudioHardwarePropertyDevices, kAudioObjectPropertyElementMain,
+    kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyScopeInput, kAudioObjectSystemObject,
 };
 
 /// CoreAudio の成功を表す `OSStatus`（= `noErr`）。
 const OS_STATUS_OK: i32 = 0;
 
-/// リスナーとメインスレッドで共有する監視状態。`AtomicBool` のみで、ロック不要。
-///
-/// 共有するのは独立した 2 つのフラグの受け渡しだけで、他メモリとの順序依存が無い（フラグ自体が
-/// 唯一のシグナルで、これを介して別のデータを公開しない）。そのため各操作は `Relaxed` で足りる。
-struct MonitorState {
-    /// 非稼働→稼働の立ち上がりを検知したら真にする。`take_activated()` で 1 回だけ取り出す。
-    activated: AtomicBool,
-    /// 直前に観測した稼働状態。リスナーは変化通知のたびに現在値を読み直し、これと比較して
-    /// 立ち上がりエッジだけを拾う。起動時に既に稼働中でも、その状態を初期値に入れておくことで
-    /// 遡っての自動開始をしない（`start()` で現在値を初期化する）。
-    was_running: AtomicBool,
-}
+/// 稼働状態をポーリングする間隔。100ms タイマーから毎回読むと無駄なので、この間隔に間引く。
+/// 会議開始の検知としてはこの程度の遅延で十分。
+const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-/// 既定入力デバイスの稼働状態を監視するモニタ。生存している間だけリスナーが登録される。
-///
-/// 常駐アプリの全ライフタイムにわたって保持する想定で、`Drop` でリスナーを解除する。
-/// `state` は `Arc` でリスナーのクライアントデータとして渡したポインタの実体を生かし続ける。
+/// 入力デバイスの稼働状態を監視するモニタ。全状態はメインスレッド上でのみ触るため同期は不要。
 pub struct MicMonitor {
-    /// 監視対象の既定入力デバイス（起動時に確定）。解除時に同じデバイスへ指定する。
-    device: AudioObjectID,
-    /// リスナーと共有する状態。リスナー解除まで生かすため `Arc` で保持する。
-    state: Arc<MonitorState>,
+    /// 直近に観測した各入力デバイスの稼働状態。立ち上がりエッジ判定と、消えたデバイスの掃除に使う。
+    running: RefCell<HashMap<AudioObjectID, bool>>,
+    /// 最後にポーリングした時刻。`POLL_INTERVAL` 未満の呼び出しは読み取りを省く。
+    last_poll: Cell<Instant>,
 }
 
 impl MicMonitor {
-    /// 既定入力デバイスを取得し、`IsRunningSomewhere` のプロパティリスナーを登録して監視を始める。
+    /// 監視を開始する。起動時点の各入力デバイスの稼働状態を初期値にして、以後の立ち上がりだけを
+    /// 検知できるようにする（起動時に既に使用中だったものを遡って拾わない）。
     ///
-    /// 既定入力デバイスが得られない、またはリスナー登録に失敗した場合はエラーを返す
-    /// （呼び出し側はモニタ無しで続行する）。
+    /// 入力デバイスの列挙に失敗した場合はエラーを返す（呼び出し側はモニタ無しで続行する）。
     pub fn start() -> Result<Self, Box<dyn Error>> {
-        let device = default_input_device()?;
-
-        // 起動時点の稼働状態を初期値にする。既に使用中なら was_running=true とし、以後の
-        // 「停止→開始」でだけ立ち上がりを検知する（起動時の使用中を遡って拾わない）。
-        let was_running = read_device_running(device).unwrap_or(false);
-        let state = Arc::new(MonitorState {
-            activated: AtomicBool::new(false),
-            was_running: AtomicBool::new(was_running),
-        });
-
-        let address = running_somewhere_address();
-        // クライアントデータには state の実体ポインタを渡す。state は本構造体が保持し続けるため、
-        // Drop でリスナーを解除するまでポインタは有効。
-        let client_data = Arc::as_ptr(&state) as *mut c_void;
-        let status = unsafe {
-            AudioObjectAddPropertyListener(
-                device,
-                NonNull::from(&address),
-                Some(property_listener),
-                client_data,
-            )
-        };
-        if status != OS_STATUS_OK {
-            return Err(format!("プロパティリスナーの登録に失敗した (OSStatus={status})").into());
+        let mut running = HashMap::new();
+        for device in input_devices()? {
+            running.insert(device, read_device_running(device).unwrap_or(false));
         }
-
-        Ok(Self { device, state })
+        Ok(Self {
+            running: RefCell::new(running),
+            last_poll: Cell::new(Instant::now()),
+        })
     }
 
-    /// 直近に検知した立ち上がりを 1 回だけ取り出す。フラグを立ててからこれが呼ばれるまでに
-    /// 複数回の立ち上がりがあっても、まとめて 1 回として返す（多重開始を招かないため）。
+    /// 前回ポーリング以降に、いずれかの入力デバイスが非稼働→稼働へ変化していたら `true` を返す。
+    ///
+    /// 100ms タイマーから毎ティック呼ばれる想定。`POLL_INTERVAL` 未満の呼び出しでは読み取りを
+    /// 行わず `false` を返す（間引き）。録音中かどうかの判定は呼び出し側が行うため、ここは
+    /// 「立ち上がりがあったか」だけを返す。
     pub fn take_activated(&self) -> bool {
-        self.state.activated.swap(false, Ordering::Relaxed)
-    }
-}
-
-impl Drop for MicMonitor {
-    // リスナーを解除してから `state`（Arc）が落ちる（Drop はフィールド破棄の前に走る）。
-    // ただし `AudioObjectRemovePropertyListener` は、CoreAudio の通知スレッドで実行中／
-    // ディスパッチ済みのコールバックの完了までは保証しない。理論上は「解除直後に state が解放され、
-    // 実行中のコールバックが解放済みメモリを読む」use-after-free の窓が残る。本モニタは常駐アプリの
-    // 全ライフタイムにわたって保持し、Drop はプロセス終了時にしか走らない運用のため、この残存リスクは
-    // 実害が無いものとして許容する（プロセス寿命を超えて Drop を繰り返す使い方はしない）。
-    fn drop(&mut self) {
-        let address = running_somewhere_address();
-        let client_data = Arc::as_ptr(&self.state) as *mut c_void;
-        let status = unsafe {
-            AudioObjectRemovePropertyListener(
-                self.device,
-                NonNull::from(&address),
-                Some(property_listener),
-                client_data,
-            )
-        };
-        // 後始末の失敗も握りつぶさずログに残す（`docs/rules/error-handling.md`）。
-        if status != OS_STATUS_OK {
-            eprintln!("プロパティリスナーの解除に失敗した (OSStatus={status})");
+        if self.last_poll.get().elapsed() < POLL_INTERVAL {
+            return false;
         }
+        self.last_poll.set(Instant::now());
+
+        let devices = match input_devices() {
+            Ok(devices) => devices,
+            Err(err) => {
+                eprintln!("入力デバイスの列挙に失敗したため、この回の監視を飛ばす: {err}");
+                return false;
+            }
+        };
+
+        let mut running = self.running.borrow_mut();
+        let mut activated = false;
+        for &device in &devices {
+            let now = read_device_running(device).unwrap_or(false);
+            // insert は旧値を返す。未知のデバイス（今回初めて見た）は旧値なし=非稼働扱い。
+            let was_running = running.insert(device, now).unwrap_or(false);
+            if now && !was_running {
+                activated = true;
+            }
+        }
+        // 消えたデバイスのエントリを捨てる（同じ ID で再登場したときに立ち上がりとして扱えるよう）。
+        running.retain(|device, _| devices.contains(device));
+        activated
     }
 }
 
-/// `IsRunningSomewhere` の変化通知を受け取るリスナー。CoreAudio 管理のスレッドから呼ばれる。
-///
-/// 変化通知は「何かが変わった」ことしか伝えないため、現在の稼働状態を読み直して、
-/// 非稼働→稼働の立ち上がりだけを共有フラグに記録する。重い処理はせず即座に返す。
-///
-/// この関数は **パニックしてはならない**。署名がバインディング指定の `extern "C-unwind"` で、
-/// パニックが CoreAudio の C フレームへ巻き戻ると未定義動作になる。本体は生ポインタの参照化・
-/// プロパティ読み取り・`AtomicBool` 操作だけでパニック経路を持たない。処理を足すときも同様に保つ
-/// （`unwrap`・添字アクセス・`expect` など、パニックしうる処理を持ち込まない）。
-///
-/// # Safety
-///
-/// `in_client_data` は `start()` で登録した `Arc<MonitorState>` の実体を指す有効なポインタで
-/// なければならない（リスナー解除まで生存することを `MicMonitor` が保証する）。
-unsafe extern "C-unwind" fn property_listener(
-    in_object_id: AudioObjectID,
-    _in_number_addresses: u32,
-    _in_addresses: NonNull<AudioObjectPropertyAddress>,
-    in_client_data: *mut c_void,
-) -> i32 {
-    let state = unsafe { &*(in_client_data as *const MonitorState) };
-    // 稼働状態を読めなかった通知は無視する（was_running を書き換えず、誤検知も起こさない）。
-    let Some(running) = read_device_running(in_object_id) else {
-        return OS_STATUS_OK;
-    };
-    let was_running = state.was_running.swap(running, Ordering::Relaxed);
-    if running && !was_running {
-        state.activated.store(true, Ordering::Relaxed);
-    }
-    OS_STATUS_OK
-}
-
-/// `IsRunningSomewhere` を指すプロパティアドレス（グローバルスコープ・主エレメント）。
-fn running_somewhere_address() -> AudioObjectPropertyAddress {
+/// 指定セレクタの、システムオブジェクト用グローバルアドレス（スコープ Global・主エレメント）。
+fn global_address(
+    selector: objc2_core_audio::AudioObjectPropertySelector,
+) -> AudioObjectPropertyAddress {
     AudioObjectPropertyAddress {
-        mSelector: kAudioDevicePropertyDeviceIsRunningSomewhere,
+        mSelector: selector,
         mScope: kAudioObjectPropertyScopeGlobal,
         mElement: kAudioObjectPropertyElementMain,
     }
 }
 
-/// 既定入力デバイスの ID を取得する。取得に失敗、または未設定なら失敗理由（OSStatus など）を返す。
-///
-/// 失敗理由に OSStatus を含めるのは、リスナー登録失敗（`start()`）と同様に、自動録音が動かない原因を
-/// ログから切り分けられるようにするため（`docs/rules/error-handling.md`）。
-fn default_input_device() -> Result<AudioObjectID, Box<dyn Error>> {
-    let address = AudioObjectPropertyAddress {
-        mSelector: kAudioHardwarePropertyDefaultInputDevice,
-        mScope: kAudioObjectPropertyScopeGlobal,
-        mElement: kAudioObjectPropertyElementMain,
+/// システムに存在する全 AudioObject（デバイス含む）の一覧を取得する。
+fn all_devices() -> Result<Vec<AudioObjectID>, Box<dyn Error>> {
+    let address = global_address(kAudioHardwarePropertyDevices);
+    let mut size: u32 = 0;
+    let status = unsafe {
+        AudioObjectGetPropertyDataSize(
+            kAudioObjectSystemObject as AudioObjectID,
+            NonNull::from(&address),
+            0,
+            std::ptr::null(),
+            NonNull::from(&mut size),
+        )
     };
-    let mut device: AudioObjectID = 0;
-    let mut size = size_of::<AudioObjectID>() as u32;
+    if status != OS_STATUS_OK {
+        return Err(format!("デバイス一覧のサイズ取得に失敗した (OSStatus={status})").into());
+    }
+    let count = size as usize / size_of::<AudioObjectID>();
+    let mut devices = vec![0 as AudioObjectID; count];
+    let Some(out) = NonNull::new(devices.as_mut_ptr()) else {
+        return Ok(devices); // デバイスが 0 台（out バッファが空）なら空で返す。
+    };
+    // size は確保済みバッファのバイト数として渡し、実際に書き込まれたバイト数が返る。
     let status = unsafe {
         AudioObjectGetPropertyData(
             kAudioObjectSystemObject as AudioObjectID,
@@ -181,22 +140,54 @@ fn default_input_device() -> Result<AudioObjectID, Box<dyn Error>> {
             0,
             std::ptr::null(),
             NonNull::from(&mut size),
-            NonNull::from(&mut device).cast(),
+            out.cast(),
         )
     };
     if status != OS_STATUS_OK {
-        return Err(format!("既定入力デバイスの取得に失敗した (OSStatus={status})").into());
+        return Err(format!("デバイス一覧の取得に失敗した (OSStatus={status})").into());
     }
-    if device == 0 {
-        return Err("既定入力デバイスが未設定".into());
-    }
-    Ok(device)
+    // 実際に書き込まれた要素数へ切り詰める（列挙中に台数が変わってもはみ出さない）。
+    devices.truncate(size as usize / size_of::<AudioObjectID>());
+    Ok(devices)
+}
+
+/// デバイスが入力ストリームを持つ（＝マイク等の入力デバイス）かを判定する。
+/// 入力スコープのストリーム一覧のサイズが 0 より大きければ入力デバイス。
+fn device_has_input(device: AudioObjectID) -> bool {
+    let address = AudioObjectPropertyAddress {
+        mSelector: kAudioDevicePropertyStreams,
+        mScope: kAudioObjectPropertyScopeInput,
+        mElement: kAudioObjectPropertyElementMain,
+    };
+    let mut size: u32 = 0;
+    let status = unsafe {
+        AudioObjectGetPropertyDataSize(
+            device,
+            NonNull::from(&address),
+            0,
+            std::ptr::null(),
+            NonNull::from(&mut size),
+        )
+    };
+    status == OS_STATUS_OK && size > 0
+}
+
+/// 入力デバイス（マイク等）だけを列挙する。
+fn input_devices() -> Result<Vec<AudioObjectID>, Box<dyn Error>> {
+    Ok(all_devices()?
+        .into_iter()
+        .filter(|&device| device_has_input(device))
+        .collect())
 }
 
 /// 指定デバイスの `IsRunningSomewhere`（いずれかのプロセスが稼働させているか）を読む。
-/// 取得に失敗したら `None`（呼び出し側が通知の無視・既定値扱いを決める）。
+/// 取得に失敗したら `None`（呼び出し側が既定値扱いを決める）。
 fn read_device_running(device: AudioObjectID) -> Option<bool> {
-    let address = running_somewhere_address();
+    let address = AudioObjectPropertyAddress {
+        mSelector: kAudioDevicePropertyDeviceIsRunningSomewhere,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain,
+    };
     let mut value: u32 = 0;
     let mut size = size_of::<u32>() as u32;
     let status = unsafe {
