@@ -3927,6 +3927,7 @@ dependencies = [
  "mp3lame-encoder",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
+ "objc2-core-audio",
  "rfd",
  "screencapturekit",
  "serde",
