@@ -130,7 +130,7 @@ impl MicSource {
         let config: cpal::StreamConfig = supported.config();
         // cpal 0.18 では SampleRate は u32 の型エイリアス。
         let sample_rate = config.sample_rate;
-        let channels = config.channels;
+        let input_channels = config.channels;
 
         // 未対応のサンプル形式なら、ファイルやスレッドを作る前に弾く（副作用を残さない）。
         if !matches!(
@@ -139,10 +139,14 @@ impl MicSource {
         ) {
             return Err(format!("未対応のサンプル形式: {sample_format:?}").into());
         }
-        // LAME はモノラル(1)/ステレオ(2)のみ対応。それ以外は弾く。
-        if !matches!(channels, 1 | 2) {
-            return Err(format!("未対応のチャンネル数: {channels}").into());
-        }
+        // LAME はモノラル(1)/ステレオ(2)のみ対応。入力デバイスは 3ch 以上を報告することがある
+        // （例: ブラウザ/会議アプリが VoiceProcessingIO でマイクを開いている間や、複数マイクを
+        // 束ねたデバイス）。その場合はモノラルへダウンミックスして録音する。1/2ch はそのまま。
+        let output_channels: u16 = match input_channels {
+            0 => return Err("未対応のチャンネル数: 0".into()),
+            1 | 2 => input_channels,
+            _ => 1,
+        };
 
         let path = session_dir.join(MIC_FILENAME);
         // 録音は機微データのため、所有者のみ読み書き可で作成する（Unix）。
@@ -154,13 +158,15 @@ impl MicSource {
         let (tx, rx) = std::sync::mpsc::channel::<Vec<i16>>();
         let writer = std::thread::Builder::new()
             .name("openshoki-mic-writer".to_owned())
-            .spawn(move || run_writer(rx, sample_rate, channels, file))?;
+            .spawn(move || run_writer(rx, sample_rate, output_channels, file))?;
 
         // ストリームを構築して再生開始する。冒頭で対応形式に絞っているため match は網羅済み。
+        // ストリームは入力デバイス本来の channel 数（config.channels）で開き、コールバック内で
+        // 必要ならモノラルへダウンミックスして writer（output_channels）へ渡す。
         let built = match sample_format {
-            SampleFormat::F32 => build_input_stream::<f32>(&device, config, tx),
-            SampleFormat::I16 => build_input_stream::<i16>(&device, config, tx),
-            SampleFormat::U16 => build_input_stream::<u16>(&device, config, tx),
+            SampleFormat::F32 => build_input_stream::<f32>(&device, config, output_channels, tx),
+            SampleFormat::I16 => build_input_stream::<i16>(&device, config, output_channels, tx),
+            SampleFormat::U16 => build_input_stream::<u16>(&device, config, output_channels, tx),
             other => unreachable!("start() の冒頭で対応形式に絞り済み: {other:?}"),
         };
         // 構築・再生に失敗したら副作用を残さない（writer を終了・回収し、作成済みの空ファイルを消す）。
@@ -207,22 +213,25 @@ impl MicSource {
     }
 }
 
-/// 指定のサンプル形式で入力ストリームを構築する。コールバックは PCM を i16 に変換して送るだけ。
+/// 指定のサンプル形式で入力ストリームを構築する。コールバックは PCM を i16 に変換し、必要なら
+/// モノラルへダウンミックスして送るだけ（エンコードは writer スレッドに任せる）。
 fn build_input_stream<T>(
     device: &cpal::Device,
     config: cpal::StreamConfig,
+    output_channels: u16,
     tx: Sender<Vec<i16>>,
 ) -> Result<cpal::Stream, RecordError>
 where
     T: SizedSample,
     i16: FromSample<T>,
 {
+    let input_channels = config.channels as usize;
+    let output_channels = output_channels as usize;
     let err_fn = |err| eprintln!("入力ストリームでエラーが発生した: {err}");
     let stream = device.build_input_stream(
         config,
         move |data: &[T], _: &cpal::InputCallbackInfo| {
-            // LAME 入力に合わせて i16 へ変換し、エンコードは writer スレッドに任せる。
-            let pcm: Vec<i16> = data.iter().map(|&s| i16::from_sample(s)).collect();
+            let pcm = to_i16_pcm(data, input_channels, output_channels);
             // writer 終了済み（エラー等）なら送信は失敗するが、その原因は stop() の join() で
             // 受け取るため、取りこぼしたサンプルはここでは捨てる。
             let _ = tx.send(pcm);
@@ -231,6 +240,27 @@ where
         None,
     )?;
     Ok(stream)
+}
+
+/// インターリーブ PCM を i16 に変換する。`input_channels == output_channels` ならそのまま変換し、
+/// それ以外（入力が 3ch 以上で `output_channels == 1`）は各フレームの全チャンネルを平均して
+/// モノラルへダウンミックスする（LAME はモノラル/ステレオのみ対応のため）。
+fn to_i16_pcm<T>(data: &[T], input_channels: usize, output_channels: usize) -> Vec<i16>
+where
+    T: Copy,
+    i16: FromSample<T>,
+{
+    if input_channels == output_channels || input_channels == 0 {
+        return data.iter().map(|&s| i16::from_sample(s)).collect();
+    }
+    // モノラルへダウンミックス。フレーム（input_channels サンプル）ごとに平均を取る。
+    // i32 で合算してからチャンネル数で割り、桁あふれを避ける。
+    data.chunks_exact(input_channels)
+        .map(|frame| {
+            let sum: i32 = frame.iter().map(|&s| i16::from_sample(s) as i32).sum();
+            (sum / input_channels as i32) as i16
+        })
+        .collect()
 }
 
 /// writer スレッド本体。チャネルから受け取った PCM を MP3 にエンコードして書き込み、
@@ -317,5 +347,39 @@ pub(crate) fn discard_partial_recording(writer: JoinHandle<Result<(), RecordErro
     }
     if let Err(err) = std::fs::remove_file(path) {
         eprintln!("開始失敗時の空ファイル削除に失敗した: {err}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::to_i16_pcm;
+
+    #[test]
+    fn passthrough_when_input_equals_output() {
+        // 入力と出力のチャンネル数が同じならそのまま i16 化する（T=i16 は恒等変換）。
+        let data: [i16; 4] = [10, -20, 30, -40];
+        assert_eq!(to_i16_pcm(&data, 2, 2), vec![10, -20, 30, -40]);
+        assert_eq!(to_i16_pcm(&data, 1, 1), vec![10, -20, 30, -40]);
+    }
+
+    #[test]
+    fn downmixes_multichannel_to_mono_by_averaging() {
+        // 3ch → mono。フレームごとに全チャンネルの平均を取る。
+        let data: [i16; 6] = [3, 6, 9, 30, 60, 90];
+        assert_eq!(to_i16_pcm(&data, 3, 1), vec![6, 60]);
+    }
+
+    #[test]
+    fn downmix_averages_with_i32_accumulation() {
+        // 大きな値でも i32 で合算するため桁あふれしない（(32767+32767+(-32768))/3 = 10922）。
+        let data: [i16; 3] = [i16::MAX, i16::MAX, i16::MIN];
+        assert_eq!(to_i16_pcm(&data, 3, 1), vec![10922]);
+    }
+
+    #[test]
+    fn downmix_drops_trailing_partial_frame() {
+        // フレーム境界に満たない端数は無視する（通常はフレーム整列しているため発生しない）。
+        let data: [i16; 4] = [3, 6, 9, 12];
+        assert_eq!(to_i16_pcm(&data, 3, 1), vec![6]);
     }
 }
