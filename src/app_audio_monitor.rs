@@ -52,7 +52,8 @@ pub struct AppAudioMonitor {
     /// 有効時に初めて照会できなかったときだけ 1 回知らせる。
     warned_unavailable: Cell<bool>,
     /// 自動停止用: 登録アプリのマイク使用が途絶えた時刻。`None` は「まだ途絶えていない（マイク使用中）」。
-    /// 途絶えてから `DEBOUNCE` 継続したら自動停止する（瞬間的な途切れで誤停止しない）。
+    /// 途絶えてから設定のデバウンス期間（`should_stop` の `debounce` 引数）継続したら自動停止する
+    /// （瞬間的な途切れで誤停止しない）。
     input_ceased_since: Cell<Option<Instant>>,
 }
 
@@ -115,8 +116,8 @@ impl AppAudioMonitor {
     }
 
     /// 自動停止すべきか（登録アプリのいずれもマイク入力していない状態が `debounce`
-    /// 継続したか）を判定する。自動開始した録音中にのみ呼ぶ想定。`debounce` は設定
-    /// （`Config::auto_stop_debounce_secs`）由来で、呼び出し側が渡す。
+    /// 継続したか）を判定する。自動開始した録音中にのみ呼ぶ想定。`debounce` は呼び出し側が渡す
+    /// （`Config::auto_stop_debounce()` が設定秒数を範囲へ丸めた `Duration`）。
     ///
     /// **副作用のあるポーリング**であり、間引きを通過するたびにマイク使用を照会して途絶えタイマー
     /// （`input_ceased_since`）を進める（純粋なクエリではない）。間引きタイマー `last_poll` は
@@ -402,8 +403,8 @@ mod tests {
     use std::collections::HashSet;
     use std::time::{Duration, Instant};
 
-    /// デバウンス期間はもう設定値（`Config::auto_stop_debounce_secs`）由来で `should_stop` に渡す
-    /// ため、純粋関数のテストでは代表値を用いる。
+    /// デバウンス期間は `Config::auto_stop_debounce()` 由来で `should_stop` に渡すため、純粋関数
+    /// `evaluate_auto_stop` のテストでは代表値を用いる。
     const DEBOUNCE: Duration = Duration::from_secs(4);
 
     fn triggers(bundle_ids: &[&str]) -> Vec<AppTrigger> {

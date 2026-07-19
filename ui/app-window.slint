@@ -75,7 +75,7 @@ export component AppWindow inherits Window {
                 horizontal-stretch: 1;
             }
             SpinBox {
-                // 範囲は src/main.rs の DEBOUNCE_MIN_SECS / DEBOUNCE_MAX_SECS と一致させること。
+                // 範囲は src/config.rs の DEBOUNCE_MIN_SECS / DEBOUNCE_MAX_SECS と一致させること。
                 minimum: 1;
                 maximum: 60;
                 value: root.auto-stop-debounce-secs;
