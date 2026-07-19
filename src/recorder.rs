@@ -59,7 +59,7 @@ impl Recorder {
             Ok(system) => Some(system),
             Err(err) => {
                 eprintln!(
-                    "Could not start system-audio recording, continuing with mic only: {err}"
+                    "Continuing with mic only because system-audio recording could not start: {err}"
                 );
                 None
             }
@@ -210,7 +210,7 @@ impl MicSource {
         // writer スレッドの完了（flush・ファイル確定）を待ち、結果を伝播する。
         writer
             .join()
-            .map_err(|_| "The mic recording writer thread panicked")??;
+            .map_err(|_| "The mic-recording writer thread panicked")??;
         Ok(path)
     }
 }

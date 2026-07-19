@@ -109,7 +109,7 @@ fn default_recording_dir() -> PathBuf {
     // ホームディレクトリすら取得できない異例環境。黙って縮退させず、相対パスへ
     // フォールバックする旨をログに残す。
     eprintln!(
-        "Falling back to a relative recording path because the user directory could not be determined"
+        "Falling back to a relative recording folder because the user directory could not be determined"
     );
     PathBuf::from(DEFAULT_DIR_NAME)
 }
