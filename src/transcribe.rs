@@ -14,6 +14,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
 
+use rubato::audioadapter_buffers::direct::InterleavedSlice;
+use rubato::{Fft, FixedSync, Resampler};
 use serde::Serialize;
 use symphonia::core::codecs::audio::AudioDecoderOptions;
 use symphonia::core::errors::Error as SymphoniaError;
@@ -84,12 +86,13 @@ impl TranscribeWorker {
 
     /// ジョブを投入する。ワーカーが動いていない場合はログのみ（録音自体は既に保存済み）。
     pub fn submit(&self, job: TranscribeJob) {
-        let sent = self.tx.as_ref().map(|tx| tx.send(job));
-        match sent {
-            Some(Ok(())) => {}
-            Some(Err(_)) | None => {
-                eprintln!("Skipping transcription because the transcription worker is not running");
-            }
+        let Some(tx) = &self.tx else {
+            eprintln!("Skipping transcription because the transcription worker is not running");
+            return;
+        };
+        // 送信失敗 = ワーカースレッドが（panic 等で）終了しレシーバが閉じた状態。
+        if tx.send(job).is_err() {
+            eprintln!("Skipping transcription because the transcription worker is not running");
         }
     }
 }
@@ -97,6 +100,10 @@ impl TranscribeWorker {
 /// 1 ジョブ（1 回の録音停止分）を処理する。モデルはジョブ内で 1 回だけロードして
 /// 複数音源で使い回す（モデルのロードが重いため）。音源単位の失敗は他の音源へ波及させない。
 fn run_job(job: &TranscribeJob) {
+    if job.audio_paths.is_empty() {
+        // 対象なしでモデル（数百 MB〜）をロードしない防御。通常は投入側が空を渡さない。
+        return;
+    }
     if !job.model_path.is_file() {
         eprintln!(
             "Skipping transcription because the whisper model file was not found: {}",
@@ -144,9 +151,16 @@ fn transcribe_file(
         .unwrap_or("audio")
         .to_owned();
 
-    let decoded = decode_mp3(audio_path)?;
-    let mono = downmix_to_mono(&decoded.samples, decoded.channels);
-    let pcm = resample_to_whisper_rate(&mono, decoded.sample_rate)?;
+    // 中間バッファ（インターリーブ全量→モノラル）は各段階へ move で渡し、次の段階を作った時点で
+    // 解放する。長時間録音では中間バッファが GB 級になり、秒〜分オーダーの whisper 推論中に
+    // 抱え続けるとメモリピークが跳ね上がるため（推論中に生きるのは 16kHz モノラルの `pcm` のみ）。
+    let DecodedAudio {
+        samples,
+        sample_rate,
+        channels,
+    } = decode_mp3(audio_path)?;
+    let mono = downmix_to_mono(samples, channels);
+    let pcm = resample_to_whisper_rate(mono, sample_rate)?;
     let duration_secs = pcm.len() as f64 / WHISPER_SAMPLE_RATE as f64;
 
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
@@ -156,8 +170,18 @@ fn transcribe_file(
     params.set_print_realtime(false);
     params.set_print_timestamps(false);
     params.set_translate(false);
-    if let Some(language) = job.language.as_deref() {
-        params.set_language(Some(language));
+    // 言語は設定 TOML（手編集されうる信頼境界外）由来。whisper-rs の set_language は NUL バイトを
+    // 含む文字列で panic するため（内部の CString::new が expect）、ここで弾いて自動判定へ
+    // フォールバックする。未知の言語コードは whisper.cpp 側が検証して full() が Err を返すので、
+    // ここでは NUL だけ防げばよい。
+    match job.language.as_deref() {
+        Some(language) if language.contains('\0') => {
+            eprintln!(
+                "Ignoring the configured transcription language because it contains a NUL byte"
+            );
+        }
+        Some(language) => params.set_language(Some(language)),
+        None => {}
     }
 
     let mut state = ctx.create_state()?;
@@ -204,8 +228,9 @@ struct Segment {
     text: String,
 }
 
-/// whisper の認識結果からセグメント列を集める。テキストが UTF-8 として壊れている
-/// セグメントは空文字にして続行する（1 セグメントのために全体を失敗させない）。
+/// whisper の認識結果からセグメント列を集める。テキストの不正な UTF-8 は置換文字（U+FFFD）に
+/// 置き換えられ（`to_str_lossy`）、（稀な）ヌルポインタ取得の失敗時のみ空文字にして続行する
+/// （1 セグメントのために全体を失敗させない）。
 fn collect_segments(state: &whisper_rs::WhisperState) -> Vec<Segment> {
     (0..state.full_n_segments())
         .filter_map(|i| state.get_segment(i))
@@ -263,7 +288,6 @@ fn decode_mp3(path: &Path) -> Result<DecodedAudio, Box<dyn std::error::Error>> {
     let track_id = track.id;
 
     let mut samples: Vec<f32> = Vec::new();
-    let mut chunk: Vec<f32> = Vec::new();
     let mut sample_rate = 0u32;
     let mut channels = 0usize;
     loop {
@@ -278,11 +302,19 @@ fn decode_mp3(path: &Path) -> Result<DecodedAudio, Box<dyn std::error::Error>> {
         match decoder.decode(&packet) {
             Ok(buffer) => {
                 let spec = buffer.spec();
-                sample_rate = spec.rate();
-                channels = spec.channels().count();
-                chunk.resize(buffer.samples_interleaved(), 0.0);
-                buffer.copy_to_slice_interleaved(&mut chunk);
-                samples.extend_from_slice(&chunk);
+                if channels == 0 {
+                    // 最初のデコード成功パケットの形式で固定する。
+                    sample_rate = spec.rate();
+                    channels = spec.channels().count();
+                } else if spec.rate() != sample_rate || spec.channels().count() != channels {
+                    // 途中でレート/チャンネル数が変わるファイルは、無検知で連結すると
+                    // フレーム境界がずれて壊れた音声になるため、正直に失敗させる。
+                    return Err("audio parameters changed mid-stream".into());
+                }
+                // 中間バッファを介さず samples の末尾へ直接書き、全量の二重コピーを避ける。
+                let base = samples.len();
+                samples.resize(base + buffer.samples_interleaved(), 0.0);
+                buffer.copy_to_slice_interleaved(&mut samples[base..]);
             }
             // 壊れたパケットはスキップして続行（symphonia の推奨ハンドリング）。
             Err(SymphoniaError::DecodeError(_)) | Err(SymphoniaError::IoError(_)) => continue,
@@ -301,9 +333,11 @@ fn decode_mp3(path: &Path) -> Result<DecodedAudio, Box<dyn std::error::Error>> {
 
 /// インターリーブ PCM をチャンネル平均でモノラルへ落とす純粋関数。
 /// 末尾にチャンネル数へ満たない端数サンプルがあれば捨てる（1 フレーム未満の欠けは無視できる）。
-fn downmix_to_mono(samples: &[f32], channels: usize) -> Vec<f32> {
+/// 入力は move で受け、モノラルはコピーせずそのまま返す。複数チャンネルでは元バッファを
+/// この関数内で解放する（長時間録音の全量コピー・二重保持を避ける）。
+fn downmix_to_mono(samples: Vec<f32>, channels: usize) -> Vec<f32> {
     if channels <= 1 {
-        return samples.to_vec();
+        return samples;
     }
     samples
         .chunks_exact(channels)
@@ -312,17 +346,15 @@ fn downmix_to_mono(samples: &[f32], channels: usize) -> Vec<f32> {
 }
 
 /// モノラル PCM を whisper のサンプルレート（16kHz）へリサンプルする。
-/// 元がすでに 16kHz ならそのまま返す。品質はアンチエイリアス込みの FFT リサンプラ（rubato）に任せる。
+/// 入力は move で受け、元がすでに 16kHz ならコピーせずそのまま返す。リサンプル時は元バッファを
+/// この関数内で解放する。品質はアンチエイリアス込みの FFT リサンプラ（rubato）に任せる。
 fn resample_to_whisper_rate(
-    mono: &[f32],
+    mono: Vec<f32>,
     sample_rate: u32,
 ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
     if sample_rate as usize == WHISPER_SAMPLE_RATE {
-        return Ok(mono.to_vec());
+        return Ok(mono);
     }
-    use rubato::audioadapter_buffers::direct::InterleavedSlice;
-    use rubato::{Fft, FixedSync, Resampler};
-
     let mut resampler = Fft::<f32>::new(
         sample_rate as usize,
         WHISPER_SAMPLE_RATE,
@@ -330,7 +362,7 @@ fn resample_to_whisper_rate(
         1,
         FixedSync::Input,
     )?;
-    let input = InterleavedSlice::new(mono, 1, mono.len())?;
+    let input = InterleavedSlice::new(&mono, 1, mono.len())?;
     let output = resampler.process_all(&input, mono.len(), None)?;
     Ok(output.take_data())
 }
@@ -360,22 +392,22 @@ mod tests {
 
     #[test]
     fn downmix_passes_through_mono() {
-        let samples = [0.1, -0.2, 0.3];
-        assert_eq!(downmix_to_mono(&samples, 1), samples);
+        let samples = vec![0.1, -0.2, 0.3];
+        assert_eq!(downmix_to_mono(samples.clone(), 1), samples);
     }
 
     #[test]
     fn downmix_averages_stereo_frames() {
         // (0.2+0.4)/2=0.3, (-0.5+0.5)/2=0.0
-        let samples = [0.2, 0.4, -0.5, 0.5];
-        assert_eq!(downmix_to_mono(&samples, 2), vec![0.3, 0.0]);
+        let samples = vec![0.2, 0.4, -0.5, 0.5];
+        assert_eq!(downmix_to_mono(samples, 2), vec![0.3, 0.0]);
     }
 
     #[test]
     fn downmix_drops_trailing_partial_frame() {
         // 端数の 0.9 は 1 フレームに満たないため捨てる。
-        let samples = [0.2, 0.4, 0.9];
-        assert_eq!(downmix_to_mono(&samples, 2), vec![0.3]);
+        let samples = vec![0.2, 0.4, 0.9];
+        assert_eq!(downmix_to_mono(samples, 2), vec![0.3]);
     }
 
     #[test]
@@ -388,15 +420,25 @@ mod tests {
     #[test]
     fn resample_passes_through_16khz() {
         let mono = vec![0.5f32; 1600];
-        let out = resample_to_whisper_rate(&mono, 16_000).expect("resampling should succeed");
+        let out =
+            resample_to_whisper_rate(mono.clone(), 16_000).expect("resampling should succeed");
         assert_eq!(out, mono);
     }
 
     #[test]
-    fn resample_48khz_yields_one_third_length() {
-        // 48kHz→16kHz は 1/3。process_all は開始遅延をトリムするため、ほぼ厳密に 1/3 になる。
-        let mono = vec![0.0f32; 48_000];
-        let out = resample_to_whisper_rate(&mono, 48_000).expect("resampling should succeed");
+    fn resample_48khz_preserves_length_ratio_and_energy() {
+        // 440Hz サイン波 1 秒。48kHz→16kHz は 1/3 の長さになり、可聴帯域の信号なので
+        // エネルギー（RMS ≈ 振幅/√2）もほぼ保たれる（全ゼロ入力だと長さしか検証できない）。
+        let amplitude = 0.5f32;
+        let mono: Vec<f32> = (0..48_000)
+            .map(|i| {
+                let t = i as f32 / 48_000.0;
+                (2.0 * std::f32::consts::PI * 440.0 * t).sin() * amplitude
+            })
+            .collect();
+        let out = resample_to_whisper_rate(mono, 48_000).expect("resampling should succeed");
+
+        // 長さ: process_all は開始遅延をトリムするため、ほぼ厳密に 1/3 になる。
         let expected = 16_000usize;
         let diff = out.len().abs_diff(expected);
         assert!(
@@ -404,6 +446,62 @@ mod tests {
             "expected ~{expected} samples, got {}",
             out.len()
         );
+
+        // エネルギー: サイン波の RMS は振幅/√2。リサンプル後も 5% 以内で保たれる。
+        let rms = (out.iter().map(|s| s * s).sum::<f32>() / out.len() as f32).sqrt();
+        let expected_rms = amplitude / 2.0f32.sqrt();
+        assert!(
+            (rms - expected_rms).abs() < expected_rms * 0.05,
+            "expected RMS ~{expected_rms}, got {rms}"
+        );
+    }
+
+    #[test]
+    fn decode_mp3_fails_on_empty_file() {
+        // 壊れた/空の入力ではエラーを返す（黙って空の音声にしない）。
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("openshoki-empty-{}.mp3", std::process::id()));
+        std::fs::write(&path, b"").expect("writing the empty file should succeed");
+        let result = decode_mp3(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn write_transcription_creates_json_with_owner_only_permissions() {
+        // 文字起こしは録音と同じ機微データ。JSON の内容と 0600（Unix）を whisper なしで検証する
+        // （E2E は #[ignore] のため、この安全性は CI ではここで担保する）。
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "openshoki-transcription-{}.json",
+            std::process::id()
+        ));
+        let result = Transcription {
+            source: "mic".to_owned(),
+            model: "ggml-base.bin".to_owned(),
+            language: "ja".to_owned(),
+            duration_secs: 1.0,
+            segments: vec![Segment {
+                start: 0.0,
+                end: 1.0,
+                text: "hi".to_owned(),
+            }],
+        };
+        write_transcription(&path, &result).expect("writing should succeed");
+
+        let text = std::fs::read_to_string(&path).expect("the JSON should be readable");
+        let value: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+        assert_eq!(value["segments"][0]["text"], "hi");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path)
+                .expect("metadata should be readable")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "the JSON must be created with 0600");
+        }
+        let _ = std::fs::remove_file(&path);
     }
 
     /// パイプライン全体（MP3 デコード→リサンプル→whisper→JSON 保存）のスモークテスト。

@@ -59,6 +59,11 @@ jobs:
             echo "Swift 後方互換ライブラリが見つからない: $swiftlib" >&2
             exit 1
           fi
+      # whisper-rs が whisper.cpp を CMake でビルドする（README の前提と対応）。macOS ランナーには
+      # CMake がプリインストールされているが、暗黙依存のままイメージ更新で外れると原因が分かり
+      # にくいので、ここで存在を明示的に確認して早く・明確に失敗させる。
+      - name: CMake の存在確認（whisper.cpp のビルドに必要）
+        run: cmake --version
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
