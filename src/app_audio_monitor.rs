@@ -37,6 +37,10 @@ const OS_STATUS_OK: i32 = 0;
 /// 出力状態をポーリングする間隔。100ms タイマーから毎回照会すると無駄なので、この間隔に間引く。
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+/// 自動停止のデバウンス期間。登録アプリの音声出力が途絶えてからこの期間継続して初めて停止する。
+/// 通話終了後に確実に閉じつつ、無音区間や瞬間的な途切れで誤停止しない長さ（実機調整前提の初期値）。
+const OUTPUT_STOP_DEBOUNCE: Duration = Duration::from_secs(4);
+
 /// 登録アプリの音声出力の立ち上がりを検知するモニタ。全状態はメインスレッド上でのみ触る。
 pub struct AppAudioMonitor {
     /// 最後にポーリングした時刻。`POLL_INTERVAL` 未満の呼び出しは照会を省く。
@@ -50,6 +54,9 @@ pub struct AppAudioMonitor {
     /// 照会不能（macOS 14.4 未満／失敗）を一度ログしたか。500ms ごとのログ氾濫を避けるため、
     /// 有効時に初めて照会できなかったときだけ 1 回知らせる。
     warned_unavailable: Cell<bool>,
+    /// 自動停止用: 登録アプリの出力が途絶えた時刻。`None` は「まだ途絶えていない（出力中）」。
+    /// 途絶えてから `OUTPUT_STOP_DEBOUNCE` 継続したら自動停止する（瞬間的な途切れで誤停止しない）。
+    output_ceased_since: Cell<Option<Instant>>,
 }
 
 impl Default for AppAudioMonitor {
@@ -67,6 +74,7 @@ impl AppAudioMonitor {
             prev_outputting: RefCell::new(HashSet::new()),
             primed: Cell::new(false),
             warned_unavailable: Cell::new(false),
+            output_ceased_since: Cell::new(None),
         }
     }
 
@@ -108,6 +116,66 @@ impl AppAudioMonitor {
         *prev = outputting;
         activated
     }
+
+    /// 自動停止すべきか（登録アプリのいずれも音声出力していない状態が `OUTPUT_STOP_DEBOUNCE`
+    /// 継続したか）を判定する。自動開始した録音中にのみ呼ぶ想定。
+    ///
+    /// `enabled` が false／`triggers` が空／照会不能のときは `false`（自動停止しない）。有効時は
+    /// `POLL_INTERVAL` に間引いて照会する。ミュートや発言の合間・長い沈黙では止まらない（参加者の
+    /// 音声はアプリの出力として通話中ずっと流れ続ける前提。合図は音量ではなく「出力セッションの有無」）。
+    pub fn should_stop(&self, triggers: &[AppTrigger], enabled: bool) -> bool {
+        if !enabled || triggers.is_empty() {
+            self.output_ceased_since.set(None);
+            return false;
+        }
+        if self.last_poll.get().elapsed() < POLL_INTERVAL {
+            return false;
+        }
+        let now = Instant::now();
+        self.last_poll.set(now);
+
+        let Some(outputting) = output_running_bundle_ids() else {
+            return false; // 照会不能時は自動停止しない（状態は保持）。
+        };
+        let any_outputting = triggers
+            .iter()
+            .any(|trigger| outputting.contains(&trigger.bundle_id));
+        let (next_ceased, should_stop) = evaluate_auto_stop(
+            any_outputting,
+            self.output_ceased_since.get(),
+            now,
+            OUTPUT_STOP_DEBOUNCE,
+        );
+        self.output_ceased_since.set(next_ceased);
+        should_stop
+    }
+
+    /// 録音停止後に呼ぶ。次の開始検知の照会で現在値を取り込み直し（`primed` を落とす）、録音中に
+    /// 出力を始めたアプリを誤って立ち上がりとして拾わないようにする。停止デバウンス状態も初期化する。
+    pub fn reset_after_stop(&self) {
+        self.primed.set(false);
+        self.output_ceased_since.set(None);
+    }
+}
+
+/// 自動停止判定の純粋部分。登録アプリの出力状況（`any_outputting`）と、出力が途絶えた時刻
+/// （`ceased_since`）・現在時刻（`now`）・デバウンス期間（`debounce`）から、次の「途絶え開始時刻」と
+/// 停止すべきかを返す。
+///
+/// - 出力中（`any_outputting == true`）: 途絶えていないので `None` にリセット、停止しない。
+/// - 途絶え中: `ceased_since` が `None` なら `now` から計測開始。経過が `debounce` 以上なら停止。
+fn evaluate_auto_stop(
+    any_outputting: bool,
+    ceased_since: Option<Instant>,
+    now: Instant,
+    debounce: Duration,
+) -> (Option<Instant>, bool) {
+    if any_outputting {
+        return (None, false);
+    }
+    let since = ceased_since.unwrap_or(now);
+    let should_stop = now.duration_since(since) >= debounce;
+    (Some(since), should_stop)
 }
 
 /// 立ち上がり判定の純粋部分: 登録アプリ（`triggers`）のうち、今は出力中（`current`）で
@@ -254,9 +322,10 @@ fn bundle_id_for_pid(pid: i32) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::has_rising_edge;
+    use super::{OUTPUT_STOP_DEBOUNCE, evaluate_auto_stop, has_rising_edge};
     use crate::config::AppTrigger;
     use std::collections::HashSet;
+    use std::time::{Duration, Instant};
 
     fn triggers(bundle_ids: &[&str]) -> Vec<AppTrigger> {
         bundle_ids
@@ -325,5 +394,42 @@ mod tests {
             &set(&["com.apple.Music"]),
             &set(&["com.apple.Music", "com.apple.QuickTimePlayerX"])
         ));
+    }
+
+    #[test]
+    fn auto_stop_resets_while_outputting() {
+        // 出力中は途絶えていないので ceased=None にリセット、停止しない（途絶えていた履歴も消す）。
+        let now = Instant::now();
+        let (ceased, stop) = evaluate_auto_stop(true, Some(now), now, OUTPUT_STOP_DEBOUNCE);
+        assert_eq!(ceased, None);
+        assert!(!stop);
+    }
+
+    #[test]
+    fn auto_stop_starts_timer_on_first_cease() {
+        // 途絶えの初回は now から計測を始めるだけで、まだ停止しない。
+        let now = Instant::now();
+        let (ceased, stop) = evaluate_auto_stop(false, None, now, OUTPUT_STOP_DEBOUNCE);
+        assert_eq!(ceased, Some(now));
+        assert!(!stop);
+    }
+
+    #[test]
+    fn auto_stop_waits_for_debounce() {
+        // 途絶え継続がデバウンス未満なら停止しない（瞬間的な途切れで誤停止しない）。
+        let start = Instant::now();
+        let now = start + OUTPUT_STOP_DEBOUNCE - Duration::from_millis(1);
+        let (ceased, stop) = evaluate_auto_stop(false, Some(start), now, OUTPUT_STOP_DEBOUNCE);
+        assert_eq!(ceased, Some(start));
+        assert!(!stop);
+    }
+
+    #[test]
+    fn auto_stop_fires_after_debounce() {
+        // 途絶えがデバウンス以上継続したら停止する。
+        let start = Instant::now();
+        let now = start + OUTPUT_STOP_DEBOUNCE;
+        let (_, stop) = evaluate_auto_stop(false, Some(start), now, OUTPUT_STOP_DEBOUNCE);
+        assert!(stop);
     }
 }

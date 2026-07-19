@@ -244,10 +244,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// 表示/非表示トグルや録音トグルは現在の状態（ウィンドウの可視状態・録音セッションの有無）から
 /// 判断し、別途フラグを持たない（「ありえない状態」を作らないため）。
 ///
-/// macOS では `mic_monitor`（あれば）から毎ティックでマイク使用の立ち上がりを取り出し、設定が
-/// ON かつ未録音なら自動録音を開始する（他アプリのマイク使用開始を起点にした自動録音）。
+/// macOS では毎ティックで自動録音の開始／停止も駆動する: `mic_monitor` のマイク使用の立ち上がりと
+/// `app_monitor` の登録アプリ再生の立ち上がりで（設定 ON・未録音なら）開始し、登録アプリ再生で
+/// 自動開始した録音は、登録アプリの出力途絶がデバウンス継続したところで自動停止する。
 ///
-/// 録音セッション（`Option<Recorder>`）と `cpal::Stream`(`!Send`)、および `mic_monitor` は
+/// 録音セッション（`Option<Recorder>`）と `cpal::Stream`(`!Send`)、および各モニタは
 /// このクロージャ内で所有する。クロージャはメインスレッド（Slint イベントループ）上でのみ
 /// 実行されるため問題ない。
 fn build_menu_event_handler(
@@ -274,6 +275,10 @@ fn build_menu_event_handler(
     let mut last_rendered_secs: Option<u64> = None;
     // 直前 tick で録音中だったか。録音中→待機の遷移を 1 度だけ拾って待機表示へ戻すのに使う。
     let mut was_recording = false;
+    // 実行中の録音が「登録アプリ再生」由来の自動開始か。true のときだけ、登録アプリの出力途絶で
+    // 自動停止する（マイク由来・手動開始の録音は app の沈黙では止めない）。
+    #[cfg(target_os = "macos")]
+    let mut recording_started_by_app = false;
 
     move || {
         while let Ok(event) = menu_channel.try_recv() {
@@ -282,6 +287,11 @@ fn build_menu_event_handler(
                 show_window(ui.window(), &mut geometry_committed);
             } else if event.id == record_id {
                 toggle_recording(&mut recorder, &record_item, &config);
+                // 手動トグルの録音は自動停止の対象にしない（開始でも停止でもフラグを下ろす）。
+                #[cfg(target_os = "macos")]
+                {
+                    recording_started_by_app = false;
+                }
             } else if event.id == quit_id
                 && let Err(err) = slint::quit_event_loop()
             {
@@ -298,22 +308,36 @@ fn build_menu_event_handler(
             let activated = mic_monitor.as_ref().is_some_and(|m| m.take_activated());
             if activated && recorder.is_none() && config.borrow().auto_record_on_mic_active {
                 start_recording(&mut recorder, &record_item, &config);
+                recording_started_by_app = false;
             }
         }
 
-        // 登録アプリの音声再生の立ち上がりを取り出し、未録音のときだけ自動開始する（macOS 14.4+）。
-        // take_activated は設定 OFF／登録なしのときはシステム照会を行わず、有効時のみ POLL_INTERVAL に
-        // 間引いて照会し、登録アプリの非出力→出力の立ち上がりだけを返す（照会不能時は発火しない）。
+        // 登録アプリの再生に連動した自動録音（macOS 14.4+）。未録音なら登録アプリの出力の立ち上がりで
+        // 開始する。「登録アプリ再生」由来の録音中なら、登録アプリのいずれも出力しなくなった状態が
+        // デバウンス継続したところで自動停止する（通話終了の合図）。設定 OFF／登録なし／照会不能の
+        // ときは開始・停止いずれも行わない。照会は録音中・未録音のどちらか一方だけで走る。
         #[cfg(target_os = "macos")]
         {
             let config_ref = config.borrow();
-            let activated = app_monitor.take_activated(
-                &config_ref.app_playback_triggers,
-                config_ref.auto_record_on_app_playback,
-            );
-            drop(config_ref);
-            if activated && recorder.is_none() {
-                start_recording(&mut recorder, &record_item, &config);
+            let enabled = config_ref.auto_record_on_app_playback;
+            if recorder.is_none() {
+                let activated =
+                    app_monitor.take_activated(&config_ref.app_playback_triggers, enabled);
+                drop(config_ref);
+                if activated {
+                    start_recording(&mut recorder, &record_item, &config);
+                    // 実際に開始できたときだけ「app 由来」として自動停止の対象にする。
+                    recording_started_by_app = recorder.is_some();
+                }
+            } else if recording_started_by_app {
+                let stop = app_monitor.should_stop(&config_ref.app_playback_triggers, enabled);
+                drop(config_ref);
+                if stop {
+                    stop_recording(&mut recorder, &record_item);
+                    recording_started_by_app = false;
+                    // 停止後は開始検知を再初期化する（録音中に出力を始めたアプリを誤検知しない）。
+                    app_monitor.reset_after_stop();
+                }
             }
         }
 
@@ -349,18 +373,28 @@ fn toggle_recording(
 ) {
     if recorder.is_none() {
         start_recording(recorder, record_item, config);
-    } else if let Some(session) = recorder.take() {
-        // 停止。stop() が各音源のストリーム停止→flush→ファイル確定まで行い、保存できたパスを返す。
-        let saved = session.stop();
-        if saved.is_empty() {
-            eprintln!("Failed to stop and save the recording (no files were saved)");
-        } else {
-            // 保存先のフルパスは機微情報（録音データの所在・フォルダ構造がプライバシーに関わる）
-            // なので出さない。完了が分かるように、保存できたファイル数だけを知らせる。
-            println!("Saved the recording ({} files)", saved.len());
-        }
-        record_item.set_text(RECORD_LABEL_START);
+    } else {
+        stop_recording(recorder, record_item);
     }
+}
+
+/// 録音セッションを停止する。手動トグルと自動停止（登録アプリの出力途絶）で共用する
+/// （`start_recording` と対称）。stop() が各音源のストリーム停止→flush→ファイル確定まで行う。
+/// 録音していなければ何もしない。トレイアイコン／経過時間の表示はタイマー closure が録音状態を
+/// 見て駆動するため、ここではメニュー項目のラベルを待機へ戻すだけにする。
+fn stop_recording(recorder: &mut Option<Recorder>, record_item: &MenuItem) {
+    let Some(session) = recorder.take() else {
+        return;
+    };
+    let saved = session.stop();
+    if saved.is_empty() {
+        eprintln!("Failed to stop and save the recording (no files were saved)");
+    } else {
+        // 保存先のフルパスは機微情報（録音データの所在・フォルダ構造がプライバシーに関わる）
+        // なので出さない。完了が分かるように、保存できたファイル数だけを知らせる。
+        println!("Saved the recording ({} files)", saved.len());
+    }
+    record_item.set_text(RECORD_LABEL_START);
 }
 
 /// 録音セッションを開始する。手動トグルと自動開始（マイク使用検知）で共用する。
