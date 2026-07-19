@@ -82,7 +82,6 @@ MP3 エンコードに `mp3lame-encoder`、設定の永続化に `directories` /
 - **現状**: macOS 先行。マイク録音は全 OS、システム音声録音は macOS のみ。
 - **今後**:
   - Windows（WASAPI loopback）／Linux（monitor source）のシステム音声録音（[#23](https://github.com/pkshimizu/openshoki/issues/23) / [#24](https://github.com/pkshimizu/openshoki/issues/24)）
-  - macOS でマイク使用を検知して録音を自動開始・停止する機能（オプトイン）
   - 配布用 macOS `.app` バンドルの生成（[#20](https://github.com/pkshimizu/openshoki/issues/20)）
   - 録音した音声の文字起こし
 

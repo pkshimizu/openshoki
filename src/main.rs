@@ -243,7 +243,7 @@ fn build_menu_event_handler(
     // 直前 tick で録音中だったか。録音中→待機の遷移を 1 度だけ拾って待機表示へ戻すのに使う。
     let mut was_recording = false;
     // 実行中の録音が「登録アプリのマイク使用」由来の自動開始か。true のときだけ、登録アプリのマイク使用の途絶で
-    // 自動停止する（マイク由来・手動開始の録音は app の沈黙では止めない）。
+    // 自動停止する（手動開始の録音は app の沈黙では止めない）。
     #[cfg(target_os = "macos")]
     let mut recording_started_by_app = false;
 
@@ -357,7 +357,7 @@ fn stop_recording(recorder: &mut Option<Recorder>, record_item: &MenuItem) {
     record_item.set_text(RECORD_LABEL_START);
 }
 
-/// 録音セッションを開始する。手動トグルと自動開始（マイク使用検知）で共用する。
+/// 録音セッションを開始する。手動トグルと自動開始（登録アプリのマイク使用検知）で共用する。
 ///
 /// 保存先は設定の現在値を使う。セッションごとに `<保存先>/<日時>` のディレクトリを作り、その中に
 /// 音源（将来は文字起こしも）をまとめる。日時はローカル時刻で衝突を避ける。既に録音中なら何もしない
