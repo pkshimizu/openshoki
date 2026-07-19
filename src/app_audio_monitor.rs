@@ -217,9 +217,21 @@ pub fn input_running_bundle_ids() -> Option<HashSet<String>> {
     let processes = process_object_list()?;
     let mut ids = HashSet::new();
     for process in processes {
-        if process_is_running_input(process) == Some(true)
-            && let Some(pid) = process_pid(process)
-            && let Some(bundle) = bundle_id_for_pid(pid)
+        if process_is_running_input(process) != Some(true) {
+            continue;
+        }
+        let Some(pid) = process_pid(process) else {
+            continue;
+        };
+        // 直接のバンドル ID（本体プロセスならこれで取れる。例: Zen/Firefox 系）。
+        if let Some(bundle) = bundle_id_for_pid(pid) {
+            ids.insert(bundle);
+        }
+        // マルチプロセスのアプリ（Chrome 等）は、マイクを掴むのが本体ではなくヘルパープロセスで、
+        // ヘルパーは `NSRunningApplication` のバンドル ID が nil になることがある。responsible pid を
+        // 辿って親アプリのバンドル ID（例: `com.google.Chrome`）でも照合できるようにする。
+        if let Some(parent) = responsible_pid(pid)
+            && let Some(bundle) = bundle_id_for_pid(parent)
         {
             ids.insert(bundle);
         }
@@ -341,6 +353,47 @@ fn bundle_id_for_pid(pid: i32) -> Option<String> {
     Some(bundle_id.to_string())
 }
 
+/// プロセスの「responsible pid」（そのプロセスに責任を持つ親アプリの pid）を返す。ヘルパーや
+/// XPC 子プロセスなら親アプリの pid、本体プロセスなら自分自身になる。親と一致しない場合のみ
+/// `Some(親pid)` を返す（本体プロセスは直接のバンドル ID で足りるため `None`）。
+///
+/// `responsibility_get_pid_responsible_for_pid` は TCC 等が使う挙動安定の関数だが公開ヘッダに無い
+/// private シンボルのため、`dlsym` で実行時に解決する。見つからなければ（将来の OS 変更等）親解決を
+/// 諦めて `None` にフォールバックする（アプリは落とさない）。
+fn responsible_pid(pid: i32) -> Option<i32> {
+    use std::ffi::{c_char, c_int, c_void};
+    use std::sync::OnceLock;
+
+    type ResponsibleFn = unsafe extern "C" fn(c_int) -> c_int;
+    static RESOLVER: OnceLock<Option<ResponsibleFn>> = OnceLock::new();
+
+    let resolver = RESOLVER.get_or_init(|| {
+        unsafe extern "C" {
+            fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+        }
+        // RTLD_DEFAULT(-2): 現在のプロセスにロード済みの全イメージからシンボルを探す。
+        let rtld_default = (-2isize) as *mut c_void;
+        // SAFETY: シンボル名は有効な C 文字列。dlsym は見つからなければ null を返すだけ。
+        let sym = unsafe {
+            dlsym(
+                rtld_default,
+                c"responsibility_get_pid_responsible_for_pid".as_ptr(),
+            )
+        };
+        if sym.is_null() {
+            None
+        } else {
+            // SAFETY: 非 null を確認済み。対象シンボルの実シグネチャは (pid_t) -> pid_t。
+            Some(unsafe { std::mem::transmute::<*mut c_void, ResponsibleFn>(sym) })
+        }
+    });
+
+    let func = (*resolver)?;
+    // SAFETY: 解決済みの C 関数を pid_t 引数で呼ぶだけ。副作用なく responsible pid を返す。
+    let responsible = unsafe { func(pid) };
+    (responsible > 0 && responsible != pid).then_some(responsible)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{STOP_DEBOUNCE, evaluate_auto_stop, has_rising_edge};
@@ -415,6 +468,13 @@ mod tests {
             &set(&["com.apple.Music"]),
             &set(&["com.apple.Music", "com.apple.QuickTimePlayerX"])
         ));
+    }
+
+    #[test]
+    fn responsible_pid_ffi_does_not_crash() {
+        // dlsym + private シンボル呼び出しの FFI 経路が例外なく Option を返すことのスモークテスト
+        // （値は環境依存なので、パニックせず戻ることだけを確認する）。
+        let _ = super::responsible_pid(std::process::id() as i32);
     }
 
     #[test]
