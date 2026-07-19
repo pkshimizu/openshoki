@@ -79,7 +79,9 @@ impl MicMonitor {
         let devices = match input_devices() {
             Ok(devices) => devices,
             Err(err) => {
-                eprintln!("入力デバイスの列挙に失敗したため、この回の監視を飛ばす: {err}");
+                eprintln!(
+                    "Skipping this monitoring pass because input-device enumeration failed: {err}"
+                );
                 return false;
             }
         };
@@ -125,7 +127,7 @@ fn all_devices() -> Result<Vec<AudioObjectID>, Box<dyn Error>> {
         )
     };
     if status != OS_STATUS_OK {
-        return Err(format!("デバイス一覧のサイズ取得に失敗した (OSStatus={status})").into());
+        return Err(format!("Failed to get the device-list size (OSStatus={status})").into());
     }
     let count = size as usize / size_of::<AudioObjectID>();
     let mut devices = vec![0 as AudioObjectID; count];
@@ -144,7 +146,7 @@ fn all_devices() -> Result<Vec<AudioObjectID>, Box<dyn Error>> {
         )
     };
     if status != OS_STATUS_OK {
-        return Err(format!("デバイス一覧の取得に失敗した (OSStatus={status})").into());
+        return Err(format!("Failed to get the device list (OSStatus={status})").into());
     }
     // 実際に書き込まれた要素数へ切り詰める（列挙中に台数が変わってもはみ出さない）。
     devices.truncate(size as usize / size_of::<AudioObjectID>());

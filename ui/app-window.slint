@@ -27,12 +27,12 @@ export component AppWindow inherits Window {
         padding: 20px;
 
         Text {
-            text: "openshoki 設定";
+            text: "openshoki Settings";
             font-size: 20px;
             horizontal-alignment: center;
         }
         Text {
-            text: "録音ファイルの保存先";
+            text: "Recording folder";
             font-size: 14px;
         }
         Text {
@@ -41,13 +41,13 @@ export component AppWindow inherits Window {
             color: #aaaaaa;
         }
         Button {
-            text: "フォルダを選択";
+            text: "Choose Folder";
             clicked => {
                 root.choose-folder();
             }
         }
         CheckBox {
-            text: "マイク使用時に自動録音（macOS）";
+            text: "Auto-record when the mic is in use (macOS)";
             checked: root.auto-record;
             toggled => {
                 root.auto-record = self.checked;

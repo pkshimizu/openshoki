@@ -76,7 +76,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 永続化に成功してからメモリ上の設定と画面表示を更新する。
         // 先に更新すると、保存失敗時に「表示は変わったのに保存されていない」不整合になる。
         if let Err(err) = candidate.save() {
-            eprintln!("設定の保存に失敗したため、保存先は変更しない: {err}");
+            eprintln!(
+                "Not changing the recording folder because saving the settings failed: {err}"
+            );
             return;
         }
         ui.set_recording_dir(recording_dir_text(&candidate.recording_dir));
@@ -91,7 +93,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut candidate = config_for_auto.borrow().clone();
         candidate.auto_record_on_mic_active = enabled;
         if let Err(err) = candidate.save() {
-            eprintln!("設定の保存に失敗したため、自動録音の設定は変更しない: {err}");
+            eprintln!(
+                "Not changing the auto-record setting because saving the settings failed: {err}"
+            );
             return;
         }
         *config_for_auto.borrow_mut() = candidate;
@@ -106,7 +110,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mic_monitor = match mic_monitor::MicMonitor::start() {
         Ok(monitor) => Some(monitor),
         Err(err) => {
-            eprintln!("マイク使用の監視を開始できないため、自動録音は無効で続行する: {err}");
+            eprintln!(
+                "Continuing with auto-record disabled because mic-usage monitoring could not start: {err}"
+            );
             None
         }
     };
@@ -197,7 +203,7 @@ fn build_menu_event_handler(
             } else if event.id == quit_id
                 && let Err(err) = slint::quit_event_loop()
             {
-                eprintln!("イベントループの終了に失敗した: {err}");
+                eprintln!("Failed to quit the event loop: {err}");
             }
         }
 
@@ -249,11 +255,11 @@ fn toggle_recording(
         // 停止。stop() が各音源のストリーム停止→flush→ファイル確定まで行い、保存できたパスを返す。
         let saved = session.stop();
         if saved.is_empty() {
-            eprintln!("録音の停止・保存に失敗した（保存できたファイルが無い）");
+            eprintln!("Failed to stop and save the recording (no files were saved)");
         } else {
             // 保存先のフルパスは機微情報（録音データの所在・フォルダ構造がプライバシーに関わる）
             // なので出さない。完了が分かるように、保存できたファイル数だけを知らせる。
-            println!("録音を保存した（{} ファイル）", saved.len());
+            println!("Saved the recording ({} files)", saved.len());
         }
         record_item.set_text(RECORD_LABEL_START);
     }
@@ -280,7 +286,7 @@ fn start_recording(
             *recorder = Some(session);
             record_item.set_text(RECORD_LABEL_STOP);
         }
-        Err(err) => eprintln!("録音の開始に失敗した: {err}"),
+        Err(err) => eprintln!("Failed to start recording: {err}"),
     }
 }
 
@@ -295,7 +301,7 @@ fn show_window(window: &slint::Window, toggle_item: &MenuItem, geometry_committe
         *geometry_committed = true;
     }
     if let Err(err) = window.show() {
-        eprintln!("ウィンドウの表示に失敗した: {err}");
+        eprintln!("Failed to show the window: {err}");
     }
     toggle_item.set_text(SETTINGS_LABEL_CLOSE);
 }
@@ -319,7 +325,7 @@ fn recording_dir_text(dir: &std::path::Path) -> slint::SharedString {
 /// ウィンドウを非表示にし、トグル項目のラベルを「表示」に戻す。
 fn hide_window(window: &slint::Window, toggle_item: &MenuItem) {
     if let Err(err) = window.hide() {
-        eprintln!("ウィンドウの非表示に失敗した: {err}");
+        eprintln!("Failed to hide the window: {err}");
     }
     toggle_item.set_text(SETTINGS_LABEL_OPEN);
 }
@@ -333,7 +339,8 @@ fn hide_dock_icon() {
     use objc2::MainThreadMarker;
     use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 
-    let mtm = MainThreadMarker::new().expect("main は常にメインスレッドで動くため成功する");
+    let mtm =
+        MainThreadMarker::new().expect("main always runs on the main thread, so this succeeds");
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 }
@@ -382,7 +389,7 @@ mod tests {
             let level = breathing_level(Duration::from_secs_f32(t), CYCLE);
             assert!(
                 (0.0..=1.0).contains(&level),
-                "level {level} が範囲外 (t={t})"
+                "level {level} out of range (t={t})"
             );
         }
     }

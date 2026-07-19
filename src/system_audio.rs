@@ -92,13 +92,13 @@ impl SystemAudioSource {
             Ok(content) => content,
             Err(err) => {
                 abort(&sender, writer, &path);
-                return Err(format!("共有可能コンテンツの取得に失敗した: {err}").into());
+                return Err(format!("Failed to get shareable content: {err}").into());
             }
         };
         let displays = content.displays();
         let Some(display) = displays.first() else {
             abort(&sender, writer, &path);
-            return Err("ディスプレイが見つからない".into());
+            return Err("No display found".into());
         };
         let filter = SCContentFilter::create()
             .with_display(display)
@@ -122,7 +122,7 @@ impl SystemAudioSource {
         );
         if let Err(err) = stream.start_capture() {
             abort(&sender, writer, &path);
-            return Err(format!("システム音声のキャプチャ開始に失敗した: {err}").into());
+            return Err(format!("Failed to start system-audio capture: {err}").into());
         }
 
         Ok(Self {
@@ -145,14 +145,14 @@ impl SystemAudioSource {
             path,
         } = self;
         if let Err(err) = stream.stop_capture() {
-            eprintln!("システム音声のキャプチャ停止に失敗した: {err}");
+            eprintln!("Failed to stop system-audio capture: {err}");
         }
         // 送信側を落としてチャネルを閉じる（ハンドラ保持に依存せず writer を終わらせる）。
         close_sender(&sender);
         drop(stream);
         writer
             .join()
-            .map_err(|_| "システム音声書き込みスレッドがパニックした")??;
+            .map_err(|_| "The system-audio writer thread panicked")??;
         Ok(path)
     }
 }

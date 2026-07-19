@@ -58,7 +58,9 @@ impl Recorder {
         let system = match crate::system_audio::SystemAudioSource::start(session_dir) {
             Ok(system) => Some(system),
             Err(err) => {
-                eprintln!("システム音声の録音を開始できなかったため、マイクのみで続行する: {err}");
+                eprintln!(
+                    "Could not start system-audio recording, continuing with mic only: {err}"
+                );
                 None
             }
         };
@@ -90,13 +92,13 @@ impl Recorder {
         let mut saved = Vec::new();
         match mic.stop() {
             Ok(path) => saved.push(path),
-            Err(err) => eprintln!("マイク録音の停止・保存に失敗した: {err}"),
+            Err(err) => eprintln!("Failed to stop and save the mic recording: {err}"),
         }
         #[cfg(target_os = "macos")]
         if let Some(system) = system {
             match system.stop() {
                 Ok(path) => saved.push(path),
-                Err(err) => eprintln!("システム音声の停止・保存に失敗した: {err}"),
+                Err(err) => eprintln!("Failed to stop and save the system audio: {err}"),
             }
         }
         saved
@@ -124,7 +126,7 @@ impl MicSource {
         let host = cpal::default_host();
         let device = host
             .default_input_device()
-            .ok_or("既定の入力デバイスが見つからない")?;
+            .ok_or("No default input device found")?;
         let supported = device.default_input_config()?;
         let sample_format = supported.sample_format();
         let config: cpal::StreamConfig = supported.config();
@@ -137,13 +139,13 @@ impl MicSource {
             sample_format,
             SampleFormat::F32 | SampleFormat::I16 | SampleFormat::U16
         ) {
-            return Err(format!("未対応のサンプル形式: {sample_format:?}").into());
+            return Err(format!("Unsupported sample format: {sample_format:?}").into());
         }
         // LAME はモノラル(1)/ステレオ(2)のみ対応。入力デバイスは 3ch 以上を報告することがある
         // （例: ブラウザ/会議アプリが VoiceProcessingIO でマイクを開いている間や、複数マイクを
         // 束ねたデバイス）。その場合はモノラルへダウンミックスして録音する。1/2ch はそのまま。
         let output_channels: u16 = match input_channels {
-            0 => return Err("未対応のチャンネル数: 0".into()),
+            0 => return Err("Unsupported channel count: 0".into()),
             1 | 2 => input_channels,
             _ => 1,
         };
@@ -167,7 +169,7 @@ impl MicSource {
             SampleFormat::F32 => build_input_stream::<f32>(&device, config, output_channels, tx),
             SampleFormat::I16 => build_input_stream::<i16>(&device, config, output_channels, tx),
             SampleFormat::U16 => build_input_stream::<u16>(&device, config, output_channels, tx),
-            other => unreachable!("start() の冒頭で対応形式に絞り済み: {other:?}"),
+            other => unreachable!("start() already restricted to supported formats: {other:?}"),
         };
         // 構築・再生に失敗したら副作用を残さない（writer を終了・回収し、作成済みの空ファイルを消す）。
         // tx を落としてチャネルを閉じないと writer の recv が閉じず join が返らないため、先に
@@ -208,7 +210,7 @@ impl MicSource {
         // writer スレッドの完了（flush・ファイル確定）を待ち、結果を伝播する。
         writer
             .join()
-            .map_err(|_| "マイク録音書き込みスレッドがパニックした")??;
+            .map_err(|_| "The mic recording writer thread panicked")??;
         Ok(path)
     }
 }
@@ -227,7 +229,7 @@ where
 {
     let input_channels = config.channels as usize;
     let output_channels = output_channels as usize;
-    let err_fn = |err| eprintln!("入力ストリームでエラーが発生した: {err}");
+    let err_fn = |err| eprintln!("An error occurred on the input stream: {err}");
     let stream = device.build_input_stream(
         config,
         move |data: &[T], _: &cpal::InputCallbackInfo| {
@@ -272,7 +274,7 @@ pub(crate) fn run_writer(
     file: File,
 ) -> Result<(), RecordError> {
     let mut encoder = {
-        let mut builder = Builder::new().ok_or("LAME エンコーダのビルダー生成に失敗")?;
+        let mut builder = Builder::new().ok_or("Failed to create the LAME encoder builder")?;
         builder.set_num_channels(channels as u8)?;
         builder.set_sample_rate(sample_rate)?;
         builder.set_brate(BITRATE)?;
@@ -342,11 +344,13 @@ pub(crate) fn create_recording_file(path: &Path) -> std::io::Result<File> {
 pub(crate) fn discard_partial_recording(writer: JoinHandle<Result<(), RecordError>>, path: &Path) {
     match writer.join() {
         Ok(Ok(())) => {}
-        Ok(Err(err)) => eprintln!("録音開始失敗時の writer 終了処理でエラー: {err}"),
-        Err(_) => eprintln!("録音書き込みスレッドがパニックした（開始失敗時）"),
+        Ok(Err(err)) => {
+            eprintln!("Error while shutting down the writer after a failed recording start: {err}")
+        }
+        Err(_) => eprintln!("The recording writer thread panicked (during failed start)"),
     }
     if let Err(err) = std::fs::remove_file(path) {
-        eprintln!("開始失敗時の空ファイル削除に失敗した: {err}");
+        eprintln!("Failed to delete the empty file after a failed start: {err}");
     }
 }
 
