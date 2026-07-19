@@ -301,19 +301,18 @@ fn build_menu_event_handler(
             }
         }
 
-        // 登録アプリの音声再生の立ち上がりを取り出し、設定 ON かつ未録音のときだけ自動開始する
-        // （macOS 14.4+）。take_activated は内部で一定間隔にポーリングを間引き、登録アプリのいずれかが
-        // 非出力→出力へ変化した立ち上がりだけを返す。照会不能（非対応/失敗）時は発火しない。
+        // 登録アプリの音声再生の立ち上がりを取り出し、未録音のときだけ自動開始する（macOS 14.4+）。
+        // take_activated は設定 OFF／登録なしのときはシステム照会を行わず、有効時のみ POLL_INTERVAL に
+        // 間引いて照会し、登録アプリの非出力→出力の立ち上がりだけを返す（照会不能時は発火しない）。
         #[cfg(target_os = "macos")]
         {
-            let registered: std::collections::HashSet<String> = config
-                .borrow()
-                .app_playback_triggers
-                .iter()
-                .map(|trigger| trigger.bundle_id.clone())
-                .collect();
-            let activated = app_monitor.take_activated(&registered);
-            if activated && recorder.is_none() && config.borrow().auto_record_on_app_playback {
+            let config_ref = config.borrow();
+            let activated = app_monitor.take_activated(
+                &config_ref.app_playback_triggers,
+                config_ref.auto_record_on_app_playback,
+            );
+            drop(config_ref);
+            if activated && recorder.is_none() {
                 start_recording(&mut recorder, &record_item, &config);
             }
         }

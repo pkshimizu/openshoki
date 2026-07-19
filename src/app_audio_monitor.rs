@@ -42,8 +42,14 @@ pub struct AppAudioMonitor {
     /// 最後にポーリングした時刻。`POLL_INTERVAL` 未満の呼び出しは照会を省く。
     last_poll: Cell<Instant>,
     /// 直近に観測した「出力中の全アプリ」のバンドル ID 集合（登録有無によらない）。立ち上がり
-    /// エッジ判定に使う。起動時の現在値で初期化し、起動時点で既に出力中のアプリを遡って拾わない。
+    /// エッジ判定に使う。
     prev_outputting: RefCell<HashSet<String>>,
+    /// `prev_outputting` が現在の出力状況で初期化済みか。機能 OFF／登録なしの間は `false` に戻し、
+    /// 再び有効になった最初の照会で現在値を取り込むことで、既に再生中のアプリを遡って発火させない。
+    primed: Cell<bool>,
+    /// 照会不能（macOS 14.4 未満／失敗）を一度ログしたか。500ms ごとのログ氾濫を避けるため、
+    /// 有効時に初めて照会できなかったときだけ 1 回知らせる。
+    warned_unavailable: Cell<bool>,
 }
 
 impl Default for AppAudioMonitor {
@@ -54,45 +60,66 @@ impl Default for AppAudioMonitor {
 
 impl AppAudioMonitor {
     pub fn new() -> Self {
-        // 起動時点で出力中のアプリを初期値にする。以後の「非出力→出力」だけを立ち上がりとして拾い、
-        // 起動時に既に再生中だったアプリを遡って自動開始しない（照会不能なら空集合）。
+        // 生成時にはシステム照会を行わない（プライバシー配慮のオプトイン機能なので、有効化される
+        // まで音声プロセスの走査をしない）。初期化は有効化後の最初の照会で行う（`primed`）。
         Self {
             last_poll: Cell::new(Instant::now()),
-            prev_outputting: RefCell::new(output_running_bundle_ids().unwrap_or_default()),
+            prev_outputting: RefCell::new(HashSet::new()),
+            primed: Cell::new(false),
+            warned_unavailable: Cell::new(false),
         }
     }
 
-    /// 登録アプリ（`registered` のバンドル ID）のいずれかが「非出力→出力」へ変化していたら `true`。
+    /// 登録アプリ（`triggers`）のいずれかが「非出力→出力」へ変化していたら `true`。
     ///
-    /// 100ms タイマーから毎ティック呼ばれる想定。`POLL_INTERVAL` 未満の呼び出しでは照会せず
-    /// `false` を返す（間引き）。録音中かどうかの判定は呼び出し側が行う。照会不能（非対応/失敗）の
-    /// ときは状態を変えず `false`。
-    pub fn take_activated(&self, registered: &HashSet<String>) -> bool {
+    /// 100ms タイマーから毎ティック呼ばれる想定。`enabled` が false または `triggers` が空のときは、
+    /// 重いシステム全体の照会を**一切行わず** `false` を返す（オプトイン機能を無効化している間は
+    /// 音声プロセスの走査をしない。アイドル負荷も抑える）。このとき `primed` を落とし、再び有効に
+    /// なった最初の照会で現在の出力状況を取り込んで遡り発火を防ぐ。有効時は `POLL_INTERVAL` に
+    /// 間引いて照会する。録音中かどうかの判定は呼び出し側が行う。照会不能時は状態を変えず `false`。
+    pub fn take_activated(&self, triggers: &[AppTrigger], enabled: bool) -> bool {
+        if !enabled || triggers.is_empty() {
+            self.primed.set(false);
+            return false;
+        }
         if self.last_poll.get().elapsed() < POLL_INTERVAL {
             return false;
         }
         self.last_poll.set(Instant::now());
 
         let Some(outputting) = output_running_bundle_ids() else {
+            // macOS 14.4 未満や照会失敗。原因切り分けのため一度だけ知らせる（毎回は出さない）。
+            if !self.warned_unavailable.replace(true) {
+                eprintln!(
+                    "App-playback auto-record is inactive because audio-process info is unavailable (needs macOS 14.4+)"
+                );
+            }
             return false;
         };
+
+        if !self.primed.replace(true) {
+            // 有効化後の最初の照会。現在出力中のアプリを取り込み、遡って発火しない。
+            *self.prev_outputting.borrow_mut() = outputting;
+            return false;
+        }
+
         let mut prev = self.prev_outputting.borrow_mut();
-        let activated = has_rising_edge(registered, &prev, &outputting);
+        let activated = has_rising_edge(triggers, &prev, &outputting);
         *prev = outputting;
         activated
     }
 }
 
-/// 立ち上がり判定の純粋部分: 登録アプリ（`registered`）のうち、今は出力中（`current`）で
+/// 立ち上がり判定の純粋部分: 登録アプリ（`triggers`）のうち、今は出力中（`current`）で
 /// 前回は出力していなかった（`prev` に無い）ものがあれば `true`。
 fn has_rising_edge(
-    registered: &HashSet<String>,
+    triggers: &[AppTrigger],
     prev: &HashSet<String>,
     current: &HashSet<String>,
 ) -> bool {
-    registered
+    triggers
         .iter()
-        .any(|id| current.contains(id) && !prev.contains(id))
+        .any(|trigger| current.contains(&trigger.bundle_id) && !prev.contains(&trigger.bundle_id))
 }
 
 /// いま音声出力を行っているアプリのバンドル ID 集合を返す。macOS 14.4 未満や照会失敗時は `None`
@@ -135,7 +162,8 @@ fn global_address(selector: AudioObjectPropertySelector) -> AudioObjectPropertyA
     }
 }
 
-/// システムの全プロセスオブジェクトの一覧を取得する。API 非対応（macOS 14 未満）や失敗時は `None`。
+/// システムの全プロセスオブジェクトの一覧を取得する。API 非対応（プロセスオブジェクト API は
+/// macOS 14.0+、本機能に必要な `IsRunningOutput` は 14.4+）や失敗時は `None`。
 fn process_object_list() -> Option<Vec<AudioObjectID>> {
     let address = global_address(kAudioHardwarePropertyProcessObjectList);
     let mut size: u32 = 0;
@@ -154,7 +182,9 @@ fn process_object_list() -> Option<Vec<AudioObjectID>> {
     let count = size as usize / size_of::<AudioObjectID>();
     let mut processes = vec![0 as AudioObjectID; count];
     let Some(out) = NonNull::new(processes.as_mut_ptr()) else {
-        return Some(processes); // プロセス 0 件（out バッファ空）なら空で返す。
+        // 空 Vec でも as_mut_ptr は非 null のダングリングを返すため、通常この分岐は通らない。
+        // 万一 null なら照会せず空で返す（size=0 のときも下の本流が size 0 で正しく空を返す）。
+        return Some(processes);
     };
     let status = unsafe {
         AudioObjectGetPropertyData(
@@ -225,7 +255,18 @@ fn bundle_id_for_pid(pid: i32) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::has_rising_edge;
+    use crate::config::AppTrigger;
     use std::collections::HashSet;
+
+    fn triggers(bundle_ids: &[&str]) -> Vec<AppTrigger> {
+        bundle_ids
+            .iter()
+            .map(|id| AppTrigger {
+                bundle_id: (*id).to_owned(),
+                name: (*id).to_owned(),
+            })
+            .collect()
+    }
 
     fn set(items: &[&str]) -> HashSet<String> {
         items.iter().map(|s| s.to_string()).collect()
@@ -234,45 +275,55 @@ mod tests {
     #[test]
     fn rising_edge_when_registered_app_starts_output() {
         // 登録アプリが「前回なし→今回あり」なら立ち上がり。
-        let registered = set(&["com.apple.Music"]);
-        let prev = set(&[]);
-        let current = set(&["com.apple.Music"]);
-        assert!(has_rising_edge(&registered, &prev, &current));
+        let registered = triggers(&["com.apple.Music"]);
+        assert!(has_rising_edge(
+            &registered,
+            &set(&[]),
+            &set(&["com.apple.Music"])
+        ));
     }
 
     #[test]
     fn no_edge_when_already_outputting() {
         // 前回も出力していたら立ち上がりではない（継続中）。
-        let registered = set(&["com.apple.Music"]);
-        let prev = set(&["com.apple.Music"]);
-        let current = set(&["com.apple.Music"]);
-        assert!(!has_rising_edge(&registered, &prev, &current));
+        let registered = triggers(&["com.apple.Music"]);
+        assert!(!has_rising_edge(
+            &registered,
+            &set(&["com.apple.Music"]),
+            &set(&["com.apple.Music"])
+        ));
     }
 
     #[test]
     fn no_edge_for_unregistered_app() {
         // 未登録アプリが出力し始めても発火しない。
-        let registered = set(&["com.apple.Music"]);
-        let prev = set(&[]);
-        let current = set(&["com.google.Chrome"]);
-        assert!(!has_rising_edge(&registered, &prev, &current));
+        let registered = triggers(&["com.apple.Music"]);
+        assert!(!has_rising_edge(
+            &registered,
+            &set(&[]),
+            &set(&["com.google.Chrome"])
+        ));
     }
 
     #[test]
     fn no_edge_when_output_stops() {
         // 出力が止まった（今回なし）は立ち上がりではない（自動停止は #26 の担当）。
-        let registered = set(&["com.apple.Music"]);
-        let prev = set(&["com.apple.Music"]);
-        let current = set(&[]);
-        assert!(!has_rising_edge(&registered, &prev, &current));
+        let registered = triggers(&["com.apple.Music"]);
+        assert!(!has_rising_edge(
+            &registered,
+            &set(&["com.apple.Music"]),
+            &set(&[])
+        ));
     }
 
     #[test]
     fn rising_edge_with_multiple_registered_apps() {
         // 複数登録のうち 1 つでも立ち上がれば発火。
-        let registered = set(&["com.apple.Music", "com.apple.QuickTimePlayerX"]);
-        let prev = set(&["com.apple.Music"]);
-        let current = set(&["com.apple.Music", "com.apple.QuickTimePlayerX"]);
-        assert!(has_rising_edge(&registered, &prev, &current));
+        let registered = triggers(&["com.apple.Music", "com.apple.QuickTimePlayerX"]);
+        assert!(has_rising_edge(
+            &registered,
+            &set(&["com.apple.Music"]),
+            &set(&["com.apple.Music", "com.apple.QuickTimePlayerX"])
+        ));
     }
 }
