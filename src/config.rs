@@ -21,6 +21,16 @@ const CONFIG_FILE: &str = "config.toml";
 /// デフォルト保存先のフォルダ名（Documents もしくはホーム配下に作る想定）。
 const DEFAULT_DIR_NAME: &str = "openshoki";
 
+/// 自動録音のトリガーにする登録アプリ。`.app` から取得したバンドル ID で音声出力プロセスを
+/// 照合し、表示名は設定画面での一覧表示に使う。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppTrigger {
+    /// アプリのバンドル ID（例: `com.apple.Music`）。音声出力プロセスの照合キー。
+    pub bundle_id: String,
+    /// 設定画面で表示するアプリ名。
+    pub name: String,
+}
+
 /// 永続化するユーザー設定。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -34,6 +44,13 @@ pub struct Config {
     /// （付けないとデシリアライズが失敗し、`recording_dir` ごとデフォルトへ落ちる）。
     #[serde(default)]
     pub auto_record_on_mic_active: bool,
+    /// 登録アプリの音声再生を検知したら録音を自動開始するか（macOS 14.4+ のみ有効）。
+    /// オプトインの既定 OFF。旧 `config.toml` 互換のため `#[serde(default)]`。
+    #[serde(default)]
+    pub auto_record_on_app_playback: bool,
+    /// 音声再生での自動開始トリガーにする登録アプリ一覧。
+    #[serde(default)]
+    pub app_playback_triggers: Vec<AppTrigger>,
 }
 
 impl Default for Config {
@@ -41,6 +58,8 @@ impl Default for Config {
         Self {
             recording_dir: default_recording_dir(),
             auto_record_on_mic_active: false,
+            auto_record_on_app_playback: false,
+            app_playback_triggers: Vec::new(),
         }
     }
 }
@@ -123,6 +142,11 @@ mod tests {
         let config = Config {
             recording_dir: PathBuf::from("/tmp/openshoki-test"),
             auto_record_on_mic_active: true,
+            auto_record_on_app_playback: true,
+            app_playback_triggers: vec![AppTrigger {
+                bundle_id: "com.apple.Music".to_owned(),
+                name: "Music".to_owned(),
+            }],
         };
         let text = toml::to_string_pretty(&config).expect("serialization should succeed");
         let restored: Config = toml::from_str(&text).expect("deserialization should succeed");
@@ -131,17 +155,24 @@ mod tests {
             restored.auto_record_on_mic_active,
             config.auto_record_on_mic_active
         );
+        assert_eq!(
+            restored.auto_record_on_app_playback,
+            config.auto_record_on_app_playback
+        );
+        assert_eq!(restored.app_playback_triggers, config.app_playback_triggers);
     }
 
     #[test]
     fn deserialize_old_config_without_new_field_defaults_false() {
-        // 新項目 auto_record_on_mic_active を持たない旧 config.toml を読んでも失敗せず、
-        // recording_dir は保持され、新項目は既定 false になる（#[serde(default)]）。
+        // 新項目を持たない旧 config.toml を読んでも失敗せず、recording_dir は保持され、
+        // 新項目は既定（OFF・空リスト）になる（#[serde(default)]）。
         let text = "recording_dir = \"/tmp/openshoki-old\"\n";
         let restored: Config =
             toml::from_str(text).expect("loading the old settings should succeed");
         assert_eq!(restored.recording_dir, PathBuf::from("/tmp/openshoki-old"));
         assert!(!restored.auto_record_on_mic_active);
+        assert!(!restored.auto_record_on_app_playback);
+        assert!(restored.app_playback_triggers.is_empty());
     }
 
     #[test]
