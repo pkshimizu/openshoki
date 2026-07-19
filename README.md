@@ -21,6 +21,11 @@
   （例 `20260628-143025`）サブディレクトリを作り、その中に `mic.mp3` / `system.mp3` を置きます。
 - **保存先の設定画面**: メニューの「設定を開く」から、録音ファイルの保存先を選べます。設定は
   OS 標準の設定ディレクトリに TOML で永続化されます。
+- **録音停止時の自動文字起こし（オプトイン）**: ローカルの whisper.cpp で各音源をオンデバイス
+  文字起こしし、セグメントの開始/終了時刻付き JSON（`mic.json` / `system.json`）をセッション
+  ディレクトリへ保存します（音声を外部送信しません）。whisper モデル（ggml 形式）はユーザーが
+  配置し、現状は `config.toml` の `auto_transcribe` / `whisper_model_path` で有効化します
+  （設定画面での切り替えは後続 [#31](https://github.com/pkshimizu/openshoki/issues/31)）。
 
 ## 動作要件
 
@@ -38,6 +43,7 @@
 
 - **Rust ツールチェーン**（edition 2024 を使うため Rust 1.85 以降）。
 - **C コンパイラ**: `mp3lame-encoder` が libmp3lame をビルドするために必要です。
+- **CMake**: `whisper-rs` が whisper.cpp をビルドするために必要です（`brew install cmake`）。
 - **macOS**: 安定版の Xcode コマンドラインツール。ScreenCaptureKit の Swift ブリッジの
   ビルド・リンクに使います（ベータ版 Xcode では Swift 後方互換ライブラリを解決できず
   リンクに失敗することがあります）。
@@ -70,12 +76,14 @@ openshoki/
     ├── tray.rs           トレイアイコン／メニューの構築とイベントのディスパッチ
     ├── recorder.rs       録音セッション（マイク＋システム音声）の開始・停止と MP3 書き出し
     ├── system_audio.rs   macOS のシステム音声キャプチャ（ScreenCaptureKit）
-    └── config.rs         設定（保存先）の読み込み・保存（TOML）
+    ├── transcribe.rs     録音停止後の自動文字起こし（whisper.cpp、バックグラウンド）
+    └── config.rs         設定（保存先など）の読み込み・保存（TOML）
 ```
 
 主な依存: GUI に [Slint](https://slint.dev/)、トレイ常駐に `tray-icon`、マイク取得に `cpal`、
-MP3 エンコードに `mp3lame-encoder`、設定の永続化に `directories` / `serde` / `toml`。macOS では
-`screencapturekit` と `objc2` 系を使います。
+MP3 エンコードに `mp3lame-encoder`、設定の永続化に `directories` / `serde` / `toml`、
+文字起こしに `whisper-rs`（whisper.cpp）/ `symphonia`（MP3 デコード）/ `rubato`（リサンプル）。
+macOS では `screencapturekit` と `objc2` 系を使います。
 
 ## 現状と今後
 
@@ -83,7 +91,7 @@ MP3 エンコードに `mp3lame-encoder`、設定の永続化に `directories` /
 - **今後**:
   - Windows（WASAPI loopback）／Linux（monitor source）のシステム音声録音（[#23](https://github.com/pkshimizu/openshoki/issues/23) / [#24](https://github.com/pkshimizu/openshoki/issues/24)）
   - 配布用 macOS `.app` バンドルの生成（[#20](https://github.com/pkshimizu/openshoki/issues/20)）
-  - 録音した音声の文字起こし
+  - 文字起こしの設定 UI（[#31](https://github.com/pkshimizu/openshoki/issues/31)）と録音一覧・再生ビュー（[#53](https://github.com/pkshimizu/openshoki/issues/53) / [#54](https://github.com/pkshimizu/openshoki/issues/54)）
 
 ## 開発
 

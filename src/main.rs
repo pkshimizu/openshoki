@@ -9,6 +9,7 @@ mod config;
 mod recorder;
 #[cfg(target_os = "macos")]
 mod system_audio;
+mod transcribe;
 mod tray;
 
 use std::cell::RefCell;
@@ -207,6 +208,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "macos")]
     let app_monitor = app_audio_monitor::AppAudioMonitor::new();
 
+    // 文字起こしのバックグラウンドワーカー。設定 OFF の間はジョブが来ないだけで、常駐コストは
+    // アイドルなスレッド 1 本のみ。起動失敗時は文字起こしだけが無効化される（録音は無関係）。
+    let transcriber = transcribe::TranscribeWorker::start();
+
     // ウィンドウを閉じても終了させず、非表示にして常駐を保つ。メニューからは開くだけで、
     // 閉じるのはウィンドウ自身の閉じるボタンに任せる。
     ui.window()
@@ -222,6 +227,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ui.as_weak(),
             &tray,
             Rc::clone(&config),
+            transcriber,
             #[cfg(target_os = "macos")]
             app_monitor,
         ),
@@ -255,6 +261,7 @@ fn build_menu_event_handler(
     ui: slint::Weak<AppWindow>,
     tray: &Tray,
     config: Rc<RefCell<Config>>,
+    transcriber: transcribe::TranscribeWorker,
     #[cfg(target_os = "macos")] app_monitor: app_audio_monitor::AppAudioMonitor,
 ) -> impl FnMut() + 'static {
     // クロージャは 'static のため &Tray を借用できない。必要な要素（各項目・ID・アイコン）
@@ -285,7 +292,7 @@ fn build_menu_event_handler(
                 let Some(ui) = ui.upgrade() else { continue };
                 show_window(ui.window(), &mut geometry_committed);
             } else if event.id == record_id {
-                toggle_recording(&mut recorder, &record_item, &config);
+                toggle_recording(&mut recorder, &record_item, &config, &transcriber);
                 #[cfg(target_os = "macos")]
                 {
                     // 手動トグルの録音は自動停止の対象にしない（開始でも停止でもフラグを下ろす）。
@@ -326,7 +333,7 @@ fn build_menu_event_handler(
                 let stop = app_monitor.should_stop(&config_ref.app_mic_triggers, enabled, debounce);
                 drop(config_ref);
                 if stop {
-                    stop_recording(&mut recorder, &record_item);
+                    stop_recording(&mut recorder, &record_item, &config, &transcriber);
                     recording_started_by_app = false;
                     // 停止後は開始検知を再初期化する（録音中に出力を始めたアプリを誤検知しない）。
                     app_monitor.reset_after_stop();
@@ -363,11 +370,12 @@ fn toggle_recording(
     recorder: &mut Option<Recorder>,
     record_item: &MenuItem,
     config: &Rc<RefCell<Config>>,
+    transcriber: &transcribe::TranscribeWorker,
 ) {
     if recorder.is_none() {
         start_recording(recorder, record_item, config);
     } else {
-        stop_recording(recorder, record_item);
+        stop_recording(recorder, record_item, config, transcriber);
     }
 }
 
@@ -375,7 +383,15 @@ fn toggle_recording(
 /// （`start_recording` と対称）。stop() が各音源のストリーム停止→flush→ファイル確定まで行う。
 /// 録音していなければ何もしない。トレイアイコン／経過時間の表示はタイマー closure が録音状態を
 /// 見て駆動するため、ここではメニュー項目のラベルを待機へ戻すだけにする。
-fn stop_recording(recorder: &mut Option<Recorder>, record_item: &MenuItem) {
+///
+/// 保存後、設定の自動文字起こしが ON かつモデルパスが指定されていれば、保存できた音源を
+/// バックグラウンドの文字起こしワーカーへ投入する（手動・自動どちらの停止経路もここを通る）。
+fn stop_recording(
+    recorder: &mut Option<Recorder>,
+    record_item: &MenuItem,
+    config: &Rc<RefCell<Config>>,
+    transcriber: &transcribe::TranscribeWorker,
+) {
     let Some(session) = recorder.take() else {
         return;
     };
@@ -386,8 +402,32 @@ fn stop_recording(recorder: &mut Option<Recorder>, record_item: &MenuItem) {
         // 保存先のフルパスは機微情報（録音データの所在・フォルダ構造がプライバシーに関わる）
         // なので出さない。完了が分かるように、保存できたファイル数だけを知らせる。
         println!("Saved the recording ({} files)", saved.len());
+        submit_transcription(&saved, config, transcriber);
     }
     record_item.set_text(RECORD_LABEL_START);
+}
+
+/// 保存済み音源の文字起こしジョブを組み立ててワーカーへ投入する。
+/// 設定 OFF なら何もしない（オプトイン）。ON でもモデル未指定ならスキップをログに残す
+/// （設定ミスに気づけるように）。設定値はここでスナップショットし、処理中の設定変更の影響を受けない。
+fn submit_transcription(
+    saved: &[std::path::PathBuf],
+    config: &Rc<RefCell<Config>>,
+    transcriber: &transcribe::TranscribeWorker,
+) {
+    let config_ref = config.borrow();
+    if !config_ref.auto_transcribe {
+        return;
+    }
+    let Some(model_path) = config_ref.whisper_model_path.clone() else {
+        eprintln!("Skipping transcription because no whisper model path is configured");
+        return;
+    };
+    transcriber.submit(transcribe::TranscribeJob {
+        audio_paths: saved.to_vec(),
+        model_path,
+        language: config_ref.transcribe_language.clone(),
+    });
 }
 
 /// 録音セッションを開始する。手動トグルと自動開始（登録アプリのマイク使用検知）で共用する。
