@@ -43,7 +43,8 @@ const OUTPUT_STOP_DEBOUNCE: Duration = Duration::from_secs(4);
 
 /// 登録アプリの音声出力の立ち上がりを検知するモニタ。全状態はメインスレッド上でのみ触る。
 pub struct AppAudioMonitor {
-    /// 最後にポーリングした時刻。`POLL_INTERVAL` 未満の呼び出しは照会を省く。
+    /// 最後にポーリングした時刻。`POLL_INTERVAL` 未満の呼び出しは照会を省く。開始検知
+    /// `take_activated` と停止判定 `should_stop` で共有する（両者は録音状態で排他に呼ばれる前提）。
     last_poll: Cell<Instant>,
     /// 直近に観測した「出力中の全アプリ」のバンドル ID 集合（登録有無によらない）。立ち上がり
     /// エッジ判定に使う。
@@ -119,6 +120,11 @@ impl AppAudioMonitor {
 
     /// 自動停止すべきか（登録アプリのいずれも音声出力していない状態が `OUTPUT_STOP_DEBOUNCE`
     /// 継続したか）を判定する。自動開始した録音中にのみ呼ぶ想定。
+    ///
+    /// **副作用のあるポーリング**であり、間引きを通過するたびに出力を照会して途絶えタイマー
+    /// （`output_ceased_since`）を進める（純粋なクエリではない）。間引きタイマー `last_poll` は
+    /// 開始検知 `take_activated` と共有するため、同一ティックで両方は呼ばない前提（未録音なら開始
+    /// 検知・録音中なら停止判定、と排他に呼ぶ）。
     ///
     /// `enabled` が false／`triggers` が空／照会不能のときは `false`（自動停止しない）。有効時は
     /// `POLL_INTERVAL` に間引いて照会する。ミュートや発言の合間・長い沈黙では止まらない（参加者の

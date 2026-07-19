@@ -287,10 +287,17 @@ fn build_menu_event_handler(
                 show_window(ui.window(), &mut geometry_committed);
             } else if event.id == record_id {
                 toggle_recording(&mut recorder, &record_item, &config);
-                // 手動トグルの録音は自動停止の対象にしない（開始でも停止でもフラグを下ろす）。
                 #[cfg(target_os = "macos")]
                 {
+                    // 手動トグルの録音は自動停止の対象にしない（開始でも停止でもフラグを下ろす）。
                     recording_started_by_app = false;
+                    // 停止だったら開始検知を再初期化する。録音中は app の照会（take_activated）を
+                    // 止めて prev_outputting が凍結されるため、再初期化しないと「録音中に出力を
+                    // 始めた登録アプリ」を停止直後に立ち上がりとして誤検知して即再録音してしまう
+                    // （app 自動停止経路の reset_after_stop と対称にする）。
+                    if recorder.is_none() {
+                        app_monitor.reset_after_stop();
+                    }
                 }
             } else if event.id == quit_id
                 && let Err(err) = slint::quit_event_loop()
@@ -308,6 +315,7 @@ fn build_menu_event_handler(
             let activated = mic_monitor.as_ref().is_some_and(|m| m.take_activated());
             if activated && recorder.is_none() && config.borrow().auto_record_on_mic_active {
                 start_recording(&mut recorder, &record_item, &config);
+                // マイク由来の録音は登録アプリの出力途絶では止めない（自動停止の対象外）。
                 recording_started_by_app = false;
             }
         }
