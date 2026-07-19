@@ -3,6 +3,8 @@
 //! 起動時はウィンドウを表示せずトレイに常駐し、トレイメニューから Slint ウィンドウの
 //! 表示/非表示とアプリ終了を行う。録音機能は後続の issue で実装する。
 
+#[cfg(target_os = "macos")]
+mod app_audio_monitor;
 mod config;
 #[cfg(target_os = "macos")]
 mod mic_monitor;
@@ -35,7 +37,7 @@ const BLINK_CYCLE_SECS: f32 = 2.0;
 /// 確定されないまま高さ 0 で表示される。初回表示時にこの値を明示してジオメトリを確定させる。
 /// 幅・高さは `ui/app-window.slint` の min/preferred と一致させること（片方だけ変えない）。
 const WINDOW_WIDTH: f32 = 420.0;
-const WINDOW_HEIGHT: f32 = 300.0;
+const WINDOW_HEIGHT: f32 = 500.0;
 /// 初回表示位置（画面左上からの暫定値）。中央寄せ等の調整は後続に回す。
 const WINDOW_X: f32 = 240.0;
 const WINDOW_Y: f32 = 160.0;
@@ -48,10 +50,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ウィンドウは生成するが表示はしない（起動時はトレイのみ）。
     let ui = AppWindow::new()?;
 
-    // 設定を読み込み、現在の保存先・自動録音トグルを画面へ反映する。失敗時は load() がデフォルトを返す。
+    // 設定を読み込み、現在の保存先・自動録音トグル・登録アプリ一覧を画面へ反映する。
+    // 失敗時は load() がデフォルトを返す。
     let config = Rc::new(RefCell::new(Config::load()));
     ui.set_recording_dir(recording_dir_text(&config.borrow().recording_dir));
     ui.set_auto_record(config.borrow().auto_record_on_mic_active);
+    ui.set_auto_record_app(config.borrow().auto_record_on_app_playback);
+    // 登録アプリの表示名一覧を Slint のモデルで持ち、追加/削除で更新する。
+    let app_list_model = Rc::new(slint::VecModel::<slint::SharedString>::from(
+        config
+            .borrow()
+            .app_playback_triggers
+            .iter()
+            .map(|trigger| slint::SharedString::from(trigger.name.as_str()))
+            .collect::<Vec<_>>(),
+    ));
+    ui.set_app_list(app_list_model.clone().into());
 
     // 「フォルダを選択」: ネイティブのフォルダ選択ダイアログで保存先を選び直し、保存・表示更新する。
     // コールバックはメインスレッド（Slint イベントループ）上で動くため、同期 API を使う。
@@ -99,6 +113,77 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         *config_for_auto.borrow_mut() = candidate;
     });
 
+    // 「登録アプリの再生で自動録音」トグル: 上と同じく永続化に成功してから反映する。
+    let config_for_auto_app = Rc::clone(&config);
+    ui.on_toggle_auto_record_app(move |enabled| {
+        let mut candidate = config_for_auto_app.borrow().clone();
+        candidate.auto_record_on_app_playback = enabled;
+        if let Err(err) = candidate.save() {
+            eprintln!(
+                "Not changing the app-playback auto-record setting because saving the settings failed: {err}"
+            );
+            return;
+        }
+        *config_for_auto_app.borrow_mut() = candidate;
+    });
+
+    // 登録アプリの削除: 一覧のインデックスで設定とモデルから取り除く（永続化成功後に反映）。
+    let config_for_remove = Rc::clone(&config);
+    let model_for_remove = Rc::clone(&app_list_model);
+    ui.on_remove_app(move |index| {
+        let Ok(index) = usize::try_from(index) else {
+            return;
+        };
+        let mut candidate = config_for_remove.borrow().clone();
+        if index >= candidate.app_playback_triggers.len() {
+            return;
+        }
+        candidate.app_playback_triggers.remove(index);
+        if let Err(err) = candidate.save() {
+            eprintln!("Not removing the app because saving the settings failed: {err}");
+            return;
+        }
+        model_for_remove.remove(index);
+        *config_for_remove.borrow_mut() = candidate;
+    });
+
+    // 登録アプリの追加（macOS のみ）: ネイティブダイアログで .app を選び、バンドル ID・表示名を
+    // 読んで登録する（永続化成功後に反映）。既に同じバンドル ID があれば追加しない。
+    #[cfg(target_os = "macos")]
+    {
+        let config_for_add = Rc::clone(&config);
+        let model_for_add = Rc::clone(&app_list_model);
+        ui.on_add_app(move || {
+            let Some(app_path) = rfd::FileDialog::new()
+                .add_filter("Application", &["app"])
+                .set_directory("/Applications")
+                .pick_file()
+            else {
+                return; // キャンセル。
+            };
+            let Some(trigger) = app_audio_monitor::app_info_for_path(&app_path) else {
+                eprintln!("Could not read the bundle identifier of the selected app");
+                return;
+            };
+            let mut candidate = config_for_add.borrow().clone();
+            if candidate
+                .app_playback_triggers
+                .iter()
+                .any(|existing| existing.bundle_id == trigger.bundle_id)
+            {
+                return; // 登録済み。
+            }
+            let name = slint::SharedString::from(trigger.name.as_str());
+            candidate.app_playback_triggers.push(trigger);
+            if let Err(err) = candidate.save() {
+                eprintln!("Not adding the app because saving the settings failed: {err}");
+                return;
+            }
+            model_for_add.push(name);
+            *config_for_add.borrow_mut() = candidate;
+        });
+    }
+
     // Slint バックエンドの初期化後にトレイを常駐させる（macOS の NSApplication 初期化後）。
     let tray = Tray::new()?;
 
@@ -114,6 +199,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             None
         }
     };
+
+    // 登録アプリの音声出力を監視するモニタ（macOS 14.4+）。照会は失敗しても落ちない設計のため、
+    // 生成は常に成功する。実際に照会できるかはポーリング時に判定する。
+    #[cfg(target_os = "macos")]
+    let app_monitor = app_audio_monitor::AppAudioMonitor::new();
 
     // ウィンドウを閉じても終了させず、非表示にして常駐を保つ。メニューからは開くだけで、
     // 閉じるのはウィンドウ自身の閉じるボタンに任せる。
@@ -132,6 +222,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Rc::clone(&config),
             #[cfg(target_os = "macos")]
             mic_monitor,
+            #[cfg(target_os = "macos")]
+            app_monitor,
         ),
     );
 
@@ -163,6 +255,7 @@ fn build_menu_event_handler(
     tray: &Tray,
     config: Rc<RefCell<Config>>,
     #[cfg(target_os = "macos")] mic_monitor: Option<mic_monitor::MicMonitor>,
+    #[cfg(target_os = "macos")] app_monitor: app_audio_monitor::AppAudioMonitor,
 ) -> impl FnMut() + 'static {
     // クロージャは 'static のため &Tray を借用できない。必要な要素（各項目・ID・アイコン）
     // だけを複製して所有する。
@@ -204,6 +297,22 @@ fn build_menu_event_handler(
         {
             let activated = mic_monitor.as_ref().is_some_and(|m| m.take_activated());
             if activated && recorder.is_none() && config.borrow().auto_record_on_mic_active {
+                start_recording(&mut recorder, &record_item, &config);
+            }
+        }
+
+        // 登録アプリの音声再生の立ち上がりを取り出し、未録音のときだけ自動開始する（macOS 14.4+）。
+        // take_activated は設定 OFF／登録なしのときはシステム照会を行わず、有効時のみ POLL_INTERVAL に
+        // 間引いて照会し、登録アプリの非出力→出力の立ち上がりだけを返す（照会不能時は発火しない）。
+        #[cfg(target_os = "macos")]
+        {
+            let config_ref = config.borrow();
+            let activated = app_monitor.take_activated(
+                &config_ref.app_playback_triggers,
+                config_ref.auto_record_on_app_playback,
+            );
+            drop(config_ref);
+            if activated && recorder.is_none() {
                 start_recording(&mut recorder, &record_item, &config);
             }
         }

@@ -1,25 +1,35 @@
-import { VerticalBox, Button, CheckBox } from "std-widgets.slint";
+import { VerticalBox, HorizontalBox, Button, CheckBox, ScrollView } from "std-widgets.slint";
 
-// 常駐アプリの設定画面。トレイメニューから表示/非表示する。
-// 「録音ファイルの保存先」と「マイク使用時に自動録音」を設定できる。設定項目は後続でここに増やす。
+// 常駐アプリの設定画面。トレイメニューから表示する。
+// 「録音ファイルの保存先」「マイク使用時に自動録音」「登録アプリの再生で自動録音」を設定できる。
 export component AppWindow inherits Window {
     title: "openshoki";
     // preferred だけだと中身の最小高さ（≒0）に引っ張られて潰れるため、min も指定する。
     // 幅・高さは src/main.rs の WINDOW_WIDTH/HEIGHT と一致させること（片方だけ変えない）。
     min-width: 420px;
-    min-height: 300px;
+    min-height: 500px;
     preferred-width: 420px;
-    preferred-height: 300px;
+    preferred-height: 500px;
 
     // 現在の録音ファイル保存先（表示用）。Rust 側から設定する。
     in property <string> recording-dir;
     // 「マイク使用時に自動録音」の ON/OFF。起動時に Rust 側が設定値で初期化し、以後はトグル操作で
     // Slint が状態を保持する（in-out）。
     in-out property <bool> auto-record;
+    // 「登録アプリの再生で自動録音」の ON/OFF。同上。
+    in-out property <bool> auto-record-app;
+    // 登録アプリの表示名一覧（Rust 側の app_playback_triggers を反映）。
+    in property <[string]> app-list;
     // 「フォルダを選択」押下。Rust 側でネイティブのフォルダ選択ダイアログを開く。
     callback choose-folder();
-    // 自動録音トグルの切り替え。新しい ON/OFF を渡し、Rust 側で設定へ永続化する。
+    // マイク自動録音トグルの切り替え。新しい ON/OFF を渡し、Rust 側で設定へ永続化する。
     callback toggle-auto-record(bool);
+    // アプリ再生自動録音トグルの切り替え。
+    callback toggle-auto-record-app(bool);
+    // 「アプリを追加」押下。Rust 側で .app 選択ダイアログを開き、登録する。
+    callback add-app();
+    // 登録アプリの削除。一覧のインデックスを渡す。
+    callback remove-app(int);
 
     VerticalBox {
         alignment: start;
@@ -52,6 +62,47 @@ export component AppWindow inherits Window {
             toggled => {
                 root.auto-record = self.checked;
                 root.toggle-auto-record(self.checked);
+            }
+        }
+        CheckBox {
+            text: "Auto-record when a registered app plays audio (macOS 14.4+)";
+            checked: root.auto-record-app;
+            toggled => {
+                root.auto-record-app = self.checked;
+                root.toggle-auto-record-app(self.checked);
+            }
+        }
+        Text {
+            text: "Trigger apps";
+            font-size: 14px;
+        }
+        ScrollView {
+            height: 120px;
+            VerticalBox {
+                alignment: start;
+                spacing: 6px;
+                padding: 0px;
+                for name[i] in root.app-list: HorizontalBox {
+                    padding: 0px;
+                    Text {
+                        text: name;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                        overflow: elide;
+                    }
+                    Button {
+                        text: "Remove";
+                        clicked => {
+                            root.remove-app(i);
+                        }
+                    }
+                }
+            }
+        }
+        Button {
+            text: "Add app…";
+            clicked => {
+                root.add-app();
             }
         }
     }
