@@ -19,9 +19,7 @@ use tray_icon::menu::{MenuEvent, MenuItem};
 
 use crate::config::Config;
 use crate::recorder::Recorder;
-use crate::tray::{
-    RECORD_LABEL_START, RECORD_LABEL_STOP, SETTINGS_LABEL_CLOSE, SETTINGS_LABEL_OPEN, Tray,
-};
+use crate::tray::{RECORD_LABEL_START, RECORD_LABEL_STOP, Tray};
 
 slint::include_modules!();
 
@@ -117,13 +115,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // ウィンドウを閉じても終了させず、非表示にして常駐を保つ。
-    // メニューの表示状態と整合させるため、トグル項目のラベルも戻す。
-    let toggle_on_close = tray.toggle_item.clone();
-    ui.window().on_close_requested(move || {
-        toggle_on_close.set_text(SETTINGS_LABEL_OPEN);
-        slint::CloseRequestResponse::HideWindow
-    });
+    // ウィンドウを閉じても終了させず、非表示にして常駐を保つ。メニューからは開くだけで、
+    // 閉じるのはウィンドウ自身の閉じるボタンに任せる。
+    ui.window()
+        .on_close_requested(|| slint::CloseRequestResponse::HideWindow);
 
     // トレイのメニューイベントを Slint のイベントループ上でポーリングし、
     // ウィンドウ操作・終了へ橋渡しする。
@@ -171,7 +166,6 @@ fn build_menu_event_handler(
 ) -> impl FnMut() + 'static {
     // クロージャは 'static のため &Tray を借用できない。必要な要素（各項目・ID・アイコン）
     // だけを複製して所有する。
-    let toggle_item = tray.toggle_item.clone();
     let toggle_id = tray.toggle_item.id().clone();
     let record_item = tray.record_item.clone();
     let record_id = tray.record_item.id().clone();
@@ -192,12 +186,7 @@ fn build_menu_event_handler(
         while let Ok(event) = menu_channel.try_recv() {
             if event.id == toggle_id {
                 let Some(ui) = ui.upgrade() else { continue };
-                let window = ui.window();
-                if window.is_visible() {
-                    hide_window(window, &toggle_item);
-                } else {
-                    show_window(window, &toggle_item, &mut geometry_committed);
-                }
+                show_window(ui.window(), &mut geometry_committed);
             } else if event.id == record_id {
                 toggle_recording(&mut recorder, &record_item, &config);
             } else if event.id == quit_id
@@ -290,11 +279,11 @@ fn start_recording(
     }
 }
 
-/// ウィンドウを表示し、トグル項目のラベルを「隠す」に切り替える。
+/// 設定ウィンドウを表示する。
 ///
 /// 初回表示時のみジオメトリを明示する（`geometry_committed` で一度きりに保つ）。
 /// 詳細は `WINDOW_WIDTH` などの定義コメントを参照。
-fn show_window(window: &slint::Window, toggle_item: &MenuItem, geometry_committed: &mut bool) {
+fn show_window(window: &slint::Window, geometry_committed: &mut bool) {
     if !*geometry_committed {
         window.set_position(slint::LogicalPosition::new(WINDOW_X, WINDOW_Y));
         window.set_size(slint::LogicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT));
@@ -303,7 +292,6 @@ fn show_window(window: &slint::Window, toggle_item: &MenuItem, geometry_committe
     if let Err(err) = window.show() {
         eprintln!("Failed to show the window: {err}");
     }
-    toggle_item.set_text(SETTINGS_LABEL_CLOSE);
 }
 
 /// 録音中アイコンの明滅レベルを、録音経過時間からサイン波で算出する純粋関数。
@@ -320,14 +308,6 @@ fn breathing_level(elapsed: std::time::Duration, cycle_secs: f32) -> f32 {
 /// 保存先パスを画面表示用の文字列に変換する。
 fn recording_dir_text(dir: &std::path::Path) -> slint::SharedString {
     dir.display().to_string().into()
-}
-
-/// ウィンドウを非表示にし、トグル項目のラベルを「表示」に戻す。
-fn hide_window(window: &slint::Window, toggle_item: &MenuItem) {
-    if let Err(err) = window.hide() {
-        eprintln!("Failed to hide the window: {err}");
-    }
-    toggle_item.set_text(SETTINGS_LABEL_OPEN);
 }
 
 /// macOS で Dock アイコンを隠し、メニューバー常駐アプリとして振る舞わせる。

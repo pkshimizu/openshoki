@@ -10,11 +10,10 @@ use std::time::Duration;
 use tray_icon::menu::{Menu, MenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
-/// 設定画面トグル項目のラベル。可視状態と表示文言が食い違わないよう、文字列を直書きで
-/// 散らさず、初期値・更新の双方からこの定数を参照する。OPEN=非表示時に押すと開く、
-/// CLOSE=表示時に押すと閉じる（=ウィンドウを隠す）。
-pub const SETTINGS_LABEL_OPEN: &str = "Settings";
-pub const SETTINGS_LABEL_CLOSE: &str = "Close Settings";
+/// 設定画面（ウィンドウ）を開くメニュー項目のラベル。押すとウィンドウを表示する。
+/// 閉じるのはウィンドウ自身の閉じるボタンに任せる（メニューからは閉じない）ため、
+/// ラベルは固定で切り替えない。
+pub const SETTINGS_LABEL: &str = "Settings";
 
 /// 録音トグル項目のラベル。START=待機中に押すと開始、STOP=録音中に押すと停止。
 pub const RECORD_LABEL_START: &str = "Start Recording";
@@ -44,7 +43,7 @@ impl Tray {
     /// macOS では NSApplication の初期化後（= Slint バックエンド初期化後）に呼ぶ必要がある。
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let record_item = MenuItem::new(RECORD_LABEL_START, true, None);
-        let toggle_item = MenuItem::new(SETTINGS_LABEL_OPEN, true, None);
+        let toggle_item = MenuItem::new(SETTINGS_LABEL, true, None);
         let quit_item = MenuItem::new("Quit", true, None);
 
         let menu = Menu::new();
