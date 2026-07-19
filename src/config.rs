@@ -38,12 +38,6 @@ pub struct Config {
     /// 設定 TOML は手編集されうるため信頼境界の外。録音機能で書き込む際は、存在・書き込み可否を
     /// 検証してから使う（本 issue のスコープは設定値の保持まで）。
     pub recording_dir: PathBuf,
-    /// 他アプリがマイクを使い始めたら録音を自動開始するか（macOS のみ有効に働く）。
-    /// プライバシーに関わるためオプトインの既定 OFF とする。
-    /// この項目を持たない旧 `config.toml` を読んでも失敗しないよう `#[serde(default)]` を付ける
-    /// （付けないとデシリアライズが失敗し、`recording_dir` ごとデフォルトへ落ちる）。
-    #[serde(default)]
-    pub auto_record_on_mic_active: bool,
     /// 登録アプリがマイクを使い始めたら録音を自動開始し、使い終わったら自動停止するか
     /// （macOS 14.4+ のみ有効）。会議アプリ（ブラウザの Google Meet・Zoom.app 等）は通話中だけ
     /// マイク入力を掴むため、これを合図に通話の開始/終了へ連動できる。オプトインの既定 OFF。
@@ -59,7 +53,6 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             recording_dir: default_recording_dir(),
-            auto_record_on_mic_active: false,
             auto_record_on_app_mic: false,
             app_mic_triggers: Vec::new(),
         }
@@ -143,7 +136,6 @@ mod tests {
     fn toml_roundtrip_preserves_fields() {
         let config = Config {
             recording_dir: PathBuf::from("/tmp/openshoki-test"),
-            auto_record_on_mic_active: true,
             auto_record_on_app_mic: true,
             app_mic_triggers: vec![AppTrigger {
                 bundle_id: "com.apple.Music".to_owned(),
@@ -153,10 +145,6 @@ mod tests {
         let text = toml::to_string_pretty(&config).expect("serialization should succeed");
         let restored: Config = toml::from_str(&text).expect("deserialization should succeed");
         assert_eq!(restored.recording_dir, config.recording_dir);
-        assert_eq!(
-            restored.auto_record_on_mic_active,
-            config.auto_record_on_mic_active
-        );
         assert_eq!(
             restored.auto_record_on_app_mic,
             config.auto_record_on_app_mic
@@ -172,9 +160,25 @@ mod tests {
         let restored: Config =
             toml::from_str(text).expect("loading the old settings should succeed");
         assert_eq!(restored.recording_dir, PathBuf::from("/tmp/openshoki-old"));
-        assert!(!restored.auto_record_on_mic_active);
         assert!(!restored.auto_record_on_app_mic);
         assert!(restored.app_mic_triggers.is_empty());
+    }
+
+    #[test]
+    fn deserialize_ignores_removed_mic_field() {
+        // 削除した項目 auto_record_on_mic_active が残る旧 config.toml を読んでも、未知項目として
+        // 無視され失敗しない（serde 既定で未知フィールドは無視）。
+        let text = concat!(
+            "recording_dir = \"/tmp/openshoki-removed\"\n",
+            "auto_record_on_mic_active = true\n",
+        );
+        let restored: Config =
+            toml::from_str(text).expect("loading a config with the removed field should succeed");
+        assert_eq!(
+            restored.recording_dir,
+            PathBuf::from("/tmp/openshoki-removed")
+        );
+        assert!(!restored.auto_record_on_app_mic);
     }
 
     #[test]

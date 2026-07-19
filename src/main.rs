@@ -6,8 +6,6 @@
 #[cfg(target_os = "macos")]
 mod app_audio_monitor;
 mod config;
-#[cfg(target_os = "macos")]
-mod mic_monitor;
 mod recorder;
 #[cfg(target_os = "macos")]
 mod system_audio;
@@ -37,7 +35,7 @@ const BLINK_CYCLE_SECS: f32 = 2.0;
 /// 確定されないまま高さ 0 で表示される。初回表示時にこの値を明示してジオメトリを確定させる。
 /// 幅・高さは `ui/app-window.slint` の min/preferred と一致させること（片方だけ変えない）。
 const WINDOW_WIDTH: f32 = 420.0;
-const WINDOW_HEIGHT: f32 = 500.0;
+const WINDOW_HEIGHT: f32 = 460.0;
 /// 初回表示位置（画面左上からの暫定値）。中央寄せ等の調整は後続に回す。
 const WINDOW_X: f32 = 240.0;
 const WINDOW_Y: f32 = 160.0;
@@ -54,7 +52,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 失敗時は load() がデフォルトを返す。
     let config = Rc::new(RefCell::new(Config::load()));
     ui.set_recording_dir(recording_dir_text(&config.borrow().recording_dir));
-    ui.set_auto_record(config.borrow().auto_record_on_mic_active);
     ui.set_auto_record_app(config.borrow().auto_record_on_app_mic);
     // 登録アプリの表示名一覧を Slint のモデルで持ち、追加/削除で更新する。
     let app_list_model = Rc::new(slint::VecModel::<slint::SharedString>::from(
@@ -97,23 +94,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         *config_for_pick.borrow_mut() = candidate;
     });
 
-    // 「マイク使用時に自動録音」トグル: 変更を設定へ永続化する。永続化に成功してから
+    // 「登録アプリのマイク使用で自動録音」トグル: 永続化に成功してから反映する。
     // メモリ上の設定を更新する（先に更新すると保存失敗時に表示・メモリとディスクが食い違う）。
     // UI 側のチェック状態は Slint が保持するため、ここでは Config への反映のみ行う。
-    let config_for_auto = Rc::clone(&config);
-    ui.on_toggle_auto_record(move |enabled| {
-        let mut candidate = config_for_auto.borrow().clone();
-        candidate.auto_record_on_mic_active = enabled;
-        if let Err(err) = candidate.save() {
-            eprintln!(
-                "Not changing the auto-record setting because saving the settings failed: {err}"
-            );
-            return;
-        }
-        *config_for_auto.borrow_mut() = candidate;
-    });
-
-    // 「登録アプリのマイク使用で自動録音」トグル: 上と同じく永続化に成功してから反映する。
     let config_for_auto_app = Rc::clone(&config);
     ui.on_toggle_auto_record_app(move |enabled| {
         let mut candidate = config_for_auto_app.borrow().clone();
@@ -187,19 +170,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Slint バックエンドの初期化後にトレイを常駐させる（macOS の NSApplication 初期化後）。
     let tray = Tray::new()?;
 
-    // マイク使用の監視を開始する（macOS のみ）。他アプリが既定入力デバイスを使い始めたことを
-    // 検知し、設定 ON かつ未録音なら自動録音を開始する。連携失敗時はモニタ無しで常駐を続ける。
-    #[cfg(target_os = "macos")]
-    let mic_monitor = match mic_monitor::MicMonitor::start() {
-        Ok(monitor) => Some(monitor),
-        Err(err) => {
-            eprintln!(
-                "Continuing with auto-record disabled because mic-usage monitoring could not start: {err}"
-            );
-            None
-        }
-    };
-
     // 登録アプリのマイク使用を監視するモニタ（macOS 14.4+）。照会は失敗しても落ちない設計のため、
     // 生成は常に成功する。実際に照会できるかはポーリング時に判定する。
     #[cfg(target_os = "macos")]
@@ -220,8 +190,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ui.as_weak(),
             &tray,
             Rc::clone(&config),
-            #[cfg(target_os = "macos")]
-            mic_monitor,
             #[cfg(target_os = "macos")]
             app_monitor,
         ),
@@ -244,18 +212,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// 表示/非表示トグルや録音トグルは現在の状態（ウィンドウの可視状態・録音セッションの有無）から
 /// 判断し、別途フラグを持たない（「ありえない状態」を作らないため）。
 ///
-/// macOS では毎ティックで自動録音の開始／停止も駆動する: `mic_monitor` のマイク使用の立ち上がりと
-/// `app_monitor` の登録アプリのマイク使用の立ち上がりで（設定 ON・未録音なら）開始し、登録アプリの
-/// マイク使用由来で自動開始した録音は、登録アプリのマイク使用の途絶がデバウンス継続したところで自動停止する。
+/// macOS では毎ティックで自動録音の開始／停止も駆動する: `app_monitor` の登録アプリのマイク使用の
+/// 立ち上がりで（設定 ON・未録音なら）開始し、その録音は登録アプリのマイク使用の途絶がデバウンス
+/// 継続したところで自動停止する。
 ///
-/// 録音セッション（`Option<Recorder>`）と `cpal::Stream`(`!Send`)、および各モニタは
+/// 録音セッション（`Option<Recorder>`）と `cpal::Stream`(`!Send`)、および `app_monitor` は
 /// このクロージャ内で所有する。クロージャはメインスレッド（Slint イベントループ）上でのみ
 /// 実行されるため問題ない。
 fn build_menu_event_handler(
     ui: slint::Weak<AppWindow>,
     tray: &Tray,
     config: Rc<RefCell<Config>>,
-    #[cfg(target_os = "macos")] mic_monitor: Option<mic_monitor::MicMonitor>,
     #[cfg(target_os = "macos")] app_monitor: app_audio_monitor::AppAudioMonitor,
 ) -> impl FnMut() + 'static {
     // クロージャは 'static のため &Tray を借用できない。必要な要素（各項目・ID・アイコン）
@@ -303,20 +270,6 @@ fn build_menu_event_handler(
                 && let Err(err) = slint::quit_event_loop()
             {
                 eprintln!("Failed to quit the event loop: {err}");
-            }
-        }
-
-        // マイク使用の立ち上がり検知を取り出し、設定 ON かつ未録音のときだけ自動開始する
-        // （macOS のみ）。take_activated は内部で一定間隔にポーリングを間引き、いずれかの入力
-        // デバイスが非稼働→稼働へ変化した立ち上がりだけを返す。録音中（recorder=Some）は自プロセスの
-        // 録音でデバイスが稼働するが、立ち上がり判定と recorder.is_none() のガードで再発火しない。
-        #[cfg(target_os = "macos")]
-        {
-            let activated = mic_monitor.as_ref().is_some_and(|m| m.take_activated());
-            if activated && recorder.is_none() && config.borrow().auto_record_on_mic_active {
-                start_recording(&mut recorder, &record_item, &config);
-                // マイク由来の録音は登録アプリのマイク使用の途絶では止めない（自動停止の対象外）。
-                recording_started_by_app = false;
             }
         }
 
