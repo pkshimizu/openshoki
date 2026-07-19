@@ -354,12 +354,17 @@ fn bundle_id_for_pid(pid: i32) -> Option<String> {
 }
 
 /// プロセスの「responsible pid」（そのプロセスに責任を持つ親アプリの pid）を返す。ヘルパーや
-/// XPC 子プロセスなら親アプリの pid、本体プロセスなら自分自身になる。親と一致しない場合のみ
-/// `Some(親pid)` を返す（本体プロセスは直接のバンドル ID で足りるため `None`）。
+/// XPC 子プロセスなら親アプリの pid、本体プロセスなら自分自身になる。**親アプリの pid が得られた
+/// ときだけ** `Some(親pid)` を返す。次のいずれも `None`（親解決なし）に畳む: (1) 本体プロセスで
+/// responsible が自分自身（＝直接のバンドル ID で足りる）、(2) 照会失敗（負値等）、(3) シンボル未解決。
 ///
-/// `responsibility_get_pid_responsible_for_pid` は TCC 等が使う挙動安定の関数だが公開ヘッダに無い
-/// private シンボルのため、`dlsym` で実行時に解決する。見つからなければ（将来の OS 変更等）親解決を
-/// 諦めて `None` にフォールバックする（アプリは落とさない）。
+/// 注意: responsible pid は「子プロセスのマイク使用を責任アプリに帰属させる」ため、コンテナ的な
+/// アプリ（ターミナルやランチャ等）を登録すると、そこから起動した CLI 等のマイク使用も拾いうる。
+/// 想定ユースケース（ブラウザ helper → 親ブラウザ）では正しいが、帰属範囲が広がる副作用がある。
+///
+/// `responsibility_get_pid_responsible_for_pid` は TCC やブラウザ（Chromium の `base/process` 等）が
+/// 使う挙動安定の関数だが公開ヘッダに無い private シンボルのため、`dlsym` で実行時に解決する。
+/// 見つからなければ（将来の OS 変更等）親解決を諦めて `None` にフォールバックする（アプリは落とさない）。
 fn responsible_pid(pid: i32) -> Option<i32> {
     use std::ffi::{c_char, c_int, c_void};
     use std::sync::OnceLock;
@@ -383,13 +388,16 @@ fn responsible_pid(pid: i32) -> Option<i32> {
         if sym.is_null() {
             None
         } else {
-            // SAFETY: 非 null を確認済み。対象シンボルの実シグネチャは (pid_t) -> pid_t。
+            // SAFETY: 非 null を確認済み。対象シンボルの実シグネチャは
+            // `pid_t responsibility_get_pid_responsible_for_pid(pid_t)`（TCC・Chromium 等での
+            // 既知利用による。pid_t は c_int = i32）で、`ResponsibleFn` と一致する。
             Some(unsafe { std::mem::transmute::<*mut c_void, ResponsibleFn>(sym) })
         }
     });
 
     let func = (*resolver)?;
-    // SAFETY: 解決済みの C 関数を pid_t 引数で呼ぶだけ。副作用なく responsible pid を返す。
+    // SAFETY: 解決済みの C 関数を pid_t 引数で呼ぶだけ。メモリを触らず responsible pid を照会して
+    // 返すのみで、安全性に影響する副作用は無い。
     let responsible = unsafe { func(pid) };
     (responsible > 0 && responsible != pid).then_some(responsible)
 }
