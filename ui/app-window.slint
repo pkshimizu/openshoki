@@ -1,7 +1,7 @@
 import { VerticalBox, HorizontalBox, Button, CheckBox, ScrollView } from "std-widgets.slint";
 
 // 常駐アプリの設定画面。トレイメニューから表示する。
-// 「録音ファイルの保存先」「マイク使用時に自動録音」「登録アプリの再生で自動録音」を設定できる。
+// 「録音ファイルの保存先」「マイク使用時に自動録音」「登録アプリのマイク使用で自動録音」を設定できる。
 export component AppWindow inherits Window {
     title: "openshoki";
     // preferred だけだと中身の最小高さ（≒0）に引っ張られて潰れるため、min も指定する。
@@ -16,7 +16,7 @@ export component AppWindow inherits Window {
     // 「マイク使用時に自動録音」の ON/OFF。起動時に Rust 側が設定値で初期化し、以後はトグル操作で
     // Slint が状態を保持する（in-out）。
     in-out property <bool> auto-record;
-    // 「登録アプリの再生で自動録音」の ON/OFF。同上。
+    // 「登録アプリのマイク使用で自動録音」の ON/OFF。同上。
     in-out property <bool> auto-record-app;
     // 登録アプリの表示名一覧（Rust 側の app_playback_triggers を反映）。
     in property <[string]> app-list;
@@ -24,7 +24,7 @@ export component AppWindow inherits Window {
     callback choose-folder();
     // マイク自動録音トグルの切り替え。新しい ON/OFF を渡し、Rust 側で設定へ永続化する。
     callback toggle-auto-record(bool);
-    // アプリ再生自動録音トグルの切り替え。
+    // アプリのマイク使用 自動録音トグルの切り替え。
     callback toggle-auto-record-app(bool);
     // 「アプリを追加」押下。Rust 側で .app 選択ダイアログを開き、登録する。
     callback add-app();
@@ -65,7 +65,7 @@ export component AppWindow inherits Window {
             }
         }
         CheckBox {
-            text: "Auto-record when a registered app plays audio (macOS 14.4+)";
+            text: "Auto-record while a registered app uses the mic — for calls (macOS 14.4+)";
             checked: root.auto-record-app;
             toggled => {
                 root.auto-record-app = self.checked;

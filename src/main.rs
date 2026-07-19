@@ -55,12 +55,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Rc::new(RefCell::new(Config::load()));
     ui.set_recording_dir(recording_dir_text(&config.borrow().recording_dir));
     ui.set_auto_record(config.borrow().auto_record_on_mic_active);
-    ui.set_auto_record_app(config.borrow().auto_record_on_app_playback);
+    ui.set_auto_record_app(config.borrow().auto_record_on_app_mic);
     // 登録アプリの表示名一覧を Slint のモデルで持ち、追加/削除で更新する。
     let app_list_model = Rc::new(slint::VecModel::<slint::SharedString>::from(
         config
             .borrow()
-            .app_playback_triggers
+            .app_mic_triggers
             .iter()
             .map(|trigger| slint::SharedString::from(trigger.name.as_str()))
             .collect::<Vec<_>>(),
@@ -113,14 +113,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         *config_for_auto.borrow_mut() = candidate;
     });
 
-    // 「登録アプリの再生で自動録音」トグル: 上と同じく永続化に成功してから反映する。
+    // 「登録アプリのマイク使用で自動録音」トグル: 上と同じく永続化に成功してから反映する。
     let config_for_auto_app = Rc::clone(&config);
     ui.on_toggle_auto_record_app(move |enabled| {
         let mut candidate = config_for_auto_app.borrow().clone();
-        candidate.auto_record_on_app_playback = enabled;
+        candidate.auto_record_on_app_mic = enabled;
         if let Err(err) = candidate.save() {
             eprintln!(
-                "Not changing the app-playback auto-record setting because saving the settings failed: {err}"
+                "Not changing the app-based auto-record setting because saving the settings failed: {err}"
             );
             return;
         }
@@ -135,10 +135,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return;
         };
         let mut candidate = config_for_remove.borrow().clone();
-        if index >= candidate.app_playback_triggers.len() {
+        if index >= candidate.app_mic_triggers.len() {
             return;
         }
-        candidate.app_playback_triggers.remove(index);
+        candidate.app_mic_triggers.remove(index);
         if let Err(err) = candidate.save() {
             eprintln!("Not removing the app because saving the settings failed: {err}");
             return;
@@ -167,14 +167,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let mut candidate = config_for_add.borrow().clone();
             if candidate
-                .app_playback_triggers
+                .app_mic_triggers
                 .iter()
                 .any(|existing| existing.bundle_id == trigger.bundle_id)
             {
                 return; // 登録済み。
             }
             let name = slint::SharedString::from(trigger.name.as_str());
-            candidate.app_playback_triggers.push(trigger);
+            candidate.app_mic_triggers.push(trigger);
             if let Err(err) = candidate.save() {
                 eprintln!("Not adding the app because saving the settings failed: {err}");
                 return;
@@ -200,7 +200,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // 登録アプリの音声出力を監視するモニタ（macOS 14.4+）。照会は失敗しても落ちない設計のため、
+    // 登録アプリのマイク使用を監視するモニタ（macOS 14.4+）。照会は失敗しても落ちない設計のため、
     // 生成は常に成功する。実際に照会できるかはポーリング時に判定する。
     #[cfg(target_os = "macos")]
     let app_monitor = app_audio_monitor::AppAudioMonitor::new();
@@ -245,8 +245,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// 判断し、別途フラグを持たない（「ありえない状態」を作らないため）。
 ///
 /// macOS では毎ティックで自動録音の開始／停止も駆動する: `mic_monitor` のマイク使用の立ち上がりと
-/// `app_monitor` の登録アプリ再生の立ち上がりで（設定 ON・未録音なら）開始し、登録アプリ再生で
-/// 自動開始した録音は、登録アプリの出力途絶がデバウンス継続したところで自動停止する。
+/// `app_monitor` の登録アプリのマイク使用の立ち上がりで（設定 ON・未録音なら）開始し、登録アプリの
+/// マイク使用由来で自動開始した録音は、登録アプリのマイク使用の途絶がデバウンス継続したところで自動停止する。
 ///
 /// 録音セッション（`Option<Recorder>`）と `cpal::Stream`(`!Send`)、および各モニタは
 /// このクロージャ内で所有する。クロージャはメインスレッド（Slint イベントループ）上でのみ
@@ -275,7 +275,7 @@ fn build_menu_event_handler(
     let mut last_rendered_secs: Option<u64> = None;
     // 直前 tick で録音中だったか。録音中→待機の遷移を 1 度だけ拾って待機表示へ戻すのに使う。
     let mut was_recording = false;
-    // 実行中の録音が「登録アプリ再生」由来の自動開始か。true のときだけ、登録アプリの出力途絶で
+    // 実行中の録音が「登録アプリのマイク使用」由来の自動開始か。true のときだけ、登録アプリのマイク使用の途絶で
     // 自動停止する（マイク由来・手動開始の録音は app の沈黙では止めない）。
     #[cfg(target_os = "macos")]
     let mut recording_started_by_app = false;
@@ -315,22 +315,21 @@ fn build_menu_event_handler(
             let activated = mic_monitor.as_ref().is_some_and(|m| m.take_activated());
             if activated && recorder.is_none() && config.borrow().auto_record_on_mic_active {
                 start_recording(&mut recorder, &record_item, &config);
-                // マイク由来の録音は登録アプリの出力途絶では止めない（自動停止の対象外）。
+                // マイク由来の録音は登録アプリのマイク使用の途絶では止めない（自動停止の対象外）。
                 recording_started_by_app = false;
             }
         }
 
-        // 登録アプリの再生に連動した自動録音（macOS 14.4+）。未録音なら登録アプリの出力の立ち上がりで
-        // 開始する。「登録アプリ再生」由来の録音中なら、登録アプリのいずれも出力しなくなった状態が
+        // 登録アプリのマイク使用に連動した自動録音（macOS 14.4+）。未録音なら登録アプリのマイク使用の立ち上がりで
+        // 開始する。「登録アプリのマイク使用」由来の録音中なら、登録アプリのいずれもマイクを使わなくなった状態が
         // デバウンス継続したところで自動停止する（通話終了の合図）。設定 OFF／登録なし／照会不能の
         // ときは開始・停止いずれも行わない。照会は録音中・未録音のどちらか一方だけで走る。
         #[cfg(target_os = "macos")]
         {
             let config_ref = config.borrow();
-            let enabled = config_ref.auto_record_on_app_playback;
+            let enabled = config_ref.auto_record_on_app_mic;
             if recorder.is_none() {
-                let activated =
-                    app_monitor.take_activated(&config_ref.app_playback_triggers, enabled);
+                let activated = app_monitor.take_activated(&config_ref.app_mic_triggers, enabled);
                 drop(config_ref);
                 if activated {
                     start_recording(&mut recorder, &record_item, &config);
@@ -338,7 +337,7 @@ fn build_menu_event_handler(
                     recording_started_by_app = recorder.is_some();
                 }
             } else if recording_started_by_app {
-                let stop = app_monitor.should_stop(&config_ref.app_playback_triggers, enabled);
+                let stop = app_monitor.should_stop(&config_ref.app_mic_triggers, enabled);
                 drop(config_ref);
                 if stop {
                     stop_recording(&mut recorder, &record_item);
@@ -386,7 +385,7 @@ fn toggle_recording(
     }
 }
 
-/// 録音セッションを停止する。手動トグルと自動停止（登録アプリの出力途絶）で共用する
+/// 録音セッションを停止する。手動トグルと自動停止（登録アプリのマイク使用の途絶）で共用する
 /// （`start_recording` と対称）。stop() が各音源のストリーム停止→flush→ファイル確定まで行う。
 /// 録音していなければ何もしない。トレイアイコン／経過時間の表示はタイマー closure が録音状態を
 /// 見て駆動するため、ここではメニュー項目のラベルを待機へ戻すだけにする。

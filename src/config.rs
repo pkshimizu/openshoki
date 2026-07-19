@@ -21,11 +21,11 @@ const CONFIG_FILE: &str = "config.toml";
 /// デフォルト保存先のフォルダ名（Documents もしくはホーム配下に作る想定）。
 const DEFAULT_DIR_NAME: &str = "openshoki";
 
-/// 自動録音のトリガーにする登録アプリ。`.app` から取得したバンドル ID で音声出力プロセスを
-/// 照合し、表示名は設定画面での一覧表示に使う。
+/// 自動録音のトリガーにする登録アプリ。`.app` から取得したバンドル ID で、マイク入力を使っている
+/// プロセスを照合し、表示名は設定画面での一覧表示に使う。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppTrigger {
-    /// アプリのバンドル ID（例: `com.apple.Music`）。音声出力プロセスの照合キー。
+    /// アプリのバンドル ID（例: `com.apple.Music`）。マイク使用プロセスの照合キー。
     pub bundle_id: String,
     /// 設定画面で表示するアプリ名。
     pub name: String,
@@ -44,13 +44,15 @@ pub struct Config {
     /// （付けないとデシリアライズが失敗し、`recording_dir` ごとデフォルトへ落ちる）。
     #[serde(default)]
     pub auto_record_on_mic_active: bool,
-    /// 登録アプリの音声再生を検知したら録音を自動開始するか（macOS 14.4+ のみ有効）。
-    /// オプトインの既定 OFF。旧 `config.toml` 互換のため `#[serde(default)]`。
-    #[serde(default)]
-    pub auto_record_on_app_playback: bool,
-    /// 音声再生での自動開始トリガーにする登録アプリ一覧。
-    #[serde(default)]
-    pub app_playback_triggers: Vec<AppTrigger>,
+    /// 登録アプリがマイクを使い始めたら録音を自動開始し、使い終わったら自動停止するか
+    /// （macOS 14.4+ のみ有効）。会議アプリ（ブラウザの Google Meet・Zoom.app 等）は通話中だけ
+    /// マイク入力を掴むため、これを合図に通話の開始/終了へ連動できる。オプトインの既定 OFF。
+    /// 旧項目名 `auto_record_on_app_playback`（出力ベース時代）からエイリアスで互換を保つ。
+    #[serde(default, alias = "auto_record_on_app_playback")]
+    pub auto_record_on_app_mic: bool,
+    /// マイク使用での自動録音トリガーにする登録アプリ一覧。旧名 `app_playback_triggers` と互換。
+    #[serde(default, alias = "app_playback_triggers")]
+    pub app_mic_triggers: Vec<AppTrigger>,
 }
 
 impl Default for Config {
@@ -58,8 +60,8 @@ impl Default for Config {
         Self {
             recording_dir: default_recording_dir(),
             auto_record_on_mic_active: false,
-            auto_record_on_app_playback: false,
-            app_playback_triggers: Vec::new(),
+            auto_record_on_app_mic: false,
+            app_mic_triggers: Vec::new(),
         }
     }
 }
@@ -142,8 +144,8 @@ mod tests {
         let config = Config {
             recording_dir: PathBuf::from("/tmp/openshoki-test"),
             auto_record_on_mic_active: true,
-            auto_record_on_app_playback: true,
-            app_playback_triggers: vec![AppTrigger {
+            auto_record_on_app_mic: true,
+            app_mic_triggers: vec![AppTrigger {
                 bundle_id: "com.apple.Music".to_owned(),
                 name: "Music".to_owned(),
             }],
@@ -156,10 +158,10 @@ mod tests {
             config.auto_record_on_mic_active
         );
         assert_eq!(
-            restored.auto_record_on_app_playback,
-            config.auto_record_on_app_playback
+            restored.auto_record_on_app_mic,
+            config.auto_record_on_app_mic
         );
-        assert_eq!(restored.app_playback_triggers, config.app_playback_triggers);
+        assert_eq!(restored.app_mic_triggers, config.app_mic_triggers);
     }
 
     #[test]
@@ -171,8 +173,26 @@ mod tests {
             toml::from_str(text).expect("loading the old settings should succeed");
         assert_eq!(restored.recording_dir, PathBuf::from("/tmp/openshoki-old"));
         assert!(!restored.auto_record_on_mic_active);
-        assert!(!restored.auto_record_on_app_playback);
-        assert!(restored.app_playback_triggers.is_empty());
+        assert!(!restored.auto_record_on_app_mic);
+        assert!(restored.app_mic_triggers.is_empty());
+    }
+
+    #[test]
+    fn deserialize_reads_legacy_playback_field_names() {
+        // 出力ベース時代の旧項目名（auto_record_on_app_playback / app_playback_triggers）も
+        // serde alias で読めること（互換）。
+        let text = concat!(
+            "recording_dir = \"/tmp/openshoki-legacy\"\n",
+            "auto_record_on_app_playback = true\n",
+            "[[app_playback_triggers]]\n",
+            "bundle_id = \"com.apple.Music\"\n",
+            "name = \"Music\"\n",
+        );
+        let restored: Config =
+            toml::from_str(text).expect("loading the legacy settings should succeed");
+        assert!(restored.auto_record_on_app_mic);
+        assert_eq!(restored.app_mic_triggers.len(), 1);
+        assert_eq!(restored.app_mic_triggers[0].bundle_id, "com.apple.Music");
     }
 
     #[test]
