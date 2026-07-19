@@ -50,7 +50,9 @@ impl Config {
     /// 設定ファイルが無い初回起動はデフォルト扱い（ログ不要）。
     pub fn load() -> Self {
         let Some(path) = config_path() else {
-            eprintln!("設定ディレクトリを取得できないため、デフォルト設定を使う");
+            eprintln!(
+                "Using default settings because the settings directory could not be determined"
+            );
             return Self::default();
         };
 
@@ -59,7 +61,7 @@ impl Config {
                 Ok(config) => config,
                 Err(err) => {
                     eprintln!(
-                        "設定ファイルの解析に失敗したためデフォルトを使う ({}): {err}",
+                        "Using defaults because parsing the settings file failed ({}): {err}",
                         path.display()
                     );
                     Self::default()
@@ -68,7 +70,7 @@ impl Config {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Self::default(),
             Err(err) => {
                 eprintln!(
-                    "設定ファイルの読み込みに失敗したためデフォルトを使う ({}): {err}",
+                    "Using defaults because reading the settings file failed ({}): {err}",
                     path.display()
                 );
                 Self::default()
@@ -79,7 +81,7 @@ impl Config {
     /// 設定を OS 標準の設定ディレクトリに TOML で保存する。
     /// 設定ディレクトリが無ければ作成する。
     pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let path = config_path().ok_or("設定ディレクトリを取得できない")?;
+        let path = config_path().ok_or("Cannot determine the settings directory")?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -106,7 +108,9 @@ fn default_recording_dir() -> PathBuf {
     }
     // ホームディレクトリすら取得できない異例環境。黙って縮退させず、相対パスへ
     // フォールバックする旨をログに残す。
-    eprintln!("ユーザーディレクトリを取得できないため、保存先を相対パスにフォールバックする");
+    eprintln!(
+        "Falling back to a relative recording folder because the user directory could not be determined"
+    );
     PathBuf::from(DEFAULT_DIR_NAME)
 }
 
@@ -120,8 +124,8 @@ mod tests {
             recording_dir: PathBuf::from("/tmp/openshoki-test"),
             auto_record_on_mic_active: true,
         };
-        let text = toml::to_string_pretty(&config).expect("シリアライズは成功するはず");
-        let restored: Config = toml::from_str(&text).expect("デシリアライズは成功するはず");
+        let text = toml::to_string_pretty(&config).expect("serialization should succeed");
+        let restored: Config = toml::from_str(&text).expect("deserialization should succeed");
         assert_eq!(restored.recording_dir, config.recording_dir);
         assert_eq!(
             restored.auto_record_on_mic_active,
@@ -134,7 +138,8 @@ mod tests {
         // 新項目 auto_record_on_mic_active を持たない旧 config.toml を読んでも失敗せず、
         // recording_dir は保持され、新項目は既定 false になる（#[serde(default)]）。
         let text = "recording_dir = \"/tmp/openshoki-old\"\n";
-        let restored: Config = toml::from_str(text).expect("旧設定の読み込みは成功するはず");
+        let restored: Config =
+            toml::from_str(text).expect("loading the old settings should succeed");
         assert_eq!(restored.recording_dir, PathBuf::from("/tmp/openshoki-old"));
         assert!(!restored.auto_record_on_mic_active);
     }

@@ -19,9 +19,7 @@ use tray_icon::menu::{MenuEvent, MenuItem};
 
 use crate::config::Config;
 use crate::recorder::Recorder;
-use crate::tray::{
-    RECORD_LABEL_START, RECORD_LABEL_STOP, SETTINGS_LABEL_CLOSE, SETTINGS_LABEL_OPEN, Tray,
-};
+use crate::tray::{RECORD_LABEL_START, RECORD_LABEL_STOP, Tray};
 
 slint::include_modules!();
 
@@ -76,7 +74,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 永続化に成功してからメモリ上の設定と画面表示を更新する。
         // 先に更新すると、保存失敗時に「表示は変わったのに保存されていない」不整合になる。
         if let Err(err) = candidate.save() {
-            eprintln!("設定の保存に失敗したため、保存先は変更しない: {err}");
+            eprintln!(
+                "Not changing the recording folder because saving the settings failed: {err}"
+            );
             return;
         }
         ui.set_recording_dir(recording_dir_text(&candidate.recording_dir));
@@ -91,7 +91,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut candidate = config_for_auto.borrow().clone();
         candidate.auto_record_on_mic_active = enabled;
         if let Err(err) = candidate.save() {
-            eprintln!("設定の保存に失敗したため、自動録音の設定は変更しない: {err}");
+            eprintln!(
+                "Not changing the auto-record setting because saving the settings failed: {err}"
+            );
             return;
         }
         *config_for_auto.borrow_mut() = candidate;
@@ -106,18 +108,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mic_monitor = match mic_monitor::MicMonitor::start() {
         Ok(monitor) => Some(monitor),
         Err(err) => {
-            eprintln!("マイク使用の監視を開始できないため、自動録音は無効で続行する: {err}");
+            eprintln!(
+                "Continuing with auto-record disabled because mic-usage monitoring could not start: {err}"
+            );
             None
         }
     };
 
-    // ウィンドウを閉じても終了させず、非表示にして常駐を保つ。
-    // メニューの表示状態と整合させるため、トグル項目のラベルも戻す。
-    let toggle_on_close = tray.toggle_item.clone();
-    ui.window().on_close_requested(move || {
-        toggle_on_close.set_text(SETTINGS_LABEL_OPEN);
-        slint::CloseRequestResponse::HideWindow
-    });
+    // ウィンドウを閉じても終了させず、非表示にして常駐を保つ。メニューからは開くだけで、
+    // 閉じるのはウィンドウ自身の閉じるボタンに任せる。
+    ui.window()
+        .on_close_requested(|| slint::CloseRequestResponse::HideWindow);
 
     // トレイのメニューイベントを Slint のイベントループ上でポーリングし、
     // ウィンドウ操作・終了へ橋渡しする。
@@ -165,7 +166,6 @@ fn build_menu_event_handler(
 ) -> impl FnMut() + 'static {
     // クロージャは 'static のため &Tray を借用できない。必要な要素（各項目・ID・アイコン）
     // だけを複製して所有する。
-    let toggle_item = tray.toggle_item.clone();
     let toggle_id = tray.toggle_item.id().clone();
     let record_item = tray.record_item.clone();
     let record_id = tray.record_item.id().clone();
@@ -186,18 +186,13 @@ fn build_menu_event_handler(
         while let Ok(event) = menu_channel.try_recv() {
             if event.id == toggle_id {
                 let Some(ui) = ui.upgrade() else { continue };
-                let window = ui.window();
-                if window.is_visible() {
-                    hide_window(window, &toggle_item);
-                } else {
-                    show_window(window, &toggle_item, &mut geometry_committed);
-                }
+                show_window(ui.window(), &mut geometry_committed);
             } else if event.id == record_id {
                 toggle_recording(&mut recorder, &record_item, &config);
             } else if event.id == quit_id
                 && let Err(err) = slint::quit_event_loop()
             {
-                eprintln!("イベントループの終了に失敗した: {err}");
+                eprintln!("Failed to quit the event loop: {err}");
             }
         }
 
@@ -249,11 +244,11 @@ fn toggle_recording(
         // 停止。stop() が各音源のストリーム停止→flush→ファイル確定まで行い、保存できたパスを返す。
         let saved = session.stop();
         if saved.is_empty() {
-            eprintln!("録音の停止・保存に失敗した（保存できたファイルが無い）");
+            eprintln!("Failed to stop and save the recording (no files were saved)");
         } else {
             // 保存先のフルパスは機微情報（録音データの所在・フォルダ構造がプライバシーに関わる）
             // なので出さない。完了が分かるように、保存できたファイル数だけを知らせる。
-            println!("録音を保存した（{} ファイル）", saved.len());
+            println!("Saved the recording ({} files)", saved.len());
         }
         record_item.set_text(RECORD_LABEL_START);
     }
@@ -280,24 +275,23 @@ fn start_recording(
             *recorder = Some(session);
             record_item.set_text(RECORD_LABEL_STOP);
         }
-        Err(err) => eprintln!("録音の開始に失敗した: {err}"),
+        Err(err) => eprintln!("Failed to start recording: {err}"),
     }
 }
 
-/// ウィンドウを表示し、トグル項目のラベルを「隠す」に切り替える。
+/// 設定ウィンドウを表示する。
 ///
 /// 初回表示時のみジオメトリを明示する（`geometry_committed` で一度きりに保つ）。
 /// 詳細は `WINDOW_WIDTH` などの定義コメントを参照。
-fn show_window(window: &slint::Window, toggle_item: &MenuItem, geometry_committed: &mut bool) {
+fn show_window(window: &slint::Window, geometry_committed: &mut bool) {
     if !*geometry_committed {
         window.set_position(slint::LogicalPosition::new(WINDOW_X, WINDOW_Y));
         window.set_size(slint::LogicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT));
         *geometry_committed = true;
     }
     if let Err(err) = window.show() {
-        eprintln!("ウィンドウの表示に失敗した: {err}");
+        eprintln!("Failed to show the window: {err}");
     }
-    toggle_item.set_text(SETTINGS_LABEL_CLOSE);
 }
 
 /// 録音中アイコンの明滅レベルを、録音経過時間からサイン波で算出する純粋関数。
@@ -316,14 +310,6 @@ fn recording_dir_text(dir: &std::path::Path) -> slint::SharedString {
     dir.display().to_string().into()
 }
 
-/// ウィンドウを非表示にし、トグル項目のラベルを「表示」に戻す。
-fn hide_window(window: &slint::Window, toggle_item: &MenuItem) {
-    if let Err(err) = window.hide() {
-        eprintln!("ウィンドウの非表示に失敗した: {err}");
-    }
-    toggle_item.set_text(SETTINGS_LABEL_OPEN);
-}
-
 /// macOS で Dock アイコンを隠し、メニューバー常駐アプリとして振る舞わせる。
 ///
 /// activation policy を Accessory にすることで Dock とアプリスイッチャーに出なくなる。
@@ -333,7 +319,8 @@ fn hide_dock_icon() {
     use objc2::MainThreadMarker;
     use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 
-    let mtm = MainThreadMarker::new().expect("main は常にメインスレッドで動くため成功する");
+    let mtm =
+        MainThreadMarker::new().expect("main always runs on the main thread, so this succeeds");
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 }
@@ -382,7 +369,7 @@ mod tests {
             let level = breathing_level(Duration::from_secs_f32(t), CYCLE);
             assert!(
                 (0.0..=1.0).contains(&level),
-                "level {level} が範囲外 (t={t})"
+                "level {level} out of range (t={t})"
             );
         }
     }

@@ -10,19 +10,18 @@ use std::time::Duration;
 use tray_icon::menu::{Menu, MenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
-/// 設定画面トグル項目のラベル。可視状態と表示文言が食い違わないよう、文字列を直書きで
-/// 散らさず、初期値・更新の双方からこの定数を参照する。OPEN=非表示時に押すと開く、
-/// CLOSE=表示時に押すと閉じる（=ウィンドウを隠す）。
-pub const SETTINGS_LABEL_OPEN: &str = "設定を開く";
-pub const SETTINGS_LABEL_CLOSE: &str = "設定を閉じる";
+/// 設定画面（ウィンドウ）を開くメニュー項目のラベル。押すとウィンドウを表示する。
+/// 閉じるのはウィンドウ自身の閉じるボタンに任せる（メニューからは閉じない）ため、
+/// ラベルは固定で切り替えない。
+pub const SETTINGS_LABEL: &str = "Settings";
 
 /// 録音トグル項目のラベル。START=待機中に押すと開始、STOP=録音中に押すと停止。
-pub const RECORD_LABEL_START: &str = "録音を開始";
-pub const RECORD_LABEL_STOP: &str = "録音を停止";
+pub const RECORD_LABEL_START: &str = "Start Recording";
+pub const RECORD_LABEL_STOP: &str = "Stop Recording";
 
 /// トレイのツールチップ。待機中と録音中で切り替える。
 const TOOLTIP_IDLE: &str = "openshoki";
-const TOOLTIP_RECORDING: &str = "openshoki — 録音中…";
+const TOOLTIP_RECORDING: &str = "openshoki — Recording…";
 
 /// 構築したトレイ一式。`TrayIcon` はドロップするとアイコンが消えるため、
 /// アプリが生きている間は保持し続ける必要がある。
@@ -44,8 +43,8 @@ impl Tray {
     /// macOS では NSApplication の初期化後（= Slint バックエンド初期化後）に呼ぶ必要がある。
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let record_item = MenuItem::new(RECORD_LABEL_START, true, None);
-        let toggle_item = MenuItem::new(SETTINGS_LABEL_OPEN, true, None);
-        let quit_item = MenuItem::new("終了", true, None);
+        let toggle_item = MenuItem::new(SETTINGS_LABEL, true, None);
+        let quit_item = MenuItem::new("Quit", true, None);
 
         let menu = Menu::new();
         menu.append(&record_item)?;
@@ -71,14 +70,14 @@ impl Tray {
 /// `?` を使えない呼び出し元（イベントループのコールバック）から使うため、失敗はログに残す。
 pub fn set_idle(icon: &TrayIcon) {
     if let Err(err) = icon.set_icon(Some(dot_icon(IDLE_COLOR))) {
-        eprintln!("トレイアイコンの更新に失敗した: {err}");
+        eprintln!("Failed to update the tray icon: {err}");
     }
     // set_title は Result を返さない。tray-icon 0.24 の macOS 実装では set_title(None) は
     // 既存タイトルを消さない no-op（button.setTitle を呼ぶ分岐をスキップする）ため、
     // 空文字を渡して NSStatusItem ボタンの経過時間テキストを確実に消す。
     icon.set_title(Some(""));
     if let Err(err) = icon.set_tooltip(Some(TOOLTIP_IDLE)) {
-        eprintln!("トレイのツールチップ更新に失敗した: {err}");
+        eprintln!("Failed to update the tray tooltip: {err}");
     }
 }
 
@@ -89,14 +88,14 @@ pub fn set_idle(icon: &TrayIcon) {
 /// `?` を使えない呼び出し元から使うため、失敗はログに残す。
 pub fn render_recording(icon: &TrayIcon, elapsed: Duration, level: f32, update_title: bool) {
     if let Err(err) = icon.set_icon(Some(dot_icon(recording_color(level)))) {
-        eprintln!("トレイアイコンの更新に失敗した: {err}");
+        eprintln!("Failed to update the tray icon: {err}");
     }
     if update_title {
         // set_title は Result を返さない。macOS ではメニューバーにテキスト表示される
         //（Windows/Linux では効き方が異なるが、アイコンの色・明滅を主表示にしているので許容）。
         icon.set_title(Some(format_elapsed(elapsed)));
         if let Err(err) = icon.set_tooltip(Some(TOOLTIP_RECORDING)) {
-            eprintln!("トレイのツールチップ更新に失敗した: {err}");
+            eprintln!("Failed to update the tray tooltip: {err}");
         }
     }
 }
@@ -164,7 +163,8 @@ fn dot_icon(dot: [u8; 4]) -> Icon {
         }
     }
 
-    Icon::from_rgba(rgba, SIZE, SIZE).expect("RGBA バッファ長 = SIZE*SIZE*4 を満たすため常に有効")
+    Icon::from_rgba(rgba, SIZE, SIZE)
+        .expect("RGBA buffer length always satisfies SIZE*SIZE*4, so this is always valid")
 }
 
 #[cfg(test)]
