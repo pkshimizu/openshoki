@@ -37,10 +37,6 @@ const OS_STATUS_OK: i32 = 0;
 /// マイク使用状況をポーリングする間隔。100ms タイマーから毎回照会すると無駄なので、この間隔に間引く。
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-/// 自動停止のデバウンス期間。登録アプリのマイク入力が途絶えてからこの期間継続して初めて停止する。
-/// 通話終了後に確実に閉じつつ、無音区間や瞬間的な途切れで誤停止しない長さ（実機調整前提の初期値）。
-const STOP_DEBOUNCE: Duration = Duration::from_secs(4);
-
 /// 登録アプリのマイク入力の立ち上がりを検知するモニタ。全状態はメインスレッド上でのみ触る。
 pub struct AppAudioMonitor {
     /// 最後にポーリングした時刻。`POLL_INTERVAL` 未満の呼び出しは照会を省く。開始検知
@@ -56,7 +52,7 @@ pub struct AppAudioMonitor {
     /// 有効時に初めて照会できなかったときだけ 1 回知らせる。
     warned_unavailable: Cell<bool>,
     /// 自動停止用: 登録アプリのマイク使用が途絶えた時刻。`None` は「まだ途絶えていない（マイク使用中）」。
-    /// 途絶えてから `STOP_DEBOUNCE` 継続したら自動停止する（瞬間的な途切れで誤停止しない）。
+    /// 途絶えてから `DEBOUNCE` 継続したら自動停止する（瞬間的な途切れで誤停止しない）。
     input_ceased_since: Cell<Option<Instant>>,
 }
 
@@ -118,8 +114,9 @@ impl AppAudioMonitor {
         activated
     }
 
-    /// 自動停止すべきか（登録アプリのいずれもマイク入力していない状態が `STOP_DEBOUNCE`
-    /// 継続したか）を判定する。自動開始した録音中にのみ呼ぶ想定。
+    /// 自動停止すべきか（登録アプリのいずれもマイク入力していない状態が `debounce`
+    /// 継続したか）を判定する。自動開始した録音中にのみ呼ぶ想定。`debounce` は設定
+    /// （`Config::auto_stop_debounce_secs`）由来で、呼び出し側が渡す。
     ///
     /// **副作用のあるポーリング**であり、間引きを通過するたびにマイク使用を照会して途絶えタイマー
     /// （`input_ceased_since`）を進める（純粋なクエリではない）。間引きタイマー `last_poll` は
@@ -130,7 +127,7 @@ impl AppAudioMonitor {
     /// `POLL_INTERVAL` に間引いて照会する。合図は音量ではなく「アプリがマイク入力を掴んでいるか」。
     /// 会議アプリ（ブラウザの Google Meet・Zoom.app 等）は通話中ずっとマイク入力を保持し、ミュートでも
     /// 手放さないことが多いため、ミュート・発言の合間・長い沈黙では止まらず、通話終了（マイク解放）で止まる。
-    pub fn should_stop(&self, triggers: &[AppTrigger], enabled: bool) -> bool {
+    pub fn should_stop(&self, triggers: &[AppTrigger], enabled: bool, debounce: Duration) -> bool {
         if !enabled || triggers.is_empty() {
             self.input_ceased_since.set(None);
             return false;
@@ -147,12 +144,8 @@ impl AppAudioMonitor {
         let any_mic_using = triggers
             .iter()
             .any(|trigger| trigger_matches(&trigger.bundle_id, &mic_using));
-        let (next_ceased, should_stop) = evaluate_auto_stop(
-            any_mic_using,
-            self.input_ceased_since.get(),
-            now,
-            STOP_DEBOUNCE,
-        );
+        let (next_ceased, should_stop) =
+            evaluate_auto_stop(any_mic_using, self.input_ceased_since.get(), now, debounce);
         self.input_ceased_since.set(next_ceased);
         should_stop
     }
@@ -404,10 +397,14 @@ fn responsible_pid(pid: i32) -> Option<i32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{STOP_DEBOUNCE, evaluate_auto_stop, has_rising_edge};
+    use super::{evaluate_auto_stop, has_rising_edge};
     use crate::config::AppTrigger;
     use std::collections::HashSet;
     use std::time::{Duration, Instant};
+
+    /// デバウンス期間はもう設定値（`Config::auto_stop_debounce_secs`）由来で `should_stop` に渡す
+    /// ため、純粋関数のテストでは代表値を用いる。
+    const DEBOUNCE: Duration = Duration::from_secs(4);
 
     fn triggers(bundle_ids: &[&str]) -> Vec<AppTrigger> {
         bundle_ids
@@ -525,7 +522,7 @@ mod tests {
     fn auto_stop_resets_while_outputting() {
         // 使用中は途絶えていないので ceased=None にリセット、停止しない（途絶えていた履歴も消す）。
         let now = Instant::now();
-        let (ceased, stop) = evaluate_auto_stop(true, Some(now), now, STOP_DEBOUNCE);
+        let (ceased, stop) = evaluate_auto_stop(true, Some(now), now, DEBOUNCE);
         assert_eq!(ceased, None);
         assert!(!stop);
     }
@@ -534,7 +531,7 @@ mod tests {
     fn auto_stop_starts_timer_on_first_cease() {
         // 途絶えの初回は now から計測を始めるだけで、まだ停止しない。
         let now = Instant::now();
-        let (ceased, stop) = evaluate_auto_stop(false, None, now, STOP_DEBOUNCE);
+        let (ceased, stop) = evaluate_auto_stop(false, None, now, DEBOUNCE);
         assert_eq!(ceased, Some(now));
         assert!(!stop);
     }
@@ -543,8 +540,8 @@ mod tests {
     fn auto_stop_waits_for_debounce() {
         // 途絶え継続がデバウンス未満なら停止しない（瞬間的な途切れで誤停止しない）。
         let start = Instant::now();
-        let now = start + STOP_DEBOUNCE - Duration::from_millis(1);
-        let (ceased, stop) = evaluate_auto_stop(false, Some(start), now, STOP_DEBOUNCE);
+        let now = start + DEBOUNCE - Duration::from_millis(1);
+        let (ceased, stop) = evaluate_auto_stop(false, Some(start), now, DEBOUNCE);
         assert_eq!(ceased, Some(start));
         assert!(!stop);
     }
@@ -553,8 +550,8 @@ mod tests {
     fn auto_stop_fires_after_debounce() {
         // 途絶えがデバウンス以上継続したら停止する。
         let start = Instant::now();
-        let now = start + STOP_DEBOUNCE;
-        let (_, stop) = evaluate_auto_stop(false, Some(start), now, STOP_DEBOUNCE);
+        let now = start + DEBOUNCE;
+        let (_, stop) = evaluate_auto_stop(false, Some(start), now, DEBOUNCE);
         assert!(stop);
     }
 }

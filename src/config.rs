@@ -21,6 +21,9 @@ const CONFIG_FILE: &str = "config.toml";
 /// デフォルト保存先のフォルダ名（Documents もしくはホーム配下に作る想定）。
 const DEFAULT_DIR_NAME: &str = "openshoki";
 
+/// 自動停止デバウンスの既定秒数。登録アプリのマイク使用が途絶えてから自動停止するまでの待ち時間。
+const DEFAULT_DEBOUNCE_SECS: u32 = 4;
+
 /// 自動録音のトリガーにする登録アプリ。`.app` から取得したバンドル ID で、マイク入力を使っている
 /// プロセスを照合し、表示名は設定画面での一覧表示に使う。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,6 +50,16 @@ pub struct Config {
     /// マイク使用での自動録音トリガーにする登録アプリ一覧。旧名 `app_playback_triggers` と互換。
     #[serde(default, alias = "app_playback_triggers")]
     pub app_mic_triggers: Vec<AppTrigger>,
+    /// 登録アプリのマイク使用が途絶えてから自動停止するまでのデバウンス秒数（既定 4 秒）。通話終了後に
+    /// 確実に閉じる長さは環境・好みで変わるため設定可能にする。旧 config 互換のため未指定時は既定へ
+    /// フォールバックする。設定 TOML は手編集されうるため、実際に使う側で妥当な範囲へクランプする。
+    #[serde(default = "default_debounce_secs")]
+    pub auto_stop_debounce_secs: u32,
+}
+
+/// `auto_stop_debounce_secs` の serde 既定値。項目を持たない旧 config でも既定 4 秒で読める。
+fn default_debounce_secs() -> u32 {
+    DEFAULT_DEBOUNCE_SECS
 }
 
 impl Default for Config {
@@ -55,6 +68,7 @@ impl Default for Config {
             recording_dir: default_recording_dir(),
             auto_record_on_app_mic: false,
             app_mic_triggers: Vec::new(),
+            auto_stop_debounce_secs: DEFAULT_DEBOUNCE_SECS,
         }
     }
 }
@@ -141,6 +155,7 @@ mod tests {
                 bundle_id: "com.apple.Music".to_owned(),
                 name: "Music".to_owned(),
             }],
+            auto_stop_debounce_secs: 7,
         };
         let text = toml::to_string_pretty(&config).expect("serialization should succeed");
         let restored: Config = toml::from_str(&text).expect("deserialization should succeed");
@@ -150,6 +165,10 @@ mod tests {
             config.auto_record_on_app_mic
         );
         assert_eq!(restored.app_mic_triggers, config.app_mic_triggers);
+        assert_eq!(
+            restored.auto_stop_debounce_secs,
+            config.auto_stop_debounce_secs
+        );
     }
 
     #[test]
@@ -162,6 +181,18 @@ mod tests {
         assert_eq!(restored.recording_dir, PathBuf::from("/tmp/openshoki-old"));
         assert!(!restored.auto_record_on_app_mic);
         assert!(restored.app_mic_triggers.is_empty());
+        assert_eq!(restored.auto_stop_debounce_secs, DEFAULT_DEBOUNCE_SECS);
+    }
+
+    #[test]
+    fn deserialize_reads_configured_debounce_secs() {
+        // 設定された自動停止デバウンス秒数がそのまま読める。
+        let text = concat!(
+            "recording_dir = \"/tmp/openshoki-debounce\"\n",
+            "auto_stop_debounce_secs = 10\n",
+        );
+        let restored: Config = toml::from_str(text).expect("loading the settings should succeed");
+        assert_eq!(restored.auto_stop_debounce_secs, 10);
     }
 
     #[test]

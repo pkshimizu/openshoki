@@ -1,15 +1,15 @@
-import { VerticalBox, HorizontalBox, Button, CheckBox, ScrollView } from "std-widgets.slint";
+import { VerticalBox, HorizontalBox, Button, CheckBox, ScrollView, SpinBox } from "std-widgets.slint";
 
 // 常駐アプリの設定画面。トレイメニューから表示する。
-// 「録音ファイルの保存先」「登録アプリのマイク使用で自動録音」を設定できる。
+// 「録音ファイルの保存先」「登録アプリのマイク使用で自動録音」「自動停止の待ち時間」を設定できる。
 export component AppWindow inherits Window {
     title: "openshoki";
     // preferred だけだと中身の最小高さ（≒0）に引っ張られて潰れるため、min も指定する。
     // 幅・高さは src/main.rs の WINDOW_WIDTH/HEIGHT と一致させること（片方だけ変えない）。
     min-width: 420px;
-    min-height: 460px;
+    min-height: 530px;
     preferred-width: 420px;
-    preferred-height: 460px;
+    preferred-height: 530px;
 
     // 現在の録音ファイル保存先（表示用）。Rust 側から設定する。
     in property <string> recording-dir;
@@ -18,10 +18,15 @@ export component AppWindow inherits Window {
     in-out property <bool> auto-record-app;
     // 登録アプリの表示名一覧（Rust 側の app_mic_triggers を反映）。
     in property <[string]> app-list;
+    // 自動停止のデバウンス秒数。起動時に Rust 側が設定値で初期化し、以後は SpinBox で編集する（in-out）。
+    // 範囲は minimum/maximum（下の SpinBox）で制限し、Rust 側の DEBOUNCE_MIN/MAX_SECS と一致させる。
+    in-out property <int> auto-stop-debounce-secs;
     // 「フォルダを選択」押下。Rust 側でネイティブのフォルダ選択ダイアログを開く。
     callback choose-folder();
     // アプリのマイク使用 自動録音トグルの切り替え。新しい ON/OFF を渡し、Rust 側で設定へ永続化する。
     callback toggle-auto-record-app(bool);
+    // 自動停止デバウンス秒数の変更。新しい秒数を渡し、Rust 側で範囲を丸めて永続化する。
+    callback change-auto-stop-debounce(int);
     // 「アプリを追加」押下。Rust 側で .app 選択ダイアログを開き、登録する。
     callback add-app();
     // 登録アプリの削除。一覧のインデックスを渡す。
@@ -58,6 +63,28 @@ export component AppWindow inherits Window {
             toggled => {
                 root.auto-record-app = self.checked;
                 root.toggle-auto-record-app(self.checked);
+            }
+        }
+        HorizontalBox {
+            padding: 0px;
+            spacing: 8px;
+            Text {
+                text: "Auto-stop delay (seconds)";
+                font-size: 14px;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+            SpinBox {
+                // 範囲は src/main.rs の DEBOUNCE_MIN_SECS / DEBOUNCE_MAX_SECS と一致させること。
+                minimum: 1;
+                maximum: 60;
+                value: root.auto-stop-debounce-secs;
+                // 途絶が有効なのは自動録音 ON のときだけなので、OFF では無効化して意味を伝える。
+                enabled: root.auto-record-app;
+                edited(secs) => {
+                    root.auto-stop-debounce-secs = secs;
+                    root.change-auto-stop-debounce(secs);
+                }
             }
         }
         Text {
