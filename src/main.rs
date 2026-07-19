@@ -35,7 +35,7 @@ const BLINK_CYCLE_SECS: f32 = 2.0;
 /// 確定されないまま高さ 0 で表示される。初回表示時にこの値を明示してジオメトリを確定させる。
 /// 幅・高さは `ui/app-window.slint` の min/preferred と一致させること（片方だけ変えない）。
 const WINDOW_WIDTH: f32 = 420.0;
-const WINDOW_HEIGHT: f32 = 460.0;
+const WINDOW_HEIGHT: f32 = 530.0;
 /// 初回表示位置（画面左上からの暫定値）。中央寄せ等の調整は後続に回す。
 const WINDOW_X: f32 = 240.0;
 const WINDOW_Y: f32 = 160.0;
@@ -53,6 +53,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Rc::new(RefCell::new(Config::load()));
     ui.set_recording_dir(recording_dir_text(&config.borrow().recording_dir));
     ui.set_auto_record_app(config.borrow().auto_record_on_app_mic);
+    // 保存値は load 時に範囲へ正規化済みなので、そのまま表示へ渡す。
+    ui.set_auto_stop_debounce_secs(config.borrow().auto_stop_debounce_secs as i32);
     // 登録アプリの表示名一覧を Slint のモデルで持ち、追加/削除で更新する。
     let app_list_model = Rc::new(slint::VecModel::<slint::SharedString>::from(
         config
@@ -95,19 +97,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // 「登録アプリのマイク使用で自動録音」トグル: 永続化に成功してから反映する。
-    // メモリ上の設定を更新する（先に更新すると保存失敗時に表示・メモリとディスクが食い違う）。
-    // UI 側のチェック状態は Slint が保持するため、ここでは Config への反映のみ行う。
+    // Slint 側は先にチェック状態を新値へ更新してからこのコールバックを呼ぶため、保存失敗時は
+    // 表示を保存済みの値へ戻し、表示・メモリ・ディスクの食い違いを防ぐ（debounce 側と対称）。
     let config_for_auto_app = Rc::clone(&config);
+    let ui_for_auto_app = ui.as_weak();
     ui.on_toggle_auto_record_app(move |enabled| {
+        let Some(ui) = ui_for_auto_app.upgrade() else {
+            return;
+        };
         let mut candidate = config_for_auto_app.borrow().clone();
         candidate.auto_record_on_app_mic = enabled;
         if let Err(err) = candidate.save() {
             eprintln!(
                 "Not changing the app-based auto-record setting because saving the settings failed: {err}"
             );
+            ui.set_auto_record_app(config_for_auto_app.borrow().auto_record_on_app_mic);
             return;
         }
         *config_for_auto_app.borrow_mut() = candidate;
+    });
+
+    // 自動停止デバウンス秒数の変更: SpinBox の値を範囲へ丸めて永続化し、成功後にメモリへ反映する。
+    // SpinBox 側でも minimum/maximum を持つが、手編集された設定値との整合のため保存側でも丸める。
+    let config_for_debounce = Rc::clone(&config);
+    let ui_for_debounce = ui.as_weak();
+    ui.on_change_auto_stop_debounce(move |secs| {
+        let Some(ui) = ui_for_debounce.upgrade() else {
+            return;
+        };
+        let secs =
+            config::clamp_debounce_secs(u32::try_from(secs).unwrap_or(config::DEBOUNCE_MIN_SECS));
+        let mut candidate = config_for_debounce.borrow().clone();
+        candidate.auto_stop_debounce_secs = secs;
+        if let Err(err) = candidate.save() {
+            eprintln!("Not changing the auto-stop delay because saving the settings failed: {err}");
+            // 保存できなかったので表示を保存済みの値へ戻し、表示・メモリ・ディスクの食い違いを防ぐ。
+            ui.set_auto_stop_debounce_secs(
+                config_for_debounce.borrow().auto_stop_debounce_secs as i32,
+            );
+            return;
+        }
+        // 丸めた値を SpinBox へ反映し、表示・メモリ・ディスクを一致させる。
+        ui.set_auto_stop_debounce_secs(secs as i32);
+        *config_for_debounce.borrow_mut() = candidate;
     });
 
     // 登録アプリの削除: 一覧のインデックスで設定とモデルから取り除く（永続化成功後に反映）。
@@ -290,7 +322,8 @@ fn build_menu_event_handler(
                     recording_started_by_app = recorder.is_some();
                 }
             } else if recording_started_by_app {
-                let stop = app_monitor.should_stop(&config_ref.app_mic_triggers, enabled);
+                let debounce = config_ref.auto_stop_debounce();
+                let stop = app_monitor.should_stop(&config_ref.app_mic_triggers, enabled, debounce);
                 drop(config_ref);
                 if stop {
                     stop_recording(&mut recorder, &record_item);

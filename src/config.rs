@@ -21,6 +21,14 @@ const CONFIG_FILE: &str = "config.toml";
 /// デフォルト保存先のフォルダ名（Documents もしくはホーム配下に作る想定）。
 const DEFAULT_DIR_NAME: &str = "openshoki";
 
+/// 自動停止デバウンスの既定秒数。登録アプリのマイク使用が途絶えてから自動停止するまでの待ち時間。
+const DEFAULT_DEBOUNCE_SECS: u32 = 4;
+
+/// 自動停止デバウンス秒数の設定可能範囲。設定 TOML は手編集されうるため、この範囲へ丸めて使う。
+/// 値は `ui/app-window.slint` の SpinBox の minimum/maximum と一致させること。
+pub const DEBOUNCE_MIN_SECS: u32 = 1;
+pub const DEBOUNCE_MAX_SECS: u32 = 60;
+
 /// 自動録音のトリガーにする登録アプリ。`.app` から取得したバンドル ID で、マイク入力を使っている
 /// プロセスを照合し、表示名は設定画面での一覧表示に使う。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,6 +55,43 @@ pub struct Config {
     /// マイク使用での自動録音トリガーにする登録アプリ一覧。旧名 `app_playback_triggers` と互換。
     #[serde(default, alias = "app_playback_triggers")]
     pub app_mic_triggers: Vec<AppTrigger>,
+    /// 登録アプリのマイク使用が途絶えてから自動停止するまでのデバウンス秒数（既定 4 秒）。通話終了後に
+    /// 確実に閉じる長さは環境・好みで変わるため設定可能にする。旧 config 互換のため未指定時は既定へ
+    /// フォールバックする。設定 TOML は手編集されうる信頼境界外だが、`deserialize_debounce_secs` により
+    /// 読み込み後は常に範囲内。使う側は `auto_stop_debounce()` を通す。
+    #[serde(
+        default = "default_debounce_secs",
+        deserialize_with = "deserialize_debounce_secs"
+    )]
+    pub auto_stop_debounce_secs: u32,
+}
+
+/// `auto_stop_debounce_secs` の serde 既定値。項目を持たない旧 config でも既定 4 秒で読める。
+fn default_debounce_secs() -> u32 {
+    DEFAULT_DEBOUNCE_SECS
+}
+
+/// `auto_stop_debounce_secs` を寛容にデシリアライズし、常に有効範囲 `[DEBOUNCE_MIN_SECS,
+/// DEBOUNCE_MAX_SECS]` の値を返す。設定 TOML は手編集されうる信頼境界外で、このフィールドが
+/// 負値・非数値・範囲外でも、当該項目だけ丸めて他の設定（保存先・登録アプリ）を巻き添えで失わせない
+/// （`u32` で直接受けると型不一致でファイル全体が既定へ落ちてしまう）。これによりデシリアライズ後は
+/// 「フィールドは常に範囲内」が保証される。なお TOML 整数は i64 のため、i64 も超える極端値は TOML
+/// パース段階で弾かれ、他の縮退と同様にファイル全体が既定へフォールバックする（現実的な秒数では起きない）。
+fn deserialize_debounce_secs<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = toml::Value::deserialize(deserializer)?;
+    let secs = value
+        .as_integer()
+        .and_then(|n| u32::try_from(n).ok())
+        .unwrap_or(DEFAULT_DEBOUNCE_SECS);
+    Ok(clamp_debounce_secs(secs))
+}
+
+/// デバウンス秒数を設定可能範囲へ丸める。表示・保存・判定で同じ丸めを使う単一の口。
+pub fn clamp_debounce_secs(secs: u32) -> u32 {
+    secs.clamp(DEBOUNCE_MIN_SECS, DEBOUNCE_MAX_SECS)
 }
 
 impl Default for Config {
@@ -55,6 +100,7 @@ impl Default for Config {
             recording_dir: default_recording_dir(),
             auto_record_on_app_mic: false,
             app_mic_triggers: Vec::new(),
+            auto_stop_debounce_secs: DEFAULT_DEBOUNCE_SECS,
         }
     }
 }
@@ -72,6 +118,7 @@ impl Config {
 
         match std::fs::read_to_string(&path) {
             Ok(text) => match toml::from_str::<Config>(&text) {
+                // auto_stop_debounce_secs はデシリアライズ時に範囲へ丸め済み（deserialize_debounce_secs）。
                 Ok(config) => config,
                 Err(err) => {
                     eprintln!(
@@ -90,6 +137,13 @@ impl Config {
                 Self::default()
             }
         }
+    }
+
+    /// 自動停止のデバウンス期間。設定値を範囲へ丸めて `Duration` にする（呼び出し側にクランプと単位変換の
+    /// 重複を持たせない単一の口）。デシリアライズ経由の値は既に範囲内だが、構造体リテラルで組んだ値
+    /// （テスト等）も安全なよう冪等に丸める。
+    pub fn auto_stop_debounce(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(u64::from(clamp_debounce_secs(self.auto_stop_debounce_secs)))
     }
 
     /// 設定を OS 標準の設定ディレクトリに TOML で保存する。
@@ -141,6 +195,7 @@ mod tests {
                 bundle_id: "com.apple.Music".to_owned(),
                 name: "Music".to_owned(),
             }],
+            auto_stop_debounce_secs: 7,
         };
         let text = toml::to_string_pretty(&config).expect("serialization should succeed");
         let restored: Config = toml::from_str(&text).expect("deserialization should succeed");
@@ -150,6 +205,10 @@ mod tests {
             config.auto_record_on_app_mic
         );
         assert_eq!(restored.app_mic_triggers, config.app_mic_triggers);
+        assert_eq!(
+            restored.auto_stop_debounce_secs,
+            config.auto_stop_debounce_secs
+        );
     }
 
     #[test]
@@ -162,6 +221,82 @@ mod tests {
         assert_eq!(restored.recording_dir, PathBuf::from("/tmp/openshoki-old"));
         assert!(!restored.auto_record_on_app_mic);
         assert!(restored.app_mic_triggers.is_empty());
+        assert_eq!(restored.auto_stop_debounce_secs, DEFAULT_DEBOUNCE_SECS);
+    }
+
+    #[test]
+    fn deserialize_reads_configured_debounce_secs() {
+        // 設定された自動停止デバウンス秒数がそのまま読める。
+        let text = concat!(
+            "recording_dir = \"/tmp/openshoki-debounce\"\n",
+            "auto_stop_debounce_secs = 10\n",
+        );
+        let restored: Config = toml::from_str(text).expect("loading the settings should succeed");
+        assert_eq!(restored.auto_stop_debounce_secs, 10);
+    }
+
+    #[test]
+    fn deserialize_clamps_in_range_type_but_out_of_bounds_value() {
+        // u32 として妥当だが範囲外（0・1000）の値は、デシリアライズ時に [MIN, MAX] へ丸まる。
+        let low = "recording_dir = \"/tmp/x\"\nauto_stop_debounce_secs = 0\n";
+        let high = "recording_dir = \"/tmp/x\"\nauto_stop_debounce_secs = 1000\n";
+        assert_eq!(
+            toml::from_str::<Config>(low)
+                .unwrap()
+                .auto_stop_debounce_secs,
+            DEBOUNCE_MIN_SECS
+        );
+        assert_eq!(
+            toml::from_str::<Config>(high)
+                .unwrap()
+                .auto_stop_debounce_secs,
+            DEBOUNCE_MAX_SECS
+        );
+    }
+
+    #[test]
+    fn clamp_debounce_secs_bounds() {
+        assert_eq!(clamp_debounce_secs(0), DEBOUNCE_MIN_SECS);
+        assert_eq!(clamp_debounce_secs(DEBOUNCE_MIN_SECS), DEBOUNCE_MIN_SECS);
+        assert_eq!(clamp_debounce_secs(30), 30);
+        assert_eq!(clamp_debounce_secs(DEBOUNCE_MAX_SECS), DEBOUNCE_MAX_SECS);
+        assert_eq!(clamp_debounce_secs(u32::MAX), DEBOUNCE_MAX_SECS);
+    }
+
+    #[test]
+    fn deserialize_out_of_range_debounce_keeps_other_fields() {
+        // 手編集で負値・u32 範囲外・非数値でもパース失敗させず、当該項目のみ既定へ丸め、
+        // 他設定（保存先）を巻き添えで失わない（deserialize_debounce_secs）。
+        for bad in ["-5", "999999999999", "\"abc\"", "1.5"] {
+            let text = format!(
+                "recording_dir = \"/tmp/openshoki-bad\"\nauto_stop_debounce_secs = {bad}\n"
+            );
+            let restored: Config =
+                toml::from_str(&text).expect("loading should not fail on a bad debounce value");
+            assert_eq!(restored.recording_dir, PathBuf::from("/tmp/openshoki-bad"));
+            assert_eq!(restored.auto_stop_debounce_secs, DEFAULT_DEBOUNCE_SECS);
+        }
+    }
+
+    #[test]
+    fn auto_stop_debounce_clamps_to_duration() {
+        // 使用側の単一口。範囲外のメモリ値でも Duration は必ず [MIN, MAX] に収まる。
+        let over = Config {
+            auto_stop_debounce_secs: 1000,
+            ..Config::default()
+        };
+        assert_eq!(
+            over.auto_stop_debounce(),
+            std::time::Duration::from_secs(u64::from(DEBOUNCE_MAX_SECS))
+        );
+        let under = Config {
+            auto_stop_debounce_secs: 0,
+            ..Config::default()
+        };
+        assert_eq!(
+            under.auto_stop_debounce(),
+            std::time::Duration::from_secs(u64::from(DEBOUNCE_MIN_SECS))
+        );
     }
 
     #[test]
