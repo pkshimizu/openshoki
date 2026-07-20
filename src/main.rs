@@ -253,12 +253,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
     );
 
-    // Dock にアイコンを出さない設定は、イベントループが動き始めた後に一度だけ適用する。
-    // Slint のイベントループ（winit）は未バンドル起動（`cargo run`）だと、起動時の
-    // `applicationDidFinishLaunching:` で activation policy を Regular に強制する。main() 冒頭で
-    // Accessory にしても上書きされるため、ループ開始後に invoke_from_event_loop 経由で適用して
-    // 上書きし直す。バンドル済み `.app` では winit が policy を触らず Info.plist の LSUIElement が
-    // 効くため、これは未バンドル起動向けの補正。
+    // Dock 非表示はイベントループ開始後に適用する必要があるため、ここで一度だけ予約する
+    // （なぜループ開始後かは `hide_dock_icon` の doc コメント参照）。
     #[cfg(target_os = "macos")]
     if let Err(err) = slint::invoke_from_event_loop(hide_dock_icon) {
         eprintln!("Failed to schedule hiding the Dock icon: {err}");
