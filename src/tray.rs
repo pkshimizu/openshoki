@@ -15,6 +15,9 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 /// ラベルは固定で切り替えない。
 pub const SETTINGS_LABEL: &str = "Settings";
 
+/// 録音一覧ウィンドウを開く項目のラベル。押すと Recordings ウィンドウを表示する（固定）。
+pub const RECORDINGS_LABEL: &str = "Recordings…";
+
 /// 録音トグル項目のラベル。START=待機中に押すと開始、STOP=録音中に押すと停止。
 pub const RECORD_LABEL_START: &str = "Start Recording";
 pub const RECORD_LABEL_STOP: &str = "Stop Recording";
@@ -29,6 +32,7 @@ const TOOLTIP_RECORDING: &str = "openshoki — Recording…";
 const RECORD_ICON_PNG: &[u8] = include_bytes!("../assets/menu/record.png");
 const STOP_ICON_PNG: &[u8] = include_bytes!("../assets/menu/stop.png");
 const SETTINGS_ICON_PNG: &[u8] = include_bytes!("../assets/menu/settings.png");
+const RECORDINGS_ICON_PNG: &[u8] = include_bytes!("../assets/menu/recordings.png");
 const QUIT_ICON_PNG: &[u8] = include_bytes!("../assets/menu/quit.png");
 
 /// 構築したトレイ一式。`TrayIcon` はドロップするとアイコンが消えるため、
@@ -39,6 +43,8 @@ pub struct Tray {
     pub icon: Rc<TrayIcon>,
     /// 設定画面（ウィンドウ）を開く項目。ラベル・アイコンは固定（歯車）。
     pub toggle_item: IconMenuItem,
+    /// 録音一覧（Recordings）ウィンドウを開く項目。ラベル・アイコンは固定。
+    pub recordings_item: IconMenuItem,
     /// 録音の開始/停止を切り替える項目。録音状態に応じてラベルとアイコンを更新する。
     pub record_item: IconMenuItem,
     /// アプリを終了する項目。
@@ -61,11 +67,18 @@ impl Tray {
             load_menu_icon(SETTINGS_ICON_PNG),
             None,
         );
+        let recordings_item = IconMenuItem::new(
+            RECORDINGS_LABEL,
+            true,
+            load_menu_icon(RECORDINGS_ICON_PNG),
+            None,
+        );
         let quit_item = IconMenuItem::new("Quit", true, load_menu_icon(QUIT_ICON_PNG), None);
 
         let menu = Menu::new();
         menu.append(&record_item)?;
         menu.append(&toggle_item)?;
+        menu.append(&recordings_item)?;
         menu.append(&quit_item)?;
 
         let icon = TrayIconBuilder::new()
@@ -77,6 +90,7 @@ impl Tray {
         Ok(Self {
             icon: Rc::new(icon),
             toggle_item,
+            recordings_item,
             record_item,
             quit_item,
         })
@@ -136,7 +150,8 @@ fn recording_color(level: f32) -> [u8; 4] {
 }
 
 /// 経過時間を表示用文字列にする。既定は `mm:ss`、1 時間以上は `h:mm:ss`。
-fn format_elapsed(elapsed: Duration) -> String {
+/// 録音中のメニューバー表示と Recordings の再生時間表示で共用する。
+pub fn format_elapsed(elapsed: Duration) -> String {
     const SECS_PER_MINUTE: u64 = 60;
     const SECS_PER_HOUR: u64 = 60 * SECS_PER_MINUTE;
 

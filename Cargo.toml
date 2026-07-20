@@ -11,6 +11,7 @@ fs2 = "0.4.3"
 mp3lame-encoder = { version = "0.2.4", features = ["std"] }
 png = "0.18"
 rfd = "0.17.2"
+rodio = "0.22.2"
 rubato = "4.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1"

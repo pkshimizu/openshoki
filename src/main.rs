@@ -6,7 +6,9 @@
 #[cfg(target_os = "macos")]
 mod app_audio_monitor;
 mod config;
+mod player;
 mod recorder;
+mod recordings;
 mod single_instance;
 #[cfg(target_os = "macos")]
 mod system_audio;
@@ -42,6 +44,13 @@ const WINDOW_HEIGHT: f32 = 680.0;
 /// 初回表示位置（画面左上からの暫定値）。中央寄せ等の調整は後続に回す。
 const WINDOW_X: f32 = 240.0;
 const WINDOW_Y: f32 = 160.0;
+
+/// Recordings ウィンドウの初期ジオメトリ。幅・高さは `ui/recordings-window.slint` の
+/// min/preferred と一致させること（片方だけ変えない）。設定ウィンドウと重ならない位置に出す。
+const RECORDINGS_WIDTH: f32 = 720.0;
+const RECORDINGS_HEIGHT: f32 = 540.0;
+const RECORDINGS_X: f32 = 200.0;
+const RECORDINGS_Y: f32 = 120.0;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 多重起動ガード。取得したロックは _instance_lock でプロセス終了まで保持し続ける
@@ -249,6 +258,99 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ui.window()
         .on_close_requested(|| slint::CloseRequestResponse::HideWindow);
 
+    // Recordings ウィンドウ（録音一覧＋再生）。設定ウィンドウと同じく起動時に生成して隠しておき、
+    // トレイの「Recordings…」で表示する。閉じても常駐を保つ。
+    let recordings_ui = RecordingsWindow::new()?;
+    recordings_ui
+        .window()
+        .on_close_requested(|| slint::CloseRequestResponse::HideWindow);
+
+    // 音声再生ハンドル。出力デバイスを開けない環境では再生機能なしで続行する（一覧・常駐は動く）。
+    let player: Rc<RefCell<Option<player::AudioPlayer>>> = Rc::new(RefCell::new(
+        match player::AudioPlayer::new() {
+            Ok(p) => Some(p),
+            Err(err) => {
+                eprintln!(
+                    "Continuing without audio playback because the output device could not be opened: {err}"
+                );
+                None
+            }
+        },
+    ));
+    // 一覧に表示中のセッション（選択インデックス→音源パスの解決に使う）。
+    let sessions: Rc<RefCell<Vec<recordings::RecordingSession>>> =
+        Rc::new(RefCell::new(Vec::new()));
+
+    // セッション選択: 詳細を更新し、その音源を再生準備（停止状態でロード。Play で再生開始）。
+    {
+        let player = Rc::clone(&player);
+        let sessions = Rc::clone(&sessions);
+        let rec_weak = recordings_ui.as_weak();
+        recordings_ui.on_select_session(move |index| {
+            let Some(rec) = rec_weak.upgrade() else {
+                return;
+            };
+            let sessions = sessions.borrow();
+            let Some(session) = usize::try_from(index).ok().and_then(|i| sessions.get(i)) else {
+                return;
+            };
+            rec.set_has_selection(true);
+            rec.set_detail_datetime(session.display_datetime.clone().into());
+            rec.set_detail_summary(session.source_summary().into());
+            rec.set_has_transcript(session.has_transcript);
+            rec.set_playing(false);
+            rec.set_progress(0.0);
+            let mut player = player.borrow_mut();
+            let duration = if let Some(p) = player.as_mut() {
+                match p.load_session(
+                    session.mic_path().as_deref(),
+                    session.system_path().as_deref(),
+                ) {
+                    Ok(()) => p.duration(),
+                    Err(err) => {
+                        eprintln!("Failed to load the recording for playback: {err}");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            rec.set_time_text(format_playback_time(Duration::ZERO, duration).into());
+        });
+    }
+
+    // 再生/一時停止トグル。
+    {
+        let player = Rc::clone(&player);
+        let rec_weak = recordings_ui.as_weak();
+        recordings_ui.on_play_pause(move || {
+            let Some(rec) = rec_weak.upgrade() else {
+                return;
+            };
+            if let Some(p) = player.borrow().as_ref() {
+                p.play_pause();
+                rec.set_playing(p.is_playing());
+            }
+        });
+    }
+
+    // 停止（先頭へ戻す）。
+    {
+        let player = Rc::clone(&player);
+        let rec_weak = recordings_ui.as_weak();
+        recordings_ui.on_stop(move || {
+            let Some(rec) = rec_weak.upgrade() else {
+                return;
+            };
+            if let Some(p) = player.borrow().as_ref() {
+                p.stop();
+                rec.set_playing(false);
+                rec.set_progress(0.0);
+                rec.set_time_text(format_playback_time(Duration::ZERO, p.duration()).into());
+            }
+        });
+    }
+
     // トレイのメニューイベントを Slint のイベントループ上でポーリングし、
     // ウィンドウ操作・終了へ橋渡しする。
     let timer = slint::Timer::default();
@@ -257,6 +359,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         MENU_POLL_INTERVAL,
         build_menu_event_handler(
             ui.as_weak(),
+            RecordingsHandles {
+                ui: recordings_ui.as_weak(),
+                player: Rc::clone(&player),
+                sessions: Rc::clone(&sessions),
+            },
             &tray,
             Rc::clone(&config),
             transcriber,
@@ -284,6 +391,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Recordings ウィンドウの操作・再生に必要なハンドル一式。`build_menu_event_handler` の引数を
+/// 増やしすぎないためにまとめる。
+struct RecordingsHandles {
+    ui: slint::Weak<RecordingsWindow>,
+    player: Rc<RefCell<Option<player::AudioPlayer>>>,
+    sessions: Rc<RefCell<Vec<recordings::RecordingSession>>>,
+}
+
 /// メニューイベントの処理と、録音中のメニューバー表示更新を毎ティック行うクロージャを作る。
 ///
 /// 表示/非表示トグルや録音トグルは現在の状態（ウィンドウの可視状態・録音セッションの有無）から
@@ -298,14 +413,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// 実行されるため問題ない。
 fn build_menu_event_handler(
     ui: slint::Weak<AppWindow>,
+    recordings: RecordingsHandles,
     tray: &Tray,
     config: Rc<RefCell<Config>>,
     transcriber: transcribe::TranscribeWorker,
     #[cfg(target_os = "macos")] app_monitor: app_audio_monitor::AppAudioMonitor,
 ) -> impl FnMut() + 'static {
+    // Recordings ウィンドウ・再生・一覧のハンドルは 1 つにまとめて受け取り、ここで分解する。
+    let RecordingsHandles {
+        ui: rec_ui,
+        player,
+        sessions,
+    } = recordings;
     // クロージャは 'static のため &Tray を借用できない。必要な要素（各項目・ID・アイコン）
     // だけを複製して所有する。
     let toggle_id = tray.toggle_item.id().clone();
+    let recordings_id = tray.recordings_item.id().clone();
     let record_item = tray.record_item.clone();
     let record_id = tray.record_item.id().clone();
     let quit_id = tray.quit_item.id().clone();
@@ -313,6 +436,10 @@ fn build_menu_event_handler(
     let menu_channel = MenuEvent::receiver();
     // 初回表示でジオメトリを確定させたか。2 回目以降は位置・サイズを動かさない。
     let mut geometry_committed = false;
+    // Recordings ウィンドウの初回ジオメトリを確定させたか。
+    let mut rec_geometry_committed = false;
+    // 再生の経過時間テキストを、秒が変わったときだけ更新するための前回値。
+    let mut last_play_secs: Option<u64> = None;
     // 実行中の録音セッション。None=待機中、Some=録音中。
     let mut recorder: Option<Recorder> = None;
     // 録音中の経過時間テキストを、秒が変わったときだけ更新するための前回値。
@@ -330,6 +457,18 @@ fn build_menu_event_handler(
             if event.id == toggle_id {
                 let Some(ui) = ui.upgrade() else { continue };
                 show_window(ui.window(), &mut geometry_committed);
+            } else if event.id == recordings_id {
+                let Some(rec) = rec_ui.upgrade() else {
+                    continue;
+                };
+                open_recordings_window(
+                    &rec,
+                    &config,
+                    &player,
+                    &sessions,
+                    &mut rec_geometry_committed,
+                    &mut last_play_secs,
+                );
             } else if event.id == record_id {
                 toggle_recording(&mut recorder, &record_item, &config, &transcriber);
                 #[cfg(target_os = "macos")]
@@ -397,7 +536,84 @@ fn build_menu_event_handler(
             last_rendered_secs = None;
             was_recording = false;
         }
+
+        // Recordings ウィンドウが開いている間だけ、再生の経過時間・進捗・再生状態を反映する
+        // （閉じているときは更新しない＝アイドル時の無駄な描画をしない）。
+        if let Some(rec) = rec_ui.upgrade()
+            && rec.window().is_visible()
+            && let Some(player) = player.borrow().as_ref()
+        {
+            let position = player.position();
+            let duration = player.duration();
+            let secs = position.as_secs();
+            if last_play_secs != Some(secs) {
+                rec.set_time_text(format_playback_time(position, duration).into());
+                last_play_secs = Some(secs);
+            }
+            let progress = match duration {
+                Some(total) if total > Duration::ZERO => {
+                    (position.as_secs_f32() / total.as_secs_f32()).clamp(0.0, 1.0)
+                }
+                _ => 0.0,
+            };
+            rec.set_progress(progress);
+            rec.set_playing(player.is_playing());
+        }
     }
+}
+
+/// トレイの「Recordings…」で Recordings ウィンドウを開く。保存先を走査して一覧を更新し、
+/// 選択・再生状態を初期化してから表示する（初回表示はジオメトリを明示する。`docs/rules/slint.md`）。
+fn open_recordings_window(
+    rec: &RecordingsWindow,
+    config: &Rc<RefCell<Config>>,
+    player: &Rc<RefCell<Option<player::AudioPlayer>>>,
+    sessions: &Rc<RefCell<Vec<recordings::RecordingSession>>>,
+    geometry_committed: &mut bool,
+    last_play_secs: &mut Option<u64>,
+) {
+    let list = recordings::list_sessions(&config.borrow().recording_dir);
+    let rows: Vec<SessionRow> = list
+        .iter()
+        .map(|session| SessionRow {
+            datetime: session.display_datetime.clone().into(),
+            has_mic: session.has_mic,
+            has_system: session.has_system,
+            has_transcript: session.has_transcript,
+        })
+        .collect();
+    rec.set_sessions(Rc::new(slint::VecModel::from(rows)).into());
+    // 開くたびに未選択・停止表示へ初期化する。
+    rec.set_selected_index(-1);
+    rec.set_has_selection(false);
+    rec.set_playing(false);
+    rec.set_progress(0.0);
+    rec.set_time_text(format_playback_time(Duration::ZERO, None).into());
+    *sessions.borrow_mut() = list;
+    *last_play_secs = None;
+    // 前回の再生が残っていれば止める。
+    if let Some(p) = player.borrow().as_ref() {
+        p.stop();
+    }
+
+    if !*geometry_committed {
+        rec.window()
+            .set_position(slint::LogicalPosition::new(RECORDINGS_X, RECORDINGS_Y));
+        rec.window()
+            .set_size(slint::LogicalSize::new(RECORDINGS_WIDTH, RECORDINGS_HEIGHT));
+        *geometry_committed = true;
+    }
+    if let Err(err) = rec.window().show() {
+        eprintln!("Failed to show the Recordings window: {err}");
+    }
+}
+
+/// 再生時間の表示文字列（`mm:ss / mm:ss`）。全体長が不明なときは `--:--` を出す。
+fn format_playback_time(position: Duration, duration: Option<Duration>) -> String {
+    let total = duration
+        .map(tray::format_elapsed)
+        .unwrap_or_else(|| "--:--".to_string());
+    format!("{} / {}", tray::format_elapsed(position), total)
 }
 
 /// 録音セッションの有無に応じて、録音の開始／停止を切り替える。録音セッションの開始・停止と

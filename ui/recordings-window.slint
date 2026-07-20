@@ -1,0 +1,301 @@
+import { Button, ScrollView, Palette } from "std-widgets.slint";
+
+// 一覧の 1 行分。Rust の recordings::RecordingSession から詰める。
+export struct SessionRow {
+    datetime: string,
+    has-mic: bool,
+    has-system: bool,
+    has-transcript: bool,
+}
+
+// 音源バッジ（`Mic` / `System`）。選択行では白アウトライン、非選択では補助色アウトライン。
+component SourceBadge inherits Rectangle {
+    in property <string> label;
+    in property <bool> on-selected;
+    border-radius: 4px;
+    border-width: 1px;
+    border-color: on-selected ? #ffffff : Palette.border;
+    background: transparent;
+    HorizontalLayout {
+        padding-left: 6px;
+        padding-right: 6px;
+        padding-top: 2px;
+        padding-bottom: 2px;
+        Text {
+            text: root.label;
+            font-size: 10px;
+            font-weight: 600;
+            color: root.on-selected ? #ffffff : Palette.foreground.transparentize(0.3);
+        }
+    }
+}
+
+// トレイの「Recordings…」から開く録音一覧ウィンドウ。左＝セッション一覧、右＝再生と
+// （#54 で埋める）文字起こし。配色は Palette でライト/ダークに追従する（色をハードコードしない。
+// 選択行の白文字だけは背景がアクセント固定のため白リテラルを使う）。
+export component RecordingsWindow inherits Window {
+    title: "Recordings";
+    // 幅・高さは src/main.rs の RECORDINGS_WIDTH/HEIGHT と一致させること（片方だけ変えない）。
+    min-width: 720px;
+    min-height: 540px;
+    preferred-width: 720px;
+    preferred-height: 540px;
+
+    // セッション一覧（新しい順）。Rust 側が list_sessions の結果で更新する。
+    in property <[SessionRow]> sessions;
+    // 選択中セッションの一覧インデックス。未選択は -1。行クリックで更新し select-session を呼ぶ。
+    in-out property <int> selected-index: -1;
+    // 選択セッションの詳細（Rust 側が選択時に更新する）。
+    in property <bool> has-selection;
+    in property <string> detail-datetime;
+    in property <string> detail-summary;
+    // 選択セッションに文字起こし JSON があるか（無ければ Transcript は縮退表示。中身は #54）。
+    in property <bool> has-transcript;
+    // 再生状態。playing は Play/Pause ラベルの切替、time-text は "mm:ss / mm:ss"、
+    // progress は 0.0〜1.0 の進捗（表示のみ・ドラッグ不可）。
+    in property <bool> playing;
+    in property <string> time-text;
+    in property <float> progress;
+
+    // 行クリックでの選択通知。Rust 側で詳細更新・再生対象のロードを行う。
+    callback select-session(int);
+    // 再生/一時停止トグルと停止。
+    callback play-pause();
+    callback stop();
+
+    HorizontalLayout {
+        padding: 16px;
+        spacing: 14px;
+
+        // --- 左ペイン: セッション一覧 ---
+        Rectangle {
+            width: 236px;
+            border-width: 1px;
+            border-color: Palette.border;
+            border-radius: 8px;
+            background: Palette.control-background;
+            clip: true;
+
+            if root.sessions.length == 0: VerticalLayout {
+                alignment: center;
+                padding: 24px;
+                spacing: 6px;
+                Text {
+                    text: "No Recordings Yet";
+                    font-size: 13px;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                    color: Palette.foreground;
+                }
+
+                Text {
+                    text: "Recordings you make will appear here.";
+                    font-size: 12px;
+                    wrap: word-wrap;
+                    horizontal-alignment: center;
+                    color: Palette.foreground.transparentize(0.4);
+                }
+            }
+            if root.sessions.length > 0: ScrollView {
+                VerticalLayout {
+                    alignment: start;
+                    for row[i] in root.sessions: Rectangle {
+                        // 行間の区切り罫線（先頭行は出さない）。
+                        VerticalLayout {
+                            Rectangle {
+                                height: i > 0 ? 1px : 0px;
+                                background: Palette.border;
+                            }
+
+                            rowbg := Rectangle {
+                                // 選択状態は id で参照する（レイアウトを跨ぐ parent 参照は Slint で
+                                // 使えないため）。
+                                property <bool> selected: i == root.selected-index;
+                                background: rowbg.selected ? Palette.accent-background : transparent;
+                                TouchArea {
+                                    clicked => {
+                                        root.selected-index = i;
+                                        root.select-session(i);
+                                    }
+                                }
+
+                                VerticalLayout {
+                                    padding-left: 11px;
+                                    padding-right: 11px;
+                                    padding-top: 8px;
+                                    padding-bottom: 8px;
+                                    spacing: 5px;
+                                    HorizontalLayout {
+                                        spacing: 8px;
+                                        Text {
+                                            text: row.datetime;
+                                            font-size: 12.5px;
+                                            font-weight: 500;
+                                            color: rowbg.selected ? #ffffff : Palette.foreground;
+                                            vertical-alignment: center;
+                                            horizontal-stretch: 1;
+                                        }
+                                        // 文字起こし済みを表すドット（無ければ透明にして場所だけ確保）。
+                                        Rectangle {
+                                            width: 6px;
+                                            height: 6px;
+                                            border-radius: 3px;
+                                            background: row.has-transcript ? (rowbg.selected ? #ffffff : Palette.accent-background) : transparent;
+                                        }
+                                    }
+
+                                    HorizontalLayout {
+                                        alignment: start;
+                                        spacing: 5px;
+                                        if row.has-mic: SourceBadge {
+                                            label: "Mic";
+                                            on-selected: rowbg.selected;
+                                        }
+                                        if row.has-system: SourceBadge {
+                                            label: "System";
+                                            on-selected: rowbg.selected;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- 右ペイン: 詳細（再生・文字起こし） ---
+        Rectangle {
+            horizontal-stretch: 1;
+            // 未選択（録音ゼロ含む）のときは淡色化して非活性にする。
+            opacity: root.has-selection ? 1.0 : 0.4;
+
+            if !root.has-selection: Text {
+                text: "No Recording Selected";
+                font-size: 13px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                color: Palette.foreground.transparentize(0.3);
+            }
+
+            if root.has-selection: VerticalLayout {
+                alignment: start;
+                spacing: 12px;
+
+                // ヘッダ: 日時と音源要約。
+                VerticalLayout {
+                    spacing: 3px;
+                    Text {
+                        text: root.detail-datetime;
+                        font-size: 16px;
+                        font-weight: 600;
+                        color: Palette.foreground;
+                    }
+
+                    Text {
+                        text: root.detail-summary;
+                        font-size: 12.5px;
+                        color: Palette.foreground.transparentize(0.4);
+                    }
+                }
+
+                // Playback セクション。
+                Rectangle {
+                    border-width: 1px;
+                    border-color: Palette.border;
+                    border-radius: 8px;
+                    VerticalLayout {
+                        padding-left: 14px;
+                        padding-right: 14px;
+                        padding-top: 12px;
+                        padding-bottom: 14px;
+                        spacing: 11px;
+                        Text {
+                            text: "Playback";
+                            font-size: 12px;
+                            font-weight: 600;
+                            color: Palette.foreground;
+                        }
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Button {
+                                text: root.playing ? "Pause" : "Play";
+                                clicked => {
+                                    root.play-pause();
+                                }
+                            }
+
+                            Button {
+                                text: "Stop";
+                                clicked => {
+                                    root.stop();
+                                }
+                            }
+
+                            Rectangle {
+                                horizontal-stretch: 1;
+                            }
+
+                            Text {
+                                text: root.time-text;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                                color: Palette.foreground.transparentize(0.4);
+                            }
+                        }
+
+                        // 進捗バー（表示のみ）。トラック＋アクセントの塗り。
+                        Rectangle {
+                            height: 5px;
+                            border-radius: 3px;
+                            background: Palette.border;
+                            clip: true;
+                            Rectangle {
+                                x: 0;
+                                width: parent.width * min(max(root.progress, 0.0), 1.0);
+                                height: parent.height;
+                                border-radius: 3px;
+                                background: Palette.accent-background;
+                            }
+                        }
+                    }
+                }
+
+                // Transcript セクション（枠のみ。セグメント描画・クリックは #54 で実装）。
+                Rectangle {
+                    vertical-stretch: 1;
+                    border-width: 1px;
+                    border-color: Palette.border;
+                    border-radius: 8px;
+                    VerticalLayout {
+                        padding-left: 14px;
+                        padding-right: 14px;
+                        padding-top: 12px;
+                        padding-bottom: 12px;
+                        spacing: 10px;
+                        Text {
+                            text: "Transcript";
+                            font-size: 12px;
+                            font-weight: 600;
+                            color: Palette.foreground;
+                        }
+
+                        Rectangle {
+                            vertical-stretch: 1;
+                            Text {
+                                // #53 では文字起こしの中身表示は未実装。生成済みでも本ウィンドウでは
+                                // まだ読まないため、常に未実装の縮退表示にする（#54 でセグメント描画に置換）。
+                                text: "Not Transcribed Yet";
+                                font-size: 12.5px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                                color: Palette.foreground.transparentize(0.4);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
