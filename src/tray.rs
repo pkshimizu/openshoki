@@ -50,14 +50,11 @@ impl Tray {
     ///
     /// macOS では NSApplication の初期化後（= Slint バックエンド初期化後）に呼ぶ必要がある。
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        // アイコンのデコードに失敗しても None（アイコン無し）でメニューは成立させる
-        // （アイコンのためにトレイ常駐を諦めない）。
-        let record_item = IconMenuItem::new(
-            RECORD_LABEL_START,
-            true,
-            load_menu_icon(RECORD_ICON_PNG),
-            None,
-        );
+        // 各項目のアイコンは load_menu_icon で読み込む（デコード失敗時の扱いは同 doc 参照）。
+        // 録音項目の待機表示（ラベル＋アイコン）は set_record_item_idle に集約しているため、
+        // 初期状態もそれを通して設定し、対応の定義を 1 箇所に保つ。
+        let record_item = IconMenuItem::new(RECORD_LABEL_START, true, None, None);
+        set_record_item_idle(&record_item);
         let toggle_item = IconMenuItem::new(
             SETTINGS_LABEL,
             true,
@@ -240,8 +237,51 @@ fn dot_icon(dot: [u8; 4]) -> Icon {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_elapsed, recording_color};
+    use super::{
+        QUIT_ICON_PNG, RECORD_ICON_PNG, SETTINGS_ICON_PNG, STOP_ICON_PNG, format_elapsed,
+        load_menu_icon, recording_color,
+    };
     use std::time::Duration;
+
+    #[test]
+    fn load_menu_icon_decodes_embedded_assets() {
+        // 埋め込み素材はすべて 8bit RGBA でデコードでき、Icon を作れる（素材差し替えの回帰検知）。
+        for png in [
+            RECORD_ICON_PNG,
+            STOP_ICON_PNG,
+            SETTINGS_ICON_PNG,
+            QUIT_ICON_PNG,
+        ] {
+            assert!(
+                load_menu_icon(png).is_some(),
+                "embedded menu icons should decode to an icon"
+            );
+        }
+    }
+
+    #[test]
+    fn load_menu_icon_returns_none_for_invalid_bytes() {
+        // PNG として不正なバイト列はデコードに失敗し、アイコン無し（None）へ縮退する。
+        assert!(load_menu_icon(&[0, 1, 2, 3]).is_none());
+    }
+
+    #[test]
+    fn load_menu_icon_returns_none_for_non_rgba_png() {
+        // 8bit RGB（RGBA でない）PNG を生成し、フォーマット判定で弾かれて None になることを確認する。
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, 2, 2);
+            encoder.set_color(png::ColorType::Rgb);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder
+                .write_header()
+                .expect("writing the PNG header succeeds in test");
+            writer
+                .write_image_data(&[0u8; 2 * 2 * 3])
+                .expect("writing the PNG data succeeds in test");
+        }
+        assert!(load_menu_icon(&bytes).is_none());
+    }
 
     #[test]
     fn recording_color_interpolates_by_level() {
