@@ -29,6 +29,9 @@
   whisper モデル（ggml-small、約 465MB）は初回の文字起こし時に Hugging Face から自動ダウンロード
   してデータディレクトリへ保存・再利用します（SHA-256 検証つき）。通信はこのダウンロード
   （受信）のみで、音声や文字起こし結果を送信することはありません。
+- **録音の一覧と再生**: メニューの「Recordings…」から、録音済みセッションを新しい順に一覧し、
+  選んで再生（Play / Pause / Stop、経過/全体時間の表示）できます。マイクとシステム音声の両方が
+  あるセッションは、ミックスして同時に再生します。
 
 ## 動作要件
 
@@ -73,13 +76,17 @@ openshoki/
 ├── Cargo.toml            クレート定義・依存
 ├── build.rs              Slint UI のコンパイルと macOS 向けリンク設定
 ├── ui/
-│   └── app-window.slint  設定画面の UI 定義（Slint）
+│   ├── app-window.slint       設定画面の UI 定義（Slint）
+│   └── recordings-window.slint 録音一覧・再生ウィンドウの UI 定義（Slint）
 ├── assets/
 │   └── menu/             トレイメニュー項目のアイコン（PNG, 32x32 RGBA。ビルド時に埋め込む）
 └── src/
     ├── main.rs           エントリ。トレイ初期化と Slint イベントループ起動
     ├── tray.rs           トレイアイコン／メニューの構築とイベントのディスパッチ
     ├── recorder.rs       録音セッション（マイク＋システム音声）の開始・停止と MP3 書き出し
+    ├── player.rs         録音の再生（rodio でファイルをストリーミング再生）
+    ├── mixdown.rs        録音停止後の mic＋system ミックス音声（mix.mp3）生成（バックグラウンド）
+    ├── recordings.rs     録音セッションの探索（保存先を走査し新しい順に一覧）
     ├── system_audio.rs   macOS のシステム音声キャプチャ（ScreenCaptureKit）
     ├── transcribe.rs     録音停止後の自動文字起こし（whisper.cpp、バックグラウンド）
     ├── whisper_model.rs  内蔵 whisper モデルの管理（初回ダウンロード・SHA-256 検証）
@@ -88,7 +95,7 @@ openshoki/
 ```
 
 主な依存: GUI に [Slint](https://slint.dev/)、トレイ常駐に `tray-icon`、マイク取得に `cpal`、
-MP3 エンコードに `mp3lame-encoder`、設定の永続化に `directories` / `serde` / `toml`、
+MP3 エンコードに `mp3lame-encoder`、再生に `rodio`、設定の永続化に `directories` / `serde` / `toml`、
 多重起動防止に `fs2`、
 文字起こしに `whisper-rs`（whisper.cpp）/ `symphonia`（MP3 デコード）/ `rubato`（リサンプル）。
 macOS では `screencapturekit` と `objc2` 系を使います。
@@ -99,7 +106,7 @@ macOS では `screencapturekit` と `objc2` 系を使います。
 - **今後**:
   - Windows（WASAPI loopback）／Linux（monitor source）のシステム音声録音（[#23](https://github.com/pkshimizu/openshoki/issues/23) / [#24](https://github.com/pkshimizu/openshoki/issues/24)）
   - 配布用 macOS `.app` バンドルの生成（[#20](https://github.com/pkshimizu/openshoki/issues/20)）
-  - 録音一覧・再生ビュー（[#53](https://github.com/pkshimizu/openshoki/issues/53) / [#54](https://github.com/pkshimizu/openshoki/issues/54)）
+  - 録音の文字起こし表示と発話秒数へのスキップ（[#54](https://github.com/pkshimizu/openshoki/issues/54)）
 
 ## 開発
 

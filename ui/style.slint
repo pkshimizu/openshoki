@@ -1,0 +1,15 @@
+// タイポグラフィと淡色のトークン。意味のある繰り返し値を 1 箇所に集約し、トーン調整時の
+// 追従漏れ・不整合を防ぐ（余白やインデントの一回きりの値は各所に直書きのままでよい）。
+// 設定ウィンドウ（app-window.slint）と Recordings ウィンドウ（recordings-window.slint）で共有する。
+export global Style {
+    out property <length> title-size: 15px; // ウィンドウタイトル
+    out property <length> detail-title-size: 16px; // 詳細見出し（Recordings の日時）
+    out property <length> heading-size: 12px; // セクション見出し
+    out property <length> body-size: 13px; // 本文ラベル
+    out property <length> caption-size: 12px; // 補助テキスト（パス・注記）
+    out property <length> badge-size: 10px; // 音源バッジ（Mic / System）
+    out property <int> semibold: 600;
+    out property <float> muted-alpha: 0.4; // 補助テキストの淡色化（transparentize の引数）
+    out property <float> disabled-opacity: 0.4; // 従属/未選択ブロックの淡色化（opacity）
+    out property <brush> on-accent-foreground: #ffffff; // アクセント背景の上に載る前景（白固定）
+}

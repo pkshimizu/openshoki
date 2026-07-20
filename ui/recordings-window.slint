@@ -1,0 +1,307 @@
+import { Button, ScrollView, Palette } from "std-widgets.slint";
+import { Style } from "style.slint";
+
+// 一覧の 1 行分。Rust の recordings::RecordingSession から詰める。
+export struct SessionRow {
+    datetime: string,
+    has-mic: bool,
+    has-system: bool,
+    has-transcript: bool,
+}
+
+// 音源バッジ（`Mic` / `System`）。選択行では白アウトライン、非選択では補助色アウトライン。
+component SourceBadge inherits Rectangle {
+    in property <string> label;
+    in property <bool> selected;
+    border-radius: 4px;
+    border-width: 1px;
+    border-color: selected ? Style.on-accent-foreground : Palette.border;
+    background: transparent;
+    HorizontalLayout {
+        padding-left: 6px;
+        padding-right: 6px;
+        padding-top: 2px;
+        padding-bottom: 2px;
+        Text {
+            text: root.label;
+            font-size: Style.badge-size;
+            font-weight: Style.semibold;
+            color: root.selected ? Style.on-accent-foreground : Palette.foreground.transparentize(Style.muted-alpha);
+        }
+    }
+}
+
+// トレイの「Recordings…」から開く録音一覧ウィンドウ。左＝セッション一覧、右＝再生と
+// （#54 で埋める）文字起こし。配色は Palette でライト/ダークに追従し、サイズ・淡色は共有の
+// Style トークンを使う（選択行の白文字はアクセント固定背景のため Style.on-accent-foreground）。
+export component RecordingsWindow inherits Window {
+    title: "Recordings";
+    // 幅・高さは src/main.rs の RECORDINGS_WIDTH/HEIGHT と一致させること（片方だけ変えない）。
+    min-width: 720px;
+    min-height: 540px;
+    preferred-width: 720px;
+    preferred-height: 540px;
+
+    // セッション一覧（新しい順）。Rust 側が list_sessions の結果で更新する。
+    in property <[SessionRow]> sessions;
+    // 選択中セッションの一覧インデックス。未選択は -1。行クリックで更新し select-session を呼ぶ。
+    in-out property <int> selected-index: -1;
+    // 選択セッションの詳細（Rust 側が選択時に更新する）。
+    in property <bool> has-selection;
+    in property <string> detail-datetime;
+    in property <string> detail-summary;
+    // 選択セッションに文字起こし JSON があるか（無ければ Transcript は縮退表示。中身は #54）。
+    in property <bool> has-transcript;
+    // 選択セッションが再生可能か（両音源は mix.mp3 生成済み、単一音源は常に可）。false なら
+    // 再生ボタンを無効化する。
+    in property <bool> playable;
+    // 再生状態。playing は Play/Pause ラベルの切替、time-text は "mm:ss / mm:ss"、
+    // progress は 0.0〜1.0 の進捗（表示のみ・ドラッグ不可）。
+    in property <bool> playing;
+    in property <string> time-text;
+    in property <float> progress;
+
+    // 行クリックでの選択通知。Rust 側で詳細更新・再生対象のロードを行う。
+    callback select-session(int);
+    // 再生/一時停止トグルと停止。
+    callback play-pause();
+    callback stop();
+
+    HorizontalLayout {
+        padding: 16px;
+        spacing: 14px;
+
+        // --- 左ペイン: セッション一覧 ---
+        Rectangle {
+            width: 236px;
+            border-width: 1px;
+            border-color: Palette.border;
+            border-radius: 8px;
+            background: Palette.control-background;
+            clip: true;
+
+            if root.sessions.length == 0: VerticalLayout {
+                alignment: center;
+                padding: 24px;
+                spacing: 6px;
+                Text {
+                    text: "No Recordings Yet";
+                    font-size: Style.body-size;
+                    font-weight: Style.semibold;
+                    horizontal-alignment: center;
+                    color: Palette.foreground;
+                }
+
+                Text {
+                    text: "Recordings you make will appear here.";
+                    font-size: Style.caption-size;
+                    wrap: word-wrap;
+                    horizontal-alignment: center;
+                    color: Palette.foreground.transparentize(Style.muted-alpha);
+                }
+            }
+            if root.sessions.length > 0: ScrollView {
+                VerticalLayout {
+                    alignment: start;
+                    for row[i] in root.sessions: Rectangle {
+                        // 行間の区切り罫線（先頭行は出さない）。
+                        VerticalLayout {
+                            Rectangle {
+                                height: i > 0 ? 1px : 0px;
+                                background: Palette.border;
+                            }
+
+                            rowbg := Rectangle {
+                                // 選択状態は id で参照する（レイアウトを跨ぐ parent 参照は Slint で
+                                // 使えないため）。
+                                property <bool> selected: i == root.selected-index;
+                                background: rowbg.selected ? Palette.accent-background : transparent;
+                                TouchArea {
+                                    clicked => {
+                                        root.selected-index = i;
+                                        root.select-session(i);
+                                    }
+                                }
+
+                                VerticalLayout {
+                                    padding-left: 11px;
+                                    padding-right: 11px;
+                                    padding-top: 8px;
+                                    padding-bottom: 8px;
+                                    spacing: 5px;
+                                    HorizontalLayout {
+                                        spacing: 8px;
+                                        Text {
+                                            text: row.datetime;
+                                            font-size: Style.body-size;
+                                            font-weight: Style.semibold;
+                                            color: rowbg.selected ? Style.on-accent-foreground : Palette.foreground;
+                                            vertical-alignment: center;
+                                            horizontal-stretch: 1;
+                                        }
+                                        // 文字起こし済みを表すドット（無ければ透明にして場所だけ確保）。
+                                        Rectangle {
+                                            width: 6px;
+                                            height: 6px;
+                                            border-radius: 3px;
+                                            background: row.has-transcript ? (rowbg.selected ? Style.on-accent-foreground : Palette.accent-background) : transparent;
+                                        }
+                                    }
+
+                                    HorizontalLayout {
+                                        alignment: start;
+                                        spacing: 5px;
+                                        if row.has-mic: SourceBadge {
+                                            label: "Mic";
+                                            selected: rowbg.selected;
+                                        }
+                                        if row.has-system: SourceBadge {
+                                            label: "System";
+                                            selected: rowbg.selected;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- 右ペイン: 詳細（再生・文字起こし） ---
+        Rectangle {
+            horizontal-stretch: 1;
+            // 未選択（録音ゼロ含む）のときは淡色化して非活性にする。
+            opacity: root.has-selection ? 1.0 : Style.disabled-opacity;
+
+            if !root.has-selection: Text {
+                text: "No Recording Selected";
+                font-size: Style.body-size;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                color: Palette.foreground.transparentize(Style.muted-alpha);
+            }
+
+            if root.has-selection: VerticalLayout {
+                alignment: start;
+                spacing: 12px;
+
+                // ヘッダ: 日時と音源要約。
+                VerticalLayout {
+                    spacing: 3px;
+                    Text {
+                        text: root.detail-datetime;
+                        font-size: Style.detail-title-size;
+                        font-weight: Style.semibold;
+                        color: Palette.foreground;
+                    }
+
+                    Text {
+                        text: root.detail-summary;
+                        font-size: Style.caption-size;
+                        color: Palette.foreground.transparentize(Style.muted-alpha);
+                    }
+                }
+
+                // Playback セクション。
+                Rectangle {
+                    border-width: 1px;
+                    border-color: Palette.border;
+                    border-radius: 8px;
+                    VerticalLayout {
+                        padding-left: 14px;
+                        padding-right: 14px;
+                        padding-top: 12px;
+                        padding-bottom: 14px;
+                        spacing: 11px;
+                        Text {
+                            text: "Playback";
+                            font-size: Style.heading-size;
+                            font-weight: Style.semibold;
+                            color: Palette.foreground;
+                        }
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Button {
+                                text: root.playing ? "Pause" : "Play";
+                                enabled: root.playable;
+                                clicked => {
+                                    root.play-pause();
+                                }
+                            }
+
+                            Button {
+                                text: "Stop";
+                                enabled: root.playable;
+                                clicked => {
+                                    root.stop();
+                                }
+                            }
+
+                            Rectangle {
+                                horizontal-stretch: 1;
+                            }
+
+                            Text {
+                                text: root.time-text;
+                                font-size: Style.caption-size;
+                                vertical-alignment: center;
+                                color: Palette.foreground.transparentize(Style.muted-alpha);
+                            }
+                        }
+
+                        // 進捗バー（表示のみ）。トラック＋アクセントの塗り。
+                        Rectangle {
+                            height: 5px;
+                            border-radius: 3px;
+                            background: Palette.border;
+                            clip: true;
+                            Rectangle {
+                                x: 0;
+                                width: parent.width * min(max(root.progress, 0.0), 1.0);
+                                height: parent.height;
+                                border-radius: 3px;
+                                background: Palette.accent-background;
+                            }
+                        }
+                    }
+                }
+
+                // Transcript セクション（枠のみ。セグメント描画・クリックは #54 で実装）。
+                Rectangle {
+                    vertical-stretch: 1;
+                    border-width: 1px;
+                    border-color: Palette.border;
+                    border-radius: 8px;
+                    VerticalLayout {
+                        padding-left: 14px;
+                        padding-right: 14px;
+                        padding-top: 12px;
+                        padding-bottom: 12px;
+                        spacing: 10px;
+                        Text {
+                            text: "Transcript";
+                            font-size: Style.heading-size;
+                            font-weight: Style.semibold;
+                            color: Palette.foreground;
+                        }
+
+                        Rectangle {
+                            vertical-stretch: 1;
+                            Text {
+                                // #53 では文字起こしの中身表示は未実装。生成済みでも本ウィンドウでは
+                                // まだ読まないため、常に未実装の縮退表示にする（#54 でセグメント描画に置換）。
+                                text: "Not Transcribed Yet";
+                                font-size: Style.body-size;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                                color: Palette.foreground.transparentize(Style.muted-alpha);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

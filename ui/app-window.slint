@@ -1,16 +1,10 @@
 import { Button, CheckBox, ScrollView, SpinBox, Palette } from "std-widgets.slint";
+import { Style } from "style.slint";
 
-// タイポグラフィと淡色のトークン。意味のある繰り返し値を 1 箇所に集約し、トーン調整時の
-// 追従漏れ・不整合を防ぐ（余白やインデントの一回きりの値は各所に直書きのままでよい）。
-global Style {
-    out property <length> title-size: 15px; // ウィンドウタイトル
-    out property <length> heading-size: 12px; // セクション見出し
-    out property <length> body-size: 13px; // 本文ラベル
-    out property <length> caption-size: 12px; // 補助テキスト（パス・注記）
-    out property <int> semibold: 600;
-    out property <float> muted-alpha: 0.4; // 補助テキストの淡色化（transparentize の引数）
-    out property <float> disabled-opacity: 0.4; // 従属ブロック無効時の淡色化（opacity）
-}
+// Recordings ウィンドウは別ファイルで定義し、ここから再エクスポートして 1 つのエントリ
+// （build.rs は app-window.slint のみコンパイル）に含める。Rust 側は include_modules! で
+// RecordingsWindow / SessionRow を得る。
+export { RecordingsWindow, SessionRow } from "recordings-window.slint";
 
 // 設定項目のまとまりを表すセクション枠。GroupBox の既定描画ではなく「角丸・1px 枠線・塗りなし」の
 // 箱＋内側見出しで組み、配色は Palette でライト/ダークに追従させる（色をハードコードしない）。
