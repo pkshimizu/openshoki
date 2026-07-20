@@ -9,6 +9,8 @@
 
 - **トレイ常駐**: 起動するとウィンドウを出さずにメニューバー／タスクバーへ常駐し、アイコンの
   メニューから操作します（macOS では Dock・アプリスイッチャーに出ない常駐アプリ）。
+- **多重起動しない**: 既に起動している状態で再度起動しても、二重に常駐せず終了します（自動録音の
+  二重発火や保存先の競合を防ぐため）。ロックは起動中だけ有効で、終了・クラッシュ後は再び起動できます。
 - **ワンクリックで録音の開始／停止**: メニューの「録音を開始」「録音を停止」で切り替えます。
 - **録音中インジケーター**: 録音中はメニューバーのアイコンが赤く点滅し、ツールチップで状態が
   分かります。
@@ -79,11 +81,13 @@ openshoki/
     ├── system_audio.rs   macOS のシステム音声キャプチャ（ScreenCaptureKit）
     ├── transcribe.rs     録音停止後の自動文字起こし（whisper.cpp、バックグラウンド）
     ├── whisper_model.rs  内蔵 whisper モデルの管理（初回ダウンロード・SHA-256 検証）
+    ├── single_instance.rs 多重起動を防ぐ排他ロック（起動時に取得）
     └── config.rs         設定（保存先など）の読み込み・保存（TOML）
 ```
 
 主な依存: GUI に [Slint](https://slint.dev/)、トレイ常駐に `tray-icon`、マイク取得に `cpal`、
 MP3 エンコードに `mp3lame-encoder`、設定の永続化に `directories` / `serde` / `toml`、
+多重起動防止に `fs2`、
 文字起こしに `whisper-rs`（whisper.cpp）/ `symphonia`（MP3 デコード）/ `rubato`（リサンプル）。
 macOS では `screencapturekit` と `objc2` 系を使います。
 
