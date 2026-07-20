@@ -64,6 +64,17 @@ pub struct Config {
         deserialize_with = "deserialize_debounce_secs"
     )]
     pub auto_stop_debounce_secs: u32,
+    /// 録音停止時に保存した各音源を自動で文字起こしするか。whisper は CPU 負荷が大きいため
+    /// オプトインの既定 OFF。ON でも `whisper_model_path` が無ければ実行しない。
+    #[serde(default)]
+    pub auto_transcribe: bool,
+    /// whisper モデルファイル（ggml 形式）のパス。モデルは同梱・自動ダウンロードせず、ユーザーが
+    /// 配置してパスを指定する（設定 UI は #31）。未指定なら文字起こしを行わない。
+    #[serde(default)]
+    pub whisper_model_path: Option<PathBuf>,
+    /// 文字起こしの言語（例: `ja`）。`None` は whisper の自動判定に任せる（既定）。
+    #[serde(default)]
+    pub transcribe_language: Option<String>,
 }
 
 /// `auto_stop_debounce_secs` の serde 既定値。項目を持たない旧 config でも既定 4 秒で読める。
@@ -101,6 +112,9 @@ impl Default for Config {
             auto_record_on_app_mic: false,
             app_mic_triggers: Vec::new(),
             auto_stop_debounce_secs: DEFAULT_DEBOUNCE_SECS,
+            auto_transcribe: false,
+            whisper_model_path: None,
+            transcribe_language: None,
         }
     }
 }
@@ -196,6 +210,9 @@ mod tests {
                 name: "Music".to_owned(),
             }],
             auto_stop_debounce_secs: 7,
+            auto_transcribe: true,
+            whisper_model_path: Some(PathBuf::from("/tmp/models/ggml-base.bin")),
+            transcribe_language: Some("ja".to_owned()),
         };
         let text = toml::to_string_pretty(&config).expect("serialization should succeed");
         let restored: Config = toml::from_str(&text).expect("deserialization should succeed");
@@ -209,6 +226,9 @@ mod tests {
             restored.auto_stop_debounce_secs,
             config.auto_stop_debounce_secs
         );
+        assert_eq!(restored.auto_transcribe, config.auto_transcribe);
+        assert_eq!(restored.whisper_model_path, config.whisper_model_path);
+        assert_eq!(restored.transcribe_language, config.transcribe_language);
     }
 
     #[test]
@@ -222,6 +242,9 @@ mod tests {
         assert!(!restored.auto_record_on_app_mic);
         assert!(restored.app_mic_triggers.is_empty());
         assert_eq!(restored.auto_stop_debounce_secs, DEFAULT_DEBOUNCE_SECS);
+        assert!(!restored.auto_transcribe);
+        assert!(restored.whisper_model_path.is_none());
+        assert!(restored.transcribe_language.is_none());
     }
 
     #[test]
