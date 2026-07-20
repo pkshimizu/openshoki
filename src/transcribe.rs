@@ -40,8 +40,9 @@ const RESAMPLE_CHUNK_FRAMES: usize = 1024;
 pub struct TranscribeJob {
     /// 対象の音声ファイル（セッションディレクトリ内の `mic.mp3` / `system.mp3`）。
     pub audio_paths: Vec<PathBuf>,
-    /// whisper モデルファイル（ggml 形式）のパス。
-    pub model_path: PathBuf,
+    /// whisper モデルの上書きパス（設定 `whisper_model_path`）。`None` なら内蔵モデルを使う
+    /// （未取得なら処理時に自動ダウンロードされる。`src/whisper_model.rs`）。
+    pub model_override: Option<PathBuf>,
     /// 認識言語（例: `ja`）。`None` は whisper の自動判定。
     pub language: Option<String>,
 }
@@ -104,24 +105,40 @@ fn run_job(job: &TranscribeJob) {
         // 対象なしでモデル（数百 MB〜）をロードしない防御。通常は投入側が空を渡さない。
         return;
     }
-    if !job.model_path.is_file() {
+    // モデルを解決する。上書き指定があればそれを、無ければ内蔵モデルを使う（未取得なら
+    // ここで自動ダウンロードする。ワーカースレッド上なので分オーダーかかっても UI は塞がない）。
+    let model_path = match &job.model_override {
+        Some(path) => path.clone(),
+        None => match crate::whisper_model::ensure_model() {
+            Ok(path) => path,
+            Err(err) => {
+                eprintln!(
+                    "Skipping transcription because the Whisper model could not be prepared: {err}"
+                );
+                return;
+            }
+        },
+    };
+    if !model_path.is_file() {
         eprintln!(
-            "Skipping transcription because the whisper model file was not found: {}",
-            job.model_path.display()
+            "Skipping transcription because the Whisper model file was not found: {}",
+            model_path.display()
         );
         return;
     }
-    let Some(model_path) = job.model_path.to_str() else {
-        eprintln!("Skipping transcription because the whisper model path is not valid UTF-8");
+    let Some(model_path_str) = model_path.to_str() else {
+        eprintln!("Skipping transcription because the Whisper model path is not valid UTF-8");
         return;
     };
-    let ctx = match WhisperContext::new_with_params(model_path, WhisperContextParameters::default())
-    {
+    let ctx = match WhisperContext::new_with_params(
+        model_path_str,
+        WhisperContextParameters::default(),
+    ) {
         Ok(ctx) => ctx,
         Err(err) => {
             eprintln!(
-                "Skipping transcription because loading the whisper model failed ({}): {err}",
-                job.model_path.display()
+                "Skipping transcription because loading the Whisper model failed ({}): {err}",
+                model_path.display()
             );
             return;
         }
@@ -132,7 +149,7 @@ fn run_job(job: &TranscribeJob) {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "audio".to_owned());
-        match transcribe_file(&ctx, path, job) {
+        match transcribe_file(&ctx, path, &model_path, job) {
             Ok(segments) => println!("Transcribed {name} ({segments} segments)"),
             Err(err) => eprintln!("Skipping transcription of {name} because it failed: {err}"),
         }
@@ -140,9 +157,11 @@ fn run_job(job: &TranscribeJob) {
 }
 
 /// 1 音源を文字起こしして `<音源名>.json` に保存する。成功時はセグメント数を返す。
+/// `model_path` は `run_job` で解決済みのモデル（JSON の `model` フィールド用）。
 fn transcribe_file(
     ctx: &WhisperContext,
     audio_path: &Path,
+    model_path: &Path,
     job: &TranscribeJob,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     let source = audio_path
@@ -190,8 +209,7 @@ fn transcribe_file(
     let segments = collect_segments(&state);
     let result = Transcription {
         source,
-        model: job
-            .model_path
+        model: model_path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default(),
@@ -547,7 +565,7 @@ mod tests {
 
         run_job(&TranscribeJob {
             audio_paths: vec![audio_path.clone()],
-            model_path: PathBuf::from(model_path),
+            model_override: Some(PathBuf::from(model_path)),
             language: None,
         });
 
