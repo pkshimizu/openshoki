@@ -74,6 +74,8 @@ openshoki/
 ├── build.rs              Slint UI のコンパイルと macOS 向けリンク設定
 ├── ui/
 │   └── app-window.slint  設定画面の UI 定義（Slint）
+├── assets/
+│   └── menu/             トレイメニュー項目のアイコン（PNG, 32x32 RGBA。ビルド時に埋め込む）
 └── src/
     ├── main.rs           エントリ。トレイ初期化と Slint イベントループ起動
     ├── tray.rs           トレイアイコン／メニューの構築とイベントのディスパッチ
