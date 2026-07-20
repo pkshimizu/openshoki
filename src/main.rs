@@ -43,10 +43,6 @@ const WINDOW_X: f32 = 240.0;
 const WINDOW_Y: f32 = 160.0;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 常駐アプリとして Dock にアイコンを出さない（macOS）。
-    #[cfg(target_os = "macos")]
-    hide_dock_icon();
-
     // ウィンドウは生成するが表示はしない（起動時はトレイのみ）。
     let ui = AppWindow::new()?;
 
@@ -256,6 +252,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             app_monitor,
         ),
     );
+
+    // Dock にアイコンを出さない設定は、イベントループが動き始めた後に一度だけ適用する。
+    // Slint のイベントループ（winit）は未バンドル起動（`cargo run`）だと、起動時の
+    // `applicationDidFinishLaunching:` で activation policy を Regular に強制する。main() 冒頭で
+    // Accessory にしても上書きされるため、ループ開始後に invoke_from_event_loop 経由で適用して
+    // 上書きし直す。バンドル済み `.app` では winit が policy を触らず Info.plist の LSUIElement が
+    // 効くため、これは未バンドル起動向けの補正。
+    #[cfg(target_os = "macos")]
+    if let Err(err) = slint::invoke_from_event_loop(hide_dock_icon) {
+        eprintln!("Failed to schedule hiding the Dock icon: {err}");
+    }
 
     // run_event_loop() は「最後のウィンドウが閉じ、かつ最後の Slint の SystemTrayIcon が
     // 隠れた」時点で return する。本アプリのトレイは tray-icon クレート製で Slint からは
@@ -510,14 +517,17 @@ fn recording_dir_text(dir: &std::path::Path) -> slint::SharedString {
 /// macOS で Dock アイコンを隠し、メニューバー常駐アプリとして振る舞わせる。
 ///
 /// activation policy を Accessory にすることで Dock とアプリスイッチャーに出なくなる。
+/// **イベントループ開始後に呼ぶこと**。winit は未バンドル起動時に起動処理
+/// （`applicationDidFinishLaunching:`）で policy を Regular へ強制するため、ループ開始前に
+/// 設定しても上書きされる。呼び出しは `main` の `invoke_from_event_loop` に集約している。
 /// 配布パッケージでは `Info.plist` の `LSUIElement` 指定が確実だが、それはパッケージング時に扱う。
 #[cfg(target_os = "macos")]
 fn hide_dock_icon() {
     use objc2::MainThreadMarker;
     use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 
-    let mtm =
-        MainThreadMarker::new().expect("main always runs on the main thread, so this succeeds");
+    let mtm = MainThreadMarker::new()
+        .expect("the Slint event loop runs on the main thread, so this succeeds");
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 }
