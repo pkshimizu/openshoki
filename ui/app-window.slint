@@ -1,15 +1,16 @@
 import { VerticalBox, HorizontalBox, Button, CheckBox, ScrollView, SpinBox } from "std-widgets.slint";
 
 // 常駐アプリの設定画面。トレイメニューから表示する。
-// 「録音ファイルの保存先」「登録アプリのマイク使用で自動録音」「自動停止の待ち時間」を設定できる。
+// 「録音ファイルの保存先」「登録アプリのマイク使用で自動録音」「自動停止の待ち時間」
+// 「録音停止時の自動文字起こし」を設定できる。
 export component AppWindow inherits Window {
     title: "openshoki";
     // preferred だけだと中身の最小高さ（≒0）に引っ張られて潰れるため、min も指定する。
     // 幅・高さは src/main.rs の WINDOW_WIDTH/HEIGHT と一致させること（片方だけ変えない）。
     min-width: 420px;
-    min-height: 530px;
+    min-height: 680px;
     preferred-width: 420px;
-    preferred-height: 530px;
+    preferred-height: 680px;
 
     // 現在の録音ファイル保存先（表示用）。Rust 側から設定する。
     in property <string> recording-dir;
@@ -31,6 +32,15 @@ export component AppWindow inherits Window {
     callback add-app();
     // 登録アプリの削除。一覧のインデックスを渡す。
     callback remove-app(int);
+    // 「録音停止時に自動文字起こし」の ON/OFF。起動時に Rust 側が設定値で初期化し、以後は
+    // トグル操作で Slint が状態を保持する（in-out。保存失敗時は Rust 側が書き戻す）。
+    in-out property <bool> auto-transcribe;
+    // 選択中の whisper モデルパス（表示用）。未選択の文言も含めて Rust 側から設定する。
+    in property <string> whisper-model-path;
+    // 自動文字起こしトグルの切り替え。新しい ON/OFF を渡し、Rust 側で設定へ永続化する。
+    callback toggle-auto-transcribe(bool);
+    // 「モデルを選択」押下。Rust 側でネイティブのファイル選択ダイアログを開く。
+    callback choose-model();
 
     VerticalBox {
         alignment: start;
@@ -118,6 +128,29 @@ export component AppWindow inherits Window {
             text: "Add app…";
             clicked => {
                 root.add-app();
+            }
+        }
+        CheckBox {
+            text: "Transcribe recordings on stop — on-device Whisper";
+            checked: root.auto-transcribe;
+            toggled => {
+                root.auto-transcribe = self.checked;
+                root.toggle-auto-transcribe(self.checked);
+            }
+        }
+        Text {
+            text: "Whisper model";
+            font-size: 14px;
+        }
+        Text {
+            text: root.whisper-model-path;
+            wrap: word-wrap;
+            color: #aaaaaa;
+        }
+        Button {
+            text: "Choose Model…";
+            clicked => {
+                root.choose-model();
             }
         }
     }

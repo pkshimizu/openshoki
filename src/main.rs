@@ -36,7 +36,7 @@ const BLINK_CYCLE_SECS: f32 = 2.0;
 /// 確定されないまま高さ 0 で表示される。初回表示時にこの値を明示してジオメトリを確定させる。
 /// 幅・高さは `ui/app-window.slint` の min/preferred と一致させること（片方だけ変えない）。
 const WINDOW_WIDTH: f32 = 420.0;
-const WINDOW_HEIGHT: f32 = 530.0;
+const WINDOW_HEIGHT: f32 = 680.0;
 /// 初回表示位置（画面左上からの暫定値）。中央寄せ等の調整は後続に回す。
 const WINDOW_X: f32 = 240.0;
 const WINDOW_Y: f32 = 160.0;
@@ -56,6 +56,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ui.set_auto_record_app(config.borrow().auto_record_on_app_mic);
     // 保存値は load 時に範囲へ正規化済みなので、そのまま表示へ渡す。
     ui.set_auto_stop_debounce_secs(config.borrow().auto_stop_debounce_secs as i32);
+    ui.set_auto_transcribe(config.borrow().auto_transcribe);
+    ui.set_whisper_model_path(whisper_model_text(
+        config.borrow().whisper_model_path.as_deref(),
+    ));
     // 登録アプリの表示名一覧を Slint のモデルで持ち、追加/削除で更新する。
     let app_list_model = Rc::new(slint::VecModel::<slint::SharedString>::from(
         config
@@ -141,6 +145,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 丸めた値を SpinBox へ反映し、表示・メモリ・ディスクを一致させる。
         ui.set_auto_stop_debounce_secs(secs as i32);
         *config_for_debounce.borrow_mut() = candidate;
+    });
+
+    // 「録音停止時に自動文字起こし」トグル: 永続化に成功してから反映する。Slint 側は先に
+    // チェック状態を新値へ更新するため、保存失敗時は表示を保存済みの値へ戻す
+    // （docs/rules/slint.md。自動録音トグルと対称）。
+    let config_for_transcribe = Rc::clone(&config);
+    let ui_for_transcribe = ui.as_weak();
+    ui.on_toggle_auto_transcribe(move |enabled| {
+        let Some(ui) = ui_for_transcribe.upgrade() else {
+            return;
+        };
+        let mut candidate = config_for_transcribe.borrow().clone();
+        candidate.auto_transcribe = enabled;
+        if let Err(err) = candidate.save() {
+            eprintln!(
+                "Not changing the auto-transcribe setting because saving the settings failed: {err}"
+            );
+            ui.set_auto_transcribe(config_for_transcribe.borrow().auto_transcribe);
+            return;
+        }
+        *config_for_transcribe.borrow_mut() = candidate;
+    });
+
+    // 「モデルを選択」: ネイティブのファイル選択ダイアログで whisper モデル（ggml 形式）を選び、
+    // 保存・表示更新する（on_choose_folder と同じ要領。永続化成功後に反映）。
+    let config_for_model = Rc::clone(&config);
+    let ui_for_model = ui.as_weak();
+    ui.on_choose_model(move || {
+        let Some(ui) = ui_for_model.upgrade() else {
+            return;
+        };
+        let mut candidate = config_for_model.borrow().clone();
+        let mut dialog = rfd::FileDialog::new().add_filter("Whisper model", &["bin", "gguf"]);
+        if let Some(dir) = candidate
+            .whisper_model_path
+            .as_deref()
+            .and_then(|path| path.parent())
+            .filter(|dir| dir.is_dir())
+        {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(model) = dialog.pick_file() else {
+            return; // キャンセル時は何もしない。
+        };
+        candidate.whisper_model_path = Some(model);
+        if let Err(err) = candidate.save() {
+            eprintln!("Not changing the whisper model because saving the settings failed: {err}");
+            return;
+        }
+        ui.set_whisper_model_path(whisper_model_text(candidate.whisper_model_path.as_deref()));
+        *config_for_model.borrow_mut() = candidate;
     });
 
     // 登録アプリの削除: 一覧のインデックスで設定とモデルから取り除く（永続化成功後に反映）。
@@ -484,6 +539,15 @@ fn breathing_level(elapsed: std::time::Duration, cycle_secs: f32) -> f32 {
 /// 保存先パスを画面表示用の文字列に変換する。
 fn recording_dir_text(dir: &std::path::Path) -> slint::SharedString {
     dir.display().to_string().into()
+}
+
+/// whisper モデルパスを画面表示用の文字列に変換する。未選択は英語の案内文言にする
+/// （自動文字起こしはモデル未選択だと実行されないことに気づけるように）。
+fn whisper_model_text(model: Option<&std::path::Path>) -> slint::SharedString {
+    match model {
+        Some(path) => path.display().to_string().into(),
+        None => "No model selected".into(),
+    }
 }
 
 /// macOS で Dock アイコンを隠し、メニューバー常駐アプリとして振る舞わせる。
