@@ -65,11 +65,13 @@ pub struct Config {
     )]
     pub auto_stop_debounce_secs: u32,
     /// 録音停止時に保存した各音源を自動で文字起こしするか。whisper は CPU 負荷が大きいため
-    /// オプトインの既定 OFF。ON でも `whisper_model_path` が無ければ実行しない。
+    /// オプトインの既定 OFF。モデルは内蔵（初回の文字起こし時に自動ダウンロード）なので、
+    /// ON にするだけで使える（`src/whisper_model.rs`）。
     #[serde(default)]
     pub auto_transcribe: bool,
-    /// whisper モデルファイル（ggml 形式）のパス。モデルは同梱・自動ダウンロードせず、ユーザーが
-    /// 配置してパスを指定する（設定 UI は #31）。未指定なら文字起こしを行わない。
+    /// whisper モデルファイル（ggml 形式）のパスの上書き。通常は未指定でよく、内蔵モデル
+    /// （初回に自動ダウンロードした ggml-small）を使う。指定すると内蔵モデルより優先する
+    /// （上級者向け。config.toml の手編集のみで、設定 UI は無い）。
     #[serde(default)]
     pub whisper_model_path: Option<PathBuf>,
     /// 文字起こしの言語（例: `ja`）。`None` は whisper の自動判定に任せる（既定）。
@@ -177,6 +179,13 @@ impl Config {
 fn config_path() -> Option<PathBuf> {
     ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION)
         .map(|dirs| dirs.config_dir().join(CONFIG_FILE))
+}
+
+/// アプリの OS 標準データディレクトリ。内蔵 whisper モデルの保存先などに使う。
+/// `ProjectDirs` の識別子を設定ファイルと共有し、アプリのファイルを一箇所の系統にまとめる。
+pub fn data_dir() -> Option<PathBuf> {
+    ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION)
+        .map(|dirs| dirs.data_dir().to_path_buf())
 }
 
 /// デフォルトの録音ファイル保存先。Documents 配下を基本とし、取得できなければホーム配下、

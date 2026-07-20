@@ -23,9 +23,10 @@
   OS 標準の設定ディレクトリに TOML で永続化されます。
 - **録音停止時の自動文字起こし（オプトイン）**: ローカルの whisper.cpp で各音源をオンデバイス
   文字起こしし、セグメントの開始/終了時刻付き JSON（`mic.json` / `system.json`）をセッション
-  ディレクトリへ保存します（音声を外部送信しません）。whisper モデル（ggml 形式）はユーザーが
-  配置し、現状は `config.toml` の `auto_transcribe` / `whisper_model_path` で有効化します
-  （設定画面での切り替えは後続 [#31](https://github.com/pkshimizu/openshoki/issues/31)）。
+  ディレクトリへ保存します（音声を外部送信しません）。設定画面のトグルで有効化するだけで使え、
+  whisper モデル（ggml-small、約 465MB）は初回の文字起こし時に Hugging Face から自動ダウンロード
+  してデータディレクトリへ保存・再利用します（SHA-256 検証つき）。通信はこのダウンロード
+  （受信）のみで、音声や文字起こし結果を送信することはありません。
 
 ## 動作要件
 
@@ -77,6 +78,7 @@ openshoki/
     ├── recorder.rs       録音セッション（マイク＋システム音声）の開始・停止と MP3 書き出し
     ├── system_audio.rs   macOS のシステム音声キャプチャ（ScreenCaptureKit）
     ├── transcribe.rs     録音停止後の自動文字起こし（whisper.cpp、バックグラウンド）
+    ├── whisper_model.rs  内蔵 whisper モデルの管理（初回ダウンロード・SHA-256 検証）
     └── config.rs         設定（保存先など）の読み込み・保存（TOML）
 ```
 
@@ -91,7 +93,7 @@ macOS では `screencapturekit` と `objc2` 系を使います。
 - **今後**:
   - Windows（WASAPI loopback）／Linux（monitor source）のシステム音声録音（[#23](https://github.com/pkshimizu/openshoki/issues/23) / [#24](https://github.com/pkshimizu/openshoki/issues/24)）
   - 配布用 macOS `.app` バンドルの生成（[#20](https://github.com/pkshimizu/openshoki/issues/20)）
-  - 文字起こしの設定 UI（[#31](https://github.com/pkshimizu/openshoki/issues/31)）と録音一覧・再生ビュー（[#53](https://github.com/pkshimizu/openshoki/issues/53) / [#54](https://github.com/pkshimizu/openshoki/issues/54)）
+  - 録音一覧・再生ビュー（[#53](https://github.com/pkshimizu/openshoki/issues/53) / [#54](https://github.com/pkshimizu/openshoki/issues/54)）
 
 ## 開発
 

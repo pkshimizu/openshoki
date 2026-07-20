@@ -11,6 +11,7 @@ mod recorder;
 mod system_audio;
 mod transcribe;
 mod tray;
+mod whisper_model;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -36,7 +37,7 @@ const BLINK_CYCLE_SECS: f32 = 2.0;
 /// 確定されないまま高さ 0 で表示される。初回表示時にこの値を明示してジオメトリを確定させる。
 /// 幅・高さは `ui/app-window.slint` の min/preferred と一致させること（片方だけ変えない）。
 const WINDOW_WIDTH: f32 = 420.0;
-const WINDOW_HEIGHT: f32 = 530.0;
+const WINDOW_HEIGHT: f32 = 610.0;
 /// 初回表示位置（画面左上からの暫定値）。中央寄せ等の調整は後続に回す。
 const WINDOW_X: f32 = 240.0;
 const WINDOW_Y: f32 = 160.0;
@@ -56,6 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ui.set_auto_record_app(config.borrow().auto_record_on_app_mic);
     // 保存値は load 時に範囲へ正規化済みなので、そのまま表示へ渡す。
     ui.set_auto_stop_debounce_secs(config.borrow().auto_stop_debounce_secs as i32);
+    ui.set_auto_transcribe(config.borrow().auto_transcribe);
     // 登録アプリの表示名一覧を Slint のモデルで持ち、追加/削除で更新する。
     let app_list_model = Rc::new(slint::VecModel::<slint::SharedString>::from(
         config
@@ -141,6 +143,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 丸めた値を SpinBox へ反映し、表示・メモリ・ディスクを一致させる。
         ui.set_auto_stop_debounce_secs(secs as i32);
         *config_for_debounce.borrow_mut() = candidate;
+    });
+
+    // 「録音停止時に自動文字起こし」トグル: 永続化に成功してから反映する。Slint 側は先に
+    // チェック状態を新値へ更新するため、保存失敗時は表示を保存済みの値へ戻す
+    // （docs/rules/slint.md。自動録音トグルと対称）。モデルは内蔵（初回に自動ダウンロード）
+    // なので、ここではモデルの選択・検証は行わない。
+    let config_for_transcribe = Rc::clone(&config);
+    let ui_for_transcribe = ui.as_weak();
+    ui.on_toggle_auto_transcribe(move |enabled| {
+        let Some(ui) = ui_for_transcribe.upgrade() else {
+            return;
+        };
+        let mut candidate = config_for_transcribe.borrow().clone();
+        candidate.auto_transcribe = enabled;
+        if let Err(err) = candidate.save() {
+            eprintln!(
+                "Not changing the auto-transcribe setting because saving the settings failed: {err}"
+            );
+            ui.set_auto_transcribe(config_for_transcribe.borrow().auto_transcribe);
+            return;
+        }
+        *config_for_transcribe.borrow_mut() = candidate;
     });
 
     // 登録アプリの削除: 一覧のインデックスで設定とモデルから取り除く（永続化成功後に反映）。
@@ -408,8 +432,9 @@ fn stop_recording(
 }
 
 /// 保存済み音源の文字起こしジョブを組み立ててワーカーへ投入する。
-/// 設定 OFF なら何もしない（オプトイン）。ON でもモデル未指定ならスキップをログに残す
-/// （設定ミスに気づけるように）。設定値はここでスナップショットし、処理中の設定変更の影響を受けない。
+/// 設定 OFF なら何もしない（オプトイン）。モデルは内蔵（未取得ならワーカーが初回に自動
+/// ダウンロード）なので ON だけで走る。設定値はここでスナップショットし、処理中の設定変更の
+/// 影響を受けない。
 fn submit_transcription(
     saved: &[std::path::PathBuf],
     config: &Rc<RefCell<Config>>,
@@ -419,13 +444,9 @@ fn submit_transcription(
     if !config_ref.auto_transcribe {
         return;
     }
-    let Some(model_path) = config_ref.whisper_model_path.clone() else {
-        eprintln!("Skipping transcription because no whisper model path is configured");
-        return;
-    };
     transcriber.submit(transcribe::TranscribeJob {
         audio_paths: saved.to_vec(),
-        model_path,
+        model_override: config_ref.whisper_model_path.clone(),
         language: config_ref.transcribe_language.clone(),
     });
 }
