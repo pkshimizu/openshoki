@@ -7,6 +7,7 @@
 mod app_audio_monitor;
 mod config;
 mod recorder;
+mod single_instance;
 #[cfg(target_os = "macos")]
 mod system_audio;
 mod transcribe;
@@ -43,6 +44,17 @@ const WINDOW_X: f32 = 240.0;
 const WINDOW_Y: f32 = 160.0;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 多重起動ガード。取得したロックは _instance_lock でプロセス終了まで保持し続ける
+    // （背景・各分岐の意味・保持理由は `single_instance` モジュール doc / `Acquire` 参照）。
+    let _instance_lock = match single_instance::acquire() {
+        single_instance::Acquire::Acquired(lock) => Some(lock),
+        single_instance::Acquire::AlreadyRunning => {
+            eprintln!("Exiting because another instance of openshoki is already running.");
+            return Ok(());
+        }
+        single_instance::Acquire::Unavailable => None,
+    };
+
     // ウィンドウは生成するが表示はしない（起動時はトレイのみ）。
     let ui = AppWindow::new()?;
 

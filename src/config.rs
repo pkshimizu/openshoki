@@ -188,6 +188,13 @@ pub fn data_dir() -> Option<PathBuf> {
         .map(|dirs| dirs.data_dir().to_path_buf())
 }
 
+/// アプリの OS 標準キャッシュディレクトリ。多重起動ガードのロックファイルなど、失っても
+/// 再生成できる一時的なファイルを置く。`ProjectDirs` の識別子を設定ファイルと共有する。
+pub fn cache_dir() -> Option<PathBuf> {
+    ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION)
+        .map(|dirs| dirs.cache_dir().to_path_buf())
+}
+
 /// デフォルトの録音ファイル保存先。Documents 配下を基本とし、取得できなければホーム配下、
 /// それも無ければカレント相対のフォルダ名にフォールバックする。
 fn default_recording_dir() -> PathBuf {
