@@ -177,7 +177,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return;
         };
         let mut candidate = config_for_model.borrow().clone();
-        let mut dialog = rfd::FileDialog::new().add_filter("Whisper model", &["bin", "gguf"]);
+        // whisper.cpp が読むのは ggml 形式（.bin）。GGUF は別系統（llama.cpp）のため受け付けない。
+        let mut dialog = rfd::FileDialog::new().add_filter("Whisper model", &["bin"]);
         if let Some(dir) = candidate
             .whisper_model_path
             .as_deref()
@@ -191,7 +192,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         candidate.whisper_model_path = Some(model);
         if let Err(err) = candidate.save() {
-            eprintln!("Not changing the whisper model because saving the settings failed: {err}");
+            eprintln!("Not changing the Whisper model because saving the settings failed: {err}");
             return;
         }
         ui.set_whisper_model_path(whisper_model_text(candidate.whisper_model_path.as_deref()));
@@ -541,8 +542,8 @@ fn recording_dir_text(dir: &std::path::Path) -> slint::SharedString {
     dir.display().to_string().into()
 }
 
-/// whisper モデルパスを画面表示用の文字列に変換する。未選択は英語の案内文言にする
-/// （自動文字起こしはモデル未選択だと実行されないことに気づけるように）。
+/// whisper モデルパスを画面表示用の文字列に変換する。未選択のときはその旨を明示する
+/// （空欄だと設定済みか未設定か区別できないため）。
 fn whisper_model_text(model: Option<&std::path::Path>) -> slint::SharedString {
     match model {
         Some(path) => path.display().to_string().into(),

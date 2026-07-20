@@ -69,7 +69,7 @@ pub struct Config {
     #[serde(default)]
     pub auto_transcribe: bool,
     /// whisper モデルファイル（ggml 形式）のパス。モデルは同梱・自動ダウンロードせず、ユーザーが
-    /// 配置してパスを指定する（設定 UI は #31）。未指定なら文字起こしを行わない。
+    /// 配置して設定画面から選択する。未指定なら文字起こしを行わない。
     #[serde(default)]
     pub whisper_model_path: Option<PathBuf>,
     /// 文字起こしの言語（例: `ja`）。`None` は whisper の自動判定に任せる（既定）。

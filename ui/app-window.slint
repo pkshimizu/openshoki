@@ -22,6 +22,11 @@ export component AppWindow inherits Window {
     // 自動停止のデバウンス秒数。起動時に Rust 側が設定値で初期化し、以後は SpinBox で編集する（in-out）。
     // 範囲は minimum/maximum（下の SpinBox）で制限し、Rust 側の DEBOUNCE_MIN/MAX_SECS と一致させる。
     in-out property <int> auto-stop-debounce-secs;
+    // 「録音停止時に自動文字起こし」の ON/OFF。起動時に Rust 側が設定値で初期化し、以後は
+    // トグル操作で Slint が状態を保持する（in-out。保存失敗時は Rust 側が書き戻す）。
+    in-out property <bool> auto-transcribe;
+    // 選択中の whisper モデルパス（表示用）。未選択の文言も含めて Rust 側から設定する。
+    in property <string> whisper-model-path;
     // 「フォルダを選択」押下。Rust 側でネイティブのフォルダ選択ダイアログを開く。
     callback choose-folder();
     // アプリのマイク使用 自動録音トグルの切り替え。新しい ON/OFF を渡し、Rust 側で設定へ永続化する。
@@ -32,11 +37,6 @@ export component AppWindow inherits Window {
     callback add-app();
     // 登録アプリの削除。一覧のインデックスを渡す。
     callback remove-app(int);
-    // 「録音停止時に自動文字起こし」の ON/OFF。起動時に Rust 側が設定値で初期化し、以後は
-    // トグル操作で Slint が状態を保持する（in-out。保存失敗時は Rust 側が書き戻す）。
-    in-out property <bool> auto-transcribe;
-    // 選択中の whisper モデルパス（表示用）。未選択の文言も含めて Rust 側から設定する。
-    in property <string> whisper-model-path;
     // 自動文字起こしトグルの切り替え。新しい ON/OFF を渡し、Rust 側で設定へ永続化する。
     callback toggle-auto-transcribe(bool);
     // 「モデルを選択」押下。Rust 側でネイティブのファイル選択ダイアログを開く。
@@ -148,7 +148,8 @@ export component AppWindow inherits Window {
             color: #aaaaaa;
         }
         Button {
-            text: "Choose Model…";
+            // 対になる「Choose Folder」と文言の流儀（省略記号なし）を揃える。
+            text: "Choose Model";
             clicked => {
                 root.choose-model();
             }
