@@ -18,11 +18,11 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
 
-use tray_icon::menu::{MenuEvent, MenuItem};
+use tray_icon::menu::{IconMenuItem, MenuEvent};
 
 use crate::config::Config;
 use crate::recorder::Recorder;
-use crate::tray::{RECORD_LABEL_START, RECORD_LABEL_STOP, Tray};
+use crate::tray::Tray;
 
 slint::include_modules!();
 
@@ -401,13 +401,13 @@ fn build_menu_event_handler(
 }
 
 /// 録音セッションの有無に応じて、録音の開始／停止を切り替える。録音セッションの開始・停止と
-/// メニュー項目のラベル切替に専念する。トレイアイコン／経過時間の表示はタイマー closure が
-/// 録音状態（`Option<Recorder>`）を見て駆動するため、ここでは触らない。
+/// メニュー項目のラベル・アイコン切替に専念する。メニューバーのトレイアイコン／経過時間の表示は
+/// タイマー closure が録音状態（`Option<Recorder>`）を見て駆動するため、ここでは触らない。
 ///
 /// 失敗してもアプリ（常駐）は落とさず、状態は変えずにログを残す。
 fn toggle_recording(
     recorder: &mut Option<Recorder>,
-    record_item: &MenuItem,
+    record_item: &IconMenuItem,
     config: &Rc<RefCell<Config>>,
     transcriber: &transcribe::TranscribeWorker,
 ) {
@@ -420,14 +420,14 @@ fn toggle_recording(
 
 /// 録音セッションを停止する。手動トグルと自動停止（登録アプリのマイク使用の途絶）で共用する
 /// （`start_recording` と対称）。stop() が各音源のストリーム停止→flush→ファイル確定まで行う。
-/// 録音していなければ何もしない。トレイアイコン／経過時間の表示はタイマー closure が録音状態を
-/// 見て駆動するため、ここではメニュー項目のラベルを待機へ戻すだけにする。
+/// 録音していなければ何もしない。メニューバーのトレイアイコン／経過時間の表示はタイマー closure が
+/// 録音状態を見て駆動するため、ここではメニュー項目のラベル・アイコンを待機表示へ戻すだけにする。
 ///
 /// 保存後、設定の自動文字起こしが ON かつモデルパスが指定されていれば、保存できた音源を
 /// バックグラウンドの文字起こしワーカーへ投入する（手動・自動どちらの停止経路もここを通る）。
 fn stop_recording(
     recorder: &mut Option<Recorder>,
-    record_item: &MenuItem,
+    record_item: &IconMenuItem,
     config: &Rc<RefCell<Config>>,
     transcriber: &transcribe::TranscribeWorker,
 ) {
@@ -443,7 +443,7 @@ fn stop_recording(
         println!("Saved the recording ({} files)", saved.len());
         submit_transcription(&saved, config, transcriber);
     }
-    record_item.set_text(RECORD_LABEL_START);
+    tray::set_record_item_idle(record_item);
 }
 
 /// 保存済み音源の文字起こしジョブを組み立ててワーカーへ投入する。
@@ -474,7 +474,7 @@ fn submit_transcription(
 /// トレイアイコン／経過時間の表示はタイマー closure が録音状態を見て駆動するため、ここでは触らない。
 fn start_recording(
     recorder: &mut Option<Recorder>,
-    record_item: &MenuItem,
+    record_item: &IconMenuItem,
     config: &Rc<RefCell<Config>>,
 ) {
     if recorder.is_some() {
@@ -485,7 +485,7 @@ fn start_recording(
     match Recorder::start(&session_dir) {
         Ok(session) => {
             *recorder = Some(session);
-            record_item.set_text(RECORD_LABEL_STOP);
+            tray::set_record_item_recording(record_item);
         }
         Err(err) => eprintln!("Failed to start recording: {err}"),
     }
