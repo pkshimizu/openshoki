@@ -456,7 +456,12 @@ fn build_menu_event_handler(
         while let Ok(event) = menu_channel.try_recv() {
             if event.id == toggle_id {
                 let Some(ui) = ui.upgrade() else { continue };
-                show_window(ui.window(), &mut geometry_committed);
+                show_window(
+                    ui.window(),
+                    &mut geometry_committed,
+                    slint::LogicalPosition::new(WINDOW_X, WINDOW_Y),
+                    slint::LogicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT),
+                );
             } else if event.id == recordings_id {
                 let Some(rec) = rec_ui.upgrade() else {
                     continue;
@@ -596,16 +601,12 @@ fn open_recordings_window(
         p.stop();
     }
 
-    if !*geometry_committed {
-        rec.window()
-            .set_position(slint::LogicalPosition::new(RECORDINGS_X, RECORDINGS_Y));
-        rec.window()
-            .set_size(slint::LogicalSize::new(RECORDINGS_WIDTH, RECORDINGS_HEIGHT));
-        *geometry_committed = true;
-    }
-    if let Err(err) = rec.window().show() {
-        eprintln!("Failed to show the Recordings window: {err}");
-    }
+    show_window(
+        rec.window(),
+        geometry_committed,
+        slint::LogicalPosition::new(RECORDINGS_X, RECORDINGS_Y),
+        slint::LogicalSize::new(RECORDINGS_WIDTH, RECORDINGS_HEIGHT),
+    );
 }
 
 /// 再生時間の表示文字列（`mm:ss / mm:ss`）。全体長が不明なときは `--:--` を出す。
@@ -707,14 +708,19 @@ fn start_recording(
     }
 }
 
-/// 設定ウィンドウを表示する。
+/// ウィンドウを表示する。設定・Recordings の両ウィンドウで共用する。
 ///
-/// 初回表示時のみジオメトリを明示する（`geometry_committed` で一度きりに保つ）。
-/// 詳細は `WINDOW_WIDTH` などの定義コメントを参照。
-fn show_window(window: &slint::Window, geometry_committed: &mut bool) {
+/// 初回表示時のみジオメトリ（位置・サイズ）を明示する（`geometry_committed` で一度きりに保つ）。
+/// なぜ初回にジオメトリを明示するかは `docs/rules/slint.md` を参照。
+fn show_window(
+    window: &slint::Window,
+    geometry_committed: &mut bool,
+    position: slint::LogicalPosition,
+    size: slint::LogicalSize,
+) {
     if !*geometry_committed {
-        window.set_position(slint::LogicalPosition::new(WINDOW_X, WINDOW_Y));
-        window.set_size(slint::LogicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT));
+        window.set_position(position);
+        window.set_size(size);
         *geometry_committed = true;
     }
     if let Err(err) = window.show() {

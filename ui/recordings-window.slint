@@ -1,4 +1,5 @@
 import { Button, ScrollView, Palette } from "std-widgets.slint";
+import { Style } from "style.slint";
 
 // 一覧の 1 行分。Rust の recordings::RecordingSession から詰める。
 export struct SessionRow {
@@ -11,10 +12,10 @@ export struct SessionRow {
 // 音源バッジ（`Mic` / `System`）。選択行では白アウトライン、非選択では補助色アウトライン。
 component SourceBadge inherits Rectangle {
     in property <string> label;
-    in property <bool> on-selected;
+    in property <bool> selected;
     border-radius: 4px;
     border-width: 1px;
-    border-color: on-selected ? #ffffff : Palette.border;
+    border-color: selected ? Style.on-accent-foreground : Palette.border;
     background: transparent;
     HorizontalLayout {
         padding-left: 6px;
@@ -23,16 +24,16 @@ component SourceBadge inherits Rectangle {
         padding-bottom: 2px;
         Text {
             text: root.label;
-            font-size: 10px;
-            font-weight: 600;
-            color: root.on-selected ? #ffffff : Palette.foreground.transparentize(0.3);
+            font-size: Style.badge-size;
+            font-weight: Style.semibold;
+            color: root.selected ? Style.on-accent-foreground : Palette.foreground.transparentize(Style.muted-alpha);
         }
     }
 }
 
 // トレイの「Recordings…」から開く録音一覧ウィンドウ。左＝セッション一覧、右＝再生と
-// （#54 で埋める）文字起こし。配色は Palette でライト/ダークに追従する（色をハードコードしない。
-// 選択行の白文字だけは背景がアクセント固定のため白リテラルを使う）。
+// （#54 で埋める）文字起こし。配色は Palette でライト/ダークに追従し、サイズ・淡色は共有の
+// Style トークンを使う（選択行の白文字はアクセント固定背景のため Style.on-accent-foreground）。
 export component RecordingsWindow inherits Window {
     title: "Recordings";
     // 幅・高さは src/main.rs の RECORDINGS_WIDTH/HEIGHT と一致させること（片方だけ変えない）。
@@ -82,18 +83,18 @@ export component RecordingsWindow inherits Window {
                 spacing: 6px;
                 Text {
                     text: "No Recordings Yet";
-                    font-size: 13px;
-                    font-weight: 600;
+                    font-size: Style.body-size;
+                    font-weight: Style.semibold;
                     horizontal-alignment: center;
                     color: Palette.foreground;
                 }
 
                 Text {
                     text: "Recordings you make will appear here.";
-                    font-size: 12px;
+                    font-size: Style.caption-size;
                     wrap: word-wrap;
                     horizontal-alignment: center;
-                    color: Palette.foreground.transparentize(0.4);
+                    color: Palette.foreground.transparentize(Style.muted-alpha);
                 }
             }
             if root.sessions.length > 0: ScrollView {
@@ -129,9 +130,9 @@ export component RecordingsWindow inherits Window {
                                         spacing: 8px;
                                         Text {
                                             text: row.datetime;
-                                            font-size: 12.5px;
-                                            font-weight: 500;
-                                            color: rowbg.selected ? #ffffff : Palette.foreground;
+                                            font-size: Style.body-size;
+                                            font-weight: Style.semibold;
+                                            color: rowbg.selected ? Style.on-accent-foreground : Palette.foreground;
                                             vertical-alignment: center;
                                             horizontal-stretch: 1;
                                         }
@@ -140,7 +141,7 @@ export component RecordingsWindow inherits Window {
                                             width: 6px;
                                             height: 6px;
                                             border-radius: 3px;
-                                            background: row.has-transcript ? (rowbg.selected ? #ffffff : Palette.accent-background) : transparent;
+                                            background: row.has-transcript ? (rowbg.selected ? Style.on-accent-foreground : Palette.accent-background) : transparent;
                                         }
                                     }
 
@@ -149,11 +150,11 @@ export component RecordingsWindow inherits Window {
                                         spacing: 5px;
                                         if row.has-mic: SourceBadge {
                                             label: "Mic";
-                                            on-selected: rowbg.selected;
+                                            selected: rowbg.selected;
                                         }
                                         if row.has-system: SourceBadge {
                                             label: "System";
-                                            on-selected: rowbg.selected;
+                                            selected: rowbg.selected;
                                         }
                                     }
                                 }
@@ -168,14 +169,14 @@ export component RecordingsWindow inherits Window {
         Rectangle {
             horizontal-stretch: 1;
             // 未選択（録音ゼロ含む）のときは淡色化して非活性にする。
-            opacity: root.has-selection ? 1.0 : 0.4;
+            opacity: root.has-selection ? 1.0 : Style.disabled-opacity;
 
             if !root.has-selection: Text {
                 text: "No Recording Selected";
-                font-size: 13px;
+                font-size: Style.body-size;
                 horizontal-alignment: center;
                 vertical-alignment: center;
-                color: Palette.foreground.transparentize(0.3);
+                color: Palette.foreground.transparentize(Style.muted-alpha);
             }
 
             if root.has-selection: VerticalLayout {
@@ -187,15 +188,15 @@ export component RecordingsWindow inherits Window {
                     spacing: 3px;
                     Text {
                         text: root.detail-datetime;
-                        font-size: 16px;
-                        font-weight: 600;
+                        font-size: Style.detail-title-size;
+                        font-weight: Style.semibold;
                         color: Palette.foreground;
                     }
 
                     Text {
                         text: root.detail-summary;
-                        font-size: 12.5px;
-                        color: Palette.foreground.transparentize(0.4);
+                        font-size: Style.caption-size;
+                        color: Palette.foreground.transparentize(Style.muted-alpha);
                     }
                 }
 
@@ -212,8 +213,8 @@ export component RecordingsWindow inherits Window {
                         spacing: 11px;
                         Text {
                             text: "Playback";
-                            font-size: 12px;
-                            font-weight: 600;
+                            font-size: Style.heading-size;
+                            font-weight: Style.semibold;
                             color: Palette.foreground;
                         }
 
@@ -239,9 +240,9 @@ export component RecordingsWindow inherits Window {
 
                             Text {
                                 text: root.time-text;
-                                font-size: 12px;
+                                font-size: Style.caption-size;
                                 vertical-alignment: center;
-                                color: Palette.foreground.transparentize(0.4);
+                                color: Palette.foreground.transparentize(Style.muted-alpha);
                             }
                         }
 
@@ -276,8 +277,8 @@ export component RecordingsWindow inherits Window {
                         spacing: 10px;
                         Text {
                             text: "Transcript";
-                            font-size: 12px;
-                            font-weight: 600;
+                            font-size: Style.heading-size;
+                            font-weight: Style.semibold;
                             color: Palette.foreground;
                         }
 
@@ -287,10 +288,10 @@ export component RecordingsWindow inherits Window {
                                 // #53 では文字起こしの中身表示は未実装。生成済みでも本ウィンドウでは
                                 // まだ読まないため、常に未実装の縮退表示にする（#54 でセグメント描画に置換）。
                                 text: "Not Transcribed Yet";
-                                font-size: 12.5px;
+                                font-size: Style.body-size;
                                 horizontal-alignment: center;
                                 vertical-alignment: center;
-                                color: Palette.foreground.transparentize(0.4);
+                                color: Palette.foreground.transparentize(Style.muted-alpha);
                             }
                         }
                     }
