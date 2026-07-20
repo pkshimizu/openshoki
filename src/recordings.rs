@@ -17,6 +17,9 @@ const MIC_MP3: &str = "mic.mp3";
 const SYSTEM_MP3: &str = "system.mp3";
 const MIC_JSON: &str = "mic.json";
 const SYSTEM_JSON: &str = "system.json";
+/// 録音後に生成されるミックス音声（`src/mixdown.rs`。両音源セッションの再生対象）。名前は
+/// `mixdown::MIX_FILENAME` と一致させること。
+const MIX_MP3: &str = "mix.mp3";
 
 /// セッションディレクトリ名の日時フォーマット（`main.rs` の録音開始時の命名と一致させること）。
 const DIR_DATETIME_FORMAT: &str = "%Y%m%d-%H%M%S";
@@ -36,19 +39,30 @@ pub struct RecordingSession {
     pub has_mic: bool,
     /// `system.mp3` があるか。
     pub has_system: bool,
+    /// 録音後生成の `mix.mp3` があるか（両音源セッションの再生に使う）。
+    pub has_mix: bool,
     /// 文字起こし（`mic.json` / `system.json` のいずれか）があるか。
     pub has_transcript: bool,
 }
 
 impl RecordingSession {
-    /// 存在する場合の `mic.mp3` のパス。
-    pub fn mic_path(&self) -> Option<PathBuf> {
-        self.has_mic.then(|| self.dir.join(MIC_MP3))
+    /// 再生対象ファイルのパス。両音源のセッションは録音後生成の `mix.mp3`（まだ無ければ再生不可で
+    /// `None`）、単一音源のセッションはその音源ファイルそのもの。音源なしは `None`。
+    ///
+    /// 両音源で `mix.mp3` を再生対象にするのは、選択時に毎回デコード＋ミックスすると UI が固まる
+    /// ため（重い処理は録音直後の生成へ移す。`src/mixdown.rs`）。
+    pub fn playback_path(&self) -> Option<PathBuf> {
+        match (self.has_mic, self.has_system) {
+            (true, true) => self.has_mix.then(|| self.dir.join(MIX_MP3)),
+            (true, false) => Some(self.dir.join(MIC_MP3)),
+            (false, true) => Some(self.dir.join(SYSTEM_MP3)),
+            (false, false) => None,
+        }
     }
 
-    /// 存在する場合の `system.mp3` のパス。
-    pub fn system_path(&self) -> Option<PathBuf> {
-        self.has_system.then(|| self.dir.join(SYSTEM_MP3))
+    /// 再生できるか（再生対象ファイルが定まるか）。両音源で `mix.mp3` 未生成のときは false。
+    pub fn is_playable(&self) -> bool {
+        self.playback_path().is_some()
     }
 
     /// 含まれる音源を表す英語サマリー（右ペインのヘッダ表示用）。
@@ -97,6 +111,7 @@ pub fn list_sessions(recording_dir: &Path) -> Vec<RecordingSession> {
         if !has_mic && !has_system {
             continue;
         }
+        let has_mix = dir.join(MIX_MP3).is_file();
         let has_transcript = dir.join(MIC_JSON).is_file() || dir.join(SYSTEM_JSON).is_file();
 
         sessions.push(RecordingSession {
@@ -105,6 +120,7 @@ pub fn list_sessions(recording_dir: &Path) -> Vec<RecordingSession> {
             dir,
             has_mic,
             has_system,
+            has_mix,
             has_transcript,
         });
     }
@@ -190,6 +206,42 @@ mod tests {
         let sessions = list_sessions(&root);
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].display_datetime, "2026-06-28 14:30");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn playback_path_prefers_mix_for_dual_source_else_single_source() {
+        let root = unique_root("playback");
+        let _ = fs::remove_dir_all(&root);
+        // 両音源＋mix → mix.mp3 が再生対象。
+        make_session(
+            &root,
+            "20260628-143025",
+            &["mic.mp3", "system.mp3", "mix.mp3"],
+        );
+        // 両音源だが mix 未生成 → 再生不可。
+        make_session(&root, "20260628-110500", &["mic.mp3", "system.mp3"]);
+        // 単一音源（mic のみ）→ その音源が再生対象。
+        make_session(&root, "20260627-164200", &["mic.mp3"]);
+
+        let sessions = list_sessions(&root);
+        assert_eq!(sessions.len(), 3);
+        // 新しい順。
+        assert_eq!(
+            sessions[0].playback_path(),
+            Some(root.join("20260628-143025").join("mix.mp3"))
+        );
+        assert!(sessions[0].is_playable());
+        // 両音源で mix が無ければ再生不可（選択時にその場ミックスはしない）。
+        assert_eq!(sessions[1].playback_path(), None);
+        assert!(!sessions[1].is_playable());
+        // 単一音源はその音源ファイルを直接再生する。
+        assert_eq!(
+            sessions[2].playback_path(),
+            Some(root.join("20260627-164200").join("mic.mp3"))
+        );
+        assert!(sessions[2].is_playable());
 
         let _ = fs::remove_dir_all(&root);
     }

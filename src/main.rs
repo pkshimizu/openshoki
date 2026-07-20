@@ -6,6 +6,7 @@
 #[cfg(target_os = "macos")]
 mod app_audio_monitor;
 mod config;
+mod mixdown;
 mod player;
 mod recorder;
 mod recordings;
@@ -253,6 +254,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // アイドルなスレッド 1 本のみ。起動失敗時は文字起こしだけが無効化される（録音は無関係）。
     let transcriber = transcribe::TranscribeWorker::start();
 
+    // 録音停止後にミックス音声（mix.mp3）を生成するバックグラウンドワーカー。両音源のセッションの
+    // 再生を、選択時のその場ミックスでなく生成済みファイルで即座に行えるようにする。
+    let mixer = mixdown::MixWorker::start();
+
     // ウィンドウを閉じても終了させず、非表示にして常駐を保つ。メニューからは開くだけで、
     // 閉じるのはウィンドウ自身の閉じるボタンに任せる。
     ui.window()
@@ -300,20 +305,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             rec.set_has_transcript(session.has_transcript);
             rec.set_playing(false);
             rec.set_progress(0.0);
-            let mut player = player.borrow_mut();
-            let duration = if let Some(p) = player.as_mut() {
-                match p.load_session(
-                    session.mic_path().as_deref(),
-                    session.system_path().as_deref(),
-                ) {
-                    Ok(()) => p.duration(),
-                    Err(err) => {
-                        eprintln!("Failed to load the recording for playback: {err}");
-                        None
-                    }
-                }
-            } else {
-                None
+            // 再生対象は事前生成の mix.mp3（両音源）か単一音源ファイル。両音源で mix.mp3 が
+            // まだ無ければ再生不可（選択時にその場でミックスして UI を固めない）。
+            rec.set_playable(session.is_playable());
+            let duration = match session.playback_path() {
+                Some(path) => match player.borrow_mut().as_mut() {
+                    Some(p) => match p.load(&path) {
+                        Ok(()) => p.duration(),
+                        Err(err) => {
+                            eprintln!("Failed to load the recording for playback: {err}");
+                            None
+                        }
+                    },
+                    None => None,
+                },
+                None => None,
             };
             rec.set_time_text(format_playback_time(Duration::ZERO, duration).into());
         });
@@ -366,7 +372,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
             &tray,
             Rc::clone(&config),
-            transcriber,
+            PostStopWorkers { transcriber, mixer },
             #[cfg(target_os = "macos")]
             app_monitor,
         ),
@@ -399,6 +405,13 @@ struct RecordingsHandles {
     sessions: Rc<RefCell<Vec<recordings::RecordingSession>>>,
 }
 
+/// 録音停止後に走らせるバックグラウンド処理のワーカー一式（文字起こし・ミックス生成）。
+/// `build_menu_event_handler` の引数を増やしすぎないためにまとめる。
+struct PostStopWorkers {
+    transcriber: transcribe::TranscribeWorker,
+    mixer: mixdown::MixWorker,
+}
+
 /// メニューイベントの処理と、録音中のメニューバー表示更新を毎ティック行うクロージャを作る。
 ///
 /// 表示/非表示トグルや録音トグルは現在の状態（ウィンドウの可視状態・録音セッションの有無）から
@@ -416,7 +429,7 @@ fn build_menu_event_handler(
     recordings: RecordingsHandles,
     tray: &Tray,
     config: Rc<RefCell<Config>>,
-    transcriber: transcribe::TranscribeWorker,
+    workers: PostStopWorkers,
     #[cfg(target_os = "macos")] app_monitor: app_audio_monitor::AppAudioMonitor,
 ) -> impl FnMut() + 'static {
     // Recordings ウィンドウ・再生・一覧のハンドルは 1 つにまとめて受け取り、ここで分解する。
@@ -475,7 +488,7 @@ fn build_menu_event_handler(
                     &mut last_play_secs,
                 );
             } else if event.id == record_id {
-                toggle_recording(&mut recorder, &record_item, &config, &transcriber);
+                toggle_recording(&mut recorder, &record_item, &config, &workers);
                 #[cfg(target_os = "macos")]
                 {
                     // 手動トグルの録音は自動停止の対象にしない（開始でも停止でもフラグを下ろす）。
@@ -516,7 +529,7 @@ fn build_menu_event_handler(
                 let stop = app_monitor.should_stop(&config_ref.app_mic_triggers, enabled, debounce);
                 drop(config_ref);
                 if stop {
-                    stop_recording(&mut recorder, &record_item, &config, &transcriber);
+                    stop_recording(&mut recorder, &record_item, &config, &workers);
                     recording_started_by_app = false;
                     // 停止後は開始検知を再初期化する（録音中に出力を始めたアプリを誤検知しない）。
                     app_monitor.reset_after_stop();
@@ -626,12 +639,12 @@ fn toggle_recording(
     recorder: &mut Option<Recorder>,
     record_item: &IconMenuItem,
     config: &Rc<RefCell<Config>>,
-    transcriber: &transcribe::TranscribeWorker,
+    workers: &PostStopWorkers,
 ) {
     if recorder.is_none() {
         start_recording(recorder, record_item, config);
     } else {
-        stop_recording(recorder, record_item, config, transcriber);
+        stop_recording(recorder, record_item, config, workers);
     }
 }
 
@@ -640,13 +653,13 @@ fn toggle_recording(
 /// 録音していなければ何もしない。メニューバーのトレイアイコン／経過時間の表示はタイマー closure が
 /// 録音状態を見て駆動するため、ここではメニュー項目のラベル・アイコンを待機表示へ戻すだけにする。
 ///
-/// 保存後、設定の自動文字起こしが ON かつモデルパスが指定されていれば、保存できた音源を
-/// バックグラウンドの文字起こしワーカーへ投入する（手動・自動どちらの停止経路もここを通る）。
+/// 保存後、（設定 ON なら）文字起こしをワーカーへ投入し、両音源が保存できていれば Recordings 用の
+/// ミックス音声（mix.mp3）生成もワーカーへ投入する（手動・自動どちらの停止経路もここを通る）。
 fn stop_recording(
     recorder: &mut Option<Recorder>,
     record_item: &IconMenuItem,
     config: &Rc<RefCell<Config>>,
-    transcriber: &transcribe::TranscribeWorker,
+    workers: &PostStopWorkers,
 ) {
     let Some(session) = recorder.take() else {
         return;
@@ -658,9 +671,28 @@ fn stop_recording(
         // 保存先のフルパスは機微情報（録音データの所在・フォルダ構造がプライバシーに関わる）
         // なので出さない。完了が分かるように、保存できたファイル数だけを知らせる。
         println!("Saved the recording ({} files)", saved.len());
-        submit_transcription(&saved, config, transcriber);
+        submit_transcription(&saved, config, &workers.transcriber);
+        submit_mixdown(&saved, &workers.mixer);
     }
     tray::set_record_item_idle(record_item);
+}
+
+/// 両音源（`mic.mp3` と `system.mp3`）が保存できたセッションだけ、ミックス音声の生成を投入する。
+/// 単一音源のセッションはミックス不要（Recordings は元ファイルを直接再生する）。
+fn submit_mixdown(saved: &[std::path::PathBuf], mixer: &mixdown::MixWorker) {
+    // ファイル名は recorder.rs の保存名と一致させること（`mic.mp3` / `system.mp3`）。
+    let has_name = |name: &str| {
+        saved
+            .iter()
+            .any(|p| p.file_name().is_some_and(|f| f == name))
+    };
+    if !(has_name("mic.mp3") && has_name("system.mp3")) {
+        return;
+    }
+    let Some(session_dir) = saved.first().and_then(|p| p.parent()) else {
+        return;
+    };
+    mixer.submit(session_dir.to_path_buf());
 }
 
 /// 保存済み音源の文字起こしジョブを組み立ててワーカーへ投入する。

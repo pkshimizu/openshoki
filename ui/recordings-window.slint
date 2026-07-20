@@ -52,6 +52,9 @@ export component RecordingsWindow inherits Window {
     in property <string> detail-summary;
     // 選択セッションに文字起こし JSON があるか（無ければ Transcript は縮退表示。中身は #54）。
     in property <bool> has-transcript;
+    // 選択セッションが再生可能か（両音源は mix.mp3 生成済み、単一音源は常に可）。false なら
+    // 再生ボタンを無効化する。
+    in property <bool> playable;
     // 再生状態。playing は Play/Pause ラベルの切替、time-text は "mm:ss / mm:ss"、
     // progress は 0.0〜1.0 の進捗（表示のみ・ドラッグ不可）。
     in property <bool> playing;
@@ -222,6 +225,7 @@ export component RecordingsWindow inherits Window {
                             spacing: 8px;
                             Button {
                                 text: root.playing ? "Pause" : "Play";
+                                enabled: root.playable;
                                 clicked => {
                                     root.play-pause();
                                 }
@@ -229,6 +233,7 @@ export component RecordingsWindow inherits Window {
 
                             Button {
                                 text: "Stop";
+                                enabled: root.playable;
                                 clicked => {
                                     root.stop();
                                 }

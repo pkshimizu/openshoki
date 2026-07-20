@@ -84,7 +84,8 @@ openshoki/
     ├── main.rs           エントリ。トレイ初期化と Slint イベントループ起動
     ├── tray.rs           トレイアイコン／メニューの構築とイベントのディスパッチ
     ├── recorder.rs       録音セッション（マイク＋システム音声）の開始・停止と MP3 書き出し
-    ├── player.rs         録音の再生（rodio。mic＋system をミックスした単一タイムライン）
+    ├── player.rs         録音の再生（rodio でファイルをストリーミング再生）
+    ├── mixdown.rs        録音停止後の mic＋system ミックス音声（mix.mp3）生成（バックグラウンド）
     ├── recordings.rs     録音セッションの探索（保存先を走査し新しい順に一覧）
     ├── system_audio.rs   macOS のシステム音声キャプチャ（ScreenCaptureKit）
     ├── transcribe.rs     録音停止後の自動文字起こし（whisper.cpp、バックグラウンド）
