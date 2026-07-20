@@ -1,16 +1,39 @@
-import { VerticalBox, HorizontalBox, Button, CheckBox, ScrollView, SpinBox } from "std-widgets.slint";
+import { Button, CheckBox, ScrollView, SpinBox, Palette } from "std-widgets.slint";
+
+// 設定項目のまとまりを表すセクション枠。GroupBox の既定描画ではなく「角丸・1px 枠線・塗りなし」の
+// 箱＋内側見出しで組み、配色は Palette でライト/ダークに追従させる（色をハードコードしない）。
+component SettingsSection inherits Rectangle {
+    in property <string> title;
+    border-width: 1px;
+    border-color: Palette.border;
+    border-radius: 8px;
+    background: transparent;
+    VerticalLayout {
+        padding: 14px;
+        spacing: 10px;
+        Text {
+            text: root.title;
+            font-size: 12px;
+            font-weight: 600;
+            color: Palette.foreground;
+        }
+
+        @children
+    }
+}
 
 // 常駐アプリの設定画面。トレイメニューから表示する。
 // 「録音ファイルの保存先」「登録アプリのマイク使用で自動録音」「自動停止の待ち時間」
-// 「録音停止時の自動文字起こし」を設定できる。
+// 「録音停止時の自動文字起こし」を、意味のまとまりでセクション化して設定できる。
 export component AppWindow inherits Window {
     title: "openshoki";
     // preferred だけだと中身の最小高さ（≒0）に引っ張られて潰れるため、min も指定する。
     // 幅・高さは src/main.rs の WINDOW_WIDTH/HEIGHT と一致させること（片方だけ変えない）。
+    // 幅は 420 固定。高さは新レイアウト（3 セクション）に合わせた値。
     min-width: 420px;
-    min-height: 610px;
+    min-height: 680px;
     preferred-width: 420px;
-    preferred-height: 610px;
+    preferred-height: 680px;
 
     // 現在の録音ファイル保存先（表示用）。Rust 側から設定する。
     in property <string> recording-dir;
@@ -38,109 +61,206 @@ export component AppWindow inherits Window {
     // 自動文字起こしトグルの切り替え。新しい ON/OFF を渡し、Rust 側で設定へ永続化する。
     callback toggle-auto-transcribe(bool);
 
-    VerticalBox {
+    VerticalLayout {
         alignment: start;
-        spacing: 12px;
-        padding: 20px;
+        spacing: 14px;
+        padding-left: 20px;
+        padding-right: 20px;
+        padding-top: 18px;
+        padding-bottom: 22px;
 
         Text {
             text: "openshoki Settings";
-            font-size: 20px;
+            font-size: 15px;
+            font-weight: 600;
             horizontal-alignment: center;
         }
-        Text {
-            text: "Recording folder";
-            font-size: 14px;
-        }
-        Text {
-            text: root.recording-dir;
-            wrap: word-wrap;
-            color: #aaaaaa;
-        }
-        Button {
-            text: "Choose Folder";
-            clicked => {
-                root.choose-folder();
-            }
-        }
-        CheckBox {
-            text: "Auto-record while a registered app uses the mic — for calls (macOS 14.4+)";
-            checked: root.auto-record-app;
-            toggled => {
-                root.auto-record-app = self.checked;
-                root.toggle-auto-record-app(self.checked);
-            }
-        }
-        HorizontalBox {
-            padding: 0px;
-            spacing: 8px;
+
+        // --- Recording: 保存先フォルダ ---
+        SettingsSection {
+            title: "Recording";
             Text {
-                text: "Auto-stop delay (seconds)";
-                font-size: 14px;
-                vertical-alignment: center;
-                horizontal-stretch: 1;
+                text: "Folder";
+                font-size: 13px;
+                color: Palette.foreground;
             }
-            SpinBox {
-                // 範囲は src/config.rs の DEBOUNCE_MIN_SECS / DEBOUNCE_MAX_SECS と一致させること。
-                minimum: 1;
-                maximum: 60;
-                value: root.auto-stop-debounce-secs;
-                // 途絶が有効なのは自動録音 ON のときだけなので、OFF では無効化して意味を伝える。
-                enabled: root.auto-record-app;
-                edited(secs) => {
-                    root.auto-stop-debounce-secs = secs;
-                    root.change-auto-stop-debounce(secs);
+            // パス（折り返し）とボタン（折り返さない）を同一行・両端揃えにする。
+            HorizontalLayout {
+                spacing: 12px;
+                Text {
+                    text: root.recording-dir;
+                    wrap: word-wrap;
+                    font-size: 12px;
+                    color: Palette.foreground.transparentize(0.4);
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+
+                Button {
+                    text: "Choose Folder";
+                    horizontal-stretch: 0;
+                    clicked => {
+                        root.choose-folder();
+                    }
                 }
             }
         }
-        Text {
-            text: "Trigger apps";
-            font-size: 14px;
-        }
-        ScrollView {
-            height: 120px;
-            VerticalBox {
-                alignment: start;
-                spacing: 6px;
-                padding: 0px;
-                for name[i] in root.app-list: HorizontalBox {
-                    padding: 0px;
-                    Text {
-                        text: name;
-                        vertical-alignment: center;
-                        horizontal-stretch: 1;
-                        overflow: elide;
+
+        // --- Auto-record: 登録アプリのマイク使用に連動 ---
+        SettingsSection {
+            title: "Auto-record";
+            // 複数行ラベルにするため、CheckBox（テキストなし）＋折り返し Text を横並びにする。
+            // トグルはチェックボックス本体で行う。
+            HorizontalLayout {
+                spacing: 8px;
+                CheckBox {
+                    checked: root.auto-record-app;
+                    toggled => {
+                        root.auto-record-app = self.checked;
+                        root.toggle-auto-record-app(self.checked);
                     }
-                    Button {
-                        text: "Remove";
-                        clicked => {
-                            root.remove-app(i);
+                }
+
+                Text {
+                    text: "Auto-record while a registered app uses the mic — for calls (macOS 14.4+)";
+                    wrap: word-wrap;
+                    font-size: 13px;
+                    color: Palette.foreground;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+            }
+
+            // 従属コントロール（delay・Trigger apps）を左インデントし、自動録音 OFF のときは
+            // opacity で淡色化＋各操作を enabled で無効化して従属関係を示す。
+            Rectangle {
+                opacity: root.auto-record-app ? 1.0 : 0.4;
+                VerticalLayout {
+                    padding-left: 23px;
+                    padding-top: 6px;
+                    spacing: 10px;
+
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: "Auto-stop delay (seconds)";
+                            font-size: 13px;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                            color: Palette.foreground;
+                        }
+
+                        SpinBox {
+                            // 範囲は src/config.rs の DEBOUNCE_MIN_SECS / DEBOUNCE_MAX_SECS と一致させること。
+                            minimum: 1;
+                            maximum: 60;
+                            value: root.auto-stop-debounce-secs;
+                            // 途絶が有効なのは自動録音 ON のときだけなので、OFF では無効化する。
+                            enabled: root.auto-record-app;
+                            edited(secs) => {
+                                root.auto-stop-debounce-secs = secs;
+                                root.change-auto-stop-debounce(secs);
+                            }
+                        }
+                    }
+
+                    Text {
+                        text: "Trigger apps";
+                        font-size: 13px;
+                        color: Palette.foreground;
+                    }
+
+                    // フィールド風のリストボックス（入力欄と同じ背景＋角丸＋枠）。空でも枠を保つ。
+                    Rectangle {
+                        height: 96px;
+                        border-width: 1px;
+                        border-color: Palette.border;
+                        border-radius: 6px;
+                        background: Palette.control-background;
+                        clip: true;
+                        ScrollView {
+                            VerticalLayout {
+                                alignment: start;
+                                for name[i] in root.app-list: VerticalLayout {
+                                    // 2 行目以降の先頭に行区切りの罫線を置く（先頭行は 0px で出さない）。
+                                    Rectangle {
+                                        height: i > 0 ? 1px : 0px;
+                                        background: Palette.border;
+                                    }
+
+                                    HorizontalLayout {
+                                        padding-left: 12px;
+                                        padding-right: 12px;
+                                        padding-top: 6px;
+                                        padding-bottom: 6px;
+                                        spacing: 8px;
+                                        Text {
+                                            text: name;
+                                            font-size: 13px;
+                                            color: Palette.foreground;
+                                            vertical-alignment: center;
+                                            horizontal-stretch: 1;
+                                            overflow: elide;
+                                        }
+
+                                        Button {
+                                            text: "Remove";
+                                            enabled: root.auto-record-app;
+                                            clicked => {
+                                                root.remove-app(i);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    HorizontalLayout {
+                        alignment: start;
+                        Button {
+                            text: "Add app…";
+                            enabled: root.auto-record-app;
+                            clicked => {
+                                root.add-app();
+                            }
                         }
                     }
                 }
             }
         }
-        Button {
-            text: "Add app…";
-            clicked => {
-                root.add-app();
+
+        // --- Transcription: 録音停止時の自動文字起こし ---
+        SettingsSection {
+            title: "Transcription";
+            HorizontalLayout {
+                spacing: 8px;
+                CheckBox {
+                    checked: root.auto-transcribe;
+                    toggled => {
+                        root.auto-transcribe = self.checked;
+                        root.toggle-auto-transcribe(self.checked);
+                    }
+                }
+
+                Text {
+                    text: "Transcribe recordings on stop — on-device Whisper";
+                    wrap: word-wrap;
+                    font-size: 13px;
+                    color: Palette.foreground;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
             }
-        }
-        CheckBox {
-            text: "Transcribe recordings on stop — on-device Whisper";
-            checked: root.auto-transcribe;
-            toggled => {
-                root.auto-transcribe = self.checked;
-                root.toggle-auto-transcribe(self.checked);
+
+            Text {
+                // モデルは内蔵（初回に自動ダウンロード）。これまで通信ゼロだったアプリで唯一の
+                // 外部通信になるため、接続先と「音声は送らない」ことを明示する（透明性）。
+                text: "First use downloads the speech model (about 465 MB) from Hugging Face — audio is never uploaded";
+                wrap: word-wrap;
+                font-size: 12px;
+                color: Palette.foreground.transparentize(0.4);
             }
-        }
-        Text {
-            // モデルは内蔵（初回に自動ダウンロード）。これまで通信ゼロだったアプリで唯一の
-            // 外部通信になるため、接続先と「音声は送らない」ことを明示する（透明性）。
-            text: "First use downloads the speech model (about 465 MB) from Hugging Face — audio is never uploaded";
-            wrap: word-wrap;
-            font-size: 12px;
-            color: #aaaaaa;
         }
     }
 }
