@@ -44,10 +44,8 @@ const WINDOW_X: f32 = 240.0;
 const WINDOW_Y: f32 = 160.0;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 多重起動ガード: 既に別インスタンスが動作中なら、トレイ常駐も録音も始めず終了する
-    // （自動録音の二重発火・保存先の奪い合いを防ぐ）。ロックを用意できない異例環境では
-    // ガードを諦めて起動を続行する。取得したロックは _instance_lock がプロセス終了まで保持し、
-    // drop で OS が解放する（早期に落とさないよう、以降で保持し続ける）。
+    // 多重起動ガード。取得したロックは _instance_lock でプロセス終了まで保持し続ける
+    // （背景・各分岐の意味・保持理由は `single_instance` モジュール doc / `Acquire` 参照）。
     let _instance_lock = match single_instance::acquire() {
         single_instance::Acquire::Acquired(lock) => Some(lock),
         single_instance::Acquire::AlreadyRunning => {

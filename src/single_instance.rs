@@ -8,6 +8,10 @@
 //! ロックは OS がプロセス終了・クラッシュ時に自動解放する（`fs2` の `flock`/`LockFileEx` ベース）ため、
 //! 前回の残骸で起動不能になる stale lock は起きない。
 //!
+//! ロックファイルは `config::cache_dir()` 配下に置く。稼働中に OS がキャッシュをパージすると
+//! （macOS の `~/Library/Caches` など）ガードが破れうるが、その場合もガード無し（従来挙動）へ
+//! 縮退するだけで害は小さい。
+//!
 //! ガードのために起動不能にはしない: ロックファイルを用意できない異例環境（`ProjectDirs` 取得不可・
 //! IO エラーなど）では排他を諦めて起動を続行する（`docs/rules/error-handling.md` の精神）。全 OS 共通で
 //! 効かせるため `cfg` で囲まない。
@@ -61,8 +65,13 @@ fn acquire_at(path: &Path) -> Acquire {
     };
     match file.try_lock_exclusive() {
         Ok(()) => Acquire::Acquired(file),
-        // 競合（別インスタンスが保持中）は WouldBlock 相当のエラーで返る。
-        Err(err) if err.kind() == fs2::lock_contended_error().kind() => Acquire::AlreadyRunning,
+        // 競合（別インスタンスが保持中）の判定。`kind()` でなく `raw_os_error()` で比較するのは、
+        // Windows の競合（`ERROR_LOCK_VIOLATION`）が std の `ErrorKind` に未マップで、`kind()` だと
+        // 他の未マップエラーと区別できず誤判定しうるため（Unix は `WouldBlock`）。`fs2` 自身も
+        // Windows のテストで `raw_os_error()` 比較を使っている。
+        Err(err) if err.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
+            Acquire::AlreadyRunning
+        }
         // 競合以外のロック失敗は異例環境として、ガードを諦めて起動を続行する。
         Err(err) => {
             eprintln!(
@@ -111,5 +120,21 @@ mod tests {
         drop(third);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// ロックファイルを開けない異例環境では Unavailable（＝ガード無しで起動続行）になる。
+    /// 存在しない親ディレクトリ配下のパスは `File::create` が失敗するため、その経路を再現する。
+    #[test]
+    fn missing_parent_directory_reports_unavailable() {
+        let path = std::env::temp_dir()
+            .join(format!("openshoki-missing-{}", std::process::id()))
+            .join("nested")
+            .join("instance.lock");
+
+        let outcome = acquire_at(&path);
+        assert!(
+            matches!(outcome, Acquire::Unavailable),
+            "opening the lock file under a missing directory should be Unavailable"
+        );
     }
 }
