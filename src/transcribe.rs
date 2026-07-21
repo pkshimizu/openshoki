@@ -222,7 +222,7 @@ fn transcribe_file(
     Ok(result.segments.len())
 }
 
-/// 文字起こし結果の保存形式。録音一覧ビュー（#54）が読む契約なので、`segments` の
+/// 文字起こし結果の保存形式。録音一覧ビュー（`src/transcript.rs`）が読む契約なので、`segments` の
 /// `start` / `end`（秒）/ `text` の形は互換を保って変更する。
 #[derive(Debug, Serialize)]
 struct Transcription {
@@ -591,7 +591,7 @@ mod tests {
 
     #[test]
     fn transcription_json_shape_matches_viewer_contract() {
-        // 録音一覧ビュー（#54）が読む契約: segments[].start/end/text（秒）。
+        // 録音一覧ビュー（src/transcript.rs）が読む契約: segments[].start/end/text（秒）。
         let result = Transcription {
             source: "mic".to_owned(),
             model: "ggml-base.bin".to_owned(),

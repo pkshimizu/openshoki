@@ -32,6 +32,10 @@
 - **録音の一覧と再生**: メニューの「Recordings…」から、録音済みセッションを新しい順に一覧し、
   選んで再生（Play / Pause / Stop、経過/全体時間の表示）できます。マイクとシステム音声の両方が
   あるセッションは、ミックスして同時に再生します。
+- **文字起こしの表示と発話へのスキップ**: 文字起こし済みのセッションを選ぶと、mic / system を
+  マージした文字起こしが時刻順に表示されます。セグメントをクリックするとその発話の開始秒へ
+  再生位置がスキップし、再生中は現在位置のセグメントがハイライトされます（未生成のセッションは
+  「Not Transcribed Yet」表示）。
 
 ## 動作要件
 
@@ -89,6 +93,7 @@ openshoki/
     ├── recordings.rs     録音セッションの探索（保存先を走査し新しい順に一覧）
     ├── system_audio.rs   macOS のシステム音声キャプチャ（ScreenCaptureKit）
     ├── transcribe.rs     録音停止後の自動文字起こし（whisper.cpp、バックグラウンド）
+    ├── transcript.rs     文字起こし JSON の読み込みと mic／system の時刻順マージ（表示用）
     ├── whisper_model.rs  内蔵 whisper モデルの管理（初回ダウンロード・SHA-256 検証）
     ├── single_instance.rs 多重起動を防ぐ排他ロック（起動時に取得）
     └── config.rs         設定（保存先など）の読み込み・保存（TOML）
@@ -106,7 +111,6 @@ macOS では `screencapturekit` と `objc2` 系を使います。
 - **今後**:
   - Windows（WASAPI loopback）／Linux（monitor source）のシステム音声録音（[#23](https://github.com/pkshimizu/openshoki/issues/23) / [#24](https://github.com/pkshimizu/openshoki/issues/24)）
   - 配布用 macOS `.app` バンドルの生成（[#20](https://github.com/pkshimizu/openshoki/issues/20)）
-  - 録音の文字起こし表示と発話秒数へのスキップ（[#54](https://github.com/pkshimizu/openshoki/issues/54)）
 
 ## 開発
 

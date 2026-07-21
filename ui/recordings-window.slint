@@ -1,4 +1,4 @@
-import { Button, ScrollView, Palette } from "std-widgets.slint";
+import { Button, ListView, ScrollView, Palette } from "std-widgets.slint";
 import { Style } from "style.slint";
 
 // 一覧の 1 行分。Rust の recordings::RecordingSession から詰める。
@@ -7,6 +7,17 @@ export struct SessionRow {
     has-mic: bool,
     has-system: bool,
     has-transcript: bool,
+}
+
+// トランスクリプトの表示 1 行分。Rust の transcript::TranscriptSegment から詰める
+// （speaker は "Mic" / "System"、time は "mm:ss"、1 時間以上は "h:mm:ss"）。配色判定はラベル文字列の
+// 比較でなく is-mic で行う（ラベルを変えても配色が壊れないように）。クリック時のシーク秒は
+// Rust 側が index で解決する。
+export struct TranscriptRow {
+    speaker: string,
+    is-mic: bool,
+    time: string,
+    text: string,
 }
 
 // 音源バッジ（`Mic` / `System`）。選択行では白アウトライン、非選択では補助色アウトライン。
@@ -31,9 +42,29 @@ component SourceBadge inherits Rectangle {
     }
 }
 
-// トレイの「Recordings…」から開く録音一覧ウィンドウ。左＝セッション一覧、右＝再生と
-// （#54 で埋める）文字起こし。配色は Palette でライト/ダークに追従し、サイズ・淡色は共有の
-// Style トークンを使う（選択行の白文字はアクセント固定背景のため Style.on-accent-foreground）。
+// トランスクリプトの話者バッジ。Mic はアクセント色背景＋白文字、System はニュートラル背景。
+component SpeakerBadge inherits Rectangle {
+    in property <string> label;
+    in property <bool> accent;
+    border-radius: 4px;
+    background: accent ? Palette.accent-background : Palette.border;
+    HorizontalLayout {
+        padding-left: 6px;
+        padding-right: 6px;
+        padding-top: 2px;
+        padding-bottom: 2px;
+        Text {
+            text: root.label;
+            font-size: Style.badge-size;
+            font-weight: Style.semibold;
+            color: root.accent ? Style.on-accent-foreground : Palette.foreground;
+        }
+    }
+}
+
+// トレイの「Recordings…」から開く録音一覧ウィンドウ。左＝セッション一覧、右＝再生と文字起こし。
+// 配色は Palette でライト/ダークに追従し、サイズ・淡色は共有の Style トークンを使う
+// （選択行の白文字はアクセント固定背景のため Style.on-accent-foreground）。
 export component RecordingsWindow inherits Window {
     title: "Recordings";
     // 幅・高さは src/main.rs の RECORDINGS_WIDTH/HEIGHT と一致させること（片方だけ変えない）。
@@ -50,8 +81,11 @@ export component RecordingsWindow inherits Window {
     in property <bool> has-selection;
     in property <string> detail-datetime;
     in property <string> detail-summary;
-    // 選択セッションに文字起こし JSON があるか（無ければ Transcript は縮退表示。中身は #54）。
-    in property <bool> has-transcript;
+    // 選択セッションのトランスクリプト（mic.json / system.json をマージしたもの。新→旧でなく時刻順）。
+    // 空なら Transcript セクションは「Not Transcribed Yet」に縮退表示する。
+    in property <[TranscriptRow]> segments;
+    // 現在の再生位置に対応するセグメントの index（ハイライト対象。-1 は該当なし）。
+    in property <int> current-segment: -1;
     // 選択セッションが再生可能か（両音源は mix.mp3 生成済み、単一音源は常に可）。false なら
     // 再生ボタンを無効化する。
     in property <bool> playable;
@@ -66,6 +100,8 @@ export component RecordingsWindow inherits Window {
     // 再生/一時停止トグルと停止。
     callback play-pause();
     callback stop();
+    // トランスクリプトのセグメントクリック。その開始秒へ再生位置をスキップする（index を渡す）。
+    callback seek-to-segment(int);
 
     HorizontalLayout {
         padding: 16px;
@@ -182,12 +218,15 @@ export component RecordingsWindow inherits Window {
                 color: Palette.foreground.transparentize(Style.muted-alpha);
             }
 
+            // alignment は既定（stretch）にし、余った高さを Transcript セクション
+            // （vertical-stretch: 1）へ与える。alignment: start だと全子要素が推奨サイズに
+            // 縮み、中身が可変の Transcript の箱が見出しだけに潰れる。
             if root.has-selection: VerticalLayout {
-                alignment: start;
                 spacing: 12px;
 
                 // ヘッダ: 日時と音源要約。
                 VerticalLayout {
+                    vertical-stretch: 0;
                     spacing: 3px;
                     Text {
                         text: root.detail-datetime;
@@ -205,6 +244,7 @@ export component RecordingsWindow inherits Window {
 
                 // Playback セクション。
                 Rectangle {
+                    vertical-stretch: 0;
                     border-width: 1px;
                     border-color: Palette.border;
                     border-radius: 8px;
@@ -268,7 +308,8 @@ export component RecordingsWindow inherits Window {
                     }
                 }
 
-                // Transcript セクション（枠のみ。セグメント描画・クリックは #54 で実装）。
+                // Transcript セクション。セグメントを時刻順に表示し、現在再生位置をハイライト、
+                // クリックでその開始秒へシークする。未生成・破損は「Not Transcribed Yet」に縮退。
                 Rectangle {
                     vertical-stretch: 1;
                     border-width: 1px;
@@ -289,9 +330,65 @@ export component RecordingsWindow inherits Window {
 
                         Rectangle {
                             vertical-stretch: 1;
-                            Text {
-                                // #53 では文字起こしの中身表示は未実装。生成済みでも本ウィンドウでは
-                                // まだ読まないため、常に未実装の縮退表示にする（#54 でセグメント描画に置換）。
+                            clip: true;
+
+                            // 文字起こしがあればセグメント一覧、無ければ縮退表示。長時間録音では
+                            // セグメントが数千件になり得るため、可視範囲だけ生成する ListView を使う
+                            // （ScrollView + for は全行を即時生成し、選択時のヒッチにつながる）。
+                            if root.segments.length > 0: ListView {
+                                for seg[i] in root.segments: Rectangle {
+                                    // 現在再生位置のセグメントをハイライト（淡色背景＋左 3px 罫線）。
+                                    property <bool> active: i == root.current-segment;
+                                    background: active ? Style.segment-highlight : transparent;
+                                    // ListView の行は自身の高さを明示する（word-wrap する本文の
+                                    // 実高さに追従させる）。
+                                    height: row-content.preferred-height;
+                                    TouchArea {
+                                        clicked => {
+                                            root.seek-to-segment(i);
+                                        }
+                                    }
+
+                                    row-content := HorizontalLayout {
+                                        // 左端のアクセント罫線（active のときだけ幅を持つ）。
+                                        Rectangle {
+                                            width: active ? 3px : 0px;
+                                            background: Palette.accent-background;
+                                        }
+
+                                        VerticalLayout {
+                                            padding-left: 8px;
+                                            padding-right: 6px;
+                                            padding-top: 6px;
+                                            padding-bottom: 6px;
+                                            spacing: 3px;
+                                            HorizontalLayout {
+                                                alignment: start;
+                                                spacing: 7px;
+                                                SpeakerBadge {
+                                                    label: seg.speaker;
+                                                    accent: seg.is-mic;
+                                                }
+
+                                                Text {
+                                                    text: seg.time;
+                                                    font-size: Style.caption-size;
+                                                    vertical-alignment: center;
+                                                    color: Palette.foreground.transparentize(Style.muted-alpha);
+                                                }
+                                            }
+
+                                            Text {
+                                                text: seg.text;
+                                                wrap: word-wrap;
+                                                font-size: Style.body-size;
+                                                color: Palette.foreground;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if root.segments.length == 0: Text {
                                 text: "Not Transcribed Yet";
                                 font-size: Style.body-size;
                                 horizontal-alignment: center;
