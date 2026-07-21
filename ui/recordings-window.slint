@@ -1,4 +1,4 @@
-import { Button, ScrollView, Palette } from "std-widgets.slint";
+import { Button, ListView, ScrollView, Palette } from "std-widgets.slint";
 import { Style } from "style.slint";
 
 // 一覧の 1 行分。Rust の recordings::RecordingSession から詰める。
@@ -9,10 +9,11 @@ export struct SessionRow {
     has-transcript: bool,
 }
 
-// トランスクリプトの 1 セグメント。Rust の transcript::TranscriptSegment から詰める
-// （speaker は "Mic" / "System"、time は "mm:ss"）。配色判定はラベル文字列の比較でなく is-mic で
-// 行う（ラベルを変えても配色が壊れないように）。クリック時のシーク秒は Rust 側が index で解決する。
-export struct TranscriptSegment {
+// トランスクリプトの表示 1 行分。Rust の transcript::TranscriptSegment から詰める
+// （speaker は "Mic" / "System"、time は "mm:ss"、1 時間以上は "h:mm:ss"）。配色判定はラベル文字列の
+// 比較でなく is-mic で行う（ラベルを変えても配色が壊れないように）。クリック時のシーク秒は
+// Rust 側が index で解決する。
+export struct TranscriptRow {
     speaker: string,
     is-mic: bool,
     time: string,
@@ -80,10 +81,9 @@ export component RecordingsWindow inherits Window {
     in property <bool> has-selection;
     in property <string> detail-datetime;
     in property <string> detail-summary;
-    // 選択セッションに文字起こしがあるか（無ければ Transcript は縮退表示）。
-    in property <bool> has-transcript;
     // 選択セッションのトランスクリプト（mic.json / system.json をマージしたもの。新→旧でなく時刻順）。
-    in property <[TranscriptSegment]> segments;
+    // 空なら Transcript セクションは「Not Transcribed Yet」に縮退表示する。
+    in property <[TranscriptRow]> segments;
     // 現在の再生位置に対応するセグメントの index（ハイライト対象。-1 は該当なし）。
     in property <int> current-segment: -1;
     // 選択セッションが再生可能か（両音源は mix.mp3 生成済み、単一音源は常に可）。false なら
@@ -328,61 +328,63 @@ export component RecordingsWindow inherits Window {
                             vertical-stretch: 1;
                             clip: true;
 
-                            // 文字起こしがあればセグメント一覧、無ければ縮退表示。
-                            if root.has-transcript && root.segments.length > 0: ScrollView {
-                                VerticalLayout {
-                                    alignment: start;
-                                    for seg[i] in root.segments: Rectangle {
-                                        // 現在再生位置のセグメントをハイライト（淡色背景＋左 3px 罫線）。
-                                        property <bool> active: i == root.current-segment;
-                                        background: active ? Style.segment-highlight : transparent;
-                                        TouchArea {
-                                            clicked => {
-                                                root.seek-to-segment(i);
-                                            }
+                            // 文字起こしがあればセグメント一覧、無ければ縮退表示。長時間録音では
+                            // セグメントが数千件になり得るため、可視範囲だけ生成する ListView を使う
+                            // （ScrollView + for は全行を即時生成し、選択時のヒッチにつながる）。
+                            if root.segments.length > 0: ListView {
+                                for seg[i] in root.segments: Rectangle {
+                                    // 現在再生位置のセグメントをハイライト（淡色背景＋左 3px 罫線）。
+                                    property <bool> active: i == root.current-segment;
+                                    background: active ? Style.segment-highlight : transparent;
+                                    // ListView の行は自身の高さを明示する（word-wrap する本文の
+                                    // 実高さに追従させる）。
+                                    height: row-content.preferred-height;
+                                    TouchArea {
+                                        clicked => {
+                                            root.seek-to-segment(i);
+                                        }
+                                    }
+
+                                    row-content := HorizontalLayout {
+                                        // 左端のアクセント罫線（active のときだけ幅を持つ）。
+                                        Rectangle {
+                                            width: active ? 3px : 0px;
+                                            background: Palette.accent-background;
                                         }
 
-                                        HorizontalLayout {
-                                            // 左端のアクセント罫線（active のときだけ幅を持つ）。
-                                            Rectangle {
-                                                width: active ? 3px : 0px;
-                                                background: Palette.accent-background;
-                                            }
-
-                                            VerticalLayout {
-                                                padding-left: 8px;
-                                                padding-right: 6px;
-                                                padding-top: 6px;
-                                                padding-bottom: 6px;
-                                                spacing: 3px;
-                                                HorizontalLayout {
-                                                    alignment: start;
-                                                    spacing: 7px;
-                                                    SpeakerBadge {
-                                                        label: seg.speaker;
-                                                        accent: seg.is-mic;
-                                                    }
-
-                                                    Text {
-                                                        text: seg.time;
-                                                        font-size: Style.caption-size;
-                                                        vertical-alignment: center;
-                                                        color: Palette.foreground.transparentize(Style.muted-alpha);
-                                                    }
+                                        VerticalLayout {
+                                            padding-left: 8px;
+                                            padding-right: 6px;
+                                            padding-top: 6px;
+                                            padding-bottom: 6px;
+                                            spacing: 3px;
+                                            HorizontalLayout {
+                                                alignment: start;
+                                                spacing: 7px;
+                                                SpeakerBadge {
+                                                    label: seg.speaker;
+                                                    accent: seg.is-mic;
                                                 }
 
                                                 Text {
-                                                    text: seg.text;
-                                                    wrap: word-wrap;
-                                                    font-size: Style.body-size;
-                                                    color: Palette.foreground;
+                                                    text: seg.time;
+                                                    font-size: Style.caption-size;
+                                                    vertical-alignment: center;
+                                                    color: Palette.foreground.transparentize(Style.muted-alpha);
                                                 }
+                                            }
+
+                                            Text {
+                                                text: seg.text;
+                                                wrap: word-wrap;
+                                                font-size: Style.body-size;
+                                                color: Palette.foreground;
                                             }
                                         }
                                     }
                                 }
                             }
-                            if !(root.has-transcript && root.segments.length > 0): Text {
+                            if root.segments.length == 0: Text {
                                 text: "Not Transcribed Yet";
                                 font-size: Style.body-size;
                                 horizontal-alignment: center;

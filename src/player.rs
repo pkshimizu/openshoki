@@ -54,11 +54,15 @@ impl AudioPlayer {
     }
 
     /// 再生対象ファイルをロードして再生準備する（停止状態でセット。`play_pause` で再生開始）。
+    /// 失敗時は前のセッションの状態を残さない（stale な `path` が残ると、後続の seek /
+    /// play_pause が前のセッションの音声を開き直し、表示中のトランスクリプトと食い違う）。
     pub fn load(&mut self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        self.player.clear();
+        self.path = None;
+        self.duration = None;
         let source = open_decoder(path)?;
         self.duration = source.total_duration();
         self.path = Some(path.to_path_buf());
-        self.player.clear();
         self.player.append(source);
         self.player.pause();
         Ok(())

@@ -308,12 +308,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             rec.set_has_selection(true);
             rec.set_detail_datetime(session.display_datetime.clone().into());
             rec.set_detail_summary(session.source_summary().into());
-            // 文字起こしを読み込み、話者ラベル＋開始時刻付きのセグメント一覧を更新する。
+            // 文字起こしを読み込み、話者ラベル＋開始時刻付きのセグメント一覧を更新する
+            // （空＝欠落・破損・未生成なら Slint 側が縮退表示する）。
             let segments = transcript::load_transcript(&session.dir);
             rec.set_segments(Rc::new(slint::VecModel::from(transcript_rows(&segments))).into());
             rec.set_current_segment(-1);
-            // 実際に表示できるセグメントがあるときだけ Transcript を出す（欠落・破損・空は縮退表示）。
-            rec.set_has_transcript(!segments.is_empty());
             *transcript_segments.borrow_mut() = segments;
             rec.set_playing(false);
             rec.set_progress(0.0);
@@ -383,7 +382,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return;
             };
             if let Some(p) = player.borrow().as_ref() {
-                p.seek(Duration::try_from_secs_f64(segment.start_secs).unwrap_or(Duration::ZERO));
+                p.seek(segment.start_duration());
             }
             // クリックしたセグメントを即ハイライトする（次の tick で位置に追従する）。
             rec.set_current_segment(index);
@@ -665,18 +664,15 @@ fn open_recordings_window(
 }
 
 /// トランスクリプトの各セグメントを Slint 表示行へ変換する。表示ラベルと配色判定（is_mic）を
-/// 分けて渡し、開始秒は不正値（負・非有限・巨大）でもパニックしないよう try_from で ZERO へ丸める。
-fn transcript_rows(segments: &[transcript::TranscriptSegment]) -> Vec<TranscriptSegment> {
+/// 分けて渡す（不正な開始秒の丸めは `TranscriptSegment::start_duration` に集約）。
+fn transcript_rows(segments: &[transcript::TranscriptSegment]) -> Vec<TranscriptRow> {
     segments
         .iter()
-        .map(|seg| TranscriptSegment {
+        .map(|seg| TranscriptRow {
             speaker: seg.speaker.label().into(),
             is_mic: seg.speaker == transcript::Speaker::Mic,
-            time: tray::format_elapsed(
-                Duration::try_from_secs_f64(seg.start_secs).unwrap_or(Duration::ZERO),
-            )
-            .into(),
-            text: seg.text.clone().into(),
+            time: tray::format_elapsed(seg.start_duration()).into(),
+            text: seg.text.as_str().into(),
         })
         .collect()
 }
