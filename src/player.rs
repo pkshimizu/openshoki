@@ -98,6 +98,37 @@ impl AudioPlayer {
         }
     }
 
+    /// 指定位置へシークする（文字起こしのセグメントクリックで使う）。再生/一時停止の状態は
+    /// 変えない（再生中はその位置から続行、一時停止中は位置だけ移動）。
+    ///
+    /// 終端・停止後でキューが空なら、まず対象ファイルを積み直してからシークする。`try_seek` が
+    /// 効かない（byte_len 不明などでシーク非対応の）ときは、対象ファイルを開き直して先頭を読み
+    /// 飛ばすフォールバックにする（この経路では再生位置表示の基準が 0 に戻りうる）。
+    pub fn seek(&self, pos: Duration) {
+        if self.player.empty() {
+            self.append_from_start();
+        }
+        if let Err(err) = self.player.try_seek(pos) {
+            eprintln!("Seeking via try_seek failed; re-decoding from the position: {err}");
+            self.append_skipping(pos);
+        }
+    }
+
+    /// 対象ファイルを開き直し、先頭 `pos` を読み飛ばしてキューへ積み直す（`try_seek` 非対応時の
+    /// フォールバック）。失敗はログして続行。
+    fn append_skipping(&self, pos: Duration) {
+        let Some(path) = &self.path else {
+            return;
+        };
+        match open_decoder(path) {
+            Ok(source) => {
+                self.player.clear();
+                self.player.append(source.skip_duration(pos));
+            }
+            Err(err) => eprintln!("Failed to reopen the audio for seeking: {err}"),
+        }
+    }
+
     /// 現在の再生位置。
     pub fn position(&self) -> Duration {
         self.player.get_pos()

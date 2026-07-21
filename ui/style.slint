@@ -1,3 +1,5 @@
+import { Palette } from "std-widgets.slint";
+
 // タイポグラフィと淡色のトークン。意味のある繰り返し値を 1 箇所に集約し、トーン調整時の
 // 追従漏れ・不整合を防ぐ（余白やインデントの一回きりの値は各所に直書きのままでよい）。
 // 設定ウィンドウ（app-window.slint）と Recordings ウィンドウ（recordings-window.slint）で共有する。
@@ -12,4 +14,6 @@ export global Style {
     out property <float> muted-alpha: 0.4; // 補助テキストの淡色化（transparentize の引数）
     out property <float> disabled-opacity: 0.4; // 従属/未選択ブロックの淡色化（opacity）
     out property <brush> on-accent-foreground: #ffffff; // アクセント背景の上に載る前景（白固定）
+    // 再生中セグメントのハイライト背景（アクセント色の淡色）。カンプの light .12 / dark .20 相当。
+    out property <brush> segment-highlight: Palette.accent-background.transparentize(0.85);
 }

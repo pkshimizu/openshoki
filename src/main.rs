@@ -14,6 +14,7 @@ mod single_instance;
 #[cfg(target_os = "macos")]
 mod system_audio;
 mod transcribe;
+mod transcript;
 mod tray;
 mod whisper_model;
 
@@ -285,11 +286,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 一覧に表示中のセッション（選択インデックス→音源パスの解決に使う）。
     let sessions: Rc<RefCell<Vec<recordings::RecordingSession>>> =
         Rc::new(RefCell::new(Vec::new()));
+    // 選択中セッションのトランスクリプト（セグメントクリック→開始秒の解決、tick→現在セグメントの
+    // 算出に使う）。選択のたびに読み直す。
+    let transcript_segments: Rc<RefCell<Vec<transcript::TranscriptSegment>>> =
+        Rc::new(RefCell::new(Vec::new()));
 
     // セッション選択: 詳細を更新し、その音源を再生準備（停止状態でロード。Play で再生開始）。
     {
         let player = Rc::clone(&player);
         let sessions = Rc::clone(&sessions);
+        let transcript_segments = Rc::clone(&transcript_segments);
         let rec_weak = recordings_ui.as_weak();
         recordings_ui.on_select_session(move |index| {
             let Some(rec) = rec_weak.upgrade() else {
@@ -302,7 +308,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             rec.set_has_selection(true);
             rec.set_detail_datetime(session.display_datetime.clone().into());
             rec.set_detail_summary(session.source_summary().into());
-            rec.set_has_transcript(session.has_transcript);
+            // 文字起こしを読み込み、話者ラベル＋開始時刻付きのセグメント一覧を更新する。
+            let segments = transcript::load_transcript(&session.dir);
+            rec.set_segments(Rc::new(slint::VecModel::from(transcript_rows(&segments))).into());
+            rec.set_current_segment(-1);
+            // 実際に表示できるセグメントがあるときだけ Transcript を出す（欠落・破損・空は縮退表示）。
+            rec.set_has_transcript(!segments.is_empty());
+            *transcript_segments.borrow_mut() = segments;
             rec.set_playing(false);
             rec.set_progress(0.0);
             // 再生対象は事前生成の mix.mp3（両音源）か単一音源ファイル。両音源で mix.mp3 が
@@ -357,6 +369,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // トランスクリプトのセグメントクリック: その開始秒へ再生位置をスキップする。
+    {
+        let player = Rc::clone(&player);
+        let transcript_segments = Rc::clone(&transcript_segments);
+        let rec_weak = recordings_ui.as_weak();
+        recordings_ui.on_seek_to_segment(move |index| {
+            let Some(rec) = rec_weak.upgrade() else {
+                return;
+            };
+            let segments = transcript_segments.borrow();
+            let Some(segment) = usize::try_from(index).ok().and_then(|i| segments.get(i)) else {
+                return;
+            };
+            if let Some(p) = player.borrow().as_ref() {
+                p.seek(Duration::try_from_secs_f64(segment.start_secs).unwrap_or(Duration::ZERO));
+            }
+            // クリックしたセグメントを即ハイライトする（次の tick で位置に追従する）。
+            rec.set_current_segment(index);
+        });
+    }
+
     // トレイのメニューイベントを Slint のイベントループ上でポーリングし、
     // ウィンドウ操作・終了へ橋渡しする。
     let timer = slint::Timer::default();
@@ -369,6 +402,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ui: recordings_ui.as_weak(),
                 player: Rc::clone(&player),
                 sessions: Rc::clone(&sessions),
+                transcript_segments: Rc::clone(&transcript_segments),
             },
             &tray,
             Rc::clone(&config),
@@ -403,6 +437,7 @@ struct RecordingsHandles {
     ui: slint::Weak<RecordingsWindow>,
     player: Rc<RefCell<Option<player::AudioPlayer>>>,
     sessions: Rc<RefCell<Vec<recordings::RecordingSession>>>,
+    transcript_segments: Rc<RefCell<Vec<transcript::TranscriptSegment>>>,
 }
 
 /// 録音停止後に走らせるバックグラウンド処理のワーカー一式（文字起こし・ミックス生成）。
@@ -437,6 +472,7 @@ fn build_menu_event_handler(
         ui: rec_ui,
         player,
         sessions,
+        transcript_segments,
     } = recordings;
     // クロージャは 'static のため &Tray を借用できない。必要な要素（各項目・ID・アイコン）
     // だけを複製して所有する。
@@ -576,6 +612,12 @@ fn build_menu_event_handler(
             };
             rec.set_progress(progress);
             rec.set_playing(player.is_playing());
+            // 再生位置に対応するトランスクリプトのセグメントをハイライトする（該当なしは -1）。
+            let current =
+                transcript::current_index(&transcript_segments.borrow(), position.as_secs_f64())
+                    .and_then(|index| i32::try_from(index).ok())
+                    .unwrap_or(-1);
+            rec.set_current_segment(current);
         }
     }
 }
@@ -620,6 +662,23 @@ fn open_recordings_window(
         slint::LogicalPosition::new(RECORDINGS_X, RECORDINGS_Y),
         slint::LogicalSize::new(RECORDINGS_WIDTH, RECORDINGS_HEIGHT),
     );
+}
+
+/// トランスクリプトの各セグメントを Slint 表示行へ変換する。表示ラベルと配色判定（is_mic）を
+/// 分けて渡し、開始秒は不正値（負・非有限・巨大）でもパニックしないよう try_from で ZERO へ丸める。
+fn transcript_rows(segments: &[transcript::TranscriptSegment]) -> Vec<TranscriptSegment> {
+    segments
+        .iter()
+        .map(|seg| TranscriptSegment {
+            speaker: seg.speaker.label().into(),
+            is_mic: seg.speaker == transcript::Speaker::Mic,
+            time: tray::format_elapsed(
+                Duration::try_from_secs_f64(seg.start_secs).unwrap_or(Duration::ZERO),
+            )
+            .into(),
+            text: seg.text.clone().into(),
+        })
+        .collect()
 }
 
 /// 再生時間の表示文字列（`mm:ss / mm:ss`）。全体長が不明なときは `--:--` を出す。
