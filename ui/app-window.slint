@@ -35,7 +35,7 @@ export component AppWindow inherits Window {
     title: "openshoki";
     // preferred だけだと中身の最小高さ（≒0）に引っ張られて潰れるため、min も指定する。
     // 幅・高さは src/main.rs の WINDOW_WIDTH/HEIGHT と一致させること（片方だけ変えない）。
-    // 幅は 420 固定。高さは新レイアウト（3 セクション）に合わせた値。
+    // 幅は 420 固定。高さは 3 セクション＋Transcription の Language 行に合わせた値。
     min-width: 420px;
     min-height: 720px;
     preferred-width: 420px;

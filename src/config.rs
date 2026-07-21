@@ -50,6 +50,21 @@ fn default_transcribe_language() -> String {
     TRANSCRIBE_LANGUAGES[0].0.to_owned()
 }
 
+/// `transcribe_language` を寛容にデシリアライズする。設定 TOML は手編集されうる信頼境界外で、
+/// 非文字列（数値・真偽値等）が入っても当該項目だけ既定へ丸め、他の設定（保存先・登録アプリ）を
+/// 巻き添えで失わせない（`String` で直接受けると型不一致でファイル全体が既定へ落ちてしまう。
+/// `docs/rules/error-handling.md`）。文字列であれば任意のコードを受け、検証は whisper 側に任せる。
+fn deserialize_transcribe_language<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = toml::Value::deserialize(deserializer)?;
+    Ok(value
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(default_transcribe_language))
+}
+
 /// 言語コード → カタログ内インデックス。カタログ外（手編集値）は既定（先頭 = English）位置へ
 /// フォールバックする（値自体は書き換えず、表示だけ既定位置になる。ユーザーが ComboBox を
 /// 操作した時点で上書き保存される）。
@@ -110,7 +125,11 @@ pub struct Config {
     /// 言語コードを入れてもそのまま whisper へ渡す（不正なら whisper.cpp 側が検証して
     /// 当該音源をスキップする）。旧 config で未指定の場合も `en` になる
     /// （従来も whisper の既定言語が `en` のため、実挙動は変わらない）。
-    #[serde(default = "default_transcribe_language")]
+    /// 手編集で非文字列が入っても当該項目のみ既定へ丸める（`deserialize_transcribe_language`）。
+    #[serde(
+        default = "default_transcribe_language",
+        deserialize_with = "deserialize_transcribe_language"
+    )]
     pub transcribe_language: String,
 }
 
@@ -296,6 +315,20 @@ mod tests {
         assert!(!restored.auto_transcribe);
         assert!(restored.whisper_model_path.is_none());
         // 言語未指定は既定の英語になる（従来も whisper の既定言語が en のため実挙動は不変）。
+        assert_eq!(restored.transcribe_language, "en");
+    }
+
+    #[test]
+    fn deserialize_keeps_auto_language_and_rounds_non_string() {
+        // "auto"（自動判定の特別値）はそのまま保持される。非文字列の手編集値は当該項目のみ
+        // 既定（en）へ丸まり、他のフィールド（保存先）を巻き添えにしない。
+        let auto = "recording_dir = \"/tmp/x\"\ntranscribe_language = \"auto\"\n";
+        let restored: Config = toml::from_str(auto).expect("auto should load");
+        assert_eq!(restored.transcribe_language, "auto");
+
+        let bad = "recording_dir = \"/tmp/openshoki-lang\"\ntranscribe_language = 123\n";
+        let restored: Config = toml::from_str(bad).expect("non-string should not fail the file");
+        assert_eq!(restored.recording_dir, PathBuf::from("/tmp/openshoki-lang"));
         assert_eq!(restored.transcribe_language, "en");
     }
 
