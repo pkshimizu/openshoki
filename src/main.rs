@@ -42,7 +42,7 @@ const BLINK_CYCLE_SECS: f32 = 2.0;
 /// 確定されないまま高さ 0 で表示される。初回表示時にこの値を明示してジオメトリを確定させる。
 /// 幅・高さは `ui/app-window.slint` の min/preferred と一致させること（片方だけ変えない）。
 const WINDOW_WIDTH: f32 = 420.0;
-const WINDOW_HEIGHT: f32 = 680.0;
+const WINDOW_HEIGHT: f32 = 720.0;
 /// 初回表示位置（画面左上からの暫定値）。中央寄せ等の調整は後続に回す。
 const WINDOW_X: f32 = 240.0;
 const WINDOW_Y: f32 = 160.0;
@@ -77,6 +77,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 保存値は load 時に範囲へ正規化済みなので、そのまま表示へ渡す。
     ui.set_auto_stop_debounce_secs(config.borrow().auto_stop_debounce_secs as i32);
     ui.set_auto_transcribe(config.borrow().auto_transcribe);
+    // 文字起こし言語: 表示名一覧はカタログ（TRANSCRIBE_LANGUAGES）から組み立てる。選択位置は
+    // 設定の言語コードから解決し、カタログ外の手編集値は既定（English）位置に表示される
+    // （値は書き換えず、ユーザーが ComboBox を操作した時点で上書き保存される）。
+    ui.set_transcribe_languages(
+        Rc::new(slint::VecModel::<slint::SharedString>::from(
+            config::TRANSCRIBE_LANGUAGES
+                .iter()
+                .map(|(_, display)| slint::SharedString::from(*display))
+                .collect::<Vec<_>>(),
+        ))
+        .into(),
+    );
+    ui.set_transcribe_language_index(config::transcribe_language_index(
+        &config.borrow().transcribe_language,
+    ) as i32);
     // 登録アプリの表示名一覧を Slint のモデルで持ち、追加/削除で更新する。
     let app_list_model = Rc::new(slint::VecModel::<slint::SharedString>::from(
         config
@@ -184,6 +199,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return;
         }
         *config_for_transcribe.borrow_mut() = candidate;
+    });
+
+    // 文字起こし言語の変更: ComboBox のインデックスをカタログの言語コードへ変換して永続化する。
+    // Slint 側は先に選択位置を新値へ更新するため、保存失敗時は表示を保存済みの値へ戻す
+    // （docs/rules/slint.md）。
+    let config_for_language = Rc::clone(&config);
+    let ui_for_language = ui.as_weak();
+    ui.on_change_transcribe_language(move |index| {
+        let Some(ui) = ui_for_language.upgrade() else {
+            return;
+        };
+        // ComboBox は Rust が渡したカタログの範囲しか返さないが、防御的に既定（先頭）へ丸める。
+        let code = usize::try_from(index)
+            .ok()
+            .and_then(|i| config::TRANSCRIBE_LANGUAGES.get(i))
+            .unwrap_or(&config::TRANSCRIBE_LANGUAGES[0])
+            .0;
+        let mut candidate = config_for_language.borrow().clone();
+        candidate.transcribe_language = code.to_owned();
+        if let Err(err) = candidate.save() {
+            eprintln!(
+                "Not changing the transcription language because saving the settings failed: {err}"
+            );
+            ui.set_transcribe_language_index(config::transcribe_language_index(
+                &config_for_language.borrow().transcribe_language,
+            ) as i32);
+            return;
+        }
+        *config_for_language.borrow_mut() = candidate;
     });
 
     // 登録アプリの削除: 一覧のインデックスで設定とモデルから取り除く（永続化成功後に反映）。

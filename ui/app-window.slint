@@ -1,4 +1,4 @@
-import { Button, CheckBox, ScrollView, SpinBox, Palette } from "std-widgets.slint";
+import { Button, CheckBox, ComboBox, ScrollView, SpinBox, Palette } from "std-widgets.slint";
 import { Style } from "style.slint";
 
 // Recordings ウィンドウは別ファイルで定義し、ここから再エクスポートして 1 つのエントリ
@@ -37,9 +37,9 @@ export component AppWindow inherits Window {
     // 幅・高さは src/main.rs の WINDOW_WIDTH/HEIGHT と一致させること（片方だけ変えない）。
     // 幅は 420 固定。高さは新レイアウト（3 セクション）に合わせた値。
     min-width: 420px;
-    min-height: 680px;
+    min-height: 720px;
     preferred-width: 420px;
-    preferred-height: 680px;
+    preferred-height: 720px;
 
     // 現在の録音ファイル保存先（表示用）。Rust 側から設定する。
     in property <string> recording-dir;
@@ -54,6 +54,11 @@ export component AppWindow inherits Window {
     // 「録音停止時に自動文字起こし」の ON/OFF。起動時に Rust 側が設定値で初期化し、以後は
     // トグル操作で Slint が状態を保持する（in-out。保存失敗時は Rust 側が書き戻す）。
     in-out property <bool> auto-transcribe;
+    // 文字起こしの言語の表示名一覧（Rust 側の TRANSCRIBE_LANGUAGES を反映。並び順も Rust が決める）。
+    in property <[string]> transcribe-languages;
+    // 選択中の言語のカタログ内インデックス。起動時に Rust 側が設定値で初期化し、以後は
+    // ComboBox で編集する（in-out。保存失敗時は Rust 側が書き戻す）。
+    in-out property <int> transcribe-language-index;
     // 「フォルダを選択」押下。Rust 側でネイティブのフォルダ選択ダイアログを開く。
     callback choose-folder();
     // アプリのマイク使用 自動録音トグルの切り替え。新しい ON/OFF を渡し、Rust 側で設定へ永続化する。
@@ -66,6 +71,8 @@ export component AppWindow inherits Window {
     callback remove-app(int);
     // 自動文字起こしトグルの切り替え。新しい ON/OFF を渡し、Rust 側で設定へ永続化する。
     callback toggle-auto-transcribe(bool);
+    // 文字起こし言語の変更。カタログ内インデックスを渡し、Rust 側でコードへ変換して永続化する。
+    callback change-transcribe-language(int);
 
     VerticalLayout {
         alignment: start;
@@ -258,6 +265,37 @@ export component AppWindow inherits Window {
                     color: Palette.foreground;
                     vertical-alignment: center;
                     horizontal-stretch: 1;
+                }
+            }
+
+            // 従属コントロール（Language）を左インデントし、文字起こし OFF のときは
+            // 淡色化＋無効化で従属関係を示す（Auto-record セクションの deps と同じ流儀）。
+            transcribe-deps := Rectangle {
+                property <bool> enabled-gate: root.auto-transcribe;
+                opacity: enabled-gate ? 1.0 : Style.disabled-opacity;
+                VerticalLayout {
+                    padding-left: 23px;
+                    padding-top: 6px;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: "Language";
+                            font-size: Style.body-size;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                            color: Palette.foreground;
+                        }
+
+                        ComboBox {
+                            model: root.transcribe-languages;
+                            current-index: root.transcribe-language-index;
+                            enabled: transcribe-deps.enabled-gate;
+                            selected => {
+                                root.transcribe-language-index = self.current-index;
+                                root.change-transcribe-language(self.current-index);
+                            }
+                        }
+                    }
                 }
             }
 
