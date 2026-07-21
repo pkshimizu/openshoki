@@ -29,6 +29,52 @@ const DEFAULT_DEBOUNCE_SECS: u32 = 4;
 pub const DEBOUNCE_MIN_SECS: u32 = 1;
 pub const DEBOUNCE_MAX_SECS: u32 = 60;
 
+/// 文字起こしの認識言語カタログ（whisper の言語コード, 設定画面の表示名）。
+/// 先頭が既定（英語）。設定画面の ComboBox はこの順で並ぶため、言語を足すときは
+/// ここへ 1 行追加するだけでよい（`ui/app-window.slint` 側は Rust から model を渡す）。
+/// `auto` は whisper の自動判定（whisper.cpp が `auto` を特別値として解釈する）。
+pub const TRANSCRIBE_LANGUAGES: &[(&str, &str)] = &[
+    ("en", "English"),
+    ("ja", "Japanese"),
+    ("zh", "Chinese"),
+    ("ko", "Korean"),
+    ("es", "Spanish"),
+    ("fr", "French"),
+    ("de", "German"),
+    ("pt", "Portuguese"),
+    ("auto", "Auto detect"),
+];
+
+/// 既定の文字起こし言語（カタログ先頭 = 英語）。
+fn default_transcribe_language() -> String {
+    TRANSCRIBE_LANGUAGES[0].0.to_owned()
+}
+
+/// `transcribe_language` を寛容にデシリアライズする。設定 TOML は手編集されうる信頼境界外で、
+/// 非文字列（数値・真偽値等）が入っても当該項目だけ既定へ丸め、他の設定（保存先・登録アプリ）を
+/// 巻き添えで失わせない（`String` で直接受けると型不一致でファイル全体が既定へ落ちてしまう。
+/// `docs/rules/error-handling.md`）。文字列であれば任意のコードを受け、検証は whisper 側に任せる。
+fn deserialize_transcribe_language<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = toml::Value::deserialize(deserializer)?;
+    Ok(value
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(default_transcribe_language))
+}
+
+/// 言語コード → カタログ内インデックス。カタログ外（手編集値）は既定（先頭 = English）位置へ
+/// フォールバックする（値自体は書き換えず、表示だけ既定位置になる。ユーザーが ComboBox を
+/// 操作した時点で上書き保存される）。
+pub fn transcribe_language_index(code: &str) -> usize {
+    TRANSCRIBE_LANGUAGES
+        .iter()
+        .position(|(c, _)| *c == code)
+        .unwrap_or(0)
+}
+
 /// 自動録音のトリガーにする登録アプリ。`.app` から取得したバンドル ID で、マイク入力を使っている
 /// プロセスを照合し、表示名は設定画面での一覧表示に使う。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,9 +120,17 @@ pub struct Config {
     /// （上級者向け。config.toml の手編集のみで、設定 UI は無い）。
     #[serde(default)]
     pub whisper_model_path: Option<PathBuf>,
-    /// 文字起こしの言語（例: `ja`）。`None` は whisper の自動判定に任せる（既定）。
-    #[serde(default)]
-    pub transcribe_language: Option<String>,
+    /// 文字起こしの認識言語（whisper の言語コード。既定 `en`）。`auto` は自動判定。
+    /// 設定画面の ComboBox（`TRANSCRIBE_LANGUAGES`）から選ぶが、手編集でカタログ外の
+    /// 言語コードを入れてもそのまま whisper へ渡す（不正なら whisper.cpp 側が検証して
+    /// 当該音源をスキップする）。旧 config で未指定の場合も `en` になる
+    /// （従来も whisper の既定言語が `en` のため、実挙動は変わらない）。
+    /// 手編集で非文字列が入っても当該項目のみ既定へ丸める（`deserialize_transcribe_language`）。
+    #[serde(
+        default = "default_transcribe_language",
+        deserialize_with = "deserialize_transcribe_language"
+    )]
+    pub transcribe_language: String,
 }
 
 /// `auto_stop_debounce_secs` の serde 既定値。項目を持たない旧 config でも既定 4 秒で読める。
@@ -116,7 +170,7 @@ impl Default for Config {
             auto_stop_debounce_secs: DEFAULT_DEBOUNCE_SECS,
             auto_transcribe: false,
             whisper_model_path: None,
-            transcribe_language: None,
+            transcribe_language: default_transcribe_language(),
         }
     }
 }
@@ -228,7 +282,7 @@ mod tests {
             auto_stop_debounce_secs: 7,
             auto_transcribe: true,
             whisper_model_path: Some(PathBuf::from("/tmp/models/ggml-base.bin")),
-            transcribe_language: Some("ja".to_owned()),
+            transcribe_language: "ja".to_owned(),
         };
         let text = toml::to_string_pretty(&config).expect("serialization should succeed");
         let restored: Config = toml::from_str(&text).expect("deserialization should succeed");
@@ -260,7 +314,34 @@ mod tests {
         assert_eq!(restored.auto_stop_debounce_secs, DEFAULT_DEBOUNCE_SECS);
         assert!(!restored.auto_transcribe);
         assert!(restored.whisper_model_path.is_none());
-        assert!(restored.transcribe_language.is_none());
+        // 言語未指定は既定の英語になる（従来も whisper の既定言語が en のため実挙動は不変）。
+        assert_eq!(restored.transcribe_language, "en");
+    }
+
+    #[test]
+    fn deserialize_keeps_auto_language_and_rounds_non_string() {
+        // "auto"（自動判定の特別値）はそのまま保持される。非文字列の手編集値は当該項目のみ
+        // 既定（en）へ丸まり、他のフィールド（保存先）を巻き添えにしない。
+        let auto = "recording_dir = \"/tmp/x\"\ntranscribe_language = \"auto\"\n";
+        let restored: Config = toml::from_str(auto).expect("auto should load");
+        assert_eq!(restored.transcribe_language, "auto");
+
+        let bad = "recording_dir = \"/tmp/openshoki-lang\"\ntranscribe_language = 123\n";
+        let restored: Config = toml::from_str(bad).expect("non-string should not fail the file");
+        assert_eq!(restored.recording_dir, PathBuf::from("/tmp/openshoki-lang"));
+        assert_eq!(restored.transcribe_language, "en");
+    }
+
+    #[test]
+    fn transcribe_language_index_resolves_known_and_falls_back() {
+        // 既知コードはカタログ位置、カタログ外の手編集値は既定（先頭 = English）位置になる。
+        assert_eq!(transcribe_language_index("en"), 0);
+        assert_eq!(transcribe_language_index("ja"), 1);
+        assert_eq!(
+            transcribe_language_index("auto"),
+            TRANSCRIBE_LANGUAGES.len() - 1
+        );
+        assert_eq!(transcribe_language_index("xx"), 0);
     }
 
     #[test]

@@ -43,8 +43,8 @@ pub struct TranscribeJob {
     /// whisper モデルの上書きパス（設定 `whisper_model_path`）。`None` なら内蔵モデルを使う
     /// （未取得なら処理時に自動ダウンロードされる。`src/whisper_model.rs`）。
     pub model_override: Option<PathBuf>,
-    /// 認識言語（例: `ja`）。`None` は whisper の自動判定。
-    pub language: Option<String>,
+    /// 認識言語（whisper の言語コード。例: `en` / `ja`）。`auto` は自動判定。
+    pub language: String,
 }
 
 /// 文字起こしのバックグラウンドワーカー。`submit` されたジョブを 1 本のスレッドで逐次処理する
@@ -190,17 +190,15 @@ fn transcribe_file(
     params.set_print_timestamps(false);
     params.set_translate(false);
     // 言語は設定 TOML（手編集されうる信頼境界外）由来。whisper-rs の set_language は NUL バイトを
-    // 含む文字列で panic するため（内部の CString::new が expect）、ここで弾いて自動判定へ
-    // フォールバックする。未知の言語コードは whisper.cpp 側が検証して full() が Err を返すので、
-    // ここでは NUL だけ防げばよい。
-    match job.language.as_deref() {
-        Some(language) if language.contains('\0') => {
-            eprintln!(
-                "Ignoring the configured transcription language because it contains a NUL byte"
-            );
-        }
-        Some(language) => params.set_language(Some(language)),
-        None => {}
+    // 含む文字列で panic するため（内部の CString::new が expect）、ここで弾いて whisper の既定
+    // （en）へフォールバックする。未知の言語コードは whisper.cpp 側が検証して full() が Err を
+    // 返すので、ここでは NUL だけ防げばよい。`auto` は whisper.cpp が自動判定として解釈する
+    // 特別値のため、そのまま渡す（set_language を呼ばないと whisper の既定 en になり、
+    // 自動判定にはならない）。
+    if job.language.contains('\0') {
+        eprintln!("Ignoring the configured transcription language because it contains a NUL byte");
+    } else {
+        params.set_language(Some(&job.language));
     }
 
     let mut state = ctx.create_state()?;
@@ -213,7 +211,7 @@ fn transcribe_file(
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default(),
-        language: job.language.clone().unwrap_or_else(|| "auto".to_owned()),
+        language: job.language.clone(),
         duration_secs,
         segments,
     };
@@ -566,7 +564,7 @@ mod tests {
         run_job(&TranscribeJob {
             audio_paths: vec![audio_path.clone()],
             model_override: Some(PathBuf::from(model_path)),
-            language: None,
+            language: "en".to_owned(),
         });
 
         let json_path = audio_path.with_extension("json");
