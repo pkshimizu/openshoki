@@ -218,12 +218,15 @@ export component RecordingsWindow inherits Window {
                 color: Palette.foreground.transparentize(Style.muted-alpha);
             }
 
+            // alignment は既定（stretch）にし、余った高さを Transcript セクション
+            // （vertical-stretch: 1）へ与える。alignment: start だと全子要素が推奨サイズに
+            // 縮み、中身が可変の Transcript の箱が見出しだけに潰れる。
             if root.has-selection: VerticalLayout {
-                alignment: start;
                 spacing: 12px;
 
                 // ヘッダ: 日時と音源要約。
                 VerticalLayout {
+                    vertical-stretch: 0;
                     spacing: 3px;
                     Text {
                         text: root.detail-datetime;
@@ -241,6 +244,7 @@ export component RecordingsWindow inherits Window {
 
                 // Playback セクション。
                 Rectangle {
+                    vertical-stretch: 0;
                     border-width: 1px;
                     border-color: Palette.border;
                     border-radius: 8px;
