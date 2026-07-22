@@ -40,8 +40,10 @@ const RESAMPLE_CHUNK_FRAMES: usize = 1024;
 pub struct TranscribeJob {
     /// 対象の音声ファイル（セッションディレクトリ内の `mic.mp3` / `system.mp3`）。
     pub audio_paths: Vec<PathBuf>,
-    /// whisper モデルの上書きパス（設定 `whisper_model_path`）。`None` なら内蔵モデルを使う
-    /// （未取得なら処理時に自動ダウンロードされる。`src/whisper_model.rs`）。
+    /// 使用する内蔵モデルの識別子（設定 `whisper_model`）。カタログ外は既定へフォールバック。
+    pub model_id: String,
+    /// whisper モデルの上書きパス（設定 `whisper_model_path`）。`None` なら内蔵モデル
+    /// （`model_id`）を使う（未取得なら処理時に自動ダウンロードされる。`src/whisper_model.rs`）。
     pub model_override: Option<PathBuf>,
     /// 認識言語（whisper の言語コード。例: `en` / `ja`）。`auto` は自動判定。
     pub language: String,
@@ -61,7 +63,7 @@ impl TranscribeWorker {
     /// スレッドは意図的に join しない（detach）: 文字起こしは数分かかりうるため、終了時に
     /// join するとアプリの終了がブロックされる。常駐終了時に処理中のジョブは中断される
     /// （ベストエフォート。#30 のスコープ）。
-    pub fn start() -> Self {
+    pub fn start(downloader: crate::whisper_model::ModelDownloader) -> Self {
         // whisper.cpp / GGML が stderr へ出す冗長な内部ログを止める（ログ backend の feature を
         // 有効にしていないため、フック先が無く事実上の無効化になる）。複数回呼んでも安全。
         whisper_rs::install_logging_hooks();
@@ -71,7 +73,7 @@ impl TranscribeWorker {
             .spawn(move || {
                 // 送信側（アプリ本体）が落ちてチャネルが閉じたら自然に終了する。
                 while let Ok(job) = rx.recv() {
-                    run_job(&job);
+                    run_job(&job, &downloader);
                 }
             });
         match spawned {
@@ -100,24 +102,30 @@ impl TranscribeWorker {
 
 /// 1 ジョブ（1 回の録音停止分）を処理する。モデルはジョブ内で 1 回だけロードして
 /// 複数音源で使い回す（モデルのロードが重いため）。音源単位の失敗は他の音源へ波及させない。
-fn run_job(job: &TranscribeJob) {
+fn run_job(job: &TranscribeJob, downloader: &crate::whisper_model::ModelDownloader) {
     if job.audio_paths.is_empty() {
         // 対象なしでモデル（数百 MB〜）をロードしない防御。通常は投入側が空を渡さない。
         return;
     }
-    // モデルを解決する。上書き指定があればそれを、無ければ内蔵モデルを使う（未取得なら
-    // ここで自動ダウンロードする。ワーカースレッド上なので分オーダーかかっても UI は塞がない）。
+    // モデルを解決する。上書き指定があればそれを、無ければ設定で選ばれた内蔵モデルを使う
+    // （カタログ外の手編集値は既定へフォールバック。未取得ならここで自動ダウンロードする。
+    // UI 起点のダウンロード中なら完了を待つ。ワーカースレッド上なので分オーダーかかっても
+    // UI は塞がない）。
     let model_path = match &job.model_override {
         Some(path) => path.clone(),
-        None => match crate::whisper_model::ensure_model() {
-            Ok(path) => path,
-            Err(err) => {
-                eprintln!(
-                    "Skipping transcription because the Whisper model could not be prepared: {err}"
-                );
-                return;
+        None => {
+            let spec = crate::whisper_model::spec_for(&job.model_id)
+                .unwrap_or_else(crate::whisper_model::default_spec);
+            match downloader.ensure_model(spec) {
+                Ok(path) => path,
+                Err(err) => {
+                    eprintln!(
+                        "Skipping transcription because the Whisper model could not be prepared: {err}"
+                    );
+                    return;
+                }
             }
-        },
+        }
     };
     if !model_path.is_file() {
         eprintln!(
@@ -561,11 +569,15 @@ mod tests {
         let audio_path = dir.join("mic.mp3");
         std::fs::write(&audio_path, &mp3).expect("writing the test MP3 should succeed");
 
-        run_job(&TranscribeJob {
-            audio_paths: vec![audio_path.clone()],
-            model_override: Some(PathBuf::from(model_path)),
-            language: "en".to_owned(),
-        });
+        run_job(
+            &TranscribeJob {
+                audio_paths: vec![audio_path.clone()],
+                model_id: crate::whisper_model::DEFAULT_MODEL_ID.to_owned(),
+                model_override: Some(PathBuf::from(model_path)),
+                language: "en".to_owned(),
+            },
+            &crate::whisper_model::ModelDownloader::new(),
+        );
 
         let json_path = audio_path.with_extension("json");
         let text =

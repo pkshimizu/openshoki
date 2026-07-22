@@ -50,6 +50,25 @@ fn default_transcribe_language() -> String {
     TRANSCRIBE_LANGUAGES[0].0.to_owned()
 }
 
+/// 既定の内蔵 whisper モデル ID（カタログの既定と同じ値。`whisper_model::DEFAULT_MODEL_ID`）。
+fn default_whisper_model() -> String {
+    crate::whisper_model::DEFAULT_MODEL_ID.to_owned()
+}
+
+/// `whisper_model` を寛容にデシリアライズする。非文字列の手編集値は当該項目のみ既定へ丸め、
+/// 他の設定を巻き添えでファイル全体フォールバックさせない（`docs/rules/error-handling.md`）。
+/// カタログ外の文字列はそのまま保持し、使用時に既定へフォールバックする（`spec_for` 側）。
+fn deserialize_whisper_model<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = toml::Value::deserialize(deserializer)?;
+    Ok(value
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(default_whisper_model))
+}
+
 /// `transcribe_language` を寛容にデシリアライズする。設定 TOML は手編集されうる信頼境界外で、
 /// 非文字列（数値・真偽値等）が入っても当該項目だけ既定へ丸め、他の設定（保存先・登録アプリ）を
 /// 巻き添えで失わせない（`String` で直接受けると型不一致でファイル全体が既定へ落ちてしまう。
@@ -115,8 +134,17 @@ pub struct Config {
     /// ON にするだけで使える（`src/whisper_model.rs`）。
     #[serde(default)]
     pub auto_transcribe: bool,
+    /// 使用する内蔵 whisper モデルの識別子（`whisper_model::CATALOG` の `id`。既定 `small`）。
+    /// 設定画面の ComboBox で選び、選択時に未取得ならダウンロードが始まる。カタログ外の
+    /// 手編集値は使用時に既定へフォールバックする。手編集で非文字列が入っても当該項目のみ
+    /// 既定へ丸める（`deserialize_whisper_model`）。
+    #[serde(
+        default = "default_whisper_model",
+        deserialize_with = "deserialize_whisper_model"
+    )]
+    pub whisper_model: String,
     /// whisper モデルファイル（ggml 形式）のパスの上書き。通常は未指定でよく、内蔵モデル
-    /// （初回に自動ダウンロードした ggml-small）を使う。指定すると内蔵モデルより優先する
+    /// （カタログから選択・自動ダウンロード）を使う。指定すると内蔵モデルより優先する
     /// （上級者向け。config.toml の手編集のみで、設定 UI は無い）。
     #[serde(default)]
     pub whisper_model_path: Option<PathBuf>,
@@ -169,6 +197,7 @@ impl Default for Config {
             app_mic_triggers: Vec::new(),
             auto_stop_debounce_secs: DEFAULT_DEBOUNCE_SECS,
             auto_transcribe: false,
+            whisper_model: default_whisper_model(),
             whisper_model_path: None,
             transcribe_language: default_transcribe_language(),
         }
@@ -281,6 +310,7 @@ mod tests {
             }],
             auto_stop_debounce_secs: 7,
             auto_transcribe: true,
+            whisper_model: "base".to_owned(),
             whisper_model_path: Some(PathBuf::from("/tmp/models/ggml-base.bin")),
             transcribe_language: "ja".to_owned(),
         };
@@ -297,6 +327,7 @@ mod tests {
             config.auto_stop_debounce_secs
         );
         assert_eq!(restored.auto_transcribe, config.auto_transcribe);
+        assert_eq!(restored.whisper_model, config.whisper_model);
         assert_eq!(restored.whisper_model_path, config.whisper_model_path);
         assert_eq!(restored.transcribe_language, config.transcribe_language);
     }
@@ -313,6 +344,7 @@ mod tests {
         assert!(restored.app_mic_triggers.is_empty());
         assert_eq!(restored.auto_stop_debounce_secs, DEFAULT_DEBOUNCE_SECS);
         assert!(!restored.auto_transcribe);
+        assert_eq!(restored.whisper_model, "small");
         assert!(restored.whisper_model_path.is_none());
         // 言語未指定は既定の英語になる（従来も whisper の既定言語が en のため実挙動は不変）。
         assert_eq!(restored.transcribe_language, "en");
@@ -330,6 +362,18 @@ mod tests {
         let restored: Config = toml::from_str(bad).expect("non-string should not fail the file");
         assert_eq!(restored.recording_dir, PathBuf::from("/tmp/openshoki-lang"));
         assert_eq!(restored.transcribe_language, "en");
+    }
+
+    #[test]
+    fn deserialize_rounds_non_string_whisper_model() {
+        // 非文字列の手編集値は当該項目のみ既定へ丸まり、他フィールドを巻き添えにしない。
+        let bad = "recording_dir = \"/tmp/openshoki-model\"\nwhisper_model = 5\n";
+        let restored: Config = toml::from_str(bad).expect("non-string should not fail the file");
+        assert_eq!(
+            restored.recording_dir,
+            PathBuf::from("/tmp/openshoki-model")
+        );
+        assert_eq!(restored.whisper_model, "small");
     }
 
     #[test]
