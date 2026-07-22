@@ -16,4 +16,7 @@ export global Style {
     out property <brush> on-accent-foreground: #ffffff; // アクセント背景の上に載る前景（白固定）
     // 再生中セグメントのハイライト背景（アクセント色の淡色）。カンプの light .12 / dark .20 相当。
     out property <brush> segment-highlight: Palette.accent-background.transparentize(0.85);
+    // 失敗状態の警告色（文字起こし失敗のドット等）。Palette に危険色が無いため固定値
+    // （ライト/ダーク両テーマで視認できる赤）。
+    out property <brush> danger: #e5484d;
 }

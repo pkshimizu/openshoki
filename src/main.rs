@@ -22,6 +22,9 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
 
+// VecModel の row_data / set_row_data（tick の行単位更新）に必要。
+use slint::Model;
+
 use tray_icon::menu::{IconMenuItem, MenuEvent};
 
 use crate::config::Config;
@@ -361,9 +364,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let transcriber = transcribe::TranscribeWorker::start(model_downloader.clone());
 
     // 録音停止後の後処理（極小音量の正規化→ミックス生成→文字起こし投入）を直列に行う
-    // バックグラウンドワーカー。文字起こしは後処理ワーカーが完了後に投入するため、
-    // transcriber はここで所有を渡す（正規化後の音声で文字起こしさせる）。
-    let postprocessor = mixdown::PostProcessWorker::start(transcriber);
+    // バックグラウンドワーカー。自動経路の文字起こしは後処理ワーカーが完了後に投入する
+    // （正規化後の音声で文字起こしさせる）。transcriber は Clone 共有で、Recordings ウィンドウの
+    // 手動再実行・状態表示も同じワーカー・同じ状態マップを使う。
+    let postprocessor = mixdown::PostProcessWorker::start(transcriber.clone());
 
     // ウィンドウを閉じても終了させず、非表示にして常駐を保つ。メニューからは開くだけで、
     // 閉じるのはウィンドウ自身の閉じるボタンに任せる。
@@ -392,6 +396,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 一覧に表示中のセッション（選択インデックス→音源パスの解決に使う）。
     let sessions: Rc<RefCell<Vec<recordings::RecordingSession>>> =
         Rc::new(RefCell::new(Vec::new()));
+    // 一覧の Slint モデル。開いたときの再構築に加え、文字起こし状態の変化を tick が
+    // 行単位で反映する（set_row_data）ため、Rc で保持し続ける。
+    let sessions_model: Rc<slint::VecModel<SessionRow>> = Rc::new(slint::VecModel::default());
+    recordings_ui.set_sessions(sessions_model.clone().into());
     // 選択中セッションのトランスクリプト（セグメントクリック→開始秒の解決、tick→現在セグメントの
     // 算出に使う）。選択のたびに読み直す。
     let transcript_segments: Rc<RefCell<Vec<transcript::TranscriptSegment>>> =
@@ -402,6 +410,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let player = Rc::clone(&player);
         let sessions = Rc::clone(&sessions);
         let transcript_segments = Rc::clone(&transcript_segments);
+        let transcriber = transcriber.clone();
         let rec_weak = recordings_ui.as_weak();
         recordings_ui.on_select_session(move |index| {
             let Some(rec) = rec_weak.upgrade() else {
@@ -414,6 +423,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             rec.set_has_selection(true);
             rec.set_detail_datetime(session.display_datetime.clone().into());
             rec.set_detail_summary(session.source_summary().into());
+            // 文字起こしの状態テキストと Transcribe ボタンの活性を、ワーカーの進行状況＋
+            // JSON の有無から設定する（以後の変化は tick が追従させる）。
+            refresh_detail_transcript_status(&rec, &transcriber, session);
             // 文字起こしを読み込み、話者ラベル＋開始時刻付きのセグメント一覧を更新する
             // （空＝欠落・破損・未生成なら Slint 側が縮退表示する）。
             let segments = transcript::load_transcript(&session.dir);
@@ -495,6 +507,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // 詳細ペインの Transcribe ボタン: 選択中セッションの文字起こしを（再）実行する。
+    // 完了済みでも上書きで再実行できる（設定 `auto_transcribe` とは独立。#69 プラン）。
+    // 設定値はここでスナップショットし、処理中の設定変更の影響を受けない。
+    {
+        let sessions = Rc::clone(&sessions);
+        let config = Rc::clone(&config);
+        let transcriber = transcriber.clone();
+        let rec_weak = recordings_ui.as_weak();
+        recordings_ui.on_transcribe_session(move |index| {
+            let sessions = sessions.borrow();
+            let Some(session) = usize::try_from(index).ok().and_then(|i| sessions.get(i)) else {
+                return;
+            };
+            let audio_paths = session.audio_source_paths();
+            if audio_paths.is_empty() {
+                return;
+            }
+            let config_ref = config.borrow();
+            transcriber.submit(transcribe::TranscribeJob {
+                session_dir: session.dir.clone(),
+                audio_paths,
+                model_id: config_ref.whisper_model.clone(),
+                model_override: config_ref.whisper_model_path.clone(),
+                language: config_ref.transcribe_language.clone(),
+            });
+            // 投入結果（通常は「文字起こし中」）を詳細ペインへ即反映し、次の tick を待つ間の
+            // 2 連クリックによる多重投入を防ぐ。一覧行のドットは tick の差分更新に任せる。
+            if let Some(rec) = rec_weak.upgrade() {
+                refresh_detail_transcript_status(&rec, &transcriber, session);
+            }
+        });
+    }
+
     // トレイのメニューイベントを Slint のイベントループ上でポーリングし、
     // ウィンドウ操作・終了へ橋渡しする。
     let timer = slint::Timer::default();
@@ -507,7 +552,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ui: recordings_ui.as_weak(),
                 player: Rc::clone(&player),
                 sessions: Rc::clone(&sessions),
+                sessions_model: Rc::clone(&sessions_model),
                 transcript_segments: Rc::clone(&transcript_segments),
+                transcriber: transcriber.clone(),
             },
             &tray,
             Rc::clone(&config),
@@ -543,7 +590,9 @@ struct RecordingsHandles {
     ui: slint::Weak<RecordingsWindow>,
     player: Rc<RefCell<Option<player::AudioPlayer>>>,
     sessions: Rc<RefCell<Vec<recordings::RecordingSession>>>,
+    sessions_model: Rc<slint::VecModel<SessionRow>>,
     transcript_segments: Rc<RefCell<Vec<transcript::TranscriptSegment>>>,
+    transcriber: transcribe::TranscribeWorker,
 }
 
 /// メニューイベントの処理と、録音中のメニューバー表示更新を毎ティック行うクロージャを作る。
@@ -567,13 +616,8 @@ fn build_menu_event_handler(
     model_downloader: whisper_model::ModelDownloader,
     #[cfg(target_os = "macos")] app_monitor: app_audio_monitor::AppAudioMonitor,
 ) -> impl FnMut() + 'static {
-    // Recordings ウィンドウ・再生・一覧のハンドルは 1 つにまとめて受け取り、ここで分解する。
-    let RecordingsHandles {
-        ui: rec_ui,
-        player,
-        sessions,
-        transcript_segments,
-    } = recordings;
+    // Recordings ウィンドウ・再生・一覧のハンドルは RecordingsHandles にまとめたまま使う
+    // （引数の氾濫を避ける。open_recordings_window にも構造体ごと渡す）。
     // クロージャは 'static のため &Tray を借用できない。必要な要素（各項目・ID・アイコン）
     // だけを複製して所有する。
     let toggle_id = tray.toggle_item.id().clone();
@@ -612,14 +656,13 @@ fn build_menu_event_handler(
                     slint::LogicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT),
                 );
             } else if event.id == recordings_id {
-                let Some(rec) = rec_ui.upgrade() else {
+                let Some(rec) = recordings.ui.upgrade() else {
                     continue;
                 };
                 open_recordings_window(
                     &rec,
+                    &recordings,
                     &config,
-                    &player,
-                    &sessions,
                     &mut rec_geometry_committed,
                     &mut last_play_secs,
                 );
@@ -693,9 +736,9 @@ fn build_menu_event_handler(
 
         // Recordings ウィンドウが開いている間だけ、再生の経過時間・進捗・再生状態を反映する
         // （閉じているときは更新しない＝アイドル時の無駄な描画をしない）。
-        if let Some(rec) = rec_ui.upgrade()
+        if let Some(rec) = recordings.ui.upgrade()
             && rec.window().is_visible()
-            && let Some(player) = player.borrow().as_ref()
+            && let Some(player) = recordings.player.borrow().as_ref()
         {
             let position = player.position();
             let duration = player.duration();
@@ -713,11 +756,51 @@ fn build_menu_event_handler(
             rec.set_progress(progress);
             rec.set_playing(player.is_playing());
             // 再生位置に対応するトランスクリプトのセグメントをハイライトする（該当なしは -1）。
-            let current =
-                transcript::current_index(&transcript_segments.borrow(), position.as_secs_f64())
-                    .and_then(|index| i32::try_from(index).ok())
-                    .unwrap_or(-1);
+            let current = transcript::current_index(
+                &recordings.transcript_segments.borrow(),
+                position.as_secs_f64(),
+            )
+            .and_then(|index| i32::try_from(index).ok())
+            .unwrap_or(-1);
             rec.set_current_segment(current);
+        }
+
+        // Recordings ウィンドウが開いている間だけ、文字起こし状態の変化を一覧・詳細ペインへ
+        // 反映する（変化した行だけ set_row_data して無駄な再描画を避ける）。選択中セッションが
+        // 文字起こし中→完了に変わったら、トランスクリプトを読み直して表示を差し替える。
+        if let Some(rec) = recordings.ui.upgrade()
+            && rec.window().is_visible()
+        {
+            let sessions_ref = recordings.sessions.borrow();
+            let selected = usize::try_from(rec.get_selected_index()).ok();
+            for (i, session) in sessions_ref.iter().enumerate() {
+                let Some(mut row) = recordings.sessions_model.row_data(i) else {
+                    continue;
+                };
+                let status = transcript_display_status(
+                    recordings.transcriber.status_of(&session.dir),
+                    session.has_transcript,
+                );
+                if row.transcript_status == status {
+                    continue;
+                }
+                let previous = row.transcript_status;
+                row.transcript_status = status;
+                recordings.sessions_model.set_row_data(i, row);
+                if selected == Some(i) {
+                    apply_detail_transcript_status(&rec, status);
+                    if previous == TranscriptStatus::Transcribing
+                        && status == TranscriptStatus::Done
+                    {
+                        let segments = transcript::load_transcript(&session.dir);
+                        rec.set_segments(
+                            Rc::new(slint::VecModel::from(transcript_rows(&segments))).into(),
+                        );
+                        rec.set_current_segment(-1);
+                        *recordings.transcript_segments.borrow_mut() = segments;
+                    }
+                }
+            }
         }
 
         // 設定ウィンドウが開いている間だけ、選択中モデルの取得状況（ダウンロード進捗等）を
@@ -739,9 +822,8 @@ fn build_menu_event_handler(
 /// 選択・再生状態を初期化してから表示する（初回表示はジオメトリを明示する。`docs/rules/slint.md`）。
 fn open_recordings_window(
     rec: &RecordingsWindow,
+    handles: &RecordingsHandles,
     config: &Rc<RefCell<Config>>,
-    player: &Rc<RefCell<Option<player::AudioPlayer>>>,
-    sessions: &Rc<RefCell<Vec<recordings::RecordingSession>>>,
     geometry_committed: &mut bool,
     last_play_secs: &mut Option<u64>,
 ) {
@@ -752,20 +834,23 @@ fn open_recordings_window(
             datetime: session.display_datetime.clone().into(),
             has_mic: session.has_mic,
             has_system: session.has_system,
-            has_transcript: session.has_transcript,
+            transcript_status: transcript_display_status(
+                handles.transcriber.status_of(&session.dir),
+                session.has_transcript,
+            ),
         })
         .collect();
-    rec.set_sessions(Rc::new(slint::VecModel::from(rows)).into());
+    handles.sessions_model.set_vec(rows);
     // 開くたびに未選択・停止表示へ初期化する。
     rec.set_selected_index(-1);
     rec.set_has_selection(false);
     rec.set_playing(false);
     rec.set_progress(0.0);
     rec.set_time_text(format_playback_time(Duration::ZERO, None).into());
-    *sessions.borrow_mut() = list;
+    *handles.sessions.borrow_mut() = list;
     *last_play_secs = None;
     // 前回の再生が残っていれば止める。
-    if let Some(p) = player.borrow().as_ref() {
+    if let Some(p) = handles.player.borrow().as_ref() {
         p.stop();
     }
 
@@ -861,6 +946,7 @@ fn submit_post_processing(
     let transcribe = config_ref
         .auto_transcribe
         .then(|| transcribe::TranscribeJob {
+            session_dir: session_dir.to_path_buf(),
             audio_paths: saved.to_vec(),
             model_id: config_ref.whisper_model.clone(),
             model_override: config_ref.whisper_model_path.clone(),
@@ -929,6 +1015,51 @@ fn breathing_level(elapsed: std::time::Duration, cycle_secs: f32) -> f32 {
     ((2.0 * PI * t / cycle_secs).sin() + 1.0) / 2.0
 }
 
+/// 文字起こしの表示状態（`ui/recordings-window.slint` の `TranscriptStatus`）を合成する。
+/// ワーカーの進行状況（メモリ）があればそれを優先し、無ければ JSON の有無で解決する。
+fn transcript_display_status(
+    worker_status: Option<transcribe::TranscribeStatus>,
+    has_transcript: bool,
+) -> TranscriptStatus {
+    match worker_status {
+        Some(transcribe::TranscribeStatus::Transcribing) => TranscriptStatus::Transcribing,
+        Some(transcribe::TranscribeStatus::Done) => TranscriptStatus::Done,
+        Some(transcribe::TranscribeStatus::Failed) => TranscriptStatus::Failed,
+        None if has_transcript => TranscriptStatus::Done,
+        None => TranscriptStatus::NotTranscribed,
+    }
+}
+
+/// 文字起こしの表示状態 → 詳細ペインの状態テキスト。
+fn transcript_status_text(display_status: TranscriptStatus) -> &'static str {
+    match display_status {
+        TranscriptStatus::NotTranscribed => "Not transcribed",
+        TranscriptStatus::Transcribing => "Transcribing…",
+        TranscriptStatus::Done => "Transcribed",
+        TranscriptStatus::Failed => "Transcription failed",
+    }
+}
+
+/// 詳細ペインの文字起こし表示（状態テキストと Transcribe ボタンの活性）を反映する。
+/// 選択時・手動投入直後・tick 追従の全経路でここを通し、表示ロジックを 1 箇所にする。
+fn apply_detail_transcript_status(rec: &RecordingsWindow, status: TranscriptStatus) {
+    rec.set_detail_transcript_text(transcript_status_text(status).into());
+    rec.set_detail_transcribing(status == TranscriptStatus::Transcribing);
+}
+
+/// セッションの現在の文字起こし状態を合成して詳細ペインへ反映する（選択時・手動投入直後用。
+/// tick は行の差分更新で status を計算済みのため `apply_detail_transcript_status` を直接使う）。
+fn refresh_detail_transcript_status(
+    rec: &RecordingsWindow,
+    transcriber: &transcribe::TranscribeWorker,
+    session: &recordings::RecordingSession,
+) {
+    apply_detail_transcript_status(
+        rec,
+        transcript_display_status(transcriber.status_of(&session.dir), session.has_transcript),
+    );
+}
+
 /// 保存先パスを画面表示用の文字列に変換する。
 fn recording_dir_text(dir: &std::path::Path) -> slint::SharedString {
     dir.display().to_string().into()
@@ -979,8 +1110,60 @@ fn hide_dock_icon() {
 
 #[cfg(test)]
 mod tests {
-    use super::{breathing_level, selected_model_status_text};
+    use super::{
+        TranscriptStatus, breathing_level, selected_model_status_text, transcript_display_status,
+        transcript_status_text,
+    };
+    use crate::transcribe::TranscribeStatus;
     use std::time::Duration;
+
+    /// ワーカーの進行状況（メモリ）があればそれを優先し、無ければ JSON の有無で解決する。
+    #[test]
+    fn transcript_display_status_prefers_worker_status_over_json() {
+        // ワーカーの状態が最優先（再実行中は完了済み JSON があっても「文字起こし中」）。
+        assert_eq!(
+            transcript_display_status(Some(TranscribeStatus::Transcribing), true),
+            TranscriptStatus::Transcribing
+        );
+        assert_eq!(
+            transcript_display_status(Some(TranscribeStatus::Done), false),
+            TranscriptStatus::Done
+        );
+        // 失敗の記録は JSON があっても優先する（古い JSON で失敗を隠さない）。
+        assert_eq!(
+            transcript_display_status(Some(TranscribeStatus::Failed), true),
+            TranscriptStatus::Failed
+        );
+        // ワーカーの記録が無ければ JSON の有無で解決する（起動前の録音など）。
+        assert_eq!(
+            transcript_display_status(None, true),
+            TranscriptStatus::Done
+        );
+        assert_eq!(
+            transcript_display_status(None, false),
+            TranscriptStatus::NotTranscribed
+        );
+    }
+
+    #[test]
+    fn transcript_status_text_covers_all_states() {
+        assert_eq!(
+            transcript_status_text(TranscriptStatus::NotTranscribed),
+            "Not transcribed"
+        );
+        assert_eq!(
+            transcript_status_text(TranscriptStatus::Transcribing),
+            "Transcribing…"
+        );
+        assert_eq!(
+            transcript_status_text(TranscriptStatus::Done),
+            "Transcribed"
+        );
+        assert_eq!(
+            transcript_status_text(TranscriptStatus::Failed),
+            "Transcription failed"
+        );
+    }
 
     /// サイン波の代表的な位相で、期待どおりの明度レベルになることを確認する。
     /// 2 秒周期なら 0s→0.5, 0.5s(1/4)→1.0, 1.0s(1/2)→0.5, 1.5s(3/4)→0.0, 2.0s(1周)→0.5。
