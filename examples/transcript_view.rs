@@ -33,7 +33,12 @@ fn main() {
     win.set_has_selection(true);
     win.set_detail_datetime("2026-07-21 12:00:00".into());
     win.set_detail_summary("Mic + System".into());
+    win.set_detail_transcript_text("Transcribed".into());
     win.set_current_segment(2);
+    // 引数に "modal" を含めると削除確認モーダルを重ねた状態で表示する（#66 の検証）。
+    if std::env::args().any(|arg| arg == "modal") {
+        win.set_show_delete_confirm(true);
+    }
 
     win.window()
         .set_position(slint::LogicalPosition::new(60.0, 60.0));

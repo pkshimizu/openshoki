@@ -155,6 +155,11 @@ impl TranscribeWorker {
     pub fn status_of(&self, session_dir: &Path) -> Option<TranscribeStatus> {
         lock_status(&self.status).get(session_dir).copied()
     }
+
+    /// セッションの進行状況の記録を破棄する（セッション削除時の掃除）。未登録なら何もしない。
+    pub fn forget(&self, session_dir: &Path) {
+        lock_status(&self.status).remove(session_dir);
+    }
 }
 
 /// 状態マップのガードを取る。poison（ロック保持中のパニック）でも状態表示を止めないため、
@@ -524,6 +529,9 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert_eq!(worker.status_of(&dir), Some(TranscribeStatus::Failed));
+        // セッション削除時の掃除（forget）で記録が消える。
+        worker.forget(&dir);
+        assert_eq!(worker.status_of(&dir), None);
     }
 
     /// 対象音源なし（Skipped）の投入は状態を残さない（「文字起こし中」のまま固まらない）。

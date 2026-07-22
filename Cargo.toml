@@ -19,6 +19,7 @@ sha2 = "0.10"
 slint = "1.17.0"
 symphonia = { version = "0.6", default-features = false, features = ["mp3"] }
 toml = "1.1.2"
+trash = "5.2.6"
 tray-icon = "0.24.1"
 ureq = "3"
 whisper-rs = "0.16.0"

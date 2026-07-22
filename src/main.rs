@@ -540,6 +540,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // 確認モーダルの Delete: 選択中セッションをディレクトリごと OS のゴミ箱へ移動し、
+    // 一覧・メモリの両方から除去する（完全削除への自動フォールバックはしない）。
+    // 失敗はログのみでアプリ・一覧を壊さない（`docs/rules/error-handling.md`）。
+    {
+        let sessions = Rc::clone(&sessions);
+        let sessions_model = Rc::clone(&sessions_model);
+        let player = Rc::clone(&player);
+        let transcriber = transcriber.clone();
+        let rec_weak = recordings_ui.as_weak();
+        recordings_ui.on_delete_session(move |index| {
+            let Some(rec) = rec_weak.upgrade() else {
+                return;
+            };
+            let Some(i) = usize::try_from(index)
+                .ok()
+                .filter(|&i| i < sessions.borrow().len())
+            else {
+                return;
+            };
+            // ゴミ箱への移動前に再生対象を手放す。削除済みファイルを play_pause / seek の
+            // 開き直し経路が参照しないようにし、開いたままのハンドルが移動を妨げる OS でも
+            // 失敗しないようにする。
+            if let Some(p) = player.borrow_mut().as_mut() {
+                p.unload();
+            }
+            let dir = sessions.borrow()[i].dir.clone();
+            if let Err(err) = trash::delete(&dir) {
+                eprintln!(
+                    "Skipping the deletion because moving the recording to the Trash failed: {err}"
+                );
+                return;
+            }
+            sessions.borrow_mut().remove(i);
+            sessions_model.remove(i);
+            // 進行状況マップに残ったエントリを掃除する（削除済みセッションの記録を残さない）。
+            transcriber.forget(&dir);
+            clear_recordings_selection(&rec);
+        });
+    }
+
     // トレイのメニューイベントを Slint のイベントループ上でポーリングし、
     // ウィンドウ操作・終了へ橋渡しする。
     let timer = slint::Timer::default();
@@ -818,6 +858,16 @@ fn build_menu_event_handler(
     }
 }
 
+/// Recordings ウィンドウの選択・再生表示を未選択状態へ初期化する
+/// （ウィンドウを開いたとき・セッション削除後に共用する）。
+fn clear_recordings_selection(rec: &RecordingsWindow) {
+    rec.set_selected_index(-1);
+    rec.set_has_selection(false);
+    rec.set_playing(false);
+    rec.set_progress(0.0);
+    rec.set_time_text(format_playback_time(Duration::ZERO, None).into());
+}
+
 /// トレイの「Recordings…」で Recordings ウィンドウを開く。保存先を走査して一覧を更新し、
 /// 選択・再生状態を初期化してから表示する（初回表示はジオメトリを明示する。`docs/rules/slint.md`）。
 fn open_recordings_window(
@@ -842,11 +892,7 @@ fn open_recordings_window(
         .collect();
     handles.sessions_model.set_vec(rows);
     // 開くたびに未選択・停止表示へ初期化する。
-    rec.set_selected_index(-1);
-    rec.set_has_selection(false);
-    rec.set_playing(false);
-    rec.set_progress(0.0);
-    rec.set_time_text(format_playback_time(Duration::ZERO, None).into());
+    clear_recordings_selection(rec);
     *handles.sessions.borrow_mut() = list;
     *last_play_secs = None;
     // 前回の再生が残っていれば止める。

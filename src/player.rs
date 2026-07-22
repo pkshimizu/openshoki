@@ -53,13 +53,21 @@ impl AudioPlayer {
         })
     }
 
+    /// 再生対象を手放す（キューを空にし、対象パス・全体長を破棄して一時停止にする）。
+    /// セッション削除の前に呼び、削除済みファイルを `play_pause` / `seek` の開き直し経路が
+    /// 参照しないようにする。
+    pub fn unload(&mut self) {
+        self.player.clear();
+        self.path = None;
+        self.duration = None;
+        self.player.pause();
+    }
+
     /// 再生対象ファイルをロードして再生準備する（停止状態でセット。`play_pause` で再生開始）。
     /// 失敗時は前のセッションの状態を残さない（stale な `path` が残ると、後続の seek /
     /// play_pause が前のセッションの音声を開き直し、表示中のトランスクリプトと食い違う）。
     pub fn load(&mut self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-        self.player.clear();
-        self.path = None;
-        self.duration = None;
+        self.unload();
         let source = open_decoder(path)?;
         self.duration = source.total_duration();
         self.path = Some(path.to_path_buf());
