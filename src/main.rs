@@ -425,12 +425,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             rec.set_detail_summary(session.source_summary().into());
             // 文字起こしの状態テキストと Transcribe ボタンの活性を、ワーカーの進行状況＋
             // JSON の有無から設定する（以後の変化は tick が追従させる）。
-            let display_status = transcript_display_status(
-                transcriber.status_of(&session.dir),
-                session.has_transcript,
-            );
-            rec.set_detail_transcript_text(transcript_status_text(display_status).into());
-            rec.set_detail_transcribing(display_status == 1);
+            refresh_detail_transcript_status(&rec, &transcriber, session);
             // 文字起こしを読み込み、話者ラベル＋開始時刻付きのセグメント一覧を更新する
             // （空＝欠落・破損・未生成なら Slint 側が縮退表示する）。
             let segments = transcript::load_transcript(&session.dir);
@@ -515,11 +510,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 詳細ペインの Transcribe ボタン: 選択中セッションの文字起こしを（再）実行する。
     // 完了済みでも上書きで再実行できる（設定 `auto_transcribe` とは独立。#69 プラン）。
     // 設定値はここでスナップショットし、処理中の設定変更の影響を受けない。
-    // 投入後の「文字起こし中」表示への切り替えは tick が状態マップを見て行う。
     {
         let sessions = Rc::clone(&sessions);
         let config = Rc::clone(&config);
         let transcriber = transcriber.clone();
+        let rec_weak = recordings_ui.as_weak();
         recordings_ui.on_transcribe_session(move |index| {
             let sessions = sessions.borrow();
             let Some(session) = usize::try_from(index).ok().and_then(|i| sessions.get(i)) else {
@@ -537,6 +532,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 model_override: config_ref.whisper_model_path.clone(),
                 language: config_ref.transcribe_language.clone(),
             });
+            // 投入結果（通常は「文字起こし中」）を詳細ペインへ即反映し、次の tick を待つ間の
+            // 2 連クリックによる多重投入を防ぐ。一覧行のドットは tick の差分更新に任せる。
+            if let Some(rec) = rec_weak.upgrade() {
+                refresh_detail_transcript_status(&rec, &transcriber, session);
+            }
         });
     }
 
@@ -788,9 +788,10 @@ fn build_menu_event_handler(
                 row.transcript_status = status;
                 recordings.sessions_model.set_row_data(i, row);
                 if selected == Some(i) {
-                    rec.set_detail_transcript_text(transcript_status_text(status).into());
-                    rec.set_detail_transcribing(status == 1);
-                    if previous == 1 && status == 2 {
+                    apply_detail_transcript_status(&rec, status);
+                    if previous == TranscriptStatus::Transcribing
+                        && status == TranscriptStatus::Done
+                    {
                         let segments = transcript::load_transcript(&session.dir);
                         rec.set_segments(
                             Rc::new(slint::VecModel::from(transcript_rows(&segments))).into(),
@@ -1014,30 +1015,49 @@ fn breathing_level(elapsed: std::time::Duration, cycle_secs: f32) -> f32 {
     ((2.0 * PI * t / cycle_secs).sin() + 1.0) / 2.0
 }
 
-/// 文字起こしの表示状態。`SessionRow.transcript-status`（Slint 側のドット描画）と対応させる。
+/// 文字起こしの表示状態（`ui/recordings-window.slint` の `TranscriptStatus`）を合成する。
 /// ワーカーの進行状況（メモリ）があればそれを優先し、無ければ JSON の有無で解決する。
-/// 0=文字起こし前 / 1=文字起こし中 / 2=完了 / 3=失敗。
 fn transcript_display_status(
     worker_status: Option<transcribe::TranscribeStatus>,
     has_transcript: bool,
-) -> i32 {
+) -> TranscriptStatus {
     match worker_status {
-        Some(transcribe::TranscribeStatus::Transcribing) => 1,
-        Some(transcribe::TranscribeStatus::Done) => 2,
-        Some(transcribe::TranscribeStatus::Failed) => 3,
-        None if has_transcript => 2,
-        None => 0,
+        Some(transcribe::TranscribeStatus::Transcribing) => TranscriptStatus::Transcribing,
+        Some(transcribe::TranscribeStatus::Done) => TranscriptStatus::Done,
+        Some(transcribe::TranscribeStatus::Failed) => TranscriptStatus::Failed,
+        None if has_transcript => TranscriptStatus::Done,
+        None => TranscriptStatus::NotTranscribed,
     }
 }
 
 /// 文字起こしの表示状態 → 詳細ペインの状態テキスト。
-fn transcript_status_text(display_status: i32) -> &'static str {
+fn transcript_status_text(display_status: TranscriptStatus) -> &'static str {
     match display_status {
-        1 => "Transcribing…",
-        2 => "Transcribed",
-        3 => "Transcription failed",
-        _ => "Not transcribed",
+        TranscriptStatus::NotTranscribed => "Not transcribed",
+        TranscriptStatus::Transcribing => "Transcribing…",
+        TranscriptStatus::Done => "Transcribed",
+        TranscriptStatus::Failed => "Transcription failed",
     }
+}
+
+/// 詳細ペインの文字起こし表示（状態テキストと Transcribe ボタンの活性）を反映する。
+/// 選択時・手動投入直後・tick 追従の全経路でここを通し、表示ロジックを 1 箇所にする。
+fn apply_detail_transcript_status(rec: &RecordingsWindow, status: TranscriptStatus) {
+    rec.set_detail_transcript_text(transcript_status_text(status).into());
+    rec.set_detail_transcribing(status == TranscriptStatus::Transcribing);
+}
+
+/// セッションの現在の文字起こし状態を合成して詳細ペインへ反映する（選択時・手動投入直後用。
+/// tick は行の差分更新で status を計算済みのため `apply_detail_transcript_status` を直接使う）。
+fn refresh_detail_transcript_status(
+    rec: &RecordingsWindow,
+    transcriber: &transcribe::TranscribeWorker,
+    session: &recordings::RecordingSession,
+) {
+    apply_detail_transcript_status(
+        rec,
+        transcript_display_status(transcriber.status_of(&session.dir), session.has_transcript),
+    );
 }
 
 /// 保存先パスを画面表示用の文字列に変換する。
@@ -1091,7 +1111,7 @@ fn hide_dock_icon() {
 #[cfg(test)]
 mod tests {
     use super::{
-        breathing_level, selected_model_status_text, transcript_display_status,
+        TranscriptStatus, breathing_level, selected_model_status_text, transcript_display_status,
         transcript_status_text,
     };
     use crate::transcribe::TranscribeStatus;
@@ -1103,28 +1123,46 @@ mod tests {
         // ワーカーの状態が最優先（再実行中は完了済み JSON があっても「文字起こし中」）。
         assert_eq!(
             transcript_display_status(Some(TranscribeStatus::Transcribing), true),
-            1
+            TranscriptStatus::Transcribing
         );
         assert_eq!(
             transcript_display_status(Some(TranscribeStatus::Done), false),
-            2
+            TranscriptStatus::Done
         );
         // 失敗の記録は JSON があっても優先する（古い JSON で失敗を隠さない）。
         assert_eq!(
             transcript_display_status(Some(TranscribeStatus::Failed), true),
-            3
+            TranscriptStatus::Failed
         );
         // ワーカーの記録が無ければ JSON の有無で解決する（起動前の録音など）。
-        assert_eq!(transcript_display_status(None, true), 2);
-        assert_eq!(transcript_display_status(None, false), 0);
+        assert_eq!(
+            transcript_display_status(None, true),
+            TranscriptStatus::Done
+        );
+        assert_eq!(
+            transcript_display_status(None, false),
+            TranscriptStatus::NotTranscribed
+        );
     }
 
     #[test]
     fn transcript_status_text_covers_all_states() {
-        assert_eq!(transcript_status_text(0), "Not transcribed");
-        assert_eq!(transcript_status_text(1), "Transcribing…");
-        assert_eq!(transcript_status_text(2), "Transcribed");
-        assert_eq!(transcript_status_text(3), "Transcription failed");
+        assert_eq!(
+            transcript_status_text(TranscriptStatus::NotTranscribed),
+            "Not transcribed"
+        );
+        assert_eq!(
+            transcript_status_text(TranscriptStatus::Transcribing),
+            "Transcribing…"
+        );
+        assert_eq!(
+            transcript_status_text(TranscriptStatus::Done),
+            "Transcribed"
+        );
+        assert_eq!(
+            transcript_status_text(TranscriptStatus::Failed),
+            "Transcription failed"
+        );
     }
 
     /// サイン波の代表的な位相で、期待どおりの明度レベルになることを確認する。

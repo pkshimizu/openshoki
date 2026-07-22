@@ -1,14 +1,21 @@
 import { Button, ListView, ScrollView, Palette } from "std-widgets.slint";
 import { Style } from "style.slint";
 
+// 文字起こしの表示状態。Rust 側（main.rs の transcript_display_status）がワーカーの
+// 進行状況と JSON の有無から合成して詰める。
+export enum TranscriptStatus {
+    not-transcribed,
+    transcribing,
+    done,
+    failed,
+}
+
 // 一覧の 1 行分。Rust の recordings::RecordingSession から詰める。
-// transcript-status は main.rs の transcript_display_status と対応:
-// 0=文字起こし前 / 1=文字起こし中 / 2=完了 / 3=失敗。
 export struct SessionRow {
     datetime: string,
     has-mic: bool,
     has-system: bool,
-    transcript-status: int,
+    transcript-status: TranscriptStatus,
 }
 
 // トランスクリプトの表示 1 行分。Rust の transcript::TranscriptSegment から詰める
@@ -190,11 +197,11 @@ export component RecordingsWindow inherits Window {
                                             width: 6px;
                                             height: 6px;
                                             border-radius: 3px;
-                                            background: row.transcript-status == 2
+                                            background: row.transcript-status == TranscriptStatus.done
                                                 ? (rowbg.selected ? Style.on-accent-foreground : Palette.accent-background)
-                                                : row.transcript-status == 1
+                                                : row.transcript-status == TranscriptStatus.transcribing
                                                     ? (rowbg.selected ? Style.on-accent-foreground : Palette.foreground).transparentize(Style.muted-alpha)
-                                                    : row.transcript-status == 3 ? Style.danger : transparent;
+                                                    : row.transcript-status == TranscriptStatus.failed ? Style.danger : transparent;
                                         }
                                     }
 

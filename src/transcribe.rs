@@ -74,10 +74,14 @@ pub enum TranscribeStatus {
 pub struct TranscribeWorker {
     /// ワーカースレッドへの送信口。スレッド起動に失敗していたら `None`（文字起こしのみ縮退）。
     tx: Option<Sender<TranscribeJob>>,
-    /// セッションディレクトリ → 進行状況。`submit` で `Transcribing`、ジョブ完了で
-    /// `Done` / `Failed` に遷移する。
-    status: Arc<Mutex<HashMap<PathBuf, TranscribeStatus>>>,
+    /// セッションディレクトリ → 進行状況。`submit` とワーカーのデキュー時に `Transcribing`、
+    /// ジョブ完了で `Done` / `Failed` に遷移する（対象なしの Skipped はエントリ削除で
+    /// JSON の有無ベースの表示へ戻す）。
+    status: Arc<Mutex<StatusMap>>,
 }
+
+/// セッションディレクトリ → 進行状況のマップ（UI スレッドとワーカースレッドで共有）。
+type StatusMap = HashMap<PathBuf, TranscribeStatus>;
 
 impl TranscribeWorker {
     /// ワーカースレッドを起動する。スレッド生成に失敗しても常駐アプリは落とさず、
@@ -90,8 +94,7 @@ impl TranscribeWorker {
         // whisper.cpp / GGML が stderr へ出す冗長な内部ログを止める（ログ backend の feature を
         // 有効にしていないため、フック先が無く事実上の無効化になる）。複数回呼んでも安全。
         whisper_rs::install_logging_hooks();
-        let status: Arc<Mutex<HashMap<PathBuf, TranscribeStatus>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let status: Arc<Mutex<StatusMap>> = Arc::new(Mutex::new(HashMap::new()));
         let status_for_worker = Arc::clone(&status);
         let (tx, rx) = mpsc::channel::<TranscribeJob>();
         let spawned = std::thread::Builder::new()
@@ -99,18 +102,20 @@ impl TranscribeWorker {
             .spawn(move || {
                 // 送信側（アプリ本体）が落ちてチャネルが閉じたら自然に終了する。
                 while let Ok(job) = rx.recv() {
+                    // 処理開始でも「文字起こし中」を入れ直す。同一セッションが複数キューされて
+                    // いる場合、先行ジョブの完了（Done/Failed）が後続の処理中表示を上書きした
+                    // ままにならないようにする（単一ワーカーの逐次処理なので、先行完了→後続
+                    // デキューの隙間はごく短い）。
+                    lock_status(&status_for_worker)
+                        .insert(job.session_dir.clone(), TranscribeStatus::Transcribing);
                     let outcome = run_job(&job, &downloader);
                     let mut map = lock_status(&status_for_worker);
                     match outcome {
                         // 対象なしで何もしなかった場合は「投入済み」の痕跡を消し、
                         // 表示を JSON の有無ベース（前/完了）へ戻す。
                         JobOutcome::Skipped => map.remove(&job.session_dir),
-                        JobOutcome::Done => {
-                            map.insert(job.session_dir.clone(), TranscribeStatus::Done)
-                        }
-                        JobOutcome::Failed => {
-                            map.insert(job.session_dir.clone(), TranscribeStatus::Failed)
-                        }
+                        JobOutcome::Done => map.insert(job.session_dir, TranscribeStatus::Done),
+                        JobOutcome::Failed => map.insert(job.session_dir, TranscribeStatus::Failed),
                     };
                 }
             });
@@ -136,12 +141,12 @@ impl TranscribeWorker {
             return;
         };
         lock_status(&self.status).insert(job.session_dir.clone(), TranscribeStatus::Transcribing);
-        let session_dir = job.session_dir.clone();
         // 送信失敗 = ワーカースレッドが（panic 等で）終了しレシーバが閉じた状態。
         // 記録した「文字起こし中」を取り消す（永遠に進行中表示のままにしない）。
-        if tx.send(job).is_err() {
+        // ジョブは SendError から回収してキーの事前 clone を避ける。
+        if let Err(mpsc::SendError(job)) = tx.send(job) {
             eprintln!("Skipping transcription because the transcription worker is not running");
-            lock_status(&self.status).remove(&session_dir);
+            lock_status(&self.status).remove(&job.session_dir);
         }
     }
 
@@ -154,9 +159,7 @@ impl TranscribeWorker {
 
 /// 状態マップのガードを取る。poison（ロック保持中のパニック）でも状態表示を止めないため、
 /// ガードを取り出して続行する（`docs/rules/error-handling.md`）。
-fn lock_status(
-    status: &Arc<Mutex<HashMap<PathBuf, TranscribeStatus>>>,
-) -> MutexGuard<'_, HashMap<PathBuf, TranscribeStatus>> {
+fn lock_status(status: &Mutex<StatusMap>) -> MutexGuard<'_, StatusMap> {
     status
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
