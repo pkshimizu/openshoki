@@ -5,11 +5,12 @@
 //!    ことがある（実測でピーク -35dBFS / RMS -61dBFS の実例）。極端に小さい音源だけを
 //!    ピーク正規化して保存し直す（正常な音源は無加工）。デバイスゲインを openshoki 側から
 //!    操作するのは会議アプリと奪い合いになるため行わない。
-//! 2. **ミックス生成**: マイク（`mic.mp3`）とシステム音声（`system.mp3`）が両方あるセッションで
+//! 2. **文字起こしの投入**: 設定 ON のとき `TranscribeWorker` へ投入する。正規化の**後**に
+//!    投入することで文字起こしは正規化済みの音声を使う。ミックスは文字起こしの入力ではない
+//!    （音源別の `mic.mp3` / `system.mp3` を使う）ため、重いミックス生成は待たせない。
+//! 3. **ミックス生成**: マイク（`mic.mp3`）とシステム音声（`system.mp3`）が両方あるセッションで
 //!    `mix.mp3` を生成する。一覧選択のたびにミックスすると長い録音で UI が固まるため、重い
 //!    デコード＋再エンコードは録音直後の 1 回へ移す（再生は `src/player.rs` がストリーミング）。
-//! 3. **文字起こしの投入**: 設定 ON のとき `TranscribeWorker` へ投入する。正規化・ミックスの
-//!    **後**に投入することで、文字起こしは正規化済みの音声を使う。
 //!
 //! 生成物は録音データと同じ機微ファイルなので所有者のみ読み書き可（Unix 0600）で作る
 //! （`docs/rules/security.md`）。各段の失敗は worker スレッド内でログして次の段へ進み、
@@ -67,7 +68,9 @@ pub struct PostProcessWorker {
 
 impl PostProcessWorker {
     /// ワーカースレッドを起動する。`transcriber` は後処理完了後の文字起こし投入に使う
-    /// （このワーカーが所有し、停止フックからの直接投入は行わない）。スレッド生成に失敗しても
+    /// （このワーカーが所有し、停止フックからの直接投入は行わない。そのためこのスレッドの
+    /// 起動失敗・停止は文字起こしの投入経路も止める——正規化前の音声で文字起こししないための
+    /// 意図的な結合で、スレッド起動失敗は初期化時のみの稀な縮退）。スレッド生成に失敗しても
     /// 常駐アプリは落とさず、後処理だけを無効化してログを残す（スレッドは detach。終了時に
     /// 処理中のジョブは中断される）。
     pub fn start(transcriber: crate::transcribe::TranscribeWorker) -> Self {
@@ -115,16 +118,27 @@ fn run_job(job: PostProcessJob, transcriber: &crate::transcribe::TranscribeWorke
                 "Normalized {name} because it was too quiet (peak {peak_db:.1} dBFS, applied +{gain_db:.1} dB)"
             ),
             // 非発動でもピークをログし、音量問題の診断（本当に無音か・単に小さいか）に使えるようにする。
-            Ok(NormalizeOutcome::Unchanged { peak_db }) => {
+            Ok(NormalizeOutcome::Unchanged { peak_db }) if peak_db.is_finite() => {
                 println!("Peak level of {name}: {peak_db:.1} dBFS")
             }
+            // 完全無音（デジタルゼロ）はピークが -inf になるため表示を整える。
+            Ok(NormalizeOutcome::Unchanged { .. }) => println!("Peak level of {name}: silent"),
             Err(err) => {
-                eprintln!("Skipping normalization of {name} because it failed: {err}")
+                eprintln!(
+                    "Skipping normalization of {name} because reading or rewriting it failed: {err}"
+                )
             }
         }
     }
 
-    // 2) 両音源が揃っていればミックスを生成する（正規化後の音声を使う）。
+    // 2) 文字起こしの投入（設定 ON のときだけ依頼が入っている）。文字起こしワーカーは別
+    // スレッドなので、続くミックス生成と並行に走る（文字起こしの入力は音源別ファイルで、
+    // ミックスの完了を待つ必要が無い）。
+    if let Some(transcribe_job) = job.transcribe {
+        transcriber.submit(transcribe_job);
+    }
+
+    // 3) 両音源が揃っていればミックスを生成する（正規化後の音声を使う）。
     let has_name = |name: &str| {
         job.saved
             .iter()
@@ -135,11 +149,6 @@ fn run_job(job: PostProcessJob, transcriber: &crate::transcribe::TranscribeWorke
         && let Err(err) = generate_mix(&job.session_dir)
     {
         eprintln!("Skipping mixdown because generating the mixed file failed: {err}");
-    }
-
-    // 3) 文字起こしの投入（設定 ON のときだけ依頼が入っている）。
-    if let Some(transcribe_job) = job.transcribe {
-        transcriber.submit(transcribe_job);
     }
 }
 
@@ -173,8 +182,7 @@ fn normalize_if_quiet(path: &Path) -> Result<NormalizeOutcome, Box<dyn std::erro
     for sample in &mut pcm {
         *sample = (*sample * gain).clamp(-1.0, 1.0);
     }
-    let mp3 = encode_mp3(&to_i16(&pcm), decoded.channels, decoded.sample_rate)?;
-    drop(pcm);
+    let mp3 = encode_mp3(&to_i16(pcm), decoded.channels, decoded.sample_rate)?;
 
     // 一時ファイルへ書いてから rename で置き換える（途中で失敗しても元ファイルが壊れない）。
     let part = path.with_extension(format!("mp3.part.{}", std::process::id()));
@@ -242,7 +250,7 @@ fn generate_mix(session_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         mix_into(system_pcm, &mic_pcm)
     };
-    let mp3 = encode_mp3(&to_i16(&mixed), channels, sample_rate)?;
+    let mp3 = encode_mp3(&to_i16(mixed), channels, sample_rate)?;
     write_owner_only(&session_dir.join(MIX_FILENAME), &mp3)?;
     Ok(())
 }
@@ -305,9 +313,11 @@ fn mix_into(mut base: Vec<f32>, other: &[f32]) -> Vec<f32> {
 }
 
 /// f32 PCM（[-1, 1]）を i16 PCM に変換する（LAME エンコーダは i16 を取る）。
-fn to_i16(pcm: &[f32]) -> Vec<i16> {
-    pcm.iter()
-        .map(|&sample| (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
+/// move で受けて変換後に f32 バッファを解放し、重いエンコード中に両方を抱えない
+/// （長時間録音では f32 全量が GB 級になりうる。`docs/rules/performance.md`）。
+fn to_i16(pcm: Vec<f32>) -> Vec<i16> {
+    pcm.into_iter()
+        .map(|sample| (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
         .collect()
 }
 
@@ -494,10 +504,31 @@ mod tests {
 
     #[test]
     fn to_i16_scales_and_clamps() {
-        assert_eq!(to_i16(&[0.0]), vec![0]);
-        assert_eq!(to_i16(&[1.0]), vec![i16::MAX]);
+        assert_eq!(to_i16(vec![0.0]), vec![0]);
+        assert_eq!(to_i16(vec![1.0]), vec![i16::MAX]);
         // 範囲外は [-1, 1] に丸めてから変換する。
-        assert_eq!(to_i16(&[2.0]), vec![i16::MAX]);
-        assert_eq!(to_i16(&[-2.0]), vec![-i16::MAX]);
+        assert_eq!(to_i16(vec![2.0]), vec![i16::MAX]);
+        assert_eq!(to_i16(vec![-2.0]), vec![-i16::MAX]);
+    }
+
+    #[test]
+    fn normalization_is_safe_against_nan() {
+        // NaN サンプルは peak_of（f32::max は NaN を無視）と gain 判定（contains が false）の
+        // 両方で安全側（非発動）に倒れる。
+        assert_eq!(peak_of(&[f32::NAN, 0.2]), 0.2);
+        assert!(normalization_gain_db(f32::NAN).is_none());
+    }
+
+    #[test]
+    fn normalize_if_quiet_fails_on_broken_mp3() {
+        // 破損した入力ではエラーを返し（run_job がログして続行する縮退経路）、
+        // 元ファイルはそのまま残る。
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("openshoki-broken-{}.mp3", std::process::id()));
+        std::fs::write(&path, b"not an mp3").expect("writing the broken file should succeed");
+        let result = super::normalize_if_quiet(&path);
+        assert!(result.is_err());
+        assert!(path.is_file(), "the original file must remain untouched");
+        let _ = std::fs::remove_file(&path);
     }
 }
