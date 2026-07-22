@@ -540,6 +540,66 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // 確認モーダルの Delete: 選択中セッションをディレクトリごと OS のゴミ箱へ移動し、
+    // 一覧・メモリの両方から除去する（完全削除への自動フォールバックはしない）。
+    // 失敗はログのみでアプリ・一覧を壊さない（`docs/rules/error-handling.md`）。
+    {
+        let sessions = Rc::clone(&sessions);
+        let sessions_model = Rc::clone(&sessions_model);
+        let player = Rc::clone(&player);
+        let transcriber = transcriber.clone();
+        let rec_weak = recordings_ui.as_weak();
+        recordings_ui.on_delete_session(move |index| {
+            let Some(rec) = rec_weak.upgrade() else {
+                return;
+            };
+            let Some(i) = usize::try_from(index).ok() else {
+                return;
+            };
+            // 境界チェックと要素取得を get(i) で一体にする（他ハンドラと同じパターン）。
+            // 失敗時の積み直しに使う再生対象パスもここでまとめて取り出す。
+            let Some((dir, playback_path)) = sessions
+                .borrow()
+                .get(i)
+                .map(|s| (s.dir.clone(), s.playback_path()))
+            else {
+                return;
+            };
+            // ゴミ箱への移動前に再生対象を手放す。削除済みファイルを play_pause / seek の
+            // 開き直し経路が参照しないようにし、開いたままのハンドルが移動を妨げる OS でも
+            // 失敗しないようにする。
+            if let Some(p) = player.borrow_mut().as_mut() {
+                p.unload();
+            }
+            if let Err(err) = move_recording_to_trash(&dir) {
+                // trash::Error の Display/Debug はフルパスを含みうるため、ログへは流さず、
+                // セッション名（日時ディレクトリ名）とパスを含まない種別だけを出す
+                // （`docs/rules/security.md`）。
+                let name = dir.file_name().map(|n| n.to_string_lossy());
+                eprintln!(
+                    "Skipping the deletion because moving the recording to the Trash failed \
+                     (session: {}, reason: {})",
+                    name.as_deref().unwrap_or("unknown"),
+                    trash_error_kind(&err)
+                );
+                // 事前に手放した再生対象を積み直し、「選択中なのに再生が沈黙する」不整合を
+                // 残さない（ベストエフォート。失敗はログのみで選択し直せば回復する）。
+                if let Some(path) = &playback_path
+                    && let Some(p) = player.borrow_mut().as_mut()
+                    && let Err(err) = p.load(path)
+                {
+                    eprintln!("Failed to reload the recording for playback: {err}");
+                }
+                return;
+            }
+            sessions.borrow_mut().remove(i);
+            sessions_model.remove(i);
+            // 進行状況マップに残ったエントリを掃除する（削除済みセッションの記録を残さない）。
+            transcriber.forget(&dir);
+            clear_recordings_selection(&rec);
+        });
+    }
+
     // トレイのメニューイベントを Slint のイベントループ上でポーリングし、
     // ウィンドウ操作・終了へ橋渡しする。
     let timer = slint::Timer::default();
@@ -818,6 +878,50 @@ fn build_menu_event_handler(
     }
 }
 
+/// セッションディレクトリを OS のゴミ箱へ移動する。macOS では `NsFileManager` 方式を明示する:
+/// `trash` の既定（Finder 方式）は osascript の子プロセス経由で Finder を操作するため、
+/// 初回に Automation 権限プロンプトが出て、拒否されると以後の削除が全て失敗するうえ、
+/// 録音のフルパスが子プロセスの引数へ渡る（`docs/rules/security.md`）。NsFileManager 方式は
+/// 追加権限も子プロセスも不要で同じ「ゴミ箱へ移動」になる。
+fn move_recording_to_trash(dir: &std::path::Path) -> Result<(), trash::Error> {
+    #[cfg(target_os = "macos")]
+    {
+        use trash::TrashContext;
+        use trash::macos::{DeleteMethod, TrashContextExtMacos};
+        let mut ctx = TrashContext::default();
+        ctx.set_delete_method(DeleteMethod::NsFileManager);
+        ctx.delete(dir)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        trash::delete(dir)
+    }
+}
+
+/// ゴミ箱移動の失敗理由を、パスを含まない固定文字列に落とす（ログの切り分け用。
+/// `trash::Error` のフィールドにはフルパスが入りうるため出力しない）。
+fn trash_error_kind(err: &trash::Error) -> String {
+    match err {
+        trash::Error::Os { code, .. } => format!("os error {code}"),
+        trash::Error::Unknown { .. } => "unknown".to_owned(),
+        trash::Error::TargetedRoot => "targeted a root folder".to_owned(),
+        trash::Error::CouldNotAccess { .. } => "could not access the target".to_owned(),
+        trash::Error::CanonicalizePath { .. } => "could not canonicalize the path".to_owned(),
+        trash::Error::ConvertOsString { .. } => "could not convert the path string".to_owned(),
+        _ => "other".to_owned(),
+    }
+}
+
+/// Recordings ウィンドウの選択・再生表示を未選択状態へ初期化する
+/// （ウィンドウを開いたとき・セッション削除後に共用する）。
+fn clear_recordings_selection(rec: &RecordingsWindow) {
+    rec.set_selected_index(-1);
+    rec.set_has_selection(false);
+    rec.set_playing(false);
+    rec.set_progress(0.0);
+    rec.set_time_text(format_playback_time(Duration::ZERO, None).into());
+}
+
 /// トレイの「Recordings…」で Recordings ウィンドウを開く。保存先を走査して一覧を更新し、
 /// 選択・再生状態を初期化してから表示する（初回表示はジオメトリを明示する。`docs/rules/slint.md`）。
 fn open_recordings_window(
@@ -842,11 +946,7 @@ fn open_recordings_window(
         .collect();
     handles.sessions_model.set_vec(rows);
     // 開くたびに未選択・停止表示へ初期化する。
-    rec.set_selected_index(-1);
-    rec.set_has_selection(false);
-    rec.set_playing(false);
-    rec.set_progress(0.0);
-    rec.set_time_text(format_playback_time(Duration::ZERO, None).into());
+    clear_recordings_selection(rec);
     *handles.sessions.borrow_mut() = list;
     *last_play_secs = None;
     // 前回の再生が残っていれば止める。

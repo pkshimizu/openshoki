@@ -71,6 +71,49 @@ component SpeakerBadge inherits Rectangle {
     }
 }
 
+// 破壊的操作用のボタン。std-widgets の Button は文字色・背景色を変えられないため、同等の
+// 見た目を Rectangle + TouchArea で作る。filled=false はヘッダの Delete（赤文字・通常背景）、
+// filled=true は確認モーダルの確定ボタン（赤背景・白文字）。
+component DangerButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> enabled: true;
+    in property <bool> filled: false;
+
+    callback clicked();
+
+    border-radius: 6px;
+    border-width: root.filled ? 0 : 1px;
+    border-color: Palette.border;
+    background: root.filled
+        ? (touch.pressed && root.enabled ? Style.danger.darker(15%) : Style.danger)
+        : (touch.pressed && root.enabled
+            ? Palette.control-background.darker(8%)
+            : Palette.control-background);
+    opacity: root.enabled ? 1.0 : Style.disabled-opacity;
+
+    HorizontalLayout {
+        padding-left: 16px;
+        padding-right: 16px;
+        padding-top: 5px;
+        padding-bottom: 5px;
+        Text {
+            text: root.text;
+            font-size: Style.body-size;
+            font-weight: root.filled ? Style.semibold : 400;
+            color: root.filled ? Style.on-accent-foreground : Style.danger;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
 // トレイの「Recordings…」から開く録音一覧ウィンドウ。左＝セッション一覧、右＝再生と文字起こし。
 // 配色は Palette でライト/ダークに追従し、サイズ・淡色は共有の Style トークンを使う
 // （選択行の白文字はアクセント固定背景のため Style.on-accent-foreground）。
@@ -108,6 +151,8 @@ export component RecordingsWindow inherits Window {
     in property <bool> playing;
     in property <string> time-text;
     in property <float> progress;
+    // 削除の確認モーダルの表示状態。Delete 押下で開き、Cancel / 確定で閉じる（Slint 内で完結）。
+    in-out property <bool> show-delete-confirm: false;
 
     // 行クリックでの選択通知。Rust 側で詳細更新・再生対象のロードを行う。
     callback select-session(int);
@@ -118,6 +163,8 @@ export component RecordingsWindow inherits Window {
     callback seek-to-segment(int);
     // 「Transcribe」押下。選択中セッションの文字起こしを（再）実行する。インデックスを渡す。
     callback transcribe-session(int);
+    // 確認モーダルの Delete 押下。選択中セッションをゴミ箱へ移動する（インデックスを渡す）。
+    callback delete-session(int);
 
     HorizontalLayout {
         padding: 16px;
@@ -275,6 +322,7 @@ export component RecordingsWindow inherits Window {
                     VerticalLayout {
                         alignment: start;
                         horizontal-stretch: 0;
+                        spacing: 8px;
                         Button {
                             text: "Transcribe";
                             // 実行中（キュー待ち含む）は多重投入を防ぐ。完了済み・失敗・未実施の
@@ -282,6 +330,16 @@ export component RecordingsWindow inherits Window {
                             enabled: !root.detail-transcribing;
                             clicked => {
                                 root.transcribe-session(root.selected-index);
+                            }
+                        }
+
+                        DangerButton {
+                            text: "Delete";
+                            // 文字起こし中はワーカーが対象ファイルを読んでいるため削除させない
+                            // （Transcribe と同じ縮退表現）。
+                            enabled: !root.detail-transcribing;
+                            clicked => {
+                                root.show-delete-confirm = true;
                             }
                         }
                     }
@@ -440,6 +498,69 @@ export component RecordingsWindow inherits Window {
                                 vertical-alignment: center;
                                 color: Palette.foreground.transparentize(Style.muted-alpha);
                             }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 削除の確認モーダル。ウィンドウ内オーバーレイでテーマに追従する（`docs/plans` #66 の
+    // デザイン準拠）。スクリムがクリックを吸収し、背後の一覧・ボタンは操作できない。
+    // 閉じる操作は Cancel（何もしない）か Delete（削除を依頼して閉じる）のみ。
+    if root.show-delete-confirm: Rectangle {
+        background: #000000.transparentize(0.65);
+
+        TouchArea { }
+
+        Rectangle {
+            width: 320px;
+            height: dialog-layout.preferred-height;
+            background: Palette.alternate-background;
+            border-width: 1px;
+            border-color: Palette.border;
+            border-radius: 12px;
+
+            dialog-layout := VerticalLayout {
+                padding: 22px;
+                padding-bottom: 16px;
+                spacing: 7px;
+
+                Text {
+                    text: "Delete This Recording?";
+                    font-size: Style.detail-title-size;
+                    font-weight: Style.semibold;
+                    color: Palette.foreground;
+                    horizontal-alignment: center;
+                }
+
+                Text {
+                    text: "The recording will be moved to the Trash.";
+                    font-size: Style.caption-size;
+                    color: Palette.foreground.transparentize(Style.muted-alpha);
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+
+                HorizontalLayout {
+                    padding-top: 11px;
+                    spacing: 10px;
+
+                    Button {
+                        text: "Cancel";
+                        horizontal-stretch: 1;
+                        clicked => {
+                            root.show-delete-confirm = false;
+                        }
+                    }
+
+                    DangerButton {
+                        text: "Delete";
+                        filled: true;
+                        horizontal-stretch: 1;
+                        clicked => {
+                            root.show-delete-confirm = false;
+                            root.delete-session(root.selected-index);
                         }
                     }
                 }
