@@ -2,11 +2,13 @@ import { Button, ListView, ScrollView, Palette } from "std-widgets.slint";
 import { Style } from "style.slint";
 
 // 一覧の 1 行分。Rust の recordings::RecordingSession から詰める。
+// transcript-status は main.rs の transcript_display_status と対応:
+// 0=文字起こし前 / 1=文字起こし中 / 2=完了 / 3=失敗。
 export struct SessionRow {
     datetime: string,
     has-mic: bool,
     has-system: bool,
-    has-transcript: bool,
+    transcript-status: int,
 }
 
 // トランスクリプトの表示 1 行分。Rust の transcript::TranscriptSegment から詰める
@@ -81,6 +83,11 @@ export component RecordingsWindow inherits Window {
     in property <bool> has-selection;
     in property <string> detail-datetime;
     in property <string> detail-summary;
+    // 選択中セッションの文字起こし状態テキスト（Rust 側が組み立てる。例: Transcribed /
+    // Transcribing… / Transcription failed / Not transcribed）。
+    in property <string> detail-transcript-text;
+    // 選択中セッションが文字起こし中か（Transcribe ボタンの無効化に使う）。
+    in property <bool> detail-transcribing;
     // 選択セッションのトランスクリプト（mic.json / system.json をマージしたもの。新→旧でなく時刻順）。
     // 空なら Transcript セクションは「Not Transcribed Yet」に縮退表示する。
     in property <[TranscriptRow]> segments;
@@ -102,6 +109,8 @@ export component RecordingsWindow inherits Window {
     callback stop();
     // トランスクリプトのセグメントクリック。その開始秒へ再生位置をスキップする（index を渡す）。
     callback seek-to-segment(int);
+    // 「Transcribe」押下。選択中セッションの文字起こしを（再）実行する。インデックスを渡す。
+    callback transcribe-session(int);
 
     HorizontalLayout {
         padding: 16px;
@@ -175,12 +184,17 @@ export component RecordingsWindow inherits Window {
                                             vertical-alignment: center;
                                             horizontal-stretch: 1;
                                         }
-                                        // 文字起こし済みを表すドット（無ければ透明にして場所だけ確保）。
+                                        // 文字起こしの状態を表すドット（前=透明で場所だけ確保 /
+                                        // 中=淡色 / 完了=アクセント / 失敗=警告色）。
                                         Rectangle {
                                             width: 6px;
                                             height: 6px;
                                             border-radius: 3px;
-                                            background: row.has-transcript ? (rowbg.selected ? Style.on-accent-foreground : Palette.accent-background) : transparent;
+                                            background: row.transcript-status == 2
+                                                ? (rowbg.selected ? Style.on-accent-foreground : Palette.accent-background)
+                                                : row.transcript-status == 1
+                                                    ? (rowbg.selected ? Style.on-accent-foreground : Palette.foreground).transparentize(Style.muted-alpha)
+                                                    : row.transcript-status == 3 ? Style.danger : transparent;
                                         }
                                     }
 
@@ -224,21 +238,45 @@ export component RecordingsWindow inherits Window {
             if root.has-selection: VerticalLayout {
                 spacing: 12px;
 
-                // ヘッダ: 日時と音源要約。
-                VerticalLayout {
+                // ヘッダ: 日時・音源要約と、文字起こしの状態＋再実行ボタン。
+                HorizontalLayout {
                     vertical-stretch: 0;
-                    spacing: 3px;
-                    Text {
-                        text: root.detail-datetime;
-                        font-size: Style.detail-title-size;
-                        font-weight: Style.semibold;
-                        color: Palette.foreground;
+                    spacing: 12px;
+                    VerticalLayout {
+                        spacing: 3px;
+                        horizontal-stretch: 1;
+                        Text {
+                            text: root.detail-datetime;
+                            font-size: Style.detail-title-size;
+                            font-weight: Style.semibold;
+                            color: Palette.foreground;
+                        }
+
+                        Text {
+                            text: root.detail-summary;
+                            font-size: Style.caption-size;
+                            color: Palette.foreground.transparentize(Style.muted-alpha);
+                        }
+
+                        Text {
+                            text: root.detail-transcript-text;
+                            font-size: Style.caption-size;
+                            color: Palette.foreground.transparentize(Style.muted-alpha);
+                        }
                     }
 
-                    Text {
-                        text: root.detail-summary;
-                        font-size: Style.caption-size;
-                        color: Palette.foreground.transparentize(Style.muted-alpha);
+                    VerticalLayout {
+                        alignment: start;
+                        horizontal-stretch: 0;
+                        Button {
+                            text: "Transcribe";
+                            // 実行中（キュー待ち含む）は多重投入を防ぐ。完了済み・失敗・未実施の
+                            // いずれからも（再）実行できる（言語・モデル変更後のやり直し用途）。
+                            enabled: !root.detail-transcribing;
+                            clicked => {
+                                root.transcribe-session(root.selected-index);
+                            }
+                        }
                     }
                 }
 

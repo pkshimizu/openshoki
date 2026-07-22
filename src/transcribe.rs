@@ -10,9 +10,11 @@
 //! ブロックしない。モデル未指定/欠如・デコード失敗・whisper 失敗は握りつぶさずログし、
 //! 他音源・アプリ・録音を巻き込まない（`docs/rules/error-handling.md`）。
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{Fft, FixedSync, Resampler};
@@ -38,6 +40,8 @@ const RESAMPLE_CHUNK_FRAMES: usize = 1024;
 /// 文字起こしジョブ。1 回の録音停止で保存された音源ファイル群と、設定のスナップショット。
 /// 設定はジョブ投入時点の値を固定で持つ（処理中に設定が変わっても影響しない）。
 pub struct TranscribeJob {
+    /// 録音セッションのディレクトリ。状態表示（`TranscribeStatus`）のキーに使う。
+    pub session_dir: PathBuf,
     /// 対象の音声ファイル（セッションディレクトリ内の `mic.mp3` / `system.mp3`）。
     pub audio_paths: Vec<PathBuf>,
     /// 使用する内蔵モデルの識別子（設定 `whisper_model`）。カタログ外は既定へフォールバック。
@@ -49,11 +53,30 @@ pub struct TranscribeJob {
     pub language: String,
 }
 
+/// セッション単位の文字起こしの進行状況。Recordings ウィンドウの状態表示に使う。
+/// マップに載らないセッションの表示は「JSON の有無」で解決する（`docs/plans/done/` の #69 プラン）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscribeStatus {
+    /// 投入済み（キュー待ちを含む）または処理中。
+    Transcribing,
+    /// 全音源の文字起こしが完了した。
+    Done,
+    /// 少なくとも 1 音源が失敗した（理由はログ。メモリのみで、再起動後は JSON の有無に基づく
+    /// 表示へ戻る。再実行でクリアされる）。
+    Failed,
+}
+
 /// 文字起こしのバックグラウンドワーカー。`submit` されたジョブを 1 本のスレッドで逐次処理する
 /// （whisper は CPU 集約のため、録音が連続してもスレッドを増やさない）。
+/// `Clone` で共有できる（後処理ワーカーからの自動投入と、Recordings ウィンドウからの
+/// 手動再実行・状態表示が同じワーカー・同じ状態マップを使う）。
+#[derive(Clone)]
 pub struct TranscribeWorker {
     /// ワーカースレッドへの送信口。スレッド起動に失敗していたら `None`（文字起こしのみ縮退）。
     tx: Option<Sender<TranscribeJob>>,
+    /// セッションディレクトリ → 進行状況。`submit` で `Transcribing`、ジョブ完了で
+    /// `Done` / `Failed` に遷移する。
+    status: Arc<Mutex<HashMap<PathBuf, TranscribeStatus>>>,
 }
 
 impl TranscribeWorker {
@@ -67,45 +90,94 @@ impl TranscribeWorker {
         // whisper.cpp / GGML が stderr へ出す冗長な内部ログを止める（ログ backend の feature を
         // 有効にしていないため、フック先が無く事実上の無効化になる）。複数回呼んでも安全。
         whisper_rs::install_logging_hooks();
+        let status: Arc<Mutex<HashMap<PathBuf, TranscribeStatus>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let status_for_worker = Arc::clone(&status);
         let (tx, rx) = mpsc::channel::<TranscribeJob>();
         let spawned = std::thread::Builder::new()
             .name("transcribe-worker".into())
             .spawn(move || {
                 // 送信側（アプリ本体）が落ちてチャネルが閉じたら自然に終了する。
                 while let Ok(job) = rx.recv() {
-                    run_job(&job, &downloader);
+                    let outcome = run_job(&job, &downloader);
+                    let mut map = lock_status(&status_for_worker);
+                    match outcome {
+                        // 対象なしで何もしなかった場合は「投入済み」の痕跡を消し、
+                        // 表示を JSON の有無ベース（前/完了）へ戻す。
+                        JobOutcome::Skipped => map.remove(&job.session_dir),
+                        JobOutcome::Done => {
+                            map.insert(job.session_dir.clone(), TranscribeStatus::Done)
+                        }
+                        JobOutcome::Failed => {
+                            map.insert(job.session_dir.clone(), TranscribeStatus::Failed)
+                        }
+                    };
                 }
             });
         match spawned {
-            Ok(_handle) => Self { tx: Some(tx) },
+            Ok(_handle) => Self {
+                tx: Some(tx),
+                status,
+            },
             Err(err) => {
                 eprintln!(
                     "Disabling transcription because the worker thread failed to start: {err}"
                 );
-                Self { tx: None }
+                Self { tx: None, status }
             }
         }
     }
 
-    /// ジョブを投入する。ワーカーが動いていない場合はログのみ（録音自体は既に保存済み）。
+    /// ジョブを投入する。投入した時点でセッションを「文字起こし中」（キュー待ちを含む）として
+    /// 記録する。ワーカーが動いていない場合はログのみ（録音自体は既に保存済み）。
     pub fn submit(&self, job: TranscribeJob) {
         let Some(tx) = &self.tx else {
             eprintln!("Skipping transcription because the transcription worker is not running");
             return;
         };
+        lock_status(&self.status).insert(job.session_dir.clone(), TranscribeStatus::Transcribing);
+        let session_dir = job.session_dir.clone();
         // 送信失敗 = ワーカースレッドが（panic 等で）終了しレシーバが閉じた状態。
+        // 記録した「文字起こし中」を取り消す（永遠に進行中表示のままにしない）。
         if tx.send(job).is_err() {
             eprintln!("Skipping transcription because the transcription worker is not running");
+            lock_status(&self.status).remove(&session_dir);
         }
     }
+
+    /// セッションの進行状況。マップに載っていなければ `None`（表示側が JSON の有無で
+    /// 「文字起こし前/完了」を解決する）。
+    pub fn status_of(&self, session_dir: &Path) -> Option<TranscribeStatus> {
+        lock_status(&self.status).get(session_dir).copied()
+    }
+}
+
+/// 状態マップのガードを取る。poison（ロック保持中のパニック）でも状態表示を止めないため、
+/// ガードを取り出して続行する（`docs/rules/error-handling.md`）。
+fn lock_status(
+    status: &Arc<Mutex<HashMap<PathBuf, TranscribeStatus>>>,
+) -> MutexGuard<'_, HashMap<PathBuf, TranscribeStatus>> {
+    status
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// 1 ジョブの処理結果（状態マップへの反映用）。
+enum JobOutcome {
+    /// 全音源の文字起こしに成功した。
+    Done,
+    /// 少なくとも 1 音源が失敗した（モデル準備の失敗を含む）。
+    Failed,
+    /// 対象なしで何もしなかった。
+    Skipped,
 }
 
 /// 1 ジョブ（1 回の録音停止分）を処理する。モデルはジョブ内で 1 回だけロードして
 /// 複数音源で使い回す（モデルのロードが重いため）。音源単位の失敗は他の音源へ波及させない。
-fn run_job(job: &TranscribeJob, downloader: &crate::whisper_model::ModelDownloader) {
+fn run_job(job: &TranscribeJob, downloader: &crate::whisper_model::ModelDownloader) -> JobOutcome {
     if job.audio_paths.is_empty() {
         // 対象なしでモデル（数百 MB〜）をロードしない防御。通常は投入側が空を渡さない。
-        return;
+        return JobOutcome::Skipped;
     }
     // モデルを解決する。上書き指定があればそれを、無ければ設定で選ばれた内蔵モデルを使う
     // （カタログ外の手編集値は既定へフォールバック。未取得ならここで自動ダウンロードする。
@@ -122,7 +194,7 @@ fn run_job(job: &TranscribeJob, downloader: &crate::whisper_model::ModelDownload
                     eprintln!(
                         "Skipping transcription because the Whisper model could not be prepared: {err}"
                     );
-                    return;
+                    return JobOutcome::Failed;
                 }
             }
         }
@@ -132,11 +204,11 @@ fn run_job(job: &TranscribeJob, downloader: &crate::whisper_model::ModelDownload
             "Skipping transcription because the Whisper model file was not found: {}",
             model_path.display()
         );
-        return;
+        return JobOutcome::Failed;
     }
     let Some(model_path_str) = model_path.to_str() else {
         eprintln!("Skipping transcription because the Whisper model path is not valid UTF-8");
-        return;
+        return JobOutcome::Failed;
     };
     let ctx = match WhisperContext::new_with_params(
         model_path_str,
@@ -148,9 +220,10 @@ fn run_job(job: &TranscribeJob, downloader: &crate::whisper_model::ModelDownload
                 "Skipping transcription because loading the Whisper model failed ({}): {err}",
                 model_path.display()
             );
-            return;
+            return JobOutcome::Failed;
         }
     };
+    let mut all_succeeded = true;
     for path in &job.audio_paths {
         // ログには（既存の録音保存ログと同じ方針で）フルパスを出さず、ファイル名だけにする。
         let name = path
@@ -159,8 +232,16 @@ fn run_job(job: &TranscribeJob, downloader: &crate::whisper_model::ModelDownload
             .unwrap_or_else(|| "audio".to_owned());
         match transcribe_file(&ctx, path, &model_path, job) {
             Ok(segments) => println!("Transcribed {name} ({segments} segments)"),
-            Err(err) => eprintln!("Skipping transcription of {name} because it failed: {err}"),
+            Err(err) => {
+                eprintln!("Skipping transcription of {name} because it failed: {err}");
+                all_succeeded = false;
+            }
         }
+    }
+    if all_succeeded {
+        JobOutcome::Done
+    } else {
+        JobOutcome::Failed
     }
 }
 
@@ -414,6 +495,55 @@ fn write_transcription(
 mod tests {
     use super::*;
 
+    /// 手動再実行・状態表示の土台となる状態マップのライフサイクルを、whisper モデルなしで
+    /// 検証する。存在しないモデル上書きパスを渡すと、ネットワークに触れず即 Failed になる。
+    #[test]
+    fn submit_tracks_status_until_failure() {
+        let worker = TranscribeWorker::start(crate::whisper_model::ModelDownloader::new());
+        let dir = std::env::temp_dir().join(format!("openshoki-status-{}", std::process::id()));
+        worker.submit(TranscribeJob {
+            session_dir: dir.clone(),
+            audio_paths: vec![dir.join("mic.mp3")],
+            model_id: "small".to_owned(),
+            model_override: Some(dir.join("missing-model.bin")),
+            language: "en".to_owned(),
+        });
+        // 投入直後は「文字起こし中」（ワーカーが速ければもう Failed でもよい）。
+        assert!(matches!(
+            worker.status_of(&dir),
+            Some(TranscribeStatus::Transcribing) | Some(TranscribeStatus::Failed)
+        ));
+        // 最終的に Failed へ収束する。無限ポーリングにしない（`docs/rules/error-handling.md`）。
+        for _ in 0..200 {
+            if worker.status_of(&dir) == Some(TranscribeStatus::Failed) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(worker.status_of(&dir), Some(TranscribeStatus::Failed));
+    }
+
+    /// 対象音源なし（Skipped）の投入は状態を残さない（「文字起こし中」のまま固まらない）。
+    #[test]
+    fn submit_with_no_audio_clears_status() {
+        let worker = TranscribeWorker::start(crate::whisper_model::ModelDownloader::new());
+        let dir = std::env::temp_dir().join(format!("openshoki-skip-{}", std::process::id()));
+        worker.submit(TranscribeJob {
+            session_dir: dir.clone(),
+            audio_paths: Vec::new(),
+            model_id: "small".to_owned(),
+            model_override: None,
+            language: "en".to_owned(),
+        });
+        for _ in 0..200 {
+            if worker.status_of(&dir).is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(worker.status_of(&dir), None);
+    }
+
     #[test]
     fn downmix_passes_through_mono() {
         let samples = vec![0.1, -0.2, 0.3];
@@ -571,6 +701,7 @@ mod tests {
 
         run_job(
             &TranscribeJob {
+                session_dir: dir.clone(),
                 audio_paths: vec![audio_path.clone()],
                 model_id: crate::whisper_model::DEFAULT_MODEL_ID.to_owned(),
                 model_override: Some(PathBuf::from(model_path)),

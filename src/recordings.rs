@@ -65,6 +65,19 @@ impl RecordingSession {
         self.playback_path().is_some()
     }
 
+    /// 文字起こしの対象となる音源ファイル（存在する `mic.mp3` / `system.mp3`）。
+    /// 手動再実行（Recordings ウィンドウの Transcribe ボタン）の投入対象に使う。
+    pub fn audio_source_paths(&self) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        if self.has_mic {
+            paths.push(self.dir.join(MIC_MP3));
+        }
+        if self.has_system {
+            paths.push(self.dir.join(SYSTEM_MP3));
+        }
+        paths
+    }
+
     /// 含まれる音源を表す英語サマリー（右ペインのヘッダ表示用）。
     pub fn source_summary(&self) -> &'static str {
         match (self.has_mic, self.has_system) {
