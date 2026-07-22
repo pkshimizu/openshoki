@@ -42,7 +42,7 @@ const BLINK_CYCLE_SECS: f32 = 2.0;
 /// 確定されないまま高さ 0 で表示される。初回表示時にこの値を明示してジオメトリを確定させる。
 /// 幅・高さは `ui/app-window.slint` の min/preferred と一致させること（片方だけ変えない）。
 const WINDOW_WIDTH: f32 = 420.0;
-const WINDOW_HEIGHT: f32 = 720.0;
+const WINDOW_HEIGHT: f32 = 790.0;
 /// 初回表示位置（画面左上からの暫定値）。中央寄せ等の調整は後続に回す。
 const WINDOW_X: f32 = 240.0;
 const WINDOW_Y: f32 = 160.0;
@@ -72,6 +72,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 設定を読み込み、現在の保存先・自動録音トグル・登録アプリ一覧を画面へ反映する。
     // 失敗時は load() がデフォルトを返す。
     let config = Rc::new(RefCell::new(Config::load()));
+
+    // 内蔵 whisper モデルのダウンロード・状態管理。設定画面（モデル選択・DL 状況表示）と
+    // 文字起こしワーカーで同じ状態を共有し、同一モデルの二重ダウンロードを防ぐ。
+    let model_downloader = whisper_model::ModelDownloader::new();
+
     ui.set_recording_dir(recording_dir_text(&config.borrow().recording_dir));
     ui.set_auto_record_app(config.borrow().auto_record_on_app_mic);
     // 保存値は load 時に範囲へ正規化済みなので、そのまま表示へ渡す。
@@ -92,6 +97,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ui.set_transcribe_language_index(config::transcribe_language_index(
         &config.borrow().transcribe_language,
     ) as i32);
+    // 内蔵 whisper モデル: 表示名一覧はカタログから「名前 — サイズ — 説明」を組み立てる。
+    // 選択位置は設定のモデル ID から解決し、カタログ外の手編集値は既定（Small）位置に表示される。
+    ui.set_whisper_models(
+        Rc::new(slint::VecModel::<slint::SharedString>::from(
+            whisper_model::CATALOG
+                .iter()
+                .map(|spec| {
+                    slint::SharedString::from(format!(
+                        "{} — {} — {}",
+                        spec.display_name,
+                        whisper_model::format_size(spec.size_bytes),
+                        spec.description
+                    ))
+                })
+                .collect::<Vec<_>>(),
+        ))
+        .into(),
+    );
+    ui.set_whisper_model_index(whisper_model::model_index(&config.borrow().whisper_model) as i32);
+    ui.set_whisper_model_status(
+        selected_model_status_text(&config.borrow().whisper_model, &model_downloader).into(),
+    );
     // 登録アプリの表示名一覧を Slint のモデルで持ち、追加/削除で更新する。
     let app_list_model = Rc::new(slint::VecModel::<slint::SharedString>::from(
         config
@@ -230,6 +257,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         *config_for_language.borrow_mut() = candidate;
     });
 
+    // 内蔵 whisper モデルの変更: ComboBox のインデックスをカタログの ID へ変換して永続化し、
+    // 未取得なら即バックグラウンドでダウンロードを開始する（進捗はタイマーが状態行へ反映する）。
+    // Slint 側は先に選択位置を新値へ更新するため、保存失敗時は表示を保存済みの値へ戻す
+    // （docs/rules/slint.md）。
+    let config_for_model = Rc::clone(&config);
+    let ui_for_model = ui.as_weak();
+    let downloader_for_model = model_downloader.clone();
+    ui.on_change_whisper_model(move |index| {
+        let Some(ui) = ui_for_model.upgrade() else {
+            return;
+        };
+        // ComboBox は Rust が渡したカタログの範囲しか返さないが、防御的に既定へ丸める。
+        let spec = usize::try_from(index)
+            .ok()
+            .and_then(|i| whisper_model::CATALOG.get(i))
+            .unwrap_or_else(|| whisper_model::default_spec());
+        let mut candidate = config_for_model.borrow().clone();
+        candidate.whisper_model = spec.id.to_owned();
+        if let Err(err) = candidate.save() {
+            eprintln!("Not changing the Whisper model because saving the settings failed: {err}");
+            ui.set_whisper_model_index(whisper_model::model_index(
+                &config_for_model.borrow().whisper_model,
+            ) as i32);
+            return;
+        }
+        *config_for_model.borrow_mut() = candidate;
+        // 選択したモデルが未取得（または直近失敗）なら取得を開始する（取得済み・DL 中は
+        // request_download 側が早期 return する）。
+        downloader_for_model.request_download(spec);
+        ui.set_whisper_model_status(
+            selected_model_status_text(spec.id, &downloader_for_model).into(),
+        );
+    });
+
     // 登録アプリの削除: 一覧のインデックスで設定とモデルから取り除く（永続化成功後に反映）。
     let config_for_remove = Rc::clone(&config);
     let model_for_remove = Rc::clone(&app_list_model);
@@ -297,7 +358,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 文字起こしのバックグラウンドワーカー。設定 OFF の間はジョブが来ないだけで、常駐コストは
     // アイドルなスレッド 1 本のみ。起動失敗時は文字起こしだけが無効化される（録音は無関係）。
-    let transcriber = transcribe::TranscribeWorker::start();
+    let transcriber = transcribe::TranscribeWorker::start(model_downloader.clone());
 
     // 録音停止後にミックス音声（mix.mp3）を生成するバックグラウンドワーカー。両音源のセッションの
     // 再生を、選択時のその場ミックスでなく生成済みファイルで即座に行えるようにする。
@@ -450,6 +511,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &tray,
             Rc::clone(&config),
             PostStopWorkers { transcriber, mixer },
+            model_downloader.clone(),
             #[cfg(target_os = "macos")]
             app_monitor,
         ),
@@ -508,6 +570,7 @@ fn build_menu_event_handler(
     tray: &Tray,
     config: Rc<RefCell<Config>>,
     workers: PostStopWorkers,
+    model_downloader: whisper_model::ModelDownloader,
     #[cfg(target_os = "macos")] app_monitor: app_audio_monitor::AppAudioMonitor,
 ) -> impl FnMut() + 'static {
     // Recordings ウィンドウ・再生・一覧のハンドルは 1 つにまとめて受け取り、ここで分解する。
@@ -662,6 +725,19 @@ fn build_menu_event_handler(
                     .unwrap_or(-1);
             rec.set_current_segment(current);
         }
+
+        // 設定ウィンドウが開いている間だけ、選択中モデルの取得状況（ダウンロード進捗等）を
+        // 状態行へ反映する（閉じているときは更新しない。変化したときだけ set して無駄な
+        // 再描画を避ける）。
+        if let Some(ui) = ui.upgrade()
+            && ui.window().is_visible()
+        {
+            let status =
+                selected_model_status_text(&config.borrow().whisper_model, &model_downloader);
+            if ui.get_whisper_model_status() != status.as_str() {
+                ui.set_whisper_model_status(status.into());
+            }
+        }
     }
 }
 
@@ -809,6 +885,7 @@ fn submit_transcription(
     }
     transcriber.submit(transcribe::TranscribeJob {
         audio_paths: saved.to_vec(),
+        model_id: config_ref.whisper_model.clone(),
         model_override: config_ref.whisper_model_path.clone(),
         language: config_ref.transcribe_language.clone(),
     });
@@ -875,6 +952,31 @@ fn recording_dir_text(dir: &std::path::Path) -> slint::SharedString {
     dir.display().to_string().into()
 }
 
+/// 設定で選択中の whisper モデルの取得状況を、設定画面の状態行テキストにする。
+/// カタログ外の手編集値は既定モデルの状況を表示する（表示位置のフォールバックと整合）。
+fn selected_model_status_text(
+    model_id: &str,
+    downloader: &whisper_model::ModelDownloader,
+) -> String {
+    let spec = whisper_model::spec_for(model_id).unwrap_or_else(|| whisper_model::default_spec());
+    match downloader.status_of(spec) {
+        whisper_model::DownloadStatus::NotDownloaded => format!(
+            // 未取得モデルは「選択した時点」または「次の文字起こし時」に自動取得される。
+            // どちらかに限定した文言にしない（両方の経路がある）。
+            "Not downloaded — downloads automatically ({})",
+            whisper_model::format_size(spec.size_bytes)
+        ),
+        whisper_model::DownloadStatus::Downloading { received, total } => {
+            // total は Content-Length または既知サイズで常に正だが、防御的にゼロ除算を避ける。
+            // Content-Length が実サイズより小さい異常時も 100% を超えて表示しない。
+            let percent = (received.saturating_mul(100) / total.max(1)).min(100);
+            format!("Downloading… {percent}%")
+        }
+        whisper_model::DownloadStatus::Downloaded => "Downloaded".to_owned(),
+        whisper_model::DownloadStatus::Failed(reason) => format!("Download failed: {reason}"),
+    }
+}
+
 /// macOS で Dock アイコンを隠し、メニューバー常駐アプリとして振る舞わせる。
 ///
 /// activation policy を Accessory にすることで Dock とアプリスイッチャーに出なくなる。
@@ -895,11 +997,63 @@ fn hide_dock_icon() {
 
 #[cfg(test)]
 mod tests {
-    use super::breathing_level;
+    use super::{breathing_level, selected_model_status_text};
     use std::time::Duration;
 
     /// サイン波の代表的な位相で、期待どおりの明度レベルになることを確認する。
     /// 2 秒周期なら 0s→0.5, 0.5s(1/4)→1.0, 1.0s(1/2)→0.5, 1.5s(3/4)→0.0, 2.0s(1周)→0.5。
+    #[test]
+    fn model_status_text_covers_all_states() {
+        let downloader = crate::whisper_model::ModelDownloader::new();
+        let spec = crate::whisper_model::spec_for("large-v3").expect("large-v3 is in the catalog");
+
+        downloader.set_status_for_test(
+            spec,
+            crate::whisper_model::DownloadStatus::Downloading {
+                received: 25,
+                total: 100,
+            },
+        );
+        assert_eq!(
+            selected_model_status_text("large-v3", &downloader),
+            "Downloading… 25%"
+        );
+
+        // Content-Length が実サイズより小さい異常時も 100% を超えない。
+        downloader.set_status_for_test(
+            spec,
+            crate::whisper_model::DownloadStatus::Downloading {
+                received: 300,
+                total: 100,
+            },
+        );
+        assert_eq!(
+            selected_model_status_text("large-v3", &downloader),
+            "Downloading… 100%"
+        );
+
+        downloader.set_status_for_test(spec, crate::whisper_model::DownloadStatus::Downloaded);
+        assert_eq!(
+            selected_model_status_text("large-v3", &downloader),
+            "Downloaded"
+        );
+
+        downloader.set_status_for_test(
+            spec,
+            crate::whisper_model::DownloadStatus::Failed("boom".into()),
+        );
+        assert_eq!(
+            selected_model_status_text("large-v3", &downloader),
+            "Download failed: boom"
+        );
+
+        downloader.set_status_for_test(spec, crate::whisper_model::DownloadStatus::NotDownloaded);
+        assert_eq!(
+            selected_model_status_text("large-v3", &downloader),
+            "Not downloaded — downloads automatically (2.9 GB)"
+        );
+    }
+
     #[test]
     fn breathing_level_matches_sine_phases() {
         const CYCLE: f32 = 2.0;

@@ -35,11 +35,11 @@ export component AppWindow inherits Window {
     title: "openshoki";
     // preferred だけだと中身の最小高さ（≒0）に引っ張られて潰れるため、min も指定する。
     // 幅・高さは src/main.rs の WINDOW_WIDTH/HEIGHT と一致させること（片方だけ変えない）。
-    // 幅は 420 固定。高さは 3 セクション＋Transcription の Language 行に合わせた値。
+    // 幅は 420 固定。高さは 3 セクション＋Transcription の Language/Model 行と状態行に合わせた値。
     min-width: 420px;
-    min-height: 720px;
+    min-height: 790px;
     preferred-width: 420px;
-    preferred-height: 720px;
+    preferred-height: 790px;
 
     // 現在の録音ファイル保存先（表示用）。Rust 側から設定する。
     in property <string> recording-dir;
@@ -59,6 +59,14 @@ export component AppWindow inherits Window {
     // 選択中の言語のカタログ内インデックス。起動時に Rust 側が設定値で初期化し、以後は
     // ComboBox で編集する（in-out。保存失敗時は Rust 側が書き戻す）。
     in-out property <int> transcribe-language-index;
+    // 内蔵 whisper モデルの表示名一覧（Rust 側の whisper_model::CATALOG を反映。名前・サイズ・
+    // 説明を 1 行に整形済み）。
+    in property <[string]> whisper-models;
+    // 選択中モデルのカタログ内インデックス。起動時に Rust 側が設定値で初期化し、以後は
+    // ComboBox で編集する（in-out。保存失敗時は Rust 側が書き戻す）。
+    in-out property <int> whisper-model-index;
+    // 選択中モデルの取得状況テキスト（Rust 側が定期的に更新する）。
+    in property <string> whisper-model-status;
     // 「フォルダを選択」押下。Rust 側でネイティブのフォルダ選択ダイアログを開く。
     callback choose-folder();
     // アプリのマイク使用 自動録音トグルの切り替え。新しい ON/OFF を渡し、Rust 側で設定へ永続化する。
@@ -73,6 +81,9 @@ export component AppWindow inherits Window {
     callback toggle-auto-transcribe(bool);
     // 文字起こし言語の変更。カタログ内インデックスを渡し、Rust 側でコードへ変換して永続化する。
     callback change-transcribe-language(int);
+    // 内蔵 whisper モデルの変更。カタログ内インデックスを渡し、Rust 側で ID へ変換して永続化し、
+    // 未取得ならダウンロードを開始する。
+    callback change-whisper-model(int);
 
     VerticalLayout {
         alignment: start;
@@ -276,6 +287,7 @@ export component AppWindow inherits Window {
                 VerticalLayout {
                     padding-left: 23px;
                     padding-top: 6px;
+                    spacing: 10px;
                     HorizontalLayout {
                         spacing: 8px;
                         Text {
@@ -296,13 +308,42 @@ export component AppWindow inherits Window {
                             }
                         }
                     }
+
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: "Model";
+                            font-size: Style.body-size;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                            color: Palette.foreground;
+                        }
+
+                        ComboBox {
+                            model: root.whisper-models;
+                            current-index: root.whisper-model-index;
+                            enabled: transcribe-deps.enabled-gate;
+                            selected => {
+                                root.whisper-model-index = self.current-index;
+                                root.change-whisper-model(self.current-index);
+                            }
+                        }
+                    }
+
+                    Text {
+                        // 選択中モデルの取得状況（Rust 側が組み立てる。例: Downloaded /
+                        // Downloading… 42% / Not downloaded — downloads automatically (465 MB)）。
+                        text: root.whisper-model-status;
+                        font-size: Style.caption-size;
+                        color: Palette.foreground.transparentize(Style.muted-alpha);
+                    }
                 }
             }
 
             Text {
                 // モデルは内蔵（初回に自動ダウンロード）。これまで通信ゼロだったアプリで唯一の
                 // 外部通信になるため、接続先と「音声は送らない」ことを明示する（透明性）。
-                text: "First use downloads the speech model (about 465 MB) from Hugging Face — audio is never uploaded";
+                text: "Models download from Hugging Face — audio is never uploaded";
                 wrap: word-wrap;
                 font-size: Style.caption-size;
                 color: Palette.foreground.transparentize(Style.muted-alpha);
