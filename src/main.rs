@@ -283,7 +283,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return;
         }
         *config_for_model.borrow_mut() = candidate;
-        // 選択したモデルが未取得なら取得を開始する（取得済み・DL 中なら何もしない）。
+        // 選択したモデルが未取得（または直近失敗）なら取得を開始する（取得済み・DL 中は
+        // request_download 側が早期 return する）。
         downloader_for_model.request_download(spec);
         ui.set_whisper_model_status(
             selected_model_status_text(spec.id, &downloader_for_model).into(),
@@ -960,12 +961,15 @@ fn selected_model_status_text(
     let spec = whisper_model::spec_for(model_id).unwrap_or_else(|| whisper_model::default_spec());
     match downloader.status_of(spec) {
         whisper_model::DownloadStatus::NotDownloaded => format!(
-            "Not downloaded — {} will download on first use",
+            // 未取得モデルは「選択した時点」または「次の文字起こし時」に自動取得される。
+            // どちらかに限定した文言にしない（両方の経路がある）。
+            "Not downloaded — downloads automatically ({})",
             whisper_model::format_size(spec.size_bytes)
         ),
         whisper_model::DownloadStatus::Downloading { received, total } => {
             // total は Content-Length または既知サイズで常に正だが、防御的にゼロ除算を避ける。
-            let percent = received.saturating_mul(100) / total.max(1);
+            // Content-Length が実サイズより小さい異常時も 100% を超えて表示しない。
+            let percent = (received.saturating_mul(100) / total.max(1)).min(100);
             format!("Downloading… {percent}%")
         }
         whisper_model::DownloadStatus::Downloaded => "Downloaded".to_owned(),
@@ -993,11 +997,63 @@ fn hide_dock_icon() {
 
 #[cfg(test)]
 mod tests {
-    use super::breathing_level;
+    use super::{breathing_level, selected_model_status_text};
     use std::time::Duration;
 
     /// サイン波の代表的な位相で、期待どおりの明度レベルになることを確認する。
     /// 2 秒周期なら 0s→0.5, 0.5s(1/4)→1.0, 1.0s(1/2)→0.5, 1.5s(3/4)→0.0, 2.0s(1周)→0.5。
+    #[test]
+    fn model_status_text_covers_all_states() {
+        let downloader = crate::whisper_model::ModelDownloader::new();
+        let spec = crate::whisper_model::spec_for("large-v3").expect("large-v3 is in the catalog");
+
+        downloader.set_status_for_test(
+            spec,
+            crate::whisper_model::DownloadStatus::Downloading {
+                received: 25,
+                total: 100,
+            },
+        );
+        assert_eq!(
+            selected_model_status_text("large-v3", &downloader),
+            "Downloading… 25%"
+        );
+
+        // Content-Length が実サイズより小さい異常時も 100% を超えない。
+        downloader.set_status_for_test(
+            spec,
+            crate::whisper_model::DownloadStatus::Downloading {
+                received: 300,
+                total: 100,
+            },
+        );
+        assert_eq!(
+            selected_model_status_text("large-v3", &downloader),
+            "Downloading… 100%"
+        );
+
+        downloader.set_status_for_test(spec, crate::whisper_model::DownloadStatus::Downloaded);
+        assert_eq!(
+            selected_model_status_text("large-v3", &downloader),
+            "Downloaded"
+        );
+
+        downloader.set_status_for_test(
+            spec,
+            crate::whisper_model::DownloadStatus::Failed("boom".into()),
+        );
+        assert_eq!(
+            selected_model_status_text("large-v3", &downloader),
+            "Download failed: boom"
+        );
+
+        downloader.set_status_for_test(spec, crate::whisper_model::DownloadStatus::NotDownloaded);
+        assert_eq!(
+            selected_model_status_text("large-v3", &downloader),
+            "Not downloaded — downloads automatically (2.9 GB)"
+        );
+    }
+
     #[test]
     fn breathing_level_matches_sine_phases() {
         const CYCLE: f32 = 2.0;

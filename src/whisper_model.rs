@@ -172,21 +172,33 @@ impl ModelDownloader {
         }
     }
 
-    /// 表示用の現在状況。マップに進行中/失敗があればそれを、無ければディスクの有無で
-    /// `Downloaded` / `NotDownloaded` を返す。
+    /// 表示用の現在状況。マップにあればそれを、無ければディスクの有無で判定する。
+    /// ディスク判定で取得済みと分かったらマップへ記録し、以後の照会（設定画面の 100ms
+    /// ポーリング）が毎回 stat を打たないようにする。表示はメモリ状態を優先するため、
+    /// 取得後にファイルを外部で消しても表示は Downloaded のまま（実際の利用時は
+    /// `ensure_model` がディスクを再確認するので機能は壊れない）。
     pub fn status_of(&self, spec: &'static ModelSpec) -> DownloadStatus {
-        if let Some(status) = self.lock().get(spec.id) {
-            return status.clone();
+        let mut status = self.lock();
+        if let Some(current) = status.get(spec.id) {
+            return current.clone();
         }
         match model_path(spec) {
-            Some(path) if path.is_file() => DownloadStatus::Downloaded,
+            Some(path) if path.is_file() => {
+                status.insert(spec.id, DownloadStatus::Downloaded);
+                DownloadStatus::Downloaded
+            }
             _ => DownloadStatus::NotDownloaded,
         }
     }
 
-    /// UI 起点: 未取得ならバックグラウンドスレッドでダウンロードを開始する（取得済み・
-    /// ダウンロード中なら何もしない）。結果は状態マップとログに残る。
+    /// UI 起点: 未取得（または直近失敗）ならバックグラウンドスレッドでダウンロードを開始する。
+    /// 取得済み・ダウンロード中ならスレッドを立てずに戻る（DL 中の完了待ちは `ensure_model` を
+    /// 呼ぶ文字起こし側だけが行えばよい）。結果は状態マップとログに残る。
     pub fn request_download(&self, spec: &'static ModelSpec) {
+        match self.status_of(spec) {
+            DownloadStatus::Downloaded | DownloadStatus::Downloading { .. } => return,
+            DownloadStatus::NotDownloaded | DownloadStatus::Failed(_) => {}
+        }
         let downloader = self.clone();
         let spawned = std::thread::Builder::new()
             .name(format!("model-download-{}", spec.id))
@@ -202,7 +214,8 @@ impl ModelDownloader {
     }
 
     /// モデルのパスを返す。未取得ならダウンロードして配置する（成功するまで返さない）。
-    /// 他スレッドが同じモデルをダウンロード中なら、その完了を待って結果を使う（二重取得しない）。
+    /// 他スレッドが同じモデルをダウンロード中なら、その完了を待って結果を使う（二重取得しない。
+    /// 先行が失敗した場合は後続が担当を引き継いで再取得する）。
     ///
     /// ダウンロードは分オーダーかかりうるため、メインスレッドから呼ばない
     /// （文字起こしワーカー／`request_download` のスレッドから呼ぶ）。
@@ -211,6 +224,11 @@ impl ModelDownloader {
         spec: &'static ModelSpec,
     ) -> Result<PathBuf, Box<dyn std::error::Error>> {
         let path = model_path(spec).ok_or("Cannot determine the data directory")?;
+        // 待機の上限。担当スレッドが結果を記録する前に異常終了すると状態が Downloading の
+        // まま残り、上限なしでは待機側（逐次の文字起こしワーカー等）が永久に固まって以後の
+        // ジョブが黙って止まる。DL 全体のタイムアウトより長い上限で打ち切り、エラーとして
+        // 返す（次のジョブ・次の選択で再試行される）。
+        let wait_deadline = std::time::Instant::now() + WAIT_FOR_OTHER_DOWNLOAD_TIMEOUT;
         loop {
             {
                 let mut status = self.lock();
@@ -235,23 +253,32 @@ impl ModelDownloader {
                     }
                 }
             }
+            if std::time::Instant::now() >= wait_deadline {
+                return Err(
+                    "timed out waiting for another download of the same model to finish".into(),
+                );
+            }
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
 
         let result = download_model(spec, &path, &self.status);
         let mut status = self.lock();
-        match &result {
+        match result {
             Ok(()) => {
                 status.insert(spec.id, DownloadStatus::Downloaded);
-                drop(status);
                 Ok(path)
             }
             Err(err) => {
                 status.insert(spec.id, DownloadStatus::Failed(err.to_string()));
-                drop(status);
-                result.map(|()| PathBuf::new())
+                Err(err)
             }
         }
+    }
+
+    /// テスト用: 状態を直接注入する（表示ロジックをディスク・ネットワーク非依存で検証する）。
+    #[cfg(test)]
+    pub(crate) fn set_status_for_test(&self, spec: &'static ModelSpec, status: DownloadStatus) {
+        self.lock().insert(spec.id, status);
     }
 
     /// 状態マップのガードを取る。poison（ロック保持中のパニック）でも状態表示・DL 管理を
@@ -276,6 +303,11 @@ const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// 無応答の接続（half-open 等）で呼び出しスレッドが恒久にハングしないようにする。
 /// 超過時は失敗し、次の要求で再試行する。
 const RECV_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120 * 60);
+
+/// 他スレッドのダウンロード完了を待つ上限。DL 全体のタイムアウト（接続＋受信）より長くし、
+/// 正常な待機を途中で打ち切らない。
+const WAIT_FOR_OTHER_DOWNLOAD_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(130 * 60);
 
 /// モデルの保存先（`<データディレクトリ>/models/<ファイル名>`）。
 fn model_path(spec: &ModelSpec) -> Option<PathBuf> {
@@ -515,6 +547,31 @@ mod tests {
         .expect_err("exceeding the size limit should fail");
         assert!(err.to_string().contains("size limit"));
         let _ = std::fs::remove_file(&dest);
+    }
+
+    #[test]
+    fn status_of_prefers_in_memory_state() {
+        // マップに載っている状態（進行中・失敗）はディスクの有無より優先される。
+        // ディスクフォールバック自体は実環境のデータディレクトリに依存するためここでは
+        // 検証しない（実 DL の #[ignore] スモークが Downloaded への遷移を確認する）。
+        let downloader = ModelDownloader::new();
+        let spec = spec_for("medium").expect("medium is in the catalog");
+        downloader.set_status_for_test(
+            spec,
+            DownloadStatus::Downloading {
+                received: 1,
+                total: 100,
+            },
+        );
+        assert!(matches!(
+            downloader.status_of(spec),
+            DownloadStatus::Downloading { .. }
+        ));
+        downloader.set_status_for_test(spec, DownloadStatus::Failed("boom".into()));
+        assert_eq!(
+            downloader.status_of(spec),
+            DownloadStatus::Failed("boom".into())
+        );
     }
 
     /// カタログ経由の実ダウンロードのスモーク（Tiny 約 74MB・要ネットワーク）。ローカルで

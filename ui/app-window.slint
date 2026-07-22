@@ -332,7 +332,7 @@ export component AppWindow inherits Window {
 
                     Text {
                         // 選択中モデルの取得状況（Rust 側が組み立てる。例: Downloaded /
-                        // Downloading 42% / Not downloaded — downloads on first use）。
+                        // Downloading… 42% / Not downloaded — downloads automatically (465 MB)）。
                         text: root.whisper-model-status;
                         font-size: Style.caption-size;
                         color: Palette.foreground.transparentize(Style.muted-alpha);
