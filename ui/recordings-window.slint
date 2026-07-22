@@ -89,7 +89,7 @@ component DangerButton inherits Rectangle {
         : (touch.pressed && root.enabled
             ? Palette.control-background.darker(8%)
             : Palette.control-background);
-    opacity: root.enabled ? 1.0 : 0.5;
+    opacity: root.enabled ? 1.0 : Style.disabled-opacity;
 
     HorizontalLayout {
         padding-left: 16px;
