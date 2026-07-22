@@ -360,9 +360,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // アイドルなスレッド 1 本のみ。起動失敗時は文字起こしだけが無効化される（録音は無関係）。
     let transcriber = transcribe::TranscribeWorker::start(model_downloader.clone());
 
-    // 録音停止後にミックス音声（mix.mp3）を生成するバックグラウンドワーカー。両音源のセッションの
-    // 再生を、選択時のその場ミックスでなく生成済みファイルで即座に行えるようにする。
-    let mixer = mixdown::MixWorker::start();
+    // 録音停止後の後処理（極小音量の正規化→ミックス生成→文字起こし投入）を直列に行う
+    // バックグラウンドワーカー。文字起こしは後処理ワーカーが完了後に投入するため、
+    // transcriber はここで所有を渡す（正規化後の音声で文字起こしさせる）。
+    let postprocessor = mixdown::PostProcessWorker::start(transcriber);
 
     // ウィンドウを閉じても終了させず、非表示にして常駐を保つ。メニューからは開くだけで、
     // 閉じるのはウィンドウ自身の閉じるボタンに任せる。
@@ -510,7 +511,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
             &tray,
             Rc::clone(&config),
-            PostStopWorkers { transcriber, mixer },
+            postprocessor,
             model_downloader.clone(),
             #[cfg(target_os = "macos")]
             app_monitor,
@@ -545,13 +546,6 @@ struct RecordingsHandles {
     transcript_segments: Rc<RefCell<Vec<transcript::TranscriptSegment>>>,
 }
 
-/// 録音停止後に走らせるバックグラウンド処理のワーカー一式（文字起こし・ミックス生成）。
-/// `build_menu_event_handler` の引数を増やしすぎないためにまとめる。
-struct PostStopWorkers {
-    transcriber: transcribe::TranscribeWorker,
-    mixer: mixdown::MixWorker,
-}
-
 /// メニューイベントの処理と、録音中のメニューバー表示更新を毎ティック行うクロージャを作る。
 ///
 /// 表示/非表示トグルや録音トグルは現在の状態（ウィンドウの可視状態・録音セッションの有無）から
@@ -569,7 +563,7 @@ fn build_menu_event_handler(
     recordings: RecordingsHandles,
     tray: &Tray,
     config: Rc<RefCell<Config>>,
-    workers: PostStopWorkers,
+    postprocessor: mixdown::PostProcessWorker,
     model_downloader: whisper_model::ModelDownloader,
     #[cfg(target_os = "macos")] app_monitor: app_audio_monitor::AppAudioMonitor,
 ) -> impl FnMut() + 'static {
@@ -630,7 +624,7 @@ fn build_menu_event_handler(
                     &mut last_play_secs,
                 );
             } else if event.id == record_id {
-                toggle_recording(&mut recorder, &record_item, &config, &workers);
+                toggle_recording(&mut recorder, &record_item, &config, &postprocessor);
                 #[cfg(target_os = "macos")]
                 {
                     // 手動トグルの録音は自動停止の対象にしない（開始でも停止でもフラグを下ろす）。
@@ -671,7 +665,7 @@ fn build_menu_event_handler(
                 let stop = app_monitor.should_stop(&config_ref.app_mic_triggers, enabled, debounce);
                 drop(config_ref);
                 if stop {
-                    stop_recording(&mut recorder, &record_item, &config, &workers);
+                    stop_recording(&mut recorder, &record_item, &config, &postprocessor);
                     recording_started_by_app = false;
                     // 停止後は開始検知を再初期化する（録音中に出力を始めたアプリを誤検知しない）。
                     app_monitor.reset_after_stop();
@@ -814,12 +808,12 @@ fn toggle_recording(
     recorder: &mut Option<Recorder>,
     record_item: &IconMenuItem,
     config: &Rc<RefCell<Config>>,
-    workers: &PostStopWorkers,
+    postprocessor: &mixdown::PostProcessWorker,
 ) {
     if recorder.is_none() {
         start_recording(recorder, record_item, config);
     } else {
-        stop_recording(recorder, record_item, config, workers);
+        stop_recording(recorder, record_item, config, postprocessor);
     }
 }
 
@@ -834,7 +828,7 @@ fn stop_recording(
     recorder: &mut Option<Recorder>,
     record_item: &IconMenuItem,
     config: &Rc<RefCell<Config>>,
-    workers: &PostStopWorkers,
+    postprocessor: &mixdown::PostProcessWorker,
 ) {
     let Some(session) = recorder.take() else {
         return;
@@ -846,48 +840,36 @@ fn stop_recording(
         // 保存先のフルパスは機微情報（録音データの所在・フォルダ構造がプライバシーに関わる）
         // なので出さない。完了が分かるように、保存できたファイル数だけを知らせる。
         println!("Saved the recording ({} files)", saved.len());
-        submit_transcription(&saved, config, &workers.transcriber);
-        submit_mixdown(&saved, &workers.mixer);
+        submit_post_processing(&saved, config, postprocessor);
     }
     tray::set_record_item_idle(record_item);
 }
 
-/// 両音源（`mic.mp3` と `system.mp3`）が保存できたセッションだけ、ミックス音声の生成を投入する。
-/// 単一音源のセッションはミックス不要（Recordings は元ファイルを直接再生する）。
-fn submit_mixdown(saved: &[std::path::PathBuf], mixer: &mixdown::MixWorker) {
-    // ファイル名は recorder.rs の保存名と一致させること（`mic.mp3` / `system.mp3`）。
-    let has_name = |name: &str| {
-        saved
-            .iter()
-            .any(|p| p.file_name().is_some_and(|f| f == name))
-    };
-    if !(has_name("mic.mp3") && has_name("system.mp3")) {
-        return;
-    }
+/// 保存済みセッションの後処理（正規化→ミックス→文字起こし）を組み立てて投入する。
+/// 文字起こしの依頼は設定 ON のときだけ添える（オプトイン。モデルは内蔵で、未取得なら
+/// ワーカーが自動ダウンロードする）。設定値はここでスナップショットし、処理中の設定変更の
+/// 影響を受けない。
+fn submit_post_processing(
+    saved: &[std::path::PathBuf],
+    config: &Rc<RefCell<Config>>,
+    postprocessor: &mixdown::PostProcessWorker,
+) {
     let Some(session_dir) = saved.first().and_then(|p| p.parent()) else {
         return;
     };
-    mixer.submit(session_dir.to_path_buf());
-}
-
-/// 保存済み音源の文字起こしジョブを組み立ててワーカーへ投入する。
-/// 設定 OFF なら何もしない（オプトイン）。モデルは内蔵（未取得ならワーカーが初回に自動
-/// ダウンロード）なので ON だけで走る。設定値はここでスナップショットし、処理中の設定変更の
-/// 影響を受けない。
-fn submit_transcription(
-    saved: &[std::path::PathBuf],
-    config: &Rc<RefCell<Config>>,
-    transcriber: &transcribe::TranscribeWorker,
-) {
     let config_ref = config.borrow();
-    if !config_ref.auto_transcribe {
-        return;
-    }
-    transcriber.submit(transcribe::TranscribeJob {
-        audio_paths: saved.to_vec(),
-        model_id: config_ref.whisper_model.clone(),
-        model_override: config_ref.whisper_model_path.clone(),
-        language: config_ref.transcribe_language.clone(),
+    let transcribe = config_ref
+        .auto_transcribe
+        .then(|| transcribe::TranscribeJob {
+            audio_paths: saved.to_vec(),
+            model_id: config_ref.whisper_model.clone(),
+            model_override: config_ref.whisper_model_path.clone(),
+            language: config_ref.transcribe_language.clone(),
+        });
+    postprocessor.submit(mixdown::PostProcessJob {
+        session_dir: session_dir.to_path_buf(),
+        saved: saved.to_vec(),
+        transcribe,
     });
 }
 
