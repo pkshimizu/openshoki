@@ -101,9 +101,10 @@ openshoki/
 │   └── recordings-window.slint 録音一覧・再生ウィンドウの UI 定義（Slint）
 ├── assets/
 │   ├── icon/             アプリアイコンの資産（マスターと生成物。scripts/generate-icons.sh 参照）
-│   │   ├── openshoki.icon/   Icon Composer 形式のマスター（icon.json + Assets/*.svg）
-│   │   ├── mark-mono.svg     メニューバー用グリフのマスター（一画のみ・黒）
-│   │   ├── tray.png          メニューバー常駐アイコン（36x36 RGBA。ビルド時に埋め込む）
+│   │   ├── mark.svg          筆の一画のマスター（形の正はこの 1 本だけ）
+│   │   ├── openshoki.icon/   Icon Composer 形式のマスター（icon.json と Assets/seal.svg。
+│   │   │                     Assets/mark-ink*.svg は mark.svg から生成する色違い）
+│   │   ├── tray.png          メニューバー常駐アイコン（36x36 RGBA。ビルド時に埋め込む。生成物）
 │   │   └── generated/        actool の生成物（Assets.car / openshoki.icns）
 │   └── menu/             トレイメニュー項目のアイコン（PNG, 32x32 RGBA。ビルド時に埋め込む）
 ├── scripts/
@@ -147,15 +148,21 @@ macOS では `screencapturekit` と `objc2` 系を使います。
   cargo dev
   ```
 
-- **アイコン資産の再生成**: アプリアイコンとメニューバーのグリフは 1 つのマスターから生成します。
-  マスター（`assets/icon/openshoki.icon` / `assets/icon/mark-mono.svg`）を変えたら次を実行し、
-  生成物（`assets/icon/generated/` と `assets/icon/tray.png`）ごとコミットしてください。
+- **アイコン資産の再生成**: 筆の一画の形は `assets/icon/mark.svg` 1 本が正で、アプリアイコンの
+  色違いレイヤーもメニューバーのグリフもここから生成します。マスター（`mark.svg` /
+  `openshoki.icon/icon.json` / `openshoki.icon/Assets/seal.svg`）を変えたら次を実行し、
+  生成物ごとコミットしてください。
 
   ```sh
   ./scripts/generate-icons.sh
   ```
 
   Xcode（`xcrun actool`）、`rsvg-convert`、ImageMagick（`magick`）が必要です。
+  `actool` が出す `Assets.car` は入力が同じでも毎回バイト列が変わるため、マスターを変えていない
+  のに差分が出たときは `git checkout -- assets/icon/generated/Assets.car` で戻してください。
+  生成物がマスターと一致しているかを確かめるだけなら、決定的に再現できる部分だけを作り直す
+  `./scripts/generate-icons.sh --skip-appicon` を実行して `git diff --exit-code assets/icon`
+  を見ます（Xcode 不要）。
 
 - コミット前の検証コマンド:
 

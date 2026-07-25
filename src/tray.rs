@@ -212,6 +212,8 @@ fn load_menu_icon(png_bytes: &[u8]) -> Option<MenuIcon> {
 /// **順序が重要**: `set_icon` は macOS で NSImage を作り直し、その際 template を必ず false に
 /// する（tray-icon 0.24 の実装）。先に `set_icon_as_template` を呼んでも捨てられるため、
 /// 差し替えた**後**に指定する。`set_icon_as_template` は macOS 以外では no-op。
+/// 一発で両方を設定する `set_icon_with_as_template` は macOS 以外で**アイコンごと無視される**
+/// no-op なので使わない（Windows / Linux でアイコンが更新されなくなる）。
 fn set_tray_glyph(icon: &TrayIcon, tint: Option<[u8; 3]>, as_template: bool) {
     if let Some(glyph) = tray_icon(tint)
         && let Err(err) = icon.set_icon(Some(glyph))
