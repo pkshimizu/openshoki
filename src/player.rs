@@ -24,10 +24,10 @@ use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player, Source};
 ///
 /// `_sink`（`MixerDeviceSink`）は drop すると出力ストリームが止まるため、再生中は保持し続ける。
 /// `cpal::Stream` を内包し `!Send` の可能性があるため、メインスレッド上でのみ扱う。
-/// 本番（`new`）では常に出力デバイスへ接続済み。デバイスを開かないテスト構築は `connected_to` 参照。
+/// 本番（`new`）では常に出力デバイスへ接続済み。デバイスを開かないテスト構築は [`AudioPlayer::connect`] 参照。
 pub struct AudioPlayer {
     /// 出力ストリーム。保持のみ（drop で停止）。テストは出力デバイスを開けないため、
-    /// ミキサーへ直接繋ぐ構築（`connected_to`）では `None` になる。
+    /// ミキサーへ直接繋ぐ構築（[`AudioPlayer::connect`] を直に使う）では `None` になる。
     _sink: Option<MixerDeviceSink>,
     /// 再生キュー（旧 Sink 相当）。play/pause/seek/位置取得を担う。
     player: Player,
@@ -56,8 +56,10 @@ impl AudioPlayer {
     ///
     /// テストで使うときの前提: rodio の再生位置更新もキューのクリアも「出力側がサンプルを引いた
     /// とき」に進む。実機ではオーディオデバイスがその役をするので、テストは対になる `MixerSource`
-    /// を読み進める役を用意すること。引かないと位置が動かず、`unload` / `stop`（内部でクリアの
-    /// 完了を待つ）は戻ってこない。ブロックする操作を呼ぶなら、読み進める役は別スレッドに置く。
+    /// を読み進める役を用意すること。引かないと位置が動かず、クリアの完了を待つ操作
+    /// （`unload` / `stop`、および内部で `unload` を呼ぶ `load`）は戻ってこない。それらを呼ぶなら、
+    /// 読み進める役は別スレッドに置く（キューが空のときのクリアは待たないので、新品ハンドルへの
+    /// 初回 `load` だけは同じスレッドから呼べる）。
     fn connect(mixer: &rodio::mixer::Mixer) -> Self {
         let player = Player::connect_new(mixer);
         // ロード前は停止状態にしておく（ロード後の Play で鳴らす）。
@@ -277,9 +279,11 @@ mod tests {
         }
     }
 
-    /// テストスレッド自身がミキサー出力を引く同期ドライバ。sleep を挟まないので位置の検証が
-    /// 決定的になる。ただしクリアの完了を待つ操作（`unload` / `stop`）は自分で引けなくなるため
-    /// 使えない（それらは `FakeOutput` を使う）。
+    /// ミキサー出力を 1 ティックずつ引く土台。回す主体は呼び出し側が決める: テストスレッド自身が
+    /// 回せば sleep ゼロで決定的になり、`FakeOutput` は同じものを別スレッドで回す。
+    ///
+    /// テストスレッド自身で回す場合、クリアの完了を待つ操作（`unload` / `stop` と、内部で
+    /// `unload` を呼ぶ 2 回目以降の `load`）は呼べない（自分が引けなくなり戻ってこない）。
     struct ManualOutput(MixerSource);
 
     impl ManualOutput {
@@ -652,7 +656,7 @@ mod tests {
         player.play_pause();
         assert!(
             !player.is_playing(),
-            "playback must not start when the file is gone"
+            "nothing can play once the queue is empty and the file is gone"
         );
         assert!(
             player.seek(SEEK_TARGET).is_err(),
