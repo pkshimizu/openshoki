@@ -25,6 +25,11 @@ tray-icon = "0.24.1"
 ureq = "3"
 whisper-rs = "0.16.0"
 
+[dev-dependencies]
+# UI 操作（クリック・ドラッグ）を実際のポインタイベントで検証するテストバックエンド
+# （`tests/ui_seekbar.rs`）。テスト専用で、出荷バイナリの依存には入らない。
+i-slint-backend-testing = "1.17.0"
+
 [build-dependencies]
 slint-build = "1.17.0"
 
