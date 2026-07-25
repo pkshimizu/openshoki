@@ -449,7 +449,7 @@ mod tests {
 
     #[test]
     fn recording_color_interpolates_by_level() {
-        // level 0.0=暗い赤、1.0=明るい赤、その間は線形補間。アルファは常に不透明。
+        // level 0.0=暗い赤、1.0=明るい赤、その間は線形補間（アルファの保持は tinted_glyph の担当）。
         assert_eq!(recording_color(0.0), [0x6a, 0x14, 0x10]);
         assert_eq!(recording_color(1.0), [0xD0, 0x21, 0x1c]);
         // 中点は両端の平均（四捨五入）。

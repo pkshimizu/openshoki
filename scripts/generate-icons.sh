@@ -76,9 +76,10 @@ generate_mark_layer() {
     echo "Failed to recolor $mark_svg to $color (is every fill written as fill=\"#000000\"?)" >&2
     exit 1
   fi
-  # 構造が残っていることも見る（コメント削除で中身を巻き込んでいないか）。
-  if ! grep -q '<svg' "$tmp" || ! grep -q '</svg>' "$tmp"; then
-    echo "Generated $out is not a complete SVG (check the comments in $mark_svg)" >&2
+  # SVG として本当に読めるかを確かめる。コメント削除はマスターの書き方（コメント内に <svg と
+  # 書く等）次第で中身を巻き込みうるので、タグの有無を見るだけでは足りない。
+  if ! rsvg-convert "$tmp" -o "$tmp_dir/validate.png" 2>/dev/null; then
+    echo "Generated $out is not valid SVG (check the comments in $mark_svg)" >&2
     exit 1
   fi
   mv "$tmp" "$out"
