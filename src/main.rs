@@ -437,18 +437,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // まだ無ければ再生不可（選択時にその場でミックスして UI を固めない）。
             let playable = session.is_playable();
             rec.set_playable(playable);
-            let duration = match session.playback_path() {
-                Some(path) => match player.borrow_mut().as_mut() {
-                    Some(p) => match p.load(&path) {
+            let duration = {
+                let mut player = player.borrow_mut();
+                match (session.playback_path(), player.as_mut()) {
+                    (Some(path), Some(p)) => match p.load(&path) {
                         Ok(()) => p.duration(),
                         Err(err) => {
                             eprintln!("Failed to load the recording for playback: {err}");
                             None
                         }
                     },
-                    None => None,
-                },
-                None => None,
+                    // 再生対象が無いセッション（両音源で mix.mp3 が未生成）でも前の音声は手放す
+                    // （理由は `AudioPlayer::unload` の doc コメント参照）。
+                    (None, Some(p)) => {
+                        p.unload();
+                        None
+                    }
+                    // 出力デバイスを開けない環境では再生ハンドルが無く、手放す対象も無い。
+                    (_, None) => None,
+                }
             };
             apply_playback_position(&rec, Duration::ZERO, duration);
             // 全体長が分からないと比率→秒の換算ができないため、その場合はシークバーを
@@ -501,9 +508,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let Some(segment) = usize::try_from(index).ok().and_then(|i| segments.get(i)) else {
                 return;
             };
-            // 再生ハンドルが無い環境（出力デバイスを開けない）ではシークせずハイライトだけ付ける。
-            // 音が鳴らないので表示と食い違わず、読み進めの目印として機能する。
-            if let Some(p) = player.borrow().as_ref()
+            // 音が鳴らない状況（出力デバイスを開けない・再生対象が無くて未ロード）ではシークせず
+            // ハイライトだけ付ける。表示と食い違わず、読み進めの目印として機能する
+            // （この間は再生 tick も表示を駆動しないのでハイライトが残る）。
+            let player = player.borrow();
+            let loaded = player.as_ref().filter(|p| p.is_loaded());
+            if let Some(p) = loaded
                 && let Err(err) = p.seek(segment.start_duration())
             {
                 eprintln!(
@@ -642,11 +652,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 // 事前に手放した再生対象を積み直し、「選択中なのに再生が沈黙する」不整合を
                 // 残さない（ベストエフォート。失敗はログのみで選択し直せば回復する）。
-                if let Some(path) = &playback_path
-                    && let Some(p) = player.borrow_mut().as_mut()
-                    && let Err(err) = p.load(path)
-                {
-                    eprintln!("Failed to reload the recording for playback: {err}");
+                let reloaded = match (&playback_path, player.borrow_mut().as_mut()) {
+                    (Some(path), Some(p)) => match p.load(path) {
+                        Ok(()) => true,
+                        Err(err) => {
+                            eprintln!("Failed to reload the recording for playback: {err}");
+                            false
+                        }
+                    },
+                    _ => false,
+                };
+                if !reloaded {
+                    // 未ロードのままだと再生 tick が表示を駆動しないため、ここで停止表示へ
+                    // 確定させる（選択中のまま「再生中の表示が固まる」ことを防ぐ）。
+                    rec.set_playing(false);
+                    apply_playback_position(&rec, Duration::ZERO, None);
+                    rec.set_seekable(false);
                 }
                 return;
             }
@@ -853,10 +874,13 @@ fn build_menu_event_handler(
         }
 
         // Recordings ウィンドウが開いている間だけ、再生の経過時間・進捗・再生状態を反映する
-        // （閉じているときは更新しない＝アイドル時の無駄な描画をしない）。
+        // （閉じているときは更新しない＝アイドル時の無駄な描画をしない）。再生対象が
+        // ロードされていない間は駆動しない: 表示は選択時に確定済みで、上書きするとユーザーが
+        // クリックしたセグメントのハイライトを 100ms 後に奪ってしまう。
         if let Some(rec) = recordings.ui.upgrade()
             && rec.window().is_visible()
             && let Some(player) = recordings.player.borrow().as_ref()
+            && player.is_loaded()
         {
             let position = player.position();
             let duration = player.duration();
@@ -1008,9 +1032,10 @@ fn open_recordings_window(
     clear_recordings_selection(rec);
     *handles.sessions.borrow_mut() = list;
     *last_play_secs = None;
-    // 前回の再生が残っていれば止める。
-    if let Some(p) = handles.player.borrow().as_ref() {
-        p.stop();
+    // 再生ハンドルがあれば前回の再生対象を手放す（未選択表示に合わせて「何もロードされて
+    // いない」状態へ揃える。理由は `AudioPlayer::unload` の doc コメント参照）。
+    if let Some(p) = handles.player.borrow_mut().as_mut() {
+        p.unload();
     }
 
     show_window(
