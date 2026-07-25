@@ -16,7 +16,8 @@ rubato = "4.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-slint = "1.17.0"
+# raw-window-handle-06: メニューからの前面化でネイティブウィンドウを得る（bring_to_front 参照）。
+slint = { version = "1.17.0", features = ["raw-window-handle-06"] }
 symphonia = { version = "0.6", default-features = false, features = ["mp3"] }
 toml = "1.1.2"
 trash = "5.2.6"
@@ -38,3 +39,5 @@ objc2-foundation = { version = "0.3.2", features = ["NSBundle", "NSString"] }
 objc2-core-audio = { version = "0.3.2", default-features = false, features = ["std", "AudioHardware"] }
 # macos_13_0 feature でシステム音声キャプチャ API（captures_audio 等）が有効になる。
 screencapturekit = { version = "8.0.0", features = ["macos_13_0"] }
+# Slint ウィンドウから NSWindow を取り出すハンドル連携（メニューからの前面化。bring_to_front 参照）。
+raw-window-handle = "0.6"

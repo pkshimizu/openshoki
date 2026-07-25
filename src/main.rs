@@ -1102,6 +1102,83 @@ fn show_window(
     if let Err(err) = window.show() {
         eprintln!("Failed to show the window: {err}");
     }
+    bring_to_front(window);
+}
+
+/// ウィンドウを前面に出してキーウィンドウにする（macOS）。
+///
+/// `slint::Window::show()` は**表示中のウィンドウには no-op** で、前面化もフォーカスもしない。
+/// さらに本アプリは Dock に出ない Accessory 常駐アプリ（`hide_dock_icon` 参照）のため、
+/// トレイメニューのクリックではアプリ自体がアクティブ化されず、表示中のウィンドウは他アプリの
+/// 背後に残る（「メニューを押したのに反応しない」ように見える）。そこで raw-window-handle
+/// 連携で対象の NSWindow を取得し、最小化からの復元・前面化・キー化とアプリのアクティブ化を
+/// 行う。対象の NSWindow を直接キー化するため、設定・Recordings の両方が開いていても選んだ
+/// メニューに対応する方がキーになる。
+///
+/// ハンドルが取得できない場合（非 AppKit バックエンド等）はログして何もしない
+/// （`show()` のみの従来挙動に縮退）。
+#[cfg(target_os = "macos")]
+fn bring_to_front(window: &slint::Window) {
+    use raw_window_handle::HasWindowHandle;
+    // slint::Window::window_handle() は Slint のラッパー（slint::WindowHandle）を返し、
+    // そこから raw-window-handle の trait で raw ハンドルを取り出す。
+    raise_ns_window(
+        window
+            .window_handle()
+            .window_handle()
+            .map(|handle| handle.as_raw()),
+    );
+}
+
+/// macOS 以外では前面化は行わない（`show()` の挙動のまま）。
+#[cfg(not(target_os = "macos"))]
+fn bring_to_front(_window: &slint::Window) {}
+
+/// `bring_to_front` の本体。raw ハンドルを引数で受けるのは、ウィンドウ実体なしで
+/// 縮退経路（取得失敗・非 AppKit）を決定的にテストできるようにするため。
+#[cfg(target_os = "macos")]
+fn raise_ns_window(
+    raw: Result<raw_window_handle::RawWindowHandle, raw_window_handle::HandleError>,
+) {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSApplication, NSView};
+
+    let handle = match raw {
+        Ok(raw_window_handle::RawWindowHandle::AppKit(handle)) => handle,
+        Ok(_) => {
+            eprintln!("Skipping bring-to-front because the window is not backed by AppKit");
+            return;
+        }
+        Err(err) => {
+            eprintln!("Skipping bring-to-front because the window handle is unavailable: {err}");
+            return;
+        }
+    };
+    // 実運用ではイベントループのコールバック（メインスレッド）から呼ばれる。テスト等の
+    // メインスレッド外では AppKit に触らず縮退する（expect でパニックさせない）。
+    let Some(mtm) = MainThreadMarker::new() else {
+        eprintln!("Skipping bring-to-front because it is not called on the main thread");
+        return;
+    };
+    // SAFETY: AppKit ハンドルの ns_view は Slint が保持する表示中ウィンドウの NSView を指す。
+    // メインスレッド上（mtm 確認済み）かつ Slint がウィンドウを所有している間（`show_window`
+    // の呼び出し中）にのみ参照し、ポインタを保持して持ち越さない。
+    let view = unsafe { handle.ns_view.cast::<NSView>().as_ref() };
+    let Some(ns_window) = view.window() else {
+        eprintln!("Skipping bring-to-front because the view has no window");
+        return;
+    };
+    // Cmd+M で最小化されている場合は復元してから前面化する。
+    if ns_window.isMiniaturized() {
+        ns_window.deminiaturize(None);
+    }
+    ns_window.makeKeyAndOrderFront(None);
+    // Accessory アプリはウィンドウを前面化してもアプリ自体が非アクティブのままなので、
+    // 明示的にアクティブ化する。他アプリからフォーカスを奪う操作だが、ユーザーのメニュー
+    // クリックへの応答としてのみ呼ばれるため許容する（バックグラウンドから呼ぶ経路は作らない）。
+    // 後継の activate() は macOS 14+ のため、最低対応 macOS 13 では非推奨版を使う。
+    #[allow(deprecated)]
+    NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
 }
 
 /// 録音中アイコンの明滅レベルを、録音経過時間からサイン波で算出する純粋関数。
@@ -1359,5 +1436,17 @@ mod tests {
                 "level {level} out of range (t={t})"
             );
         }
+    }
+
+    /// 前面化の縮退経路（ハンドル取得失敗・非 AppKit バックエンド）はパニックせず戻る。
+    /// 前面化の成否（ウィンドウの前後関係）は自動判定が困難なため実機の手動確認とし、
+    /// ここでは FFI 手前の分岐が安全に縮退することだけを検証する（`docs/rules/ffi.md`）。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn raise_ns_window_returns_without_panic_on_degraded_paths() {
+        use raw_window_handle::{HandleError, RawWindowHandle, WebWindowHandle};
+
+        super::raise_ns_window(Err(HandleError::Unavailable));
+        super::raise_ns_window(Ok(RawWindowHandle::Web(WebWindowHandle::new(1))));
     }
 }
