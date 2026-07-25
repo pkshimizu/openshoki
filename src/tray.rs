@@ -93,8 +93,12 @@ impl Tray {
             .with_tooltip(TOOLTIP_IDLE)
             .with_menu(Box::new(menu))
             .with_icon_as_template(true);
-        if let Some(icon) = tray_icon(None) {
-            builder = builder.with_icon(icon);
+        match tray_icon(idle_tint()) {
+            Some(icon) => builder = builder.with_icon(icon),
+            // アイコンが無いとステータス項目が幅ゼロになり、メニュー（＝このアプリ唯一の操作口）を
+            // 開けなくなる。製品名をテキストで出してクリックできる状態を必ず残す
+            // （Windows はタイトル非対応なので、そこでは縮退しきれない）。
+            None => builder = builder.with_title(TOOLTIP_IDLE),
         }
         let icon = builder.build()?;
 
@@ -108,16 +112,11 @@ impl Tray {
     }
 }
 
-/// 待機中の表示へ戻す。静的なグレーアイコン・経過時間テキストの消去・ツールチップを既定に戻す。
+/// 待機中の表示へ戻す。モノクロの glyph（macOS は template 表示）・経過時間テキストの消去・
+/// ツールチップを既定に戻す。
 /// `?` を使えない呼び出し元（イベントループのコールバック）から使うため、失敗はログに残す。
 pub fn set_idle(icon: &TrayIcon) {
-    // 待機中はモノクロの template（OS がライト/ダークへ反転させる）。
-    icon.set_icon_as_template(true);
-    if let Some(glyph) = tray_icon(None)
-        && let Err(err) = icon.set_icon(Some(glyph))
-    {
-        eprintln!("Failed to update the tray icon: {err}");
-    }
+    set_tray_glyph(icon, idle_tint(), true);
     // set_title は Result を返さない。tray-icon 0.24 の macOS 実装では set_title(None) は
     // 既存タイトルを消さない no-op（button.setTitle を呼ぶ分岐をスキップする）ため、
     // 空文字を渡して NSStatusItem ボタンの経過時間テキストを確実に消す。
@@ -134,12 +133,7 @@ pub fn set_idle(icon: &TrayIcon) {
 /// `?` を使えない呼び出し元から使うため、失敗はログに残す。
 pub fn render_recording(icon: &TrayIcon, elapsed: Duration, level: f32, update_title: bool) {
     // 録音中は色を見せたいので template を外す（template はアルファだけを使い、赤が黒になる）。
-    icon.set_icon_as_template(false);
-    if let Some(glyph) = tray_icon(Some(recording_color(level)))
-        && let Err(err) = icon.set_icon(Some(glyph))
-    {
-        eprintln!("Failed to update the tray icon: {err}");
-    }
+    set_tray_glyph(icon, Some(recording_color(level)), false);
     if update_title {
         // set_title は Result を返さない。macOS ではメニューバーにテキスト表示される
         //（Windows/Linux では効き方が異なるが、アイコンの色・明滅を主表示にしているので許容）。
@@ -150,12 +144,12 @@ pub fn render_recording(icon: &TrayIcon, elapsed: Duration, level: f32, update_t
     }
 }
 
-/// 録音中ドットの色を明度レベル（0.0=暗い赤, 1.0=明るい赤）で線形補間する。透明度（アルファ）は
+/// 録音中グリフの色（RGB）を明度レベル（0.0=暗い赤, 1.0=明るい赤）で線形補間する。透明度は
 /// 使わず赤の濃淡だけで表すため、明滅しても「消えた」ようには見えない。
-fn recording_color(level: f32) -> [u8; 4] {
+fn recording_color(level: f32) -> [u8; 3] {
     // 明滅の両端の赤。DIM を明るくしすぎない範囲で濃淡差を付ける（実機の見え方で微調整可）。
-    const RECORDING_BRIGHT: [u8; 4] = [0xD0, 0x21, 0x1c, 0xff];
-    const RECORDING_DIM: [u8; 4] = [0x6a, 0x14, 0x10, 0xff];
+    const RECORDING_BRIGHT: [u8; 3] = [0xD0, 0x21, 0x1c];
+    const RECORDING_DIM: [u8; 3] = [0x6a, 0x14, 0x10];
 
     let level = level.clamp(0.0, 1.0);
     let lerp =
@@ -164,7 +158,6 @@ fn recording_color(level: f32) -> [u8; 4] {
         lerp(RECORDING_DIM[0], RECORDING_BRIGHT[0]),
         lerp(RECORDING_DIM[1], RECORDING_BRIGHT[1]),
         lerp(RECORDING_DIM[2], RECORDING_BRIGHT[2]),
-        0xff,
     ]
 }
 
@@ -213,10 +206,40 @@ fn load_menu_icon(png_bytes: &[u8]) -> Option<MenuIcon> {
     }
 }
 
+/// メニューバーのグリフを差し替える。`tint` はグリフの塗り（`None` は素材のまま）、
+/// `as_template` は macOS の template 指定。
+///
+/// **順序が重要**: `set_icon` は macOS で NSImage を作り直し、その際 template を必ず false に
+/// する（tray-icon 0.24 の実装）。先に `set_icon_as_template` を呼んでも捨てられるため、
+/// 差し替えた**後**に指定する。`set_icon_as_template` は macOS 以外では no-op。
+fn set_tray_glyph(icon: &TrayIcon, tint: Option<[u8; 3]>, as_template: bool) {
+    if let Some(glyph) = tray_icon(tint)
+        && let Err(err) = icon.set_icon(Some(glyph))
+    {
+        eprintln!("Failed to update the tray icon: {err}");
+        return;
+    }
+    icon.set_icon_as_template(as_template);
+}
+
+/// 待機中のグリフの塗り。macOS は template 表示（アルファだけを使い、色は OS が決める）なので
+/// 塗らない。template の無いプラットフォームでは素材の黒のままだと暗いタスクバーで見えないため、
+/// 明暗どちらでも見える中間グレーで塗る。
+fn idle_tint() -> Option<[u8; 3]> {
+    #[cfg(target_os = "macos")]
+    {
+        None
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Some([0x8a, 0x8a, 0x8a])
+    }
+}
+
 /// メニューバー常駐アイコンを作る。`tint` が `None` なら素材そのまま（待機中の template 用。
 /// macOS はアルファだけを見る）、`Some(color)` ならグリフをその色で塗る（録音中の赤）。
 /// 素材のデコードに失敗している場合は `None`（アイコン無しで続行）。
-fn tray_icon(tint: Option<[u8; 4]>) -> Option<Icon> {
+fn tray_icon(tint: Option<[u8; 3]>) -> Option<Icon> {
     let glyph = tray_glyph()?;
     let pixels = match tint {
         Some(color) => tinted_glyph(&glyph.pixels, color),
@@ -240,9 +263,9 @@ fn tray_glyph() -> Option<&'static RgbaImage> {
         .as_ref()
 }
 
-/// グリフを 1 色で塗り直す。**アルファは素材のまま残す**ので、縁のアンチエイリアスが保たれ、
-/// 透明な画素は透明のままになる（`color` のアルファは使わない）。
-fn tinted_glyph(pixels: &[u8], color: [u8; 4]) -> Vec<u8> {
+/// グリフを 1 色（RGB）で塗り直す。**アルファは素材のまま残す**ので、縁のアンチエイリアスが
+/// 保たれ、透明な画素は透明のままになる（塗りにアルファを持たせない＝消えた表示を作れない）。
+fn tinted_glyph(pixels: &[u8], color: [u8; 3]) -> Vec<u8> {
     pixels
         .chunks_exact(4)
         .flat_map(|pixel| {
@@ -365,7 +388,7 @@ mod tests {
         );
     }
 
-    /// 録音中の塗り替え: 不透明画素は指定色になり、透明画素は透明のまま。半透明の縁は
+    /// 塗り替えの基本: 不透明画素は指定色になり、透明画素は透明のまま。半透明の縁は
     /// アルファを保って色だけ変わる（アンチエイリアスを潰さない）。
     #[test]
     fn tinted_glyph_recolors_only_visible_pixels() {
@@ -376,7 +399,7 @@ mod tests {
             0x00, 0x00, 0x00, 0x00, //
             0xff, 0xff, 0xff, 0xff,
         ];
-        let red = [0xD0, 0x21, 0x1c, 0xff];
+        let red = [0xD0, 0x21, 0x1c];
         assert_eq!(
             tinted_glyph(&pixels, red),
             vec![
@@ -388,31 +411,50 @@ mod tests {
         );
     }
 
-    /// 実素材を塗り替えても画素数・アルファの分布が変わらない（形が崩れない）。
+    /// 実素材を塗ると、見えている画素はすべて指定色になり、形（アルファ）は変わらない。
     #[test]
-    fn tinted_glyph_preserves_the_shape_of_the_real_asset() {
+    fn tinted_glyph_recolors_the_real_asset_without_changing_its_shape() {
         let glyph = decode_rgba_png(TRAY_ICON_PNG, "the tray icon in test")
             .expect("the embedded tray icon should decode as 8-bit RGBA");
-        let tinted = tinted_glyph(&glyph.pixels, recording_color(1.0));
+        let red = recording_color(1.0);
+        let tinted = tinted_glyph(&glyph.pixels, red);
         assert_eq!(tinted.len(), glyph.pixels.len());
-        let alphas: Vec<u8> = glyph.pixels.chunks_exact(4).map(|p| p[3]).collect();
-        let tinted_alphas: Vec<u8> = tinted.chunks_exact(4).map(|p| p[3]).collect();
-        assert_eq!(
-            tinted_alphas, alphas,
-            "tinting must not change the glyph's alpha channel"
+
+        let mut recolored = 0usize;
+        for (source, painted) in glyph.pixels.chunks_exact(4).zip(tinted.chunks_exact(4)) {
+            assert_eq!(painted[3], source[3], "the alpha channel must be preserved");
+            if source[3] == 0 {
+                assert_eq!(painted, [0, 0, 0, 0], "transparent pixels must stay empty");
+            } else {
+                assert_eq!(
+                    &painted[..3],
+                    &red,
+                    "every visible pixel must take the recording color"
+                );
+                recolored += 1;
+            }
+        }
+        // 素材が空だったり、塗り替えが恒等関数になっていたら気づけるようにする。
+        assert!(
+            recolored > 0,
+            "the asset must have visible pixels to recolor"
+        );
+        assert_ne!(
+            tinted, glyph.pixels,
+            "tinting must actually change the pixels"
         );
     }
 
     #[test]
     fn recording_color_interpolates_by_level() {
         // level 0.0=暗い赤、1.0=明るい赤、その間は線形補間。アルファは常に不透明。
-        assert_eq!(recording_color(0.0), [0x6a, 0x14, 0x10, 0xff]);
-        assert_eq!(recording_color(1.0), [0xD0, 0x21, 0x1c, 0xff]);
+        assert_eq!(recording_color(0.0), [0x6a, 0x14, 0x10]);
+        assert_eq!(recording_color(1.0), [0xD0, 0x21, 0x1c]);
         // 中点は両端の平均（四捨五入）。
-        assert_eq!(recording_color(0.5), [0x9d, 0x1b, 0x16, 0xff]);
-        // 範囲外はクランプされ、消えた（アルファ 0）ようにはならない。
-        assert_eq!(recording_color(-1.0), [0x6a, 0x14, 0x10, 0xff]);
-        assert_eq!(recording_color(2.0), [0xD0, 0x21, 0x1c, 0xff]);
+        assert_eq!(recording_color(0.5), [0x9d, 0x1b, 0x16]);
+        // 範囲外はクランプされる（色だけで表すのでアルファは持たない）。
+        assert_eq!(recording_color(-1.0), [0x6a, 0x14, 0x10]);
+        assert_eq!(recording_color(2.0), [0xD0, 0x21, 0x1c]);
     }
 
     #[test]
