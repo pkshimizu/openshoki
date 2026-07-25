@@ -25,6 +25,12 @@ tray-icon = "0.24.1"
 ureq = "3"
 whisper-rs = "0.16.0"
 
+[dev-dependencies]
+# UI 操作（クリック・ドラッグ）を実際のポインタイベントで検証するテストバックエンド
+# （`tests/ui_*.rs`。使い方は `docs/rules/slint.md`）。テスト専用で出荷バイナリには入らない。
+# `i-slint-core` を厳密指定で依存するため、`slint` / `slint-build` とバージョンを揃えること。
+i-slint-backend-testing = "1.17.0"
+
 [build-dependencies]
 slint-build = "1.17.0"
 

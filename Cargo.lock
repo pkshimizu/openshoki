@@ -4157,6 +4157,7 @@ dependencies = [
  "cpal 0.18.1",
  "directories",
  "fs2",
+ "i-slint-backend-testing",
  "mp3lame-encoder",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
