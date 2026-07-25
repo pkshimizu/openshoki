@@ -24,6 +24,7 @@ use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player, Source};
 ///
 /// `_sink`（`MixerDeviceSink`）は drop すると出力ストリームが止まるため、再生中は保持し続ける。
 /// `cpal::Stream` を内包し `!Send` の可能性があるため、メインスレッド上でのみ扱う。
+/// 本番（`new`）では常に出力デバイスへ接続済み。デバイスを開かないテスト構築は `connected_to` 参照。
 pub struct AudioPlayer {
     /// 出力ストリーム。保持のみ（drop で停止）。テストは出力デバイスを開けないため、
     /// ミキサーへ直接繋ぐ構築（`connected_to`）では `None` になる。
@@ -43,25 +44,23 @@ impl AudioPlayer {
         let mut sink = DeviceSinkBuilder::open_default_sink()?;
         // drop 時の stderr 警告は自前のログ方針に委ねるため抑制する。
         sink.log_on_drop(false);
-        let player = Player::connect_new(sink.mixer());
-        // ロード前は停止状態にしておく（ロード後の Play で鳴らす）。
-        player.pause();
-        Ok(Self {
-            _sink: Some(sink),
-            player,
-            path: None,
-            duration: None,
-        })
+        // ミキサーの借用と sink の move が重なるため、先に繋いでから出力ストリームを預ける。
+        let mut player = Self::connect(sink.mixer());
+        player._sink = Some(sink);
+        Ok(player)
     }
 
-    /// テスト用: 出力デバイスを開かず、渡したミキサーへ繋いだハンドルを作る。
+    /// ミキサーへ繋いだ再生ハンドルを組み立てる（出力ストリームはまだ持たない）。`new` が使うほか、
+    /// **テストが出力デバイス無しで `AudioPlayer` を作る入口**でもある（`rodio::mixer::mixer()` の
+    /// 片割れを渡す）。
     ///
-    /// rodio の再生位置更新・キューのクリアは**出力側がサンプルを引いたときに進む**ため、
-    /// 呼び出し側は対になる `MixerSource` を別スレッドで読み進める必要がある
-    /// （さもないと `unload` / `stop` が内部の完了待ちで止まる）。
-    #[cfg(test)]
-    fn connected_to(mixer: &rodio::mixer::Mixer) -> Self {
+    /// テストで使うときの前提: rodio の再生位置更新もキューのクリアも「出力側がサンプルを引いた
+    /// とき」に進む。実機ではオーディオデバイスがその役をするので、テストは対になる `MixerSource`
+    /// を読み進める役を用意すること。引かないと位置が動かず、`unload` / `stop`（内部でクリアの
+    /// 完了を待つ）は戻ってこない。ブロックする操作を呼ぶなら、読み進める役は別スレッドに置く。
+    fn connect(mixer: &rodio::mixer::Mixer) -> Self {
         let player = Player::connect_new(mixer);
+        // ロード前は停止状態にしておく（ロード後の Play で鳴らす）。
         player.pause();
         Self {
             _sink: None,
@@ -237,41 +236,93 @@ mod tests {
     const TONE_HZ: f32 = 440.0;
     const TONE_AMPLITUDE: f32 = 0.25;
     const FIXTURE_SECS: u32 = 3;
+    /// シーク先。フィクスチャの終端（`FIXTURE_SECS`）より手前にすること。
+    const SEEK_TARGET: Duration = Duration::from_secs(2);
 
-    /// 疑似オーディオ出力のフォーマット（フィクスチャと同じにして、引いた時間＝音源の時間に近づける）。
+    /// 疑似オーディオ出力のフォーマット。フィクスチャと揃えて、引いたサンプル数＝音源の再生時間に
+    /// 対応させる（モノラルなのでフレーム数＝サンプル数）。
     const OUTPUT_CHANNELS: u16 = 1;
     const OUTPUT_SAMPLE_RATE: u32 = 44_100;
-    /// 疑似オーディオスレッドが 1 周で引くサンプル数と周期（≒実時間で引く）。
-    const PULL_INTERVAL: Duration = Duration::from_millis(5);
-    const PULL_SAMPLES: usize = (OUTPUT_SAMPLE_RATE as usize / 1_000) * 5;
-    /// 状態が伝わるのを待つ上限（引く側は別スレッドなので、即時には反映されない）。
-    const SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
+    /// 出力を引く 1 周（ティック）の長さ。rodio が位置を更新する周期（5ms）と同じにして、
+    /// 1 ティックで最低 1 回は位置が反映されるようにする。
+    const PULL_INTERVAL_MS: u64 = 5;
+    const PULL_INTERVAL: Duration = Duration::from_millis(PULL_INTERVAL_MS);
+    /// 1 ティックで引くサンプル数（上の定数から導出する。手で書くと周期を変えたときにずれる）。
+    const PULL_SAMPLES_PER_TICK: usize =
+        (OUTPUT_SAMPLE_RATE as usize * OUTPUT_CHANNELS as usize * PULL_INTERVAL_MS as usize)
+            / 1_000;
+    /// 別スレッドが引くのを待つ上限。成功時の所要時間には影響しない（落ちるときだけ待つ）。
+    const SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
 
-    /// ミキサーの出力を読み進める疑似オーディオスレッド。rodio は**出力側がサンプルを引いたとき**に
-    /// 再生位置を更新し、キューのクリアも進めるため、これが無いと位置が動かず `unload` / `stop` の
-    /// 完了待ちが終わらない（実機ではオーディオデバイスがこの役割をする）。
+    /// テスト用の一時ディレクトリ。アサート失敗（panic）でも片付くよう `Drop` で消す。
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        /// プロセス固有の名前で作る（前回の残骸は先に消す）。
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("openshoki-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("creating the temp dir should succeed");
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// テストスレッド自身がミキサー出力を引く同期ドライバ。sleep を挟まないので位置の検証が
+    /// 決定的になる。ただしクリアの完了を待つ操作（`unload` / `stop`）は自分で引けなくなるため
+    /// 使えない（それらは `FakeOutput` を使う）。
+    struct ManualOutput(MixerSource);
+
+    impl ManualOutput {
+        /// rodio の位置更新 1 周期ぶんを引く。
+        fn tick(&mut self) {
+            for _ in 0..PULL_SAMPLES_PER_TICK {
+                // Player が生きている間はキューが無音を流すので None は来ない。Player の drop 後は
+                // None が返るため、その場合はこの周を打ち切る。
+                if self.0.next().is_none() {
+                    break;
+                }
+            }
+        }
+
+        fn tick_times(&mut self, times: usize) {
+            for _ in 0..times {
+                self.tick();
+            }
+        }
+    }
+
+    /// ミキサー出力を引き続ける疑似オーディオスレッド（実機のオーディオデバイスの代役。
+    /// 必要な理由は `AudioPlayer::connect` の doc コメント参照）。`unload` / `stop` のように
+    /// クリアの完了を待つ操作を呼ぶテストで使う。**テストの終わりまで保持すること**（drop すると
+    /// 引くのが止まり、以降は位置が動かない）。
     struct FakeOutput {
-        stop: Arc<AtomicBool>,
+        shutdown: Arc<AtomicBool>,
         handle: Option<JoinHandle<()>>,
     }
 
     impl FakeOutput {
-        fn spawn(mut source: MixerSource) -> Self {
-            let stop = Arc::new(AtomicBool::new(false));
-            let flag = Arc::clone(&stop);
+        fn spawn(source: MixerSource) -> Self {
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&shutdown);
             let handle = std::thread::spawn(move || {
+                let mut output = ManualOutput(source);
                 while !flag.load(Ordering::Relaxed) {
-                    for _ in 0..PULL_SAMPLES {
-                        // ミキサーは音源が無くても無音を返し続ける（終端で None にはならない）。
-                        if source.next().is_none() {
-                            break;
-                        }
-                    }
+                    output.tick();
                     std::thread::sleep(PULL_INTERVAL);
                 }
             });
             Self {
-                stop,
+                shutdown,
                 handle: Some(handle),
             }
         }
@@ -279,25 +330,32 @@ mod tests {
 
     impl Drop for FakeOutput {
         fn drop(&mut self) {
-            self.stop.store(true, Ordering::Relaxed);
+            self.shutdown.store(true, Ordering::Relaxed);
             if let Some(handle) = self.handle.take() {
                 let _ = handle.join();
             }
         }
     }
 
-    /// 出力デバイス無しの `AudioPlayer` と、それを駆動する疑似オーディオスレッド。
-    fn player_without_device() -> (AudioPlayer, FakeOutput) {
+    /// 出力デバイスを開かない `AudioPlayer` と、その出力（引く役はまだ決めない）。
+    fn player_without_device() -> (AudioPlayer, MixerSource) {
         let (mixer, source) = rodio::mixer::mixer(
             ChannelCount::new(OUTPUT_CHANNELS).expect("the channel count is non-zero"),
             SampleRate::new(OUTPUT_SAMPLE_RATE).expect("the sample rate is non-zero"),
         );
-        let player = AudioPlayer::connected_to(&mixer);
+        (AudioPlayer::connect(&mixer), source)
+    }
+
+    /// 疑似オーディオスレッドに駆動される `AudioPlayer`。第 2 要素はテストの終わりまで保持する
+    /// こと（drop すると引くのが止まり、`wait_until` が必ずタイムアウトする）。
+    fn player_driven_by_fake_output() -> (AudioPlayer, FakeOutput) {
+        let (player, source) = player_without_device();
         (player, FakeOutput::spawn(source))
     }
 
-    /// 条件が満たされるまで待つ（別スレッドがサンプルを引くのを待つ）。満たされなければ panic。
-    fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
+    /// 条件が満たされるまで上限つきで待つ（別スレッドが引くのを待つ。`docs/rules/error-handling.md`
+    /// の「完了待ちポーリングには必ず上限を設ける」に従う）。
+    fn wait_until(condition_name: &str, mut condition: impl FnMut() -> bool) {
         let deadline = Instant::now() + SETTLE_TIMEOUT;
         while Instant::now() < deadline {
             if condition() {
@@ -305,15 +363,10 @@ mod tests {
             }
             std::thread::sleep(PULL_INTERVAL);
         }
-        panic!("timed out waiting until {what}");
-    }
-
-    /// プロセス固有の一時ディレクトリ（前回の残骸を消してから作る）。
-    fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("openshoki-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("creating the temp dir should succeed");
-        dir
+        panic!(
+            "timed out after {SETTLE_TIMEOUT:?} waiting until {condition_name}; \
+             the fake audio output may have stopped pulling samples"
+        );
     }
 
     /// 録音・ミックスと同じエンコード設定（`mixdown::encode_mp3`）で試験用の MP3 を書き出す。
@@ -338,16 +391,23 @@ mod tests {
         path
     }
 
+    /// 疑似出力のフォーマットに合わせたフィクスチャ（一時ディレクトリごと返す）。
+    fn fixture(name: &str) -> (TempDir, PathBuf) {
+        let dir = TempDir::new(name);
+        let path = write_test_mp3(dir.path(), OUTPUT_CHANNELS, OUTPUT_SAMPLE_RATE);
+        (dir, path)
+    }
+
     /// `seek` が読み飛ばしフォールバックを持たない前提（アプリが出力する MP3 は全体長が分かり、
     /// `try_seek` が成立する）を固定する。ここが崩れると全てのシークが `Err` になり、クリックしても
     /// 再生位置が動かない（機能が事実上死ぬ）ため、依存（rodio / symphonia）の更新やデコーダの
     /// 開き方の変更で気づけるようにする。
     #[test]
     fn open_decoder_reports_duration_and_supports_seeking() {
-        let dir = temp_dir("decoder");
+        let dir = TempDir::new("decoder");
         // 再生対象になりうる組み合わせ（モノラル/ステレオ、44.1k/48k）で確認する。
         for (channels, sample_rate) in [(1u16, 44_100u32), (2, 48_000)] {
-            let path = write_test_mp3(&dir, channels, sample_rate);
+            let path = write_test_mp3(dir.path(), channels, sample_rate);
             let mut source =
                 super::open_decoder(&path).expect("opening the test MP3 should succeed");
             assert!(
@@ -355,24 +415,23 @@ mod tests {
                 "the duration must be known ({channels}ch/{sample_rate}Hz), \
                  otherwise the seek bar degrades to display-only"
             );
-            // 終端より手前（3 秒のうち 2 秒）へシークする。
             assert!(
-                source.try_seek(Duration::from_secs(2)).is_ok(),
+                source.try_seek(SEEK_TARGET).is_ok(),
                 "seeking must be supported ({channels}ch/{sample_rate}Hz), \
                  otherwise every seek fails and the playback position never moves"
             );
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// ロード直後の状態と、再生・一時停止で位置がどう動くか。位置は「再生中だけ進む」こと
-    /// （`is_playing` と一致すること）を固定する。表示（進捗バー・時刻・ハイライト）は
-    /// この 3 つで駆動するため、ここがずれると表示だけが動く／止まる不整合になる。
+    /// 位置は「再生中だけ進む」。表示（進捗バー・時刻・セグメントのハイライト）は位置と
+    /// `is_playing` で駆動するため、ここがずれると「音は止まっているのに表示だけ動く」不整合になる。
+    /// このテストは出力を自分で引く同期ドライバで動かすので、待ち時間に依存せず決定的に判定できる。
     #[test]
     fn playing_advances_the_position_and_pausing_holds_it() {
-        let dir = temp_dir("play");
-        let path = write_test_mp3(&dir, OUTPUT_CHANNELS, OUTPUT_SAMPLE_RATE);
-        let (mut player, _output) = player_without_device();
+        let (_dir, path) = fixture("play");
+        let (mut player, source) = player_without_device();
+        // `load` はキューが空の状態で呼ぶためクリアの完了待ちが無く、同期ドライバで足りる。
+        let mut output = ManualOutput(source);
 
         player
             .load(&path)
@@ -382,45 +441,81 @@ mod tests {
             player.duration().is_some(),
             "the duration must be known for the test fixture"
         );
+        // 新しく作ったハンドルなので rodio 内部の位置も 0（既存ハンドルへの再ロードでは
+        // `position` の doc にある数 ms のズレが出るため、その場合は待ちが要る）。
         assert_eq!(
             player.position(),
             Duration::ZERO,
-            "a freshly loaded target starts at the beginning"
+            "a freshly created handle reports the beginning right after loading"
         );
         assert!(!player.is_playing(), "loading must not start playback");
 
         player.play_pause();
         assert!(player.is_playing(), "the first toggle must start playback");
-        wait_until("the position advances while playing", || {
-            player.position() > Duration::ZERO
-        });
+        output.tick_times(4);
+        assert!(
+            player.position() > Duration::ZERO,
+            "the position must advance while playing"
+        );
 
         player.play_pause();
         assert!(
             !player.is_playing(),
             "the second toggle must pause playback"
         );
-        // 一時停止は次の位置更新（rodio は 5ms 周期）で効くので、落ち着くまで待ってから見る。
-        std::thread::sleep(PULL_INTERVAL * 4);
-        // 一時停止中は位置が止まる（rodio は pausable の内側で位置を数えるため）。
+        // 一時停止は次の位置更新で効くので、反映のティックを回してから固定を見る。
+        output.tick_times(2);
         let paused_at = player.position();
-        std::thread::sleep(PULL_INTERVAL * 20);
+        output.tick_times(20);
         assert_eq!(
             player.position(),
             paused_at,
             "the position must not advance while paused"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 手放したら観測値が「何もロードされていない」で揃う。rodio はキューが空のときの `clear()` で
-    /// 内部位置を戻さないため、終端まで再生した後に手放すと前の位置が残りうる（#96 の症状）。
+    /// 終端まで再生してキューが空になった後に手放しても、観測値が「何もロードされていない」で
+    /// 揃う（#96 の症状。rodio の `clear()` はキューが空だと内部位置を戻さないため、
+    /// `position()` のガードが無いと前のセッションの位置が残り、表示がそれで駆動される）。
     #[test]
-    fn unload_resets_every_observable_value() {
-        let dir = temp_dir("unload");
-        let path = write_test_mp3(&dir, OUTPUT_CHANNELS, OUTPUT_SAMPLE_RATE);
-        let (mut player, _output) = player_without_device();
+    fn unload_after_the_queue_drains_resets_the_position() {
+        let (_dir, path) = fixture("unload-drained");
+        let (mut player, _output) = player_driven_by_fake_output();
+
+        player
+            .load(&path)
+            .expect("loading the test MP3 should succeed");
+        let total = player.duration().expect("the duration must be known");
+        // 終端の手前まで飛ばしてから再生し、キューが空になる（自然終端）のを待つ。
+        player
+            .seek(total.saturating_sub(Duration::from_millis(200)))
+            .expect("seeking near the end should succeed");
+        player.play_pause();
+        wait_until("the queue drains at the end of the track", || {
+            !player.is_playing()
+        });
+        assert!(
+            player.position() > Duration::ZERO,
+            "the position must sit near the end before unloading, otherwise this test would \
+             not reproduce the empty-queue case"
+        );
+
+        player.unload();
+        assert!(!player.is_loaded(), "unloading must drop the target");
+        assert_eq!(
+            player.position(),
+            Duration::ZERO,
+            "unloading must report the beginning, otherwise the display keeps the old position"
+        );
+        assert_eq!(player.duration(), None, "unloading must drop the duration");
+        assert!(!player.is_playing(), "unloading must stop playback");
+    }
+
+    /// 再生中に手放した場合（キューが空でない経路）も同じく観測値が揃う。
+    #[test]
+    fn unload_while_playing_resets_every_observable_value() {
+        let (_dir, path) = fixture("unload-playing");
+        let (mut player, _output) = player_driven_by_fake_output();
 
         player
             .load(&path)
@@ -435,20 +530,18 @@ mod tests {
         assert_eq!(
             player.position(),
             Duration::ZERO,
-            "unloading must report the beginning, otherwise the display keeps the old position"
+            "unloading must report the beginning"
         );
         assert_eq!(player.duration(), None, "unloading must drop the duration");
         assert!(!player.is_playing(), "unloading must stop playback");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 停止は対象を保持したまま先頭へ戻す（`unload` との違い）。
+    /// 停止は対象を保持したまま先頭へ戻す（`unload` との違い）。対象や全体長まで落とすと詳細ペインが
+    /// 「未選択」相当に見え、キューを積み直さないと停止後の Play が無反応になる。
     #[test]
     fn stop_keeps_the_target_and_rewinds() {
-        let dir = temp_dir("stop");
-        let path = write_test_mp3(&dir, OUTPUT_CHANNELS, OUTPUT_SAMPLE_RATE);
-        let (mut player, _output) = player_without_device();
+        let (_dir, path) = fixture("stop");
+        let (mut player, _output) = player_driven_by_fake_output();
 
         player
             .load(&path)
@@ -468,28 +561,31 @@ mod tests {
         wait_until("the position rewinds to the beginning", || {
             player.position() == Duration::ZERO
         });
-        // 停止後も頭から再生し直せる（キューを積み直しているか）。
-        player.play_pause();
-        assert!(player.is_playing(), "playing after a stop must restart it");
 
-        let _ = std::fs::remove_dir_all(&dir);
+        player.play_pause();
+        assert!(
+            player.is_playing(),
+            "playing after a stop must restart from the beginning"
+        );
     }
 
     /// ロードに失敗したら前の対象を残さない（stale な対象を後続の seek / play_pause が
     /// 開き直すと、表示中のセッションと音が食い違う）。
     #[test]
     fn failed_load_leaves_nothing_loaded() {
-        let dir = temp_dir("load-failure");
-        let path = write_test_mp3(&dir, OUTPUT_CHANNELS, OUTPUT_SAMPLE_RATE);
-        let (mut player, _output) = player_without_device();
+        let (dir, path) = fixture("load-failure");
+        let (mut player, _output) = player_driven_by_fake_output();
 
         player
             .load(&path)
             .expect("loading the test MP3 should succeed");
-        assert!(player.is_loaded());
+        assert!(
+            player.is_loaded(),
+            "the fixture must load before exercising the failure path"
+        );
 
-        // MP3 として解釈できないファイルへ差し替える。
-        let broken = dir.join("broken.mp3");
+        // MP3 として解釈できない別ファイルを読ませて失敗経路へ入れる。
+        let broken = dir.path().join("broken.mp3");
         std::fs::write(&broken, b"not an audio file").expect("writing the broken file should work");
         assert!(
             player.load(&broken).is_err(),
@@ -508,20 +604,17 @@ mod tests {
             player.seek(Duration::from_secs(1)).is_err(),
             "seeking without a target must report an error instead of silently doing nothing"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// ロード済みならシークでき、位置がその値になる。未ロードなら `Err`（rodio の `try_seek` は
+    /// ロード済みならシークでき、その位置から再生が続く。未ロードなら `Err`（rodio の `try_seek` は
     /// キューが空だと何もせず `Ok` を返すので、ラッパ側で `Err` に倒していることの確認）。
     #[test]
     fn seek_moves_the_position_and_reports_missing_target() {
-        let dir = temp_dir("seek-player");
-        let path = write_test_mp3(&dir, OUTPUT_CHANNELS, OUTPUT_SAMPLE_RATE);
-        let (mut player, _output) = player_without_device();
+        let (_dir, path) = fixture("seek");
+        let (mut player, _output) = player_driven_by_fake_output();
 
         assert!(
-            player.seek(Duration::from_secs(1)).is_err(),
+            player.seek(SEEK_TARGET).is_err(),
             "seeking before loading must report an error"
         );
 
@@ -529,14 +622,45 @@ mod tests {
             .load(&path)
             .expect("loading the test MP3 should succeed");
         player
-            .seek(Duration::from_secs(2))
+            .seek(SEEK_TARGET)
             .expect("seeking a loaded target should succeed");
-        wait_until("the position reflects the seek", || {
-            player.position() >= Duration::from_secs(2)
-        });
-        // 一時停止のままシークしても再生は始まらない。
         assert!(!player.is_playing(), "seeking must not start playback");
 
-        let _ = std::fs::remove_dir_all(&dir);
+        // 位置の値そのものは rodio が要求値を書くだけなので、再生を再開して「シーク先から先へ
+        // 進む」ことまで見る（デコーダが先頭に戻っていれば進まない）。
+        player.play_pause();
+        wait_until("the position advances past the seek target", || {
+            player.position() > SEEK_TARGET + PULL_INTERVAL * 4
+        });
+    }
+
+    /// 対象ファイルが消えた後は、黙って鳴り出さずに縮退する（削除前に `unload` する設計の裏側。
+    /// 開き直しの失敗はログのみで、対象は保持したまま「鳴らない」状態になる）。
+    #[test]
+    fn missing_file_degrades_without_playing() {
+        let (_dir, path) = fixture("missing-file");
+        let (mut player, _output) = player_driven_by_fake_output();
+
+        player
+            .load(&path)
+            .expect("loading the test MP3 should succeed");
+        player.stop();
+        std::fs::remove_file(&path).expect("removing the fixture should succeed");
+        // 停止後はキューが空なので、次の操作は必ず開き直しを試みる（それが失敗する）。
+        player.stop();
+
+        player.play_pause();
+        assert!(
+            !player.is_playing(),
+            "playback must not start when the file is gone"
+        );
+        assert!(
+            player.seek(SEEK_TARGET).is_err(),
+            "seeking must report an error when the file cannot be reopened"
+        );
+        assert!(
+            player.is_loaded(),
+            "the target stays loaded; the caller decides whether to unload"
+        );
     }
 }
