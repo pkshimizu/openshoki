@@ -501,11 +501,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let Some(segment) = usize::try_from(index).ok().and_then(|i| segments.get(i)) else {
                 return;
             };
-            let player = player.borrow();
-            let Some(p) = player.as_ref() else {
-                return;
-            };
-            if let Err(err) = p.seek(segment.start_duration()) {
+            // 再生ハンドルが無い環境（出力デバイスを開けない）ではシークせずハイライトだけ付ける。
+            // 音が鳴らないので表示と食い違わず、読み進めの目印として機能する。
+            if let Some(p) = player.borrow().as_ref()
+                && let Err(err) = p.seek(segment.start_duration())
+            {
                 eprintln!(
                     "Skipping the highlight update because seeking to the segment failed: {err}"
                 );
@@ -555,7 +555,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return;
             };
             if let Err(err) = p.seek(position) {
-                eprintln!("Skipping the playback position update because seeking failed: {err}");
+                eprintln!(
+                    "Skipping the seek bar and time display update because seeking failed: {err}"
+                );
                 return;
             }
             // 離した位置で表示を即確定させる（次の tick を待たない）。

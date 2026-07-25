@@ -322,7 +322,8 @@ fn to_i16(pcm: Vec<f32>) -> Vec<i16> {
 }
 
 /// i16 インターリーブ PCM を MP3 へエンコードする（`recorder.rs` と同じビットレート・品質）。
-fn encode_mp3(
+/// 「アプリが出力するのと同じ MP3」を他モジュールからも合成できるようクレート内に公開する。
+pub(crate) fn encode_mp3(
     pcm: &[i16],
     channels: ChannelCount,
     sample_rate: SampleRate,
