@@ -5,54 +5,64 @@
 //! 見た目（レイアウト・配色）の確認は `examples/transcript_view.rs` ＋ screencapture
 //! （`docs/rules/slint.md`）。こちらは「操作したら何が起きるか」を担当する。
 //!
-//! 前提: 要素を探す `ElementHandle` は生成コードのデバッグ情報を要求する。`build.rs` が
-//! dev/test プロファイルでのみ有効にしているため、素の `cargo test` で通る（環境変数は不要）。
+//! 要素を探す `ElementHandle` は生成コードのデバッグ情報を要求する。`build.rs` が既定で
+//! 有効にしているので素の `cargo test` で通る（release を継承するプロファイルでは無効になり、
+//! 下の `slint_debug_info` cfg でテストごと切り替わる。`SLINT_EMIT_DEBUG_INFO=1` で有効化可）。
+
+#![cfg(slint_debug_info)]
 
 slint::include_modules!();
 
-use std::cell::{Cell, RefCell};
+mod ui_support;
+
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use i_slint_backend_testing::ElementHandle;
 use slint::ComponentHandle;
 use slint::LogicalPosition;
-use slint::platform::PointerEventButton;
+use slint::platform::{PointerEventButton, WindowEvent};
 
 /// テスト用のウィンドウサイズ（`src/main.rs` の RECORDINGS_WIDTH/HEIGHT と同じ）。要素の座標は
-/// レイアウトから解決するので、この値自体をアサートには使わない。
+/// レイアウト結果から解決するので、この値自体はアサートに使わない。
 const WINDOW_WIDTH: f32 = 720.0;
 const WINDOW_HEIGHT: f32 = 540.0;
 
-/// 比率の許容誤差。ポインタ座標は論理ピクセル単位なので、バー幅ぶんの丸めを吸収する。
-const RATIO_TOLERANCE: f32 = 0.01;
+/// 比率の許容誤差。`mock_drag` は最後に必ず目標座標へ移動するので、ずれは f32 の丸め程度しか
+/// 出ない。バー幅 400px 前後に対して 1e-3（≒0.4px）まで絞り、座標→比率の対応が変わったら
+/// 落ちるようにする。
+const RATIO_TOLERANCE: f32 = 1e-3;
 
-/// テストバックエンドはスレッドごとに 1 回だけ初期化する（2 回目は panic する）。
-/// `--test-threads=1` で複数のテストが同じスレッドに載っても壊れないようにする。
-fn init_backend() {
-    thread_local! {
-        static INITIALIZED: Cell<bool> = const { Cell::new(false) };
-    }
-    INITIALIZED.with(|initialized| {
-        if !initialized.replace(true) {
-            i_slint_backend_testing::init_no_event_loop();
-        }
-    });
+/// ドラッグ中に届いた 1 回のプレビュー。比率と、その時点で `scrubbing` が立っていたか。
+/// （2 本の Vec に分けると「同じ添字が同じイベント」という前提が型に出ない）
+#[derive(Debug, Clone, Copy)]
+struct Preview {
+    ratio: f32,
+    scrubbing: bool,
 }
 
-/// シークバーを操作できる状態の Recordings ウィンドウと、コールバックの記録。
+/// Recordings ウィンドウと、シークバーのコールバックの記録。
 struct Probe {
     window: RecordingsWindow,
-    /// `scrub-preview` で渡された比率（ドラッグ中のプレビュー）。
-    previews: Rc<RefCell<Vec<f32>>>,
-    /// プレビューが来た時点の `scrubbing`（Rust 側の tick 抑止が効く前提の確認）。
-    scrubbing_at_preview: Rc<RefCell<Vec<bool>>>,
-    /// `seek-to-ratio` で渡された比率（クリック確定・ドラッグ終了）。
+    /// `scrub-preview`（ドラッグ中のプレビュー通知）の記録。
+    previews: Rc<RefCell<Vec<Preview>>>,
+    /// `seek-to-ratio`（クリック確定・ドラッグ終了）で渡された比率。
     seeks: Rc<RefCell<Vec<f32>>>,
 }
 
 impl Probe {
-    fn new(seekable: bool) -> Self {
-        init_backend();
+    /// 操作できる状態（再生可能・全体長が分かる）のシークバー。
+    fn seekable() -> Self {
+        Self::with_seekable(true)
+    }
+
+    /// 表示専用に縮退した状態（再生不可・全体長不明のセッション相当）のシークバー。
+    fn display_only() -> Self {
+        Self::with_seekable(false)
+    }
+
+    fn with_seekable(seekable: bool) -> Self {
+        ui_support::init_backend();
         let window = RecordingsWindow::new().expect("creating the window should succeed");
         window
             .window()
@@ -62,20 +72,17 @@ impl Probe {
         window.set_playable(true);
         window.set_seekable(seekable);
 
-        let previews: Rc<RefCell<Vec<f32>>> = Rc::new(RefCell::new(Vec::new()));
-        let scrubbing_at_preview: Rc<RefCell<Vec<bool>>> = Rc::new(RefCell::new(Vec::new()));
+        let previews: Rc<RefCell<Vec<Preview>>> = Rc::new(RefCell::new(Vec::new()));
         let seeks: Rc<RefCell<Vec<f32>>> = Rc::new(RefCell::new(Vec::new()));
         {
             let previews = Rc::clone(&previews);
-            let scrubbing_at_preview = Rc::clone(&scrubbing_at_preview);
             let weak = window.as_weak();
             window.on_scrub_preview(move |ratio| {
-                previews.borrow_mut().push(ratio);
                 let scrubbing = weak
                     .upgrade()
                     .expect("the window outlives the callback in this test")
                     .get_scrubbing();
-                scrubbing_at_preview.borrow_mut().push(scrubbing);
+                previews.borrow_mut().push(Preview { ratio, scrubbing });
             });
         }
         {
@@ -83,22 +90,32 @@ impl Probe {
             window.on_seek_to_ratio(move |ratio| seeks.borrow_mut().push(ratio));
         }
 
-        Self {
+        let probe = Self {
             window,
             previews,
-            scrubbing_at_preview,
             seeks,
-        }
+        };
+        // 以降のアサートは「バー上の比率」に依存するので、レイアウトが解決できていることを先に
+        // 確かめる（幅 0 のまま進むと、無関係なメッセージで落ちて原因が分かりにくい）。
+        assert!(
+            probe.bar().size().width > 0.0,
+            "the seek bar must have a resolved width before simulating pointer events"
+        );
+        probe
     }
 
-    /// シークバー本体。座標はレイアウト結果から取るので、ウィンドウ構成が変わっても追従する。
+    /// シークバー本体。座標はレイアウト結果から取るので、周辺の構成が変わっても追従する。
     fn bar(&self) -> ElementHandle {
         ElementHandle::find_by_element_type_name(&self.window, "SeekBar")
             .next()
-            .expect("the Playback section contains a SeekBar")
+            .expect(
+                "no SeekBar was found: either the Playback section changed, \
+                 or the generated code has no debug info (see build.rs)",
+            )
     }
 
-    /// バー上の比率に対応する絶対座標（縦はバーの中央）。
+    /// バー上の比率に対応する絶対座標（縦はバーの中央）。比率 0.0〜1.0 の外も指定できる
+    /// （バーの外へドラッグする検証に使う）。
     fn point_at(&self, ratio: f32) -> LogicalPosition {
         let bar = self.bar();
         let position = bar.absolute_position();
@@ -109,26 +126,49 @@ impl Probe {
         )
     }
 
+    /// 指定位置で押す（`mock_single_click` は要素の中央しか押せないため、位置を選ぶときに使う）。
+    fn press_at(&self, ratio: f32) {
+        let position = self.point_at(ratio);
+        let window = self.window.window();
+        window.dispatch_event(WindowEvent::PointerMoved { position });
+        window.dispatch_event(WindowEvent::PointerPressed {
+            position,
+            button: PointerEventButton::Left,
+        });
+    }
+
+    /// 指定位置で離す。
+    fn release_at(&self, ratio: f32) {
+        let position = self.point_at(ratio);
+        let window = self.window.window();
+        window.dispatch_event(WindowEvent::PointerMoved { position });
+        window.dispatch_event(WindowEvent::PointerReleased {
+            position,
+            button: PointerEventButton::Left,
+        });
+    }
+
+    fn previews(&self) -> Vec<Preview> {
+        self.previews.borrow().clone()
+    }
+
     fn seeks(&self) -> Vec<f32> {
         self.seeks.borrow().clone()
     }
-
-    fn previews(&self) -> Vec<f32> {
-        self.previews.borrow().clone()
-    }
 }
 
-/// クリックした位置の比率でシークする（`mock_single_click` は要素の中央＝比率 0.5 を押す）。
+/// 押した位置の比率でシークする（中央ではない位置で、ポインタ座標が使われていることを見る）。
 #[test]
-fn click_seeks_to_the_clicked_ratio() {
-    let probe = Probe::new(true);
-    probe.bar().mock_single_click(PointerEventButton::Left);
+fn click_seeks_to_the_pressed_ratio() {
+    let probe = Probe::seekable();
+    probe.press_at(0.25);
+    probe.release_at(0.25);
 
     let seeks = probe.seeks();
     assert_eq!(seeks.len(), 1, "a click must seek exactly once: {seeks:?}");
     assert!(
-        (seeks[0] - 0.5).abs() < RATIO_TOLERANCE,
-        "a click at the center must seek to the middle, got {}",
+        (seeks[0] - 0.25).abs() < RATIO_TOLERANCE,
+        "a click at a quarter of the bar must seek there, got {}",
         seeks[0]
     );
     assert!(
@@ -140,8 +180,8 @@ fn click_seeks_to_the_clicked_ratio() {
 /// ドラッグ中はプレビューだけが追従し、離した位置で 1 回だけシークする。
 #[test]
 fn drag_previews_and_seeks_only_on_release() {
-    let probe = Probe::new(true);
-    // 中央（比率 0.5）から右へ、バー幅の 90% の位置まで引く。
+    let probe = Probe::seekable();
+    // `mock_drag` は要素の中央（比率 0.5）から始まる。右へバー幅の 90% の位置まで引く。
     probe
         .bar()
         .mock_drag(probe.point_at(0.9), PointerEventButton::Left);
@@ -152,12 +192,23 @@ fn drag_previews_and_seeks_only_on_release() {
         "dragging must preview repeatedly: {previews:?}"
     );
     assert!(
-        previews.windows(2).all(|pair| pair[0] <= pair[1]),
+        previews
+            .windows(2)
+            .all(|pair| pair[0].ratio <= pair[1].ratio),
         "previews must follow the pointer to the right: {previews:?}"
     );
     assert!(
-        probe.scrubbing_at_preview.borrow().iter().all(|f| *f),
-        "scrubbing must be true while previewing, so the playback tick stops overwriting"
+        previews.iter().all(|preview| preview.scrubbing),
+        "scrubbing must be true while previewing, so the playback tick stops overwriting: \
+         {previews:?}"
+    );
+    let last = previews
+        .last()
+        .expect("the drag emitted previews, so there is a last one");
+    assert!(
+        (last.ratio - 0.9).abs() < RATIO_TOLERANCE,
+        "the last preview must reach the release position, got {}",
+        last.ratio
     );
 
     let seeks = probe.seeks();
@@ -180,12 +231,11 @@ fn drag_previews_and_seeks_only_on_release() {
 /// バーの外へドラッグして離しても、比率は 0.0〜1.0 に収まる。
 #[test]
 fn dragging_outside_the_bar_clamps_the_ratio() {
-    let probe = Probe::new(true);
-    let outside_left =
-        LogicalPosition::new(probe.point_at(0.0).x - WINDOW_WIDTH, probe.point_at(0.0).y);
+    let probe = Probe::seekable();
+    // 比率 -1.0 ＝ バー 1 本ぶん左（バーの外）。
     probe
         .bar()
-        .mock_drag(outside_left, PointerEventButton::Left);
+        .mock_drag(probe.point_at(-1.0), PointerEventButton::Left);
 
     let seeks = probe.seeks();
     assert_eq!(seeks.len(), 1, "the release must seek once: {seeks:?}");
@@ -193,17 +243,46 @@ fn dragging_outside_the_bar_clamps_the_ratio() {
         seeks[0], 0.0,
         "dragging left of the bar must clamp to the start"
     );
+    let previews = probe.previews();
     assert!(
-        probe.previews().iter().all(|r| (0.0..=1.0).contains(r)),
-        "previews must stay within the bar: {:?}",
-        probe.previews()
+        previews
+            .iter()
+            .all(|preview| (0.0..=1.0).contains(&preview.ratio)),
+        "previews must stay within the bar: {previews:?}"
+    );
+}
+
+/// 取り消し（押したままウィンドウの外へ出る）はシークせず、`scrubbing` を畳む。畳み忘れると
+/// 再生 tick が表示を更新できないまま固まる。
+#[test]
+fn leaving_the_window_cancels_the_scrub_without_seeking() {
+    let probe = Probe::seekable();
+    probe.press_at(0.5);
+    assert!(
+        probe.window.get_scrubbing(),
+        "pressing the bar must start scrubbing"
+    );
+
+    probe
+        .window
+        .window()
+        .dispatch_event(WindowEvent::PointerExited);
+
+    assert!(
+        !probe.window.get_scrubbing(),
+        "leaving the window must collapse scrubbing so the playback tick resumes"
+    );
+    assert!(
+        probe.seeks().is_empty(),
+        "a cancelled scrub must not seek: {:?}",
+        probe.seeks()
     );
 }
 
 /// 左ボタン以外では何も起きない（右クリックでシークさせない）。
 #[test]
 fn right_button_neither_previews_nor_seeks() {
-    let probe = Probe::new(true);
+    let probe = Probe::seekable();
     probe.bar().mock_single_click(PointerEventButton::Right);
     probe
         .bar()
@@ -225,7 +304,7 @@ fn right_button_neither_previews_nor_seeks() {
 /// `seekable` が false（再生不可・全体長不明のセッション）では表示専用に縮退する。
 #[test]
 fn not_seekable_ignores_click_and_drag() {
-    let probe = Probe::new(false);
+    let probe = Probe::display_only();
     probe.bar().mock_single_click(PointerEventButton::Left);
     probe
         .bar()
