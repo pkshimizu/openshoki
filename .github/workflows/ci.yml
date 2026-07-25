@@ -76,3 +76,48 @@ jobs:
         run: cargo build --verbose
       - name: test
         run: cargo test --verbose
+
+  icons:
+    name: アイコン生成物の同期検査
+    # `assets/icon/mark.svg`（形の正）を変えたのに生成物を再生成し忘れると、メニューバーの
+    # アイコンだけ古い形のまま出荷される（`tray.png` は include_bytes! でバイナリに入る）。
+    # ラスタライズを挟むため、コミット済みの生成物と同じ環境で比べたい。開発機と同じ macOS で走らせる。
+    runs-on: macos-latest
+    steps:
+      # 変更判定に履歴が要るため全体を取得する（浅いクローンだと比較元に届かない）。
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # アイコン資産に触れた変更のときだけ実際の検査を行う。毎回 brew install を走らせると
+      # 全 PR の CI が数分遅くなるため、ここで早期に打ち切る。
+      - name: アイコン資産の変更有無を判定
+        id: changed
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          base="$BASE_SHA"
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            echo "比較元が取れないため検査する（ブランチ作成直後など）。"
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if git diff --name-only "$base" HEAD \
+               | grep -qE '^(assets/icon/|scripts/(generate|check)-icons\.sh$)'; then
+            echo "アイコン資産に変更があるため検査する。"
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "アイコン資産に変更が無いため検査をスキップする。"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: 検査に使うツールを用意（rsvg-convert / magick）
+        if: steps.changed.outputs.run == 'true'
+        run: |
+          for formula in librsvg imagemagick; do
+            brew list "$formula" >/dev/null 2>&1 || brew install "$formula"
+          done
+      # 生成物とマスターのズレを検出する。Assets.car は actool が毎回違うバイト列を出すため
+      # 検査対象外（理由は scripts/check-icons.sh の doc コメント参照）。
+      - name: 生成物がマスターと一致するか
+        if: steps.changed.outputs.run == 'true'
+        run: ./scripts/check-icons.sh

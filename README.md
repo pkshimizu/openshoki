@@ -108,7 +108,8 @@ openshoki/
 │   │   └── generated/        actool の生成物（Assets.car / openshoki.icns）
 │   └── menu/             トレイメニュー項目のアイコン（PNG, 32x32 RGBA。ビルド時に埋め込む）
 ├── scripts/
-│   └── generate-icons.sh アイコン資産の再生成（.icon → Assets.car / .icns、SVG → tray.png）
+│   ├── generate-icons.sh アイコン資産の再生成（.icon → Assets.car / .icns、SVG → tray.png）
+│   └── check-icons.sh    生成物がマスターと一致するかの検査（CI でも実行）
 └── src/
     ├── main.rs           エントリ。トレイ初期化と Slint イベントループ起動
     ├── tray.rs           トレイアイコン／メニューの構築とイベントのディスパッチ
@@ -160,9 +161,13 @@ macOS では `screencapturekit` と `objc2` 系を使います。
   Xcode（`xcrun actool`）、`rsvg-convert`、ImageMagick（`magick`）が必要です。
   `actool` が出す `Assets.car` は入力が同じでも毎回バイト列が変わるため、マスターを変えていない
   のに差分が出たときは `git checkout -- assets/icon/generated/Assets.car` で戻してください。
-  生成物がマスターと一致しているかを確かめるだけなら、決定的に再現できる部分だけを作り直す
-  `./scripts/generate-icons.sh --skip-appicon` を実行して `git diff --exit-code assets/icon`
-  を見ます（Xcode 不要）。
+
+  生成物がマスターと一致しているかの確認だけなら次を実行します（作業ツリーを変更せず、
+  Xcode も不要）。アイコン資産を変更した PR では CI でも同じ検査が走ります。
+
+  ```sh
+  ./scripts/check-icons.sh
+  ```
 
 - コミット前の検証コマンド:
 
