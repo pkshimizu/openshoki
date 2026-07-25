@@ -1088,6 +1088,7 @@ fn start_recording(
 ///
 /// 初回表示時のみジオメトリ（位置・サイズ）を明示する（`geometry_committed` で一度きりに保つ）。
 /// なぜ初回にジオメトリを明示するかは `docs/rules/slint.md` を参照。
+/// 表示済み・最小化中のウィンドウでも前面化・キー化まで行う（背景は `bring_to_front` 参照）。
 fn show_window(
     window: &slint::Window,
     geometry_committed: &mut bool,
@@ -1100,8 +1101,98 @@ fn show_window(
         *geometry_committed = true;
     }
     if let Err(err) = window.show() {
+        // 表示に失敗したウィンドウを前面化すると「Slint 側は非表示のつもりなのに
+        // NSWindow だけ前面に出る」不整合になりうるため、ここで打ち切る。
         eprintln!("Failed to show the window: {err}");
+        return;
     }
+    bring_to_front(window);
+}
+
+/// ウィンドウを前面に出してキーウィンドウにする（macOS）。
+///
+/// `slint::Window::show()` は**表示中のウィンドウには no-op** で、前面化もフォーカスもしない。
+/// さらに本アプリは Dock に出ない Accessory 常駐アプリ（`hide_dock_icon` 参照）のため、
+/// トレイメニューのクリックではアプリ自体がアクティブ化されず、表示中のウィンドウは他アプリの
+/// 背後に残る（「メニューを押したのに反応しない」ように見える）。そこで raw-window-handle
+/// 連携で対象の NSWindow を取得し、最小化からの復元・前面化・キー化とアプリのアクティブ化を
+/// 行う。対象の NSWindow を直接キー化するため、設定・Recordings の両方が開いていても選んだ
+/// メニューに対応する方がキーになる。
+///
+/// ハンドルが取得できない場合（非 AppKit バックエンド等）はログして何もしない
+/// （`show()` のみの従来挙動に縮退）。
+#[cfg(target_os = "macos")]
+fn bring_to_front(window: &slint::Window) {
+    use raw_window_handle::HasWindowHandle;
+    // slint::Window::window_handle() は Slint のラッパー（slint::WindowHandle）を返し、
+    // そこから raw-window-handle の trait で raw ハンドルを取り出す。
+    let raw = window
+        .window_handle()
+        .window_handle()
+        .map(|handle| handle.as_raw());
+    // SAFETY: raw は直前に、生きている slint::Window（呼び出し元が参照を保持）から
+    // 取得したハンドルで、AppKit バリアントなら表示中ウィンドウの有効な NSView を指す。
+    // この呼び出し中は Slint がウィンドウを所有し続けるため、ポインタは生存している。
+    unsafe { raise_ns_window(raw) };
+}
+
+/// macOS 以外では前面化は行わない（`show()` の挙動のまま）。
+#[cfg(not(target_os = "macos"))]
+fn bring_to_front(_window: &slint::Window) {}
+
+/// `bring_to_front` の本体。raw ハンドルを引数で受けるのは、ウィンドウ実体なしで
+/// 縮退経路（取得失敗・非 AppKit）を決定的にテストできるようにするため。
+///
+/// # Safety
+///
+/// `raw` が `AppKit` バリアントの場合、その `ns_view` はこの関数の呼び出し中に解放されない
+/// 有効な NSView を指していること。`Err` や AppKit 以外のバリアントはポインタを参照せず
+/// 縮退するため、この前提を自明に満たす。メインスレッドか否かは関数内部で確認し、
+/// 外れる場合はポインタに触れず縮退する（呼び出し側の前提ではない）。
+#[cfg(target_os = "macos")]
+unsafe fn raise_ns_window(
+    raw: Result<raw_window_handle::RawWindowHandle, raw_window_handle::HandleError>,
+) {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSApplication, NSView};
+
+    let handle = match raw {
+        Ok(raw_window_handle::RawWindowHandle::AppKit(handle)) => handle,
+        Ok(_) => {
+            eprintln!("Skipping bring-to-front because the window is not backed by AppKit");
+            return;
+        }
+        Err(err) => {
+            eprintln!("Skipping bring-to-front because the window handle is unavailable: {err}");
+            return;
+        }
+    };
+    // 実運用ではイベントループのコールバック（メインスレッド）から呼ばれる。テスト等の
+    // メインスレッド外では AppKit に触らず縮退する（expect でパニックさせない）。
+    let Some(mtm) = MainThreadMarker::new() else {
+        eprintln!("Skipping bring-to-front because it is not called on the main thread");
+        return;
+    };
+    // SAFETY: この関数の # Safety（ns_view は生存中の NSView を指す）を呼び出し側が保証する。
+    // メインスレッド上であることは直前の mtm 確認で保証済みで、参照はこの関数内で完結し
+    // ポインタを保持して持ち越さない。
+    let view = unsafe { handle.ns_view.cast::<NSView>().as_ref() };
+    let Some(ns_window) = view.window() else {
+        eprintln!("Skipping bring-to-front because the view has no window");
+        return;
+    };
+    // Cmd+M で最小化されている場合は復元してから前面化する。
+    if ns_window.isMiniaturized() {
+        ns_window.deminiaturize(None);
+    }
+    ns_window.makeKeyAndOrderFront(None);
+    // Accessory アプリはウィンドウを前面化してもアプリ自体が非アクティブのままなので、
+    // 明示的にアクティブ化する。他アプリからフォーカスを奪う操作だが、ユーザーのメニュー
+    // クリックへの応答としてのみ呼ばれるため許容する（バックグラウンドから呼ぶ経路は作らない）。
+    // 後継の activate() は macOS 14+ のため、最低対応 macOS 13 では非推奨版を使う
+    // （expect にしておけば、非推奨でなくなったときに警告で気づける）。
+    #[expect(deprecated)]
+    NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
 }
 
 /// 録音中アイコンの明滅レベルを、録音経過時間からサイン波で算出する純粋関数。
@@ -1358,6 +1449,22 @@ mod tests {
                 (0.0..=1.0).contains(&level),
                 "level {level} out of range (t={t})"
             );
+        }
+    }
+
+    /// 前面化の縮退経路（ハンドル取得失敗・非 AppKit バックエンド）はパニックせず戻る。
+    /// 前面化の成否（ウィンドウの前後関係）は自動判定が困難なため実機の手動確認とし、
+    /// ここでは FFI 手前の分岐が安全に縮退することだけを検証する（`docs/rules/ffi.md`）。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn raise_ns_window_returns_without_panic_on_degraded_paths() {
+        use raw_window_handle::{HandleError, RawWindowHandle, WebWindowHandle};
+
+        // SAFETY: Err と非 AppKit バリアントはポインタを参照せず縮退するため、
+        // # Safety の前提（AppKit の ns_view が有効）を自明に満たす。
+        unsafe {
+            super::raise_ns_window(Err(HandleError::Unavailable));
+            super::raise_ns_window(Ok(RawWindowHandle::Web(WebWindowHandle::new(1))));
         }
     }
 }
