@@ -78,8 +78,11 @@ generate_mark_layer() {
   fi
   # SVG として本当に読めるかを確かめる。コメント削除はマスターの書き方（コメント内に <svg と
   # 書く等）次第で中身を巻き込みうるので、タグの有無を見るだけでは足りない。
-  if ! rsvg-convert "$tmp" -o "$tmp_dir/validate.png" 2>/dev/null; then
-    echo "Generated $out is not valid SVG (check the comments in $mark_svg)" >&2
+  local parse_error
+  if ! parse_error="$(rsvg-convert "$tmp" -o "$tmp_dir/validate.png" 2>&1)"; then
+    echo "Generated $out is not valid SVG: $parse_error" >&2
+    echo "  (the leading comment block of $mark_svg is stripped before recoloring;" >&2
+    echo "   writing <svg inside that comment breaks the stripping)" >&2
     exit 1
   fi
   mv "$tmp" "$out"
