@@ -437,18 +437,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // まだ無ければ再生不可（選択時にその場でミックスして UI を固めない）。
             let playable = session.is_playable();
             rec.set_playable(playable);
-            let duration = match session.playback_path() {
-                Some(path) => match player.borrow_mut().as_mut() {
-                    Some(p) => match p.load(&path) {
+            let duration = {
+                let mut player = player.borrow_mut();
+                match (session.playback_path(), player.as_mut()) {
+                    (Some(path), Some(p)) => match p.load(&path) {
                         Ok(()) => p.duration(),
                         Err(err) => {
                             eprintln!("Failed to load the recording for playback: {err}");
                             None
                         }
                     },
-                    None => None,
-                },
-                None => None,
+                    // 再生対象が無いセッション（両音源で mix.mp3 が未生成）でも、前のセッションの
+                    // 音声は手放す。残すと再生 tick が前の位置・再生状態で新しいセッションの表示を
+                    // 駆動し、セグメントのクリックが前の音声をシークする（`AudioPlayer::load` が
+                    // 失敗時に前の対象を残さないのと同じ趣旨。`docs/rules/error-handling.md`）。
+                    (None, Some(p)) => {
+                        p.unload();
+                        None
+                    }
+                    // 出力デバイスを開けない環境では再生ハンドルが無く、手放す対象も無い。
+                    (_, None) => None,
+                }
             };
             apply_playback_position(&rec, Duration::ZERO, duration);
             // 全体長が分からないと比率→秒の換算ができないため、その場合はシークバーを
@@ -1008,9 +1017,11 @@ fn open_recordings_window(
     clear_recordings_selection(rec);
     *handles.sessions.borrow_mut() = list;
     *last_play_secs = None;
-    // 前回の再生が残っていれば止める。
-    if let Some(p) = handles.player.borrow().as_ref() {
-        p.stop();
+    // 前回の再生が残っていれば止め、対象も手放す（未選択の表示に合わせて「何もロードされて
+    // いない」状態へ揃える。停止だけだと前のセッションが読み込まれたまま残り、再生 tick が
+    // その位置で表示を駆動する）。
+    if let Some(p) = handles.player.borrow_mut().as_mut() {
+        p.unload();
     }
 
     show_window(
