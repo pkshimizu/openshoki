@@ -110,35 +110,30 @@ impl AudioPlayer {
         }
     }
 
-    /// 指定位置へシークする（文字起こしのセグメントクリックで使う）。再生/一時停止の状態は
-    /// 変えない（再生中はその位置から続行、一時停止中は位置だけ移動）。
+    /// 指定位置へシークする（文字起こしのセグメントクリック・シークバーの操作で使う）。
+    /// 再生/一時停止の状態は変えない（再生中はその位置から続行、一時停止中は位置だけ移動）。
     ///
-    /// 終端・停止後でキューが空なら、まず対象ファイルを積み直してからシークする。`try_seek` が
-    /// 効かない（byte_len 不明などでシーク非対応の）ときは、対象ファイルを開き直して先頭を読み
-    /// 飛ばすフォールバックにする（この経路では再生位置表示の基準が 0 に戻りうる）。
-    pub fn seek(&self, pos: Duration) {
+    /// 終端・停止後でキューが空なら、まず対象ファイルを積み直してからシークする。シークできない
+    /// （`try_seek` 非対応・デコーダのエラー）ときは**再生位置を動かさず** `Err` を返す。
+    /// 呼び出し側はそれを見て表示（進捗バー・時刻・ハイライト）を更新しないことで、「表示は
+    /// 移動後・音は移動前」の食い違いを作らない。
+    ///
+    /// 対象ファイルを開き直して目的位置まで読み飛ばすフォールバック（`Source::skip_duration`）は
+    /// **持たない**。読み飛ばしは目的位置までの全サンプルを同期デコードするため、Slint の
+    /// コールバック（＝イベントループ）上で呼ぶと長い録音で UI が固まる。再生対象は `File` 由来で
+    /// ランダムアクセスできるため通常は `try_seek` が成立し、失敗時はエラーで返す縮退で足りる。
+    pub fn seek(&self, pos: Duration) -> Result<(), Box<dyn std::error::Error>> {
         if self.player.empty() {
             self.append_from_start();
-        }
-        if let Err(err) = self.player.try_seek(pos) {
-            eprintln!("Seeking via try_seek failed; re-decoding from the position: {err}");
-            self.append_skipping(pos);
-        }
-    }
-
-    /// 対象ファイルを開き直し、先頭 `pos` を読み飛ばしてキューへ積み直す（`try_seek` 非対応時の
-    /// フォールバック）。失敗はログして続行。
-    fn append_skipping(&self, pos: Duration) {
-        let Some(path) = &self.path else {
-            return;
-        };
-        match open_decoder(path) {
-            Ok(source) => {
-                self.player.clear();
-                self.player.append(source.skip_duration(pos));
+            // 積み直せない（未ロード・開き直し失敗。失敗理由は append_from_start がログする）なら
+            // シーク対象が無い。rodio はキューが空だと何もせず Ok を返すため、ここで Err にして
+            // 呼び出し側の「移動できた前提」の表示更新を止める。
+            if self.player.empty() {
+                return Err("no audio is queued for playback".into());
             }
-            Err(err) => eprintln!("Failed to reopen the audio for seeking: {err}"),
         }
+        self.player.try_seek(pos)?;
+        Ok(())
     }
 
     /// 現在の再生位置。

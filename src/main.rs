@@ -501,8 +501,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let Some(segment) = usize::try_from(index).ok().and_then(|i| segments.get(i)) else {
                 return;
             };
-            if let Some(p) = player.borrow().as_ref() {
-                p.seek(segment.start_duration());
+            let player = player.borrow();
+            let Some(p) = player.as_ref() else {
+                return;
+            };
+            if let Err(err) = p.seek(segment.start_duration()) {
+                eprintln!(
+                    "Skipping the highlight update because seeking to the segment failed: {err}"
+                );
+                return;
             }
             // クリックしたセグメントを即ハイライトする（次の tick で位置に追従する）。
             rec.set_current_segment(index);
@@ -547,7 +554,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let Some(position) = seek_position_from_ratio(ratio, duration) else {
                 return;
             };
-            p.seek(position);
+            if let Err(err) = p.seek(position) {
+                eprintln!("Skipping the playback position update because seeking failed: {err}");
+                return;
+            }
             // 離した位置で表示を即確定させる（次の tick を待たない）。
             apply_playback_position(&rec, position, duration);
         });
@@ -1535,7 +1545,7 @@ mod tests {
             0.25
         );
         assert_eq!(playback_progress(total, Some(total)), 1.0);
-        // 全体長を超える位置（try_seek フォールバック後など）でも 1.0 で止まる。
+        // 全体長を超える位置（デコーダの報告位置が終端を跨ぐ等）でも 1.0 で止まる。
         assert_eq!(
             playback_progress(Duration::from_secs(500), Some(total)),
             1.0
