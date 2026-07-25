@@ -5,6 +5,7 @@
 //! 呼び出し側（`main`）が Slint のイベントループ上でそれを拾ってウィンドウ操作・録音・終了を行う。
 
 use std::rc::Rc;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use tray_icon::menu::{Icon as MenuIcon, IconMenuItem, Menu};
@@ -34,6 +35,11 @@ const STOP_ICON_PNG: &[u8] = include_bytes!("../assets/menu/stop.png");
 const SETTINGS_ICON_PNG: &[u8] = include_bytes!("../assets/menu/settings.png");
 const RECORDINGS_ICON_PNG: &[u8] = include_bytes!("../assets/menu/recordings.png");
 const QUIT_ICON_PNG: &[u8] = include_bytes!("../assets/menu/quit.png");
+
+/// メニューバー常駐アイコンの PNG 素材（36x36・8bit RGBA。`scripts/generate-icons.sh` が
+/// アプリアイコンと同じ SVG から生成する）。待機中は template 画像として表示し、ライト/ダークへの
+/// 追従を OS に任せる。録音中は同じグリフを赤く塗って非 template で表示する。
+const TRAY_ICON_PNG: &[u8] = include_bytes!("../assets/icon/tray.png");
 
 /// 構築したトレイ一式。`TrayIcon` はドロップするとアイコンが消えるため、
 /// アプリが生きている間は保持し続ける必要がある。
@@ -81,11 +87,16 @@ impl Tray {
         menu.append(&recordings_item)?;
         menu.append(&quit_item)?;
 
-        let icon = TrayIconBuilder::new()
+        // 待機中は template 画像（アルファだけを使うモノクロ）。メニューバーの明暗・Reduce
+        // Transparency への追従は OS に任せる。
+        let mut builder = TrayIconBuilder::new()
             .with_tooltip(TOOLTIP_IDLE)
             .with_menu(Box::new(menu))
-            .with_icon(dot_icon(IDLE_COLOR))
-            .build()?;
+            .with_icon_as_template(true);
+        if let Some(icon) = tray_icon(None) {
+            builder = builder.with_icon(icon);
+        }
+        let icon = builder.build()?;
 
         Ok(Self {
             icon: Rc::new(icon),
@@ -100,7 +111,11 @@ impl Tray {
 /// 待機中の表示へ戻す。静的なグレーアイコン・経過時間テキストの消去・ツールチップを既定に戻す。
 /// `?` を使えない呼び出し元（イベントループのコールバック）から使うため、失敗はログに残す。
 pub fn set_idle(icon: &TrayIcon) {
-    if let Err(err) = icon.set_icon(Some(dot_icon(IDLE_COLOR))) {
+    // 待機中はモノクロの template（OS がライト/ダークへ反転させる）。
+    icon.set_icon_as_template(true);
+    if let Some(glyph) = tray_icon(None)
+        && let Err(err) = icon.set_icon(Some(glyph))
+    {
         eprintln!("Failed to update the tray icon: {err}");
     }
     // set_title は Result を返さない。tray-icon 0.24 の macOS 実装では set_title(None) は
@@ -118,7 +133,11 @@ pub fn set_idle(icon: &TrayIcon) {
 /// ときだけ（＝呼び出し側で秒が変わったとき）更新する。
 /// `?` を使えない呼び出し元から使うため、失敗はログに残す。
 pub fn render_recording(icon: &TrayIcon, elapsed: Duration, level: f32, update_title: bool) {
-    if let Err(err) = icon.set_icon(Some(dot_icon(recording_color(level)))) {
+    // 録音中は色を見せたいので template を外す（template はアルファだけを使い、赤が黒になる）。
+    icon.set_icon_as_template(false);
+    if let Some(glyph) = tray_icon(Some(recording_color(level)))
+        && let Err(err) = icon.set_icon(Some(glyph))
+    {
         eprintln!("Failed to update the tray icon: {err}");
     }
     if update_title {
@@ -180,36 +199,12 @@ pub fn set_record_item_recording(item: &IconMenuItem) {
     item.set_icon(load_menu_icon(STOP_ICON_PNG));
 }
 
-/// 埋め込み PNG を RGBA へデコードして muda の `Icon` を作る。素材は 8bit RGBA 固定
-/// （`assets/menu/` 生成時に保証）。デコード失敗・想定外フォーマットは `None` を返し、呼び出し側は
-/// アイコン無しで続行する（アイコンのために機能を止めない。`docs/rules/error-handling.md`）。
+/// 埋め込み PNG を RGBA へデコードして muda の `Icon`（メニュー項目用）を作る。
+/// デコード失敗・想定外フォーマットは `None` を返し、呼び出し側はアイコン無しで続行する
+/// （アイコンのために機能を止めない。`docs/rules/error-handling.md`）。
 fn load_menu_icon(png_bytes: &[u8]) -> Option<MenuIcon> {
-    // png 0.18 の Decoder は BufRead + Seek を要求する。埋め込みバイト列を Cursor で包んで渡す。
-    let mut reader = match png::Decoder::new(std::io::Cursor::new(png_bytes)).read_info() {
-        Ok(reader) => reader,
-        Err(err) => {
-            eprintln!("Skipping a menu icon because decoding its header failed: {err}");
-            return None;
-        }
-    };
-    let Some(size) = reader.output_buffer_size() else {
-        eprintln!("Skipping a menu icon because its output buffer size is unavailable.");
-        return None;
-    };
-    let mut buf = vec![0u8; size];
-    let info = match reader.next_frame(&mut buf) {
-        Ok(info) => info,
-        Err(err) => {
-            eprintln!("Skipping a menu icon because decoding its pixels failed: {err}");
-            return None;
-        }
-    };
-    if info.color_type != png::ColorType::Rgba || info.bit_depth != png::BitDepth::Eight {
-        eprintln!("Skipping a menu icon because it is not 8-bit RGBA.");
-        return None;
-    }
-    buf.truncate(info.buffer_size());
-    match MenuIcon::from_rgba(buf, info.width, info.height) {
+    let image = decode_rgba_png(png_bytes, "a menu icon")?;
+    match MenuIcon::from_rgba(image.pixels, image.width, image.height) {
         Ok(icon) => Some(icon),
         Err(err) => {
             eprintln!("Skipping a menu icon because building it from RGBA failed: {err}");
@@ -218,43 +213,97 @@ fn load_menu_icon(png_bytes: &[u8]) -> Option<MenuIcon> {
     }
 }
 
-/// 待機中ドットのグレー（不透明）。
-const IDLE_COLOR: [u8; 4] = [0x8a, 0x8a, 0x8a, 0xff];
-
-/// トレイ用のドットアイコンを、指定した RGBA 色で生成する。色（待機のグレー／録音中の赤の濃淡）は
-/// 呼び出し側が決め、ここは描画に専念して共通化する。
-///
-/// 暫定アイコン。macOS のテンプレート画像化など見た目の調整は後続に回す。
-fn dot_icon(dot: [u8; 4]) -> Icon {
-    const SIZE: u32 = 32;
-    // ドットの半径はアイコン一辺に対する割合で決める。
-    const RADIUS_RATIO: f32 = 0.4;
-
-    let mut rgba = vec![0u8; (SIZE * SIZE * 4) as usize];
-    let center = (SIZE as f32 - 1.0) / 2.0;
-    let radius = SIZE as f32 * RADIUS_RATIO;
-    let radius_sq = radius * radius;
-
-    for y in 0..SIZE {
-        for x in 0..SIZE {
-            let dx = x as f32 - center;
-            let dy = y as f32 - center;
-            if dx * dx + dy * dy <= radius_sq {
-                let offset = ((y * SIZE + x) * 4) as usize;
-                rgba[offset..offset + 4].copy_from_slice(&dot);
-            }
+/// メニューバー常駐アイコンを作る。`tint` が `None` なら素材そのまま（待機中の template 用。
+/// macOS はアルファだけを見る）、`Some(color)` ならグリフをその色で塗る（録音中の赤）。
+/// 素材のデコードに失敗している場合は `None`（アイコン無しで続行）。
+fn tray_icon(tint: Option<[u8; 4]>) -> Option<Icon> {
+    let glyph = tray_glyph()?;
+    let pixels = match tint {
+        Some(color) => tinted_glyph(&glyph.pixels, color),
+        None => glyph.pixels.clone(),
+    };
+    match Icon::from_rgba(pixels, glyph.width, glyph.height) {
+        Ok(icon) => Some(icon),
+        Err(err) => {
+            eprintln!("Skipping the tray icon because building it from RGBA failed: {err}");
+            None
         }
     }
+}
 
-    Icon::from_rgba(rgba, SIZE, SIZE)
-        .expect("RGBA buffer length always satisfies SIZE*SIZE*4, so this is always valid")
+/// トレイアイコンの素材（デコード済み RGBA）。録音中は毎ティック塗り替えるため、デコードは
+/// 起動時 1 回だけ行って使い回す（デコード失敗も一度きり記録し、以後はアイコン無しで続ける）。
+fn tray_glyph() -> Option<&'static RgbaImage> {
+    static GLYPH: OnceLock<Option<RgbaImage>> = OnceLock::new();
+    GLYPH
+        .get_or_init(|| decode_rgba_png(TRAY_ICON_PNG, "the tray icon"))
+        .as_ref()
+}
+
+/// グリフを 1 色で塗り直す。**アルファは素材のまま残す**ので、縁のアンチエイリアスが保たれ、
+/// 透明な画素は透明のままになる（`color` のアルファは使わない）。
+fn tinted_glyph(pixels: &[u8], color: [u8; 4]) -> Vec<u8> {
+    pixels
+        .chunks_exact(4)
+        .flat_map(|pixel| {
+            let alpha = pixel[3];
+            if alpha == 0 {
+                [0, 0, 0, 0]
+            } else {
+                [color[0], color[1], color[2], alpha]
+            }
+        })
+        .collect()
+}
+
+/// デコード済みの RGBA 画像。
+struct RgbaImage {
+    pixels: Vec<u8>,
+    width: u32,
+    height: u32,
+}
+
+/// 埋め込み PNG を 8bit RGBA へデコードする。素材は 8bit RGBA 固定
+/// （`assets/menu/` と `scripts/generate-icons.sh` の生成時に保証）。失敗と想定外フォーマットは
+/// `what`（何の素材か）を添えてログし、`None` を返す。
+fn decode_rgba_png(png_bytes: &[u8], what: &str) -> Option<RgbaImage> {
+    // png 0.18 の Decoder は BufRead + Seek を要求する。埋め込みバイト列を Cursor で包んで渡す。
+    let mut reader = match png::Decoder::new(std::io::Cursor::new(png_bytes)).read_info() {
+        Ok(reader) => reader,
+        Err(err) => {
+            eprintln!("Skipping {what} because decoding its header failed: {err}");
+            return None;
+        }
+    };
+    let Some(size) = reader.output_buffer_size() else {
+        eprintln!("Skipping {what} because its output buffer size is unavailable.");
+        return None;
+    };
+    let mut pixels = vec![0u8; size];
+    let info = match reader.next_frame(&mut pixels) {
+        Ok(info) => info,
+        Err(err) => {
+            eprintln!("Skipping {what} because decoding its pixels failed: {err}");
+            return None;
+        }
+    };
+    if info.color_type != png::ColorType::Rgba || info.bit_depth != png::BitDepth::Eight {
+        eprintln!("Skipping {what} because it is not 8-bit RGBA.");
+        return None;
+    }
+    pixels.truncate(info.buffer_size());
+    Some(RgbaImage {
+        pixels,
+        width: info.width,
+        height: info.height,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        QUIT_ICON_PNG, RECORD_ICON_PNG, SETTINGS_ICON_PNG, STOP_ICON_PNG, format_elapsed,
-        load_menu_icon, recording_color,
+        QUIT_ICON_PNG, RECORD_ICON_PNG, SETTINGS_ICON_PNG, STOP_ICON_PNG, TRAY_ICON_PNG,
+        decode_rgba_png, format_elapsed, load_menu_icon, recording_color, tinted_glyph,
     };
     use std::time::Duration;
 
@@ -296,6 +345,62 @@ mod tests {
                 .expect("writing the PNG data succeeds in test");
         }
         assert!(load_menu_icon(&bytes).is_none());
+    }
+
+    /// メニューバー用の素材が 8bit RGBA でデコードでき、`tray-icon` が 18pt 表示に使う 2x
+    /// （36x36）であること。サイズが変わるとメニューバーで拡大・縮小されてぼやける。
+    #[test]
+    fn tray_icon_asset_is_36px_rgba() {
+        let glyph = decode_rgba_png(TRAY_ICON_PNG, "the tray icon in test")
+            .expect("the embedded tray icon should decode as 8-bit RGBA");
+        assert_eq!(
+            (glyph.width, glyph.height),
+            (36, 36),
+            "the tray glyph must stay 36x36 (2x of the 18pt menu bar height)"
+        );
+        // グリフが実際に描かれている（不透明画素がある）こと。空の素材を埋め込む事故を防ぐ。
+        assert!(
+            glyph.pixels.chunks_exact(4).any(|pixel| pixel[3] > 0),
+            "the tray glyph must contain visible pixels"
+        );
+    }
+
+    /// 録音中の塗り替え: 不透明画素は指定色になり、透明画素は透明のまま。半透明の縁は
+    /// アルファを保って色だけ変わる（アンチエイリアスを潰さない）。
+    #[test]
+    fn tinted_glyph_recolors_only_visible_pixels() {
+        // 4 画素: 不透明の黒 / 半透明の黒 / 完全な透明 / 不透明の白。
+        let pixels = [
+            0x00, 0x00, 0x00, 0xff, //
+            0x00, 0x00, 0x00, 0x80, //
+            0x00, 0x00, 0x00, 0x00, //
+            0xff, 0xff, 0xff, 0xff,
+        ];
+        let red = [0xD0, 0x21, 0x1c, 0xff];
+        assert_eq!(
+            tinted_glyph(&pixels, red),
+            vec![
+                0xD0, 0x21, 0x1c, 0xff, // 不透明はそのまま赤に
+                0xD0, 0x21, 0x1c, 0x80, // 半透明はアルファを保って赤に
+                0x00, 0x00, 0x00, 0x00, // 透明は触らない
+                0xD0, 0x21, 0x1c, 0xff, // 元の色に関係なく赤にする
+            ]
+        );
+    }
+
+    /// 実素材を塗り替えても画素数・アルファの分布が変わらない（形が崩れない）。
+    #[test]
+    fn tinted_glyph_preserves_the_shape_of_the_real_asset() {
+        let glyph = decode_rgba_png(TRAY_ICON_PNG, "the tray icon in test")
+            .expect("the embedded tray icon should decode as 8-bit RGBA");
+        let tinted = tinted_glyph(&glyph.pixels, recording_color(1.0));
+        assert_eq!(tinted.len(), glyph.pixels.len());
+        let alphas: Vec<u8> = glyph.pixels.chunks_exact(4).map(|p| p[3]).collect();
+        let tinted_alphas: Vec<u8> = tinted.chunks_exact(4).map(|p| p[3]).collect();
+        assert_eq!(
+            tinted_alphas, alphas,
+            "tinting must not change the glyph's alpha channel"
+        );
     }
 
     #[test]

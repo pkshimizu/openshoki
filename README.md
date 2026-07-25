@@ -12,8 +12,9 @@
 - **多重起動しない**: 既に起動している状態で再度起動しても、二重に常駐せず終了します（自動録音の
   二重発火や保存先の競合を防ぐため）。ロックは起動中だけ有効で、終了・クラッシュ後は再び起動できます。
 - **ワンクリックで録音の開始／停止**: メニューの「録音を開始」「録音を停止」で切り替えます。
-- **録音中インジケーター**: 録音中はメニューバーのアイコンが赤く点滅し、ツールチップで状態が
-  分かります。
+- **録音中インジケーター**: 録音中はメニューバーのアイコン（筆の一画）が赤く点滅し、ツールチップで
+  状態が分かります。待機中はモノクロの template 画像として表示されるため、ライト／ダークの
+  メニューバーに自動で追従します。
 - **マイク音声とシステム音声を別ファイルで保存**: マイク（発話）を `mic.mp3`、スピーカー等の
   システム音声（再生音）を `system.mp3` として、混ぜずに別々の MP3 で保存します
   （将来の文字起こしで発話と再生音を分けて扱うため）。
@@ -99,7 +100,14 @@ openshoki/
 │   ├── app-window.slint       設定画面の UI 定義（Slint）
 │   └── recordings-window.slint 録音一覧・再生ウィンドウの UI 定義（Slint）
 ├── assets/
+│   ├── icon/             アプリアイコンの資産（マスターと生成物。scripts/generate-icons.sh 参照）
+│   │   ├── openshoki.icon/   Icon Composer 形式のマスター（icon.json + Assets/*.svg）
+│   │   ├── mark-mono.svg     メニューバー用グリフのマスター（一画のみ・黒）
+│   │   ├── tray.png          メニューバー常駐アイコン（36x36 RGBA。ビルド時に埋め込む）
+│   │   └── generated/        actool の生成物（Assets.car / openshoki.icns）
 │   └── menu/             トレイメニュー項目のアイコン（PNG, 32x32 RGBA。ビルド時に埋め込む）
+├── scripts/
+│   └── generate-icons.sh アイコン資産の再生成（.icon → Assets.car / .icns、SVG → tray.png）
 └── src/
     ├── main.rs           エントリ。トレイ初期化と Slint イベントループ起動
     ├── tray.rs           トレイアイコン／メニューの構築とイベントのディスパッチ
@@ -138,6 +146,16 @@ macOS では `screencapturekit` と `objc2` 系を使います。
   cargo install cargo-watch   # 初回のみ
   cargo dev
   ```
+
+- **アイコン資産の再生成**: アプリアイコンとメニューバーのグリフは 1 つのマスターから生成します。
+  マスター（`assets/icon/openshoki.icon` / `assets/icon/mark-mono.svg`）を変えたら次を実行し、
+  生成物（`assets/icon/generated/` と `assets/icon/tray.png`）ごとコミットしてください。
+
+  ```sh
+  ./scripts/generate-icons.sh
+  ```
+
+  Xcode（`xcrun actool`）、`rsvg-convert`、ImageMagick（`magick`）が必要です。
 
 - コミット前の検証コマンド:
 
