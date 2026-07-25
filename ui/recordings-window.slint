@@ -136,11 +136,15 @@ export component RecordingsWindow inherits Window {
     // 選択中セッションの文字起こし状態テキスト（Rust 側が組み立てる。例: Transcribed /
     // Transcribing… / Transcription failed / Not transcribed）。
     in property <string> detail-transcript-text;
-    // 選択中セッションが文字起こし中か（Transcribe ボタンの無効化に使う）。
-    in property <bool> detail-transcribing;
-    // 選択中セッションの文字起こし状態。状態テキストの失敗色と Transcript 縮退表示の
-    // ラベル分岐に使う（Rust 側が detail-transcript-text と同時に更新する）。
+    // 選択中セッションの文字起こし状態。状態テキストの失敗色の分岐と、実行中判定の導出に
+    // 使う（Rust 側が detail-transcript-text と同時に更新する）。
     in property <TranscriptStatus> detail-transcript-status;
+    // Transcript セクションの縮退表示（セグメントが無いとき）のラベル。状態→文言の対応表は
+    // Rust 側（transcript_placeholder_text）に集約し、ここでは表示するだけ。
+    in property <string> detail-transcript-placeholder;
+    // 選択中セッションが文字起こし中か（Transcribe / Delete の無効化に使う）。状態 enum から
+    // 導出し、Rust から個別に set しない（bool と enum の食い違いを作らない）。
+    property <bool> detail-transcribing: root.detail-transcript-status == TranscriptStatus.transcribing;
     // 選択セッションのトランスクリプト（mic.json / system.json をマージしたもの。新→旧でなく時刻順）。
     // 空なら Transcript セクションは状態依存のラベルに縮退表示する。
     in property <[TranscriptRow]> segments;
@@ -498,14 +502,11 @@ export component RecordingsWindow inherits Window {
                                 }
                             }
                             if root.segments.length == 0: Text {
-                                // 縮退表示は実際の状態を語る（中=Transcribing… / 失敗=Transcription
-                                // Failed / 未実施=Not Transcribed Yet）。完了済みの再実行中は旧
-                                // トランスクリプトが残るため上の一覧表示が維持され、ここには来ない。
-                                text: root.detail-transcript-status == TranscriptStatus.transcribing
-                                    ? "Transcribing…"
-                                    : root.detail-transcript-status == TranscriptStatus.failed
-                                        ? "Transcription Failed"
-                                        : "Not Transcribed Yet";
+                                // 縮退表示は実際の状態を語る（ラベルの対応は Rust 側の
+                                // transcript_placeholder_text 参照。JSON の欠落・破損は状態 Done の
+                                // ままセグメントが空になり、未実施と同じ表示に落ちる）。完了済みの
+                                // 再実行中は旧トランスクリプトが残るため上の一覧表示が維持される。
+                                text: root.detail-transcript-placeholder;
                                 font-size: Style.body-size;
                                 horizontal-alignment: center;
                                 vertical-alignment: center;
