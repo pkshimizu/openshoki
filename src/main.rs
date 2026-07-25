@@ -1221,21 +1221,40 @@ fn transcript_display_status(
     }
 }
 
+/// 「文字起こし中」の表示ラベル。状態テキストと Transcript の縮退表示の両方で同じ文言を
+/// 使うため、1 箇所で管理する（片方だけ変えて食い違うのを防ぐ）。
+const TRANSCRIBING_LABEL: &str = "Transcribing…";
+
 /// 文字起こしの表示状態 → 詳細ペインの状態テキスト。
 fn transcript_status_text(display_status: TranscriptStatus) -> &'static str {
     match display_status {
         TranscriptStatus::NotTranscribed => "Not transcribed",
-        TranscriptStatus::Transcribing => "Transcribing…",
+        TranscriptStatus::Transcribing => TRANSCRIBING_LABEL,
         TranscriptStatus::Done => "Transcribed",
         TranscriptStatus::Failed => "Transcription failed",
     }
 }
 
-/// 詳細ペインの文字起こし表示（状態テキストと Transcribe ボタンの活性）を反映する。
+/// 文字起こしの表示状態 → Transcript セクションの縮退表示（セグメントが無いとき）のラベル。
+/// 状態テキスト（`transcript_status_text`）が文形式なのに対し、こちらは他の空状態ラベル
+/// （"No Recordings Yet" 等）と同じ Title Case の見出し形式にする（デザイン準拠）。
+/// `Done` でセグメントが空になるのは JSON の欠落・破損時で、従来どおり未実施と同じ表示に落とす。
+fn transcript_placeholder_text(display_status: TranscriptStatus) -> &'static str {
+    match display_status {
+        TranscriptStatus::Transcribing => TRANSCRIBING_LABEL,
+        TranscriptStatus::Failed => "Transcription Failed",
+        TranscriptStatus::NotTranscribed | TranscriptStatus::Done => "Not Transcribed Yet",
+    }
+}
+
+/// 詳細ペインの文字起こし表示（状態テキスト・状態依存の配色・縮退ラベル）を反映する。
 /// 選択時・手動投入直後・tick 追従の全経路でここを通し、表示ロジックを 1 箇所にする。
+/// Transcribe / Delete ボタンの活性は Slint 側が `detail-transcript-status` から導出する
+/// （bool を別途 set して enum と食い違う余地を作らない）。
 fn apply_detail_transcript_status(rec: &RecordingsWindow, status: TranscriptStatus) {
     rec.set_detail_transcript_text(transcript_status_text(status).into());
-    rec.set_detail_transcribing(status == TranscriptStatus::Transcribing);
+    rec.set_detail_transcript_placeholder(transcript_placeholder_text(status).into());
+    rec.set_detail_transcript_status(status);
 }
 
 /// セッションの現在の文字起こし状態を合成して詳細ペインへ反映する（選択時・手動投入直後用。
@@ -1303,7 +1322,7 @@ fn hide_dock_icon() {
 mod tests {
     use super::{
         TranscriptStatus, breathing_level, selected_model_status_text, transcript_display_status,
-        transcript_status_text,
+        transcript_placeholder_text, transcript_status_text,
     };
     use crate::transcribe::TranscribeStatus;
     use std::time::Duration;
@@ -1353,6 +1372,28 @@ mod tests {
         assert_eq!(
             transcript_status_text(TranscriptStatus::Failed),
             "Transcription failed"
+        );
+    }
+
+    /// 縮退表示ラベル。Done は「セグメントが空＝JSON の欠落・破損」の経路でのみ表示され、
+    /// 未実施と同じラベルに落とす。
+    #[test]
+    fn transcript_placeholder_text_covers_all_states() {
+        assert_eq!(
+            transcript_placeholder_text(TranscriptStatus::NotTranscribed),
+            "Not Transcribed Yet"
+        );
+        assert_eq!(
+            transcript_placeholder_text(TranscriptStatus::Transcribing),
+            "Transcribing…"
+        );
+        assert_eq!(
+            transcript_placeholder_text(TranscriptStatus::Done),
+            "Not Transcribed Yet"
+        );
+        assert_eq!(
+            transcript_placeholder_text(TranscriptStatus::Failed),
+            "Transcription Failed"
         );
     }
 
