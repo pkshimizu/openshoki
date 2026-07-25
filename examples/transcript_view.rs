@@ -1,6 +1,11 @@
-//! Transcript セクションの描画確認用バイナリ（`docs/rules/slint.md` の検証手順）。
-//! ダミーのセグメントを流し込んで RecordingsWindow を表示する。
-//! 実行: `cargo run --example transcript_view` → screencapture で目視確認。
+//! Recordings ウィンドウ（Transcript・Playback セクション）の描画確認用バイナリ
+//! （`docs/rules/slint.md` の検証手順）。ダミーの状態を流し込んで RecordingsWindow を表示する。
+//! 実行: `cargo run --example transcript_view [引数...]` → screencapture で目視確認。
+//!
+//! 引数（順不同・組み合わせ可）:
+//! - 数値: セグメント件数（0 で Transcript の縮退表示。既定は `DEFAULT_SEGMENT_COUNT`）
+//! - `modal`: 削除確認モーダルを重ねた状態
+//! - `no-seek`: シークバーを表示専用へ縮退させた状態（再生不可・全体長不明のセッション相当）
 
 slint::include_modules!();
 
@@ -8,15 +13,18 @@ use std::rc::Rc;
 
 use slint::{ModelRc, VecModel};
 
+/// 引数で件数を指定しなかったときのセグメント件数。
+const DEFAULT_SEGMENT_COUNT: usize = 30;
+
 fn main() {
     let win = RecordingsWindow::new()
         .expect("creating the window should succeed in this verification binary");
 
-    // セグメント件数は引数で変えられる（0 で縮退表示の確認）。既定 30。
+    // 引数はフラグと混ざるため、位置ではなく「数値として読めた最初の引数」を件数にする。
     let count: usize = std::env::args()
-        .nth(1)
-        .and_then(|arg| arg.parse().ok())
-        .unwrap_or(30);
+        .skip(1)
+        .find_map(|arg| arg.parse().ok())
+        .unwrap_or(DEFAULT_SEGMENT_COUNT);
     let rows: Vec<TranscriptRow> = (0..count)
         .map(|i| TranscriptRow {
             speaker: if i % 2 == 0 { "Mic" } else { "System" }.into(),
@@ -39,13 +47,10 @@ fn main() {
     win.set_playable(true);
     win.set_progress(0.35);
     win.set_time_text("01:45 / 05:00".into());
-    // 引数に "modal" を含めると削除確認モーダルを重ねた状態で表示する（#66 の検証）。
+    win.set_seekable(!std::env::args().any(|arg| arg == "no-seek"));
     if std::env::args().any(|arg| arg == "modal") {
         win.set_show_delete_confirm(true);
     }
-    // 引数に "no-seek" を含めるとシークバーを表示専用へ縮退させた状態で表示する
-    // （mix 未生成・全体長不明のセッション相当。#70 の検証）。既定は操作可能。
-    win.set_seekable(!std::env::args().any(|arg| arg == "no-seek"));
 
     win.window()
         .set_position(slint::LogicalPosition::new(60.0, 60.0));

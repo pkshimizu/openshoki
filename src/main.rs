@@ -433,7 +433,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             rec.set_current_segment(-1);
             *transcript_segments.borrow_mut() = segments;
             rec.set_playing(false);
-            rec.set_progress(0.0);
             // 再生対象は事前生成の mix.mp3（両音源）か単一音源ファイル。両音源で mix.mp3 が
             // まだ無ければ再生不可（選択時にその場でミックスして UI を固めない）。
             let playable = session.is_playable();
@@ -451,7 +450,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
                 None => None,
             };
-            rec.set_time_text(format_playback_time(Duration::ZERO, duration).into());
+            apply_playback_position(&rec, Duration::ZERO, duration);
             // 全体長が分からないと比率→秒の換算ができないため、その場合はシークバーを
             // 表示専用に縮退させる。
             rec.set_seekable(playable && duration.is_some());
@@ -484,8 +483,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(p) = player.borrow().as_ref() {
                 p.stop();
                 rec.set_playing(false);
-                rec.set_progress(0.0);
-                rec.set_time_text(format_playback_time(Duration::ZERO, p.duration()).into());
+                apply_playback_position(&rec, Duration::ZERO, p.duration());
             }
         });
     }
@@ -512,7 +510,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // シークバーのドラッグ中のプレビュー: 時刻表示だけをドラッグ位置へ追従させる
-    // （音は動かさない。塗り・つまみの追従は Slint 側で完結する）。
+    // （分担は `.slint` の `SeekBar` の doc コメント参照）。
     {
         let player = Rc::clone(&player);
         let rec_weak = recordings_ui.as_weak();
@@ -520,11 +518,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let Some(rec) = rec_weak.upgrade() else {
                 return;
             };
-            if let Some(p) = player.borrow().as_ref()
-                && let Some(position) = seek_position_from_ratio(ratio, p.duration())
-            {
-                rec.set_time_text(format_playback_time(position, p.duration()).into());
-            }
+            let player = player.borrow();
+            let Some(p) = player.as_ref() else {
+                return;
+            };
+            let duration = p.duration();
+            let Some(position) = seek_position_from_ratio(ratio, duration) else {
+                return;
+            };
+            rec.set_time_text(format_playback_time(position, duration).into());
         });
     }
 
@@ -537,14 +539,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let Some(rec) = rec_weak.upgrade() else {
                 return;
             };
-            if let Some(p) = player.borrow().as_ref()
-                && let Some(position) = seek_position_from_ratio(ratio, p.duration())
-            {
-                p.seek(position);
-                // 塗り・時刻表示を離した位置で即確定させる（次の tick を待たない）。
-                rec.set_progress(playback_progress(position, p.duration()));
-                rec.set_time_text(format_playback_time(position, p.duration()).into());
-            }
+            let player = player.borrow();
+            let Some(p) = player.as_ref() else {
+                return;
+            };
+            let duration = p.duration();
+            let Some(position) = seek_position_from_ratio(ratio, duration) else {
+                return;
+            };
+            p.seek(position);
+            // 離した位置で表示を即確定させる（次の tick を待たない）。
+            apply_playback_position(&rec, position, duration);
         });
     }
 
@@ -844,9 +849,9 @@ fn build_menu_event_handler(
             let position = player.position();
             let duration = player.duration();
             if rec.get_scrubbing() {
-                // シークバーのドラッグ中は、プレビュー表示（Slint 側の塗り・つまみと
-                // Rust 側の時刻表示）を再生位置で上書きしない。経過秒の記録は捨てて、
-                // ドラッグ終了後の tick が必ず時刻表示を出し直すようにする。
+                // シークバーのドラッグ中はプレビュー表示を上書きしない（分担は `.slint` の
+                // `SeekBar` の doc コメント参照）。経過秒の記録は捨てて、ドラッグ終了後の
+                // tick が必ず時刻表示を出し直すようにする。
                 last_play_secs = None;
             } else {
                 let secs = position.as_secs();
@@ -960,9 +965,8 @@ fn clear_recordings_selection(rec: &RecordingsWindow) {
     rec.set_selected_index(-1);
     rec.set_has_selection(false);
     rec.set_playing(false);
-    rec.set_progress(0.0);
     rec.set_seekable(false);
-    rec.set_time_text(format_playback_time(Duration::ZERO, None).into());
+    apply_playback_position(rec, Duration::ZERO, None);
 }
 
 /// トレイの「Recordings…」で Recordings ウィンドウを開く。保存先を走査して一覧を更新し、
@@ -1019,10 +1023,20 @@ fn transcript_rows(segments: &[transcript::TranscriptSegment]) -> Vec<Transcript
         .collect()
 }
 
+/// 再生位置に対応する表示（シークバーの塗りと時刻テキスト）をまとめて更新する。片方だけ
+/// 更新して「塗りは新しい位置・時刻は古い位置」という食い違いを作らないよう、対の更新を
+/// 1 箇所で保証する。個別に set するのは意図的な 2 経路だけ: 再生 tick（時刻は秒が変わった
+/// ときだけ更新して無駄な再設定を避ける）と、ドラッグ中のプレビュー（塗りは Slint 側が
+/// プレビュー比率で描くため時刻だけを更新する）。
+fn apply_playback_position(rec: &RecordingsWindow, position: Duration, duration: Option<Duration>) {
+    rec.set_progress(playback_progress(position, duration));
+    rec.set_time_text(format_playback_time(position, duration).into());
+}
+
 /// シークバー上の比率（0.0〜1.0）を再生位置へ換算する。全体長が不明なら `None`（シークしない）。
 ///
-/// 比率は Slint 側で丸めてから渡ってくるが、ここでも範囲外・NaN を 0.0〜1.0 に丸めて
-/// `Duration::from_secs_f64` のパニック（負値・NaN・オーバーフロー）を防ぐ。
+/// 比率は Slint 側で丸めてから渡ってくるが、ここでも範囲外・NaN を 0.0〜1.0 に丸める
+/// （`Duration::mul_f64` は負値・NaN・オーバーフローでパニックするため、掛ける前に潰す）。
 fn seek_position_from_ratio(ratio: f32, duration: Option<Duration>) -> Option<Duration> {
     let total = duration?;
     // f32::clamp は NaN をそのまま返すため、先に 0.0 へ落とす（比率不明は先頭扱い）。
@@ -1031,9 +1045,7 @@ fn seek_position_from_ratio(ratio: f32, duration: Option<Duration>) -> Option<Du
     } else {
         ratio.clamp(0.0, 1.0)
     };
-    Some(Duration::from_secs_f64(
-        total.as_secs_f64() * f64::from(ratio),
-    ))
+    Some(total.mul_f64(f64::from(ratio)))
 }
 
 /// 再生位置の進捗比率（0.0〜1.0。シークバーの塗り・つまみの位置）。全体長が不明・0 のときは 0.0。
