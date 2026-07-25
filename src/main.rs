@@ -1231,10 +1231,12 @@ fn transcript_status_text(display_status: TranscriptStatus) -> &'static str {
     }
 }
 
-/// 詳細ペインの文字起こし表示（状態テキストと Transcribe ボタンの活性）を反映する。
-/// 選択時・手動投入直後・tick 追従の全経路でここを通し、表示ロジックを 1 箇所にする。
+/// 詳細ペインの文字起こし表示（状態テキスト・状態依存の配色/縮退ラベル・Transcribe ボタンの
+/// 活性）を反映する。選択時・手動投入直後・tick 追従の全経路でここを通し、表示ロジックを
+/// 1 箇所にする。
 fn apply_detail_transcript_status(rec: &RecordingsWindow, status: TranscriptStatus) {
     rec.set_detail_transcript_text(transcript_status_text(status).into());
+    rec.set_detail_transcript_status(status);
     rec.set_detail_transcribing(status == TranscriptStatus::Transcribing);
 }
 

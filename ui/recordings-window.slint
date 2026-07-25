@@ -138,8 +138,11 @@ export component RecordingsWindow inherits Window {
     in property <string> detail-transcript-text;
     // 選択中セッションが文字起こし中か（Transcribe ボタンの無効化に使う）。
     in property <bool> detail-transcribing;
+    // 選択中セッションの文字起こし状態。状態テキストの失敗色と Transcript 縮退表示の
+    // ラベル分岐に使う（Rust 側が detail-transcript-text と同時に更新する）。
+    in property <TranscriptStatus> detail-transcript-status;
     // 選択セッションのトランスクリプト（mic.json / system.json をマージしたもの。新→旧でなく時刻順）。
-    // 空なら Transcript セクションは「Not Transcribed Yet」に縮退表示する。
+    // 空なら Transcript セクションは状態依存のラベルに縮退表示する。
     in property <[TranscriptRow]> segments;
     // 現在の再生位置に対応するセグメントの index（ハイライト対象。-1 は該当なし）。
     in property <int> current-segment: -1;
@@ -315,7 +318,10 @@ export component RecordingsWindow inherits Window {
                         Text {
                             text: root.detail-transcript-text;
                             font-size: Style.caption-size;
-                            color: Palette.foreground.transparentize(Style.muted-alpha);
+                            // 失敗だけ警告色にして muted に埋もれさせず一目で分かるようにする。
+                            color: root.detail-transcript-status == TranscriptStatus.failed
+                                ? Style.danger
+                                : Palette.foreground.transparentize(Style.muted-alpha);
                         }
                     }
 
@@ -412,7 +418,7 @@ export component RecordingsWindow inherits Window {
                 }
 
                 // Transcript セクション。セグメントを時刻順に表示し、現在再生位置をハイライト、
-                // クリックでその開始秒へシークする。未生成・破損は「Not Transcribed Yet」に縮退。
+                // クリックでその開始秒へシークする。セグメントが無いときは状態依存のラベルに縮退。
                 Rectangle {
                     vertical-stretch: 1;
                     border-width: 1px;
@@ -492,7 +498,14 @@ export component RecordingsWindow inherits Window {
                                 }
                             }
                             if root.segments.length == 0: Text {
-                                text: "Not Transcribed Yet";
+                                // 縮退表示は実際の状態を語る（中=Transcribing… / 失敗=Transcription
+                                // Failed / 未実施=Not Transcribed Yet）。完了済みの再実行中は旧
+                                // トランスクリプトが残るため上の一覧表示が維持され、ここには来ない。
+                                text: root.detail-transcript-status == TranscriptStatus.transcribing
+                                    ? "Transcribing…"
+                                    : root.detail-transcript-status == TranscriptStatus.failed
+                                        ? "Transcription Failed"
+                                        : "Not Transcribed Yet";
                                 font-size: Style.body-size;
                                 horizontal-alignment: center;
                                 vertical-alignment: center;
