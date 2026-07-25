@@ -1088,6 +1088,7 @@ fn start_recording(
 ///
 /// 初回表示時のみジオメトリ（位置・サイズ）を明示する（`geometry_committed` で一度きりに保つ）。
 /// なぜ初回にジオメトリを明示するかは `docs/rules/slint.md` を参照。
+/// 表示済み・最小化中のウィンドウでも前面化・キー化まで行う（背景は `bring_to_front` 参照）。
 fn show_window(
     window: &slint::Window,
     geometry_committed: &mut bool,
@@ -1100,7 +1101,10 @@ fn show_window(
         *geometry_committed = true;
     }
     if let Err(err) = window.show() {
+        // 表示に失敗したウィンドウを前面化すると「Slint 側は非表示のつもりなのに
+        // NSWindow だけ前面に出る」不整合になりうるため、ここで打ち切る。
         eprintln!("Failed to show the window: {err}");
+        return;
     }
     bring_to_front(window);
 }
@@ -1122,12 +1126,14 @@ fn bring_to_front(window: &slint::Window) {
     use raw_window_handle::HasWindowHandle;
     // slint::Window::window_handle() は Slint のラッパー（slint::WindowHandle）を返し、
     // そこから raw-window-handle の trait で raw ハンドルを取り出す。
-    raise_ns_window(
-        window
-            .window_handle()
-            .window_handle()
-            .map(|handle| handle.as_raw()),
-    );
+    let raw = window
+        .window_handle()
+        .window_handle()
+        .map(|handle| handle.as_raw());
+    // SAFETY: raw は直前に、生きている slint::Window（呼び出し元が参照を保持）から
+    // 取得したハンドルで、AppKit バリアントなら表示中ウィンドウの有効な NSView を指す。
+    // この呼び出し中は Slint がウィンドウを所有し続けるため、ポインタは生存している。
+    unsafe { raise_ns_window(raw) };
 }
 
 /// macOS 以外では前面化は行わない（`show()` の挙動のまま）。
@@ -1136,8 +1142,15 @@ fn bring_to_front(_window: &slint::Window) {}
 
 /// `bring_to_front` の本体。raw ハンドルを引数で受けるのは、ウィンドウ実体なしで
 /// 縮退経路（取得失敗・非 AppKit）を決定的にテストできるようにするため。
+///
+/// # Safety
+///
+/// `raw` が `AppKit` バリアントの場合、その `ns_view` はこの関数の呼び出し中に解放されない
+/// 有効な NSView を指していること。`Err` や AppKit 以外のバリアントはポインタを参照せず
+/// 縮退するため、この前提を自明に満たす。メインスレッドか否かは関数内部で確認し、
+/// 外れる場合はポインタに触れず縮退する（呼び出し側の前提ではない）。
 #[cfg(target_os = "macos")]
-fn raise_ns_window(
+unsafe fn raise_ns_window(
     raw: Result<raw_window_handle::RawWindowHandle, raw_window_handle::HandleError>,
 ) {
     use objc2::MainThreadMarker;
@@ -1160,9 +1173,9 @@ fn raise_ns_window(
         eprintln!("Skipping bring-to-front because it is not called on the main thread");
         return;
     };
-    // SAFETY: AppKit ハンドルの ns_view は Slint が保持する表示中ウィンドウの NSView を指す。
-    // メインスレッド上（mtm 確認済み）かつ Slint がウィンドウを所有している間（`show_window`
-    // の呼び出し中）にのみ参照し、ポインタを保持して持ち越さない。
+    // SAFETY: この関数の # Safety（ns_view は生存中の NSView を指す）を呼び出し側が保証する。
+    // メインスレッド上であることは直前の mtm 確認で保証済みで、参照はこの関数内で完結し
+    // ポインタを保持して持ち越さない。
     let view = unsafe { handle.ns_view.cast::<NSView>().as_ref() };
     let Some(ns_window) = view.window() else {
         eprintln!("Skipping bring-to-front because the view has no window");
@@ -1176,8 +1189,9 @@ fn raise_ns_window(
     // Accessory アプリはウィンドウを前面化してもアプリ自体が非アクティブのままなので、
     // 明示的にアクティブ化する。他アプリからフォーカスを奪う操作だが、ユーザーのメニュー
     // クリックへの応答としてのみ呼ばれるため許容する（バックグラウンドから呼ぶ経路は作らない）。
-    // 後継の activate() は macOS 14+ のため、最低対応 macOS 13 では非推奨版を使う。
-    #[allow(deprecated)]
+    // 後継の activate() は macOS 14+ のため、最低対応 macOS 13 では非推奨版を使う
+    // （expect にしておけば、非推奨でなくなったときに警告で気づける）。
+    #[expect(deprecated)]
     NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
 }
 
@@ -1446,7 +1460,11 @@ mod tests {
     fn raise_ns_window_returns_without_panic_on_degraded_paths() {
         use raw_window_handle::{HandleError, RawWindowHandle, WebWindowHandle};
 
-        super::raise_ns_window(Err(HandleError::Unavailable));
-        super::raise_ns_window(Ok(RawWindowHandle::Web(WebWindowHandle::new(1))));
+        // SAFETY: Err と非 AppKit バリアントはポインタを参照せず縮退するため、
+        // # Safety の前提（AppKit の ns_view が有効）を自明に満たす。
+        unsafe {
+            super::raise_ns_window(Err(HandleError::Unavailable));
+            super::raise_ns_window(Ok(RawWindowHandle::Web(WebWindowHandle::new(1))));
+        }
     }
 }
