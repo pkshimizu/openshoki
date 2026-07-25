@@ -7,17 +7,22 @@
 # 検査するのは決定的に再現できる生成物だけ:
 #   assets/icon/openshoki.icon/Assets/mark-ink.svg / mark-ink-on-dark.svg … sed の出力なので完全一致
 #   assets/icon/tray.png … ラスタライズを挟むので画素で比較（下記 TRAY_MAX_DIFF_PIXELS 参照）
+#   assets/icon/generated/openshoki.icns … actool の出力だが決定的（実測）。完全一致。
+#     これだけは actool（Xcode）が要る。無ければその旨を出してスキップする。
 # `assets/icon/generated/Assets.car` は actool が入力を変えなくても毎回違うバイト列を出すため
 # 検査しない（README の「アイコン資産の再生成」参照）。
 #
-# 必要なツール: rsvg-convert、magick（ImageMagick）。Xcode は不要。
+# 必要なツール: rsvg-convert、magick（ImageMagick）。.icns まで見るなら Xcode（xcrun actool）。
 set -euo pipefail
 
-# tray.png で許容する差分画素数（36x36 = 1296 画素中）。ラスタライザ・エンコーダのバージョン差で
-# 縁のアンチエイリアスが 1〜2 画素ぶれることがあるため、完全一致ではなく小さな上限で見る。
-# 実測: 同じ入力なら 0、目に見える形の変更では 173（13%）だったので、この幅で取り違えは起きない。
-TRAY_MAX_DIFF_PIXELS=4
-# 画素が「違う」と数える閾値。上と同じくアンチエイリアスの微差を無視するため。
+# tray.png の比較設定。バイト比較にすると rsvg / ImageMagick のバージョン差で偽陽性になるため、
+# 画素で見る。TRAY_FUZZ 未満の色差は「同じ画素」と数え、それを超える画素が
+# TRAY_MAX_DIFF_PIXELS を超えたら不一致とする（36x36 = 1296 画素）。
+#
+# 実測（同一マシン）: リサイズフィルタやラスタライズ解像度を変えても fuzz 10% では差 0 画素、
+# 一方で形を変えると差が出る（起筆の丸みを 1px 潰す程度で 4〜5 画素、目に見える変更で 173 画素）。
+# つまり環境差は fuzz 側で吸収できているので、許容画素数は小さく保って検出力を優先する。
+TRAY_MAX_DIFF_PIXELS=1
 TRAY_FUZZ=10%
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -26,8 +31,19 @@ cd "$repo_root"
 regenerated="$(mktemp -d -t openshoki-icon-check-XXXXXX)"
 trap 'rm -rf "$regenerated"' EXIT
 
-echo "Regenerating the deterministic icon artifacts into a temporary directory…"
-./scripts/generate-icons.sh --skip-appicon --out-dir "$regenerated" >/dev/null
+# .icns まで検査できるのは actool があるときだけ。無ければ mark.svg 由来の生成物だけを見る。
+if xcrun --find actool >/dev/null 2>&1; then
+  check_appicon=true
+else
+  check_appicon=false
+fi
+
+echo "Regenerating the icon artifacts into a temporary directory…"
+if [ "$check_appicon" = true ]; then
+  ./scripts/generate-icons.sh --out-dir "$regenerated" >/dev/null
+else
+  ./scripts/generate-icons.sh --skip-appicon --out-dir "$regenerated" >/dev/null
+fi
 
 failed=false
 
@@ -58,11 +74,17 @@ if [ "$committed_format" != "$regenerated_format" ]; then
   echo "  regenerated: $regenerated_format" >&2
   report_stale
 else
-  # compare は差があると非ゼロ終了するので、指標だけを取り出して自分で判定する。
-  diff_pixels="$(magick compare -metric AE -fuzz "$TRAY_FUZZ" "$tray" "$regenerated/$tray" null: 2>&1 || true)"
+  # compare は「差があると 1」「エラーだと 2」で終了し、指標は stderr に出す。1 は差があるだけ
+  # なので自分で判定し、2（と想定外の値）はエラーとして生の出力ごと見せる。
+  compare_status=0
+  compare_output="$(magick compare -metric AE -fuzz "$TRAY_FUZZ" "$tray" "$regenerated/$tray" null: 2>&1)" \
+    || compare_status=$?
+  # 警告が混ざっても拾えるよう、指標は最終行から取る。
+  diff_pixels="$(printf '%s\n' "$compare_output" | tail -n1)"
   diff_pixels="${diff_pixels%% *}"
-  if ! [[ "$diff_pixels" =~ ^[0-9]+$ ]]; then
-    echo "Could not compare $tray with the regenerated one: $diff_pixels" >&2
+  if [ "$compare_status" -gt 1 ] || ! [[ "$diff_pixels" =~ ^[0-9]+$ ]]; then
+    echo "Could not compare $tray with the regenerated one (status $compare_status):" >&2
+    echo "$compare_output" >&2
     failed=true
   elif [ "$diff_pixels" -gt "$TRAY_MAX_DIFF_PIXELS" ]; then
     echo "$tray differs from assets/icon/mark.svg ($diff_pixels pixels, allowed $TRAY_MAX_DIFF_PIXELS)." >&2
@@ -70,7 +92,22 @@ else
   fi
 fi
 
+# アプリアイコン（.icns）。icon.json / seal.svg を変えて再生成し忘れた場合もここで捕まる。
+icns="assets/icon/generated/openshoki.icns"
+if [ "$check_appicon" = true ]; then
+  if ! cmp -s "$icns" "$regenerated/$icns"; then
+    echo "$icns does not match the icon master." >&2
+    report_stale
+  fi
+else
+  echo "Skipping $icns (actool is not available; install Xcode to check it)."
+fi
+
 if [ "$failed" = true ]; then
   exit 1
 fi
-echo "OK: the committed icon artifacts match assets/icon/mark.svg."
+if [ "$check_appicon" = true ]; then
+  echo "OK: the committed icon artifacts match the masters."
+else
+  echo "OK: the committed artifacts derived from assets/icon/mark.svg match (icns not checked)."
+fi

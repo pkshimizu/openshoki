@@ -162,8 +162,9 @@ macOS では `screencapturekit` と `objc2` 系を使います。
   `actool` が出す `Assets.car` は入力が同じでも毎回バイト列が変わるため、マスターを変えていない
   のに差分が出たときは `git checkout -- assets/icon/generated/Assets.car` で戻してください。
 
-  生成物がマスターと一致しているかの確認だけなら次を実行します（作業ツリーを変更せず、
-  Xcode も不要）。アイコン資産を変更した PR では CI でも同じ検査が走ります。
+  生成物がマスターと一致しているかの確認だけなら次を実行します（作業ツリーは変更しません）。
+  Xcode があれば `openshoki.icns` まで、無ければ `mark.svg` 由来の生成物だけを検査します
+  （`Assets.car` は毎回変わるので対象外）。アイコン資産を変更した PR では CI でも同じ検査が走ります。
 
   ```sh
   ./scripts/check-icons.sh

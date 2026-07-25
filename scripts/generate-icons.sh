@@ -31,7 +31,11 @@ while [ $# -gt 0 ]; do
         echo "--out-dir requires a directory" >&2
         exit 1
       fi
-      out_root="$2"; shift 2 ;;
+      # 呼び出し元の cwd 基準で解釈する（この後 repo_root へ cd するため、相対のままだと
+      # リポジトリ内に書いてしまう）。
+      mkdir -p "$2"
+      out_root="$(cd "$2" && pwd)"
+      shift 2 ;;
     *) echo "Unknown option: $1 (usage: $0 [--skip-appicon] [--out-dir DIR])" >&2; exit 1 ;;
   esac
 done
@@ -118,8 +122,15 @@ else
   # .icns を ictool で直接書き出すと Tahoe 規定の余白が入らず大きすぎる見た目になるため、
   # 必ず actool 経由で作る。まず一時ディレクトリへ出し、成功したときだけ差し替える
   # （失敗してコミット済みの生成物が消えた状態を残さない）。
-  mkdir -p "$tmp_dir/appicon"
-  xcrun actool "$icon_master" --compile "$tmp_dir/appicon" \
+  # actool には「いま生成したレイヤー」を渡す。マスターの .icon をそのまま渡すと、--out-dir を
+  # 使ったときにリポジトリ側の古いレイヤーからアプリアイコンが作られてしまう。
+  # ディレクトリ名は --app-icon の名前と一致させる必要があるため openshoki.icon にする。
+  staged="$tmp_dir/openshoki.icon"
+  mkdir -p "$staged/Assets" "$tmp_dir/appicon"
+  cp "$icon_master/icon.json" "$staged/"
+  cp "$icon_master/Assets/seal.svg" "$staged/Assets/"
+  cp "$layers_out/mark-ink.svg" "$layers_out/mark-ink-on-dark.svg" "$staged/Assets/"
+  xcrun actool "$staged" --compile "$tmp_dir/appicon" \
     --output-format human-readable-text --notices --warnings --errors \
     --output-partial-info-plist /dev/null \
     --app-icon openshoki --include-all-app-icons \
@@ -149,7 +160,7 @@ if [ "$skip_appicon" = false ]; then
   ls -1 "$generated_out" | sed 's/^/  /'
 fi
 echo "  $tray_out ($(magick identify -format '%wx%h %[bit-depth]bit %[channels]' "$tray_out"))"
-if [ "$skip_appicon" = false ]; then
+if [ "$skip_appicon" = false ] && [ "$out_root" = "." ]; then
   # actool の Assets.car は入力が同じでも毎回バイト列が変わる（実測）。マスターを変えていない
   # のに差分が出たときは戻してよい、と分かるようにしておく。
   echo
