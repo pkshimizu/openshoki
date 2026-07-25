@@ -35,10 +35,17 @@ fn main() {
     win.set_detail_summary("Mic + System".into());
     win.set_detail_transcript_text("Transcribed".into());
     win.set_current_segment(2);
+    // Playback セクション（シークバー）の確認用のダミー再生状態。
+    win.set_playable(true);
+    win.set_progress(0.35);
+    win.set_time_text("01:45 / 05:00".into());
     // 引数に "modal" を含めると削除確認モーダルを重ねた状態で表示する（#66 の検証）。
     if std::env::args().any(|arg| arg == "modal") {
         win.set_show_delete_confirm(true);
     }
+    // 引数に "no-seek" を含めるとシークバーを表示専用へ縮退させた状態で表示する
+    // （mix 未生成・全体長不明のセッション相当。#70 の検証）。既定は操作可能。
+    win.set_seekable(!std::env::args().any(|arg| arg == "no-seek"));
 
     win.window()
         .set_position(slint::LogicalPosition::new(60.0, 60.0));

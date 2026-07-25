@@ -154,10 +154,19 @@ export component RecordingsWindow inherits Window {
     // 再生ボタンを無効化する。
     in property <bool> playable;
     // 再生状態。playing は Play/Pause ラベルの切替、time-text は "mm:ss / mm:ss"、
-    // progress は 0.0〜1.0 の進捗（表示のみ・ドラッグ不可）。
+    // progress は 0.0〜1.0 の進捗（シークバーの塗り・つまみの位置）。
     in property <bool> playing;
     in property <string> time-text;
     in property <float> progress;
+    // シークバーを操作できるか（再生可能かつ全体長が分かる）。Rust 側が選択時に計算して渡す
+    // （Slint 側で複合条件を組まない）。false ならクリック・ドラッグを受けず表示専用に縮退する。
+    in property <bool> seekable;
+    // シークバーをドラッグ中か。Rust の再生 tick はこの間 progress / time-text の上書きを止め、
+    // プレビュー表示との競合（つまみの震え）を避ける。UI が所有する状態なので out にして
+    // Rust から set できないようにする。
+    out property <bool> scrubbing: false;
+    // ドラッグ中のプレビュー比率（0.0〜1.0）。scrubbing の間だけ塗り・つまみの位置に使う。
+    property <float> scrub-ratio;
     // 削除の確認モーダルの表示状態。Delete 押下で開き、Cancel / 確定で閉じる（Slint 内で完結）。
     in-out property <bool> show-delete-confirm: false;
 
@@ -168,6 +177,11 @@ export component RecordingsWindow inherits Window {
     callback stop();
     // トランスクリプトのセグメントクリック。その開始秒へ再生位置をスキップする（index を渡す）。
     callback seek-to-segment(int);
+    // シークバーのドラッグ中のプレビュー通知（比率 0.0〜1.0）。Rust 側は時刻表示だけを更新する
+    // （音は動かさない）。
+    callback scrub-preview(float);
+    // シークバーのクリック確定・ドラッグ終了（比率 0.0〜1.0）。Rust 側が秒へ換算してシークする。
+    callback seek-to-ratio(float);
     // 「Transcribe」押下。選択中セッションの文字起こしを（再）実行する。インデックスを渡す。
     callback transcribe-session(int);
     // 確認モーダルの Delete 押下。選択中セッションをゴミ箱へ移動する（インデックスを渡す）。
@@ -404,18 +418,79 @@ export component RecordingsWindow inherits Window {
                             }
                         }
 
-                        // 進捗バー（表示のみ）。トラック＋アクセントの塗り。
-                        Rectangle {
-                            height: 5px;
-                            border-radius: 3px;
-                            background: Palette.border;
-                            clip: true;
+                        // シークバー。トラック＋アクセントの塗り（デザインは進捗バーのまま）に、
+                        // 現在位置のつまみを重ねる。当たり判定はバーの上下へ広げて細いバーでも
+                        // 掴みやすくする。ドラッグ中は塗り・つまみ・時刻表示だけが指に追従し
+                        // （プレビュー）、離した時点でシークする。
+                        seekbar := Rectangle {
+                            // 当たり判定の高さ。トラック・つまみはこの中央に置く。
+                            height: 20px;
+                            // 塗り・つまみの位置に使う比率。ドラッグ中はプレビュー、それ以外は
+                            // 再生位置（Rust から来る値は範囲外に備えて丸める）。
+                            property <float> ratio: root.scrubbing
+                                ? root.scrub-ratio
+                                : min(max(root.progress, 0.0), 1.0);
+                            property <length> knob-size: 13px;
+
                             Rectangle {
-                                x: 0;
-                                width: parent.width * min(max(root.progress, 0.0), 1.0);
-                                height: parent.height;
+                                y: (parent.height - self.height) / 2;
+                                height: 5px;
                                 border-radius: 3px;
+                                background: Palette.border;
+                                clip: true;
+                                Rectangle {
+                                    x: 0;
+                                    width: parent.width * seekbar.ratio;
+                                    height: parent.height;
+                                    border-radius: 3px;
+                                    background: Palette.accent-background;
+                                }
+                            }
+
+                            // つまみは操作できるときだけ出す（縮退時は従来の表示専用バーになる）。
+                            // 中心を塗りの右端に合わせ、両端ではバー内へ収まるよう丸める。
+                            if root.seekable: Rectangle {
+                                width: seekbar.knob-size;
+                                height: self.width;
+                                border-radius: self.width / 2;
+                                x: min(max(seekbar.width * seekbar.ratio - self.width / 2, 0px),
+                                    seekbar.width - self.width);
+                                y: (seekbar.height - self.height) / 2;
                                 background: Palette.accent-background;
+                            }
+
+                            touch := TouchArea {
+                                enabled: root.seekable;
+                                // ポインタ位置をバー上の比率へ換算した値（バー外へドラッグしても
+                                // 0.0〜1.0 に収める）。
+                                property <float> pointer-ratio: min(max(self.mouse-x / self.width, 0.0), 1.0);
+                                // ドラッグ中の追従。scrubbing のときだけ動かす（左ボタン以外の
+                                // ドラッグでプレビューだけが動いて表示がずれるのを防ぐ）。
+                                moved => {
+                                    if (root.scrubbing) {
+                                        root.scrub-ratio = self.pointer-ratio;
+                                        root.scrub-preview(root.scrub-ratio);
+                                    }
+                                }
+                                // pointer-event はどのボタンでも来るため、開始・確定は左ボタンに
+                                // 限る（右クリックでシークさせない）。取り消しはボタンを問わない。
+                                pointer-event(event) => {
+                                    if (event.kind == PointerEventKind.down
+                                        && event.button == PointerEventButton.left) {
+                                        root.scrub-ratio = self.pointer-ratio;
+                                        root.scrubbing = true;
+                                        root.scrub-preview(root.scrub-ratio);
+                                    } else if (event.kind == PointerEventKind.up
+                                        && event.button == PointerEventButton.left
+                                        && root.scrubbing) {
+                                        root.seek-to-ratio(root.scrub-ratio);
+                                        root.scrubbing = false;
+                                    } else if (event.kind == PointerEventKind.cancel) {
+                                        // 取り消し（ウィンドウ外へドラッグ等）はシークせず
+                                        // プレビューを畳んで再生位置の表示へ戻す。
+                                        root.scrubbing = false;
+                                    }
+                                }
                             }
                         }
                     }
