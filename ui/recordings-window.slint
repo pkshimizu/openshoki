@@ -114,6 +114,99 @@ component DangerButton inherits Rectangle {
     }
 }
 
+// 再生位置のシークバー。トラック＋アクセント色の塗り（従来の進捗バーのデザイン据え置き）に
+// 現在位置のつまみを重ね、当たり判定はバーの上下へ広げて細いバーでも掴みやすくする。
+//
+// ドラッグ中の分担（**この仕様の正はここ**。他の箇所はここを参照する）: 押下から離すまでを
+// `scrubbing` とし、その間は塗り・つまみ（この部品内）と時刻表示（`scrub-preview` → Rust）だけが
+// ポインタへ追従するプレビューにして、音は動かさない。離した時点で `seek-to-ratio` を呼び、
+// Rust 側が比率を秒へ換算してシークする。MP3 のシークを連続発行して音を途切れさせないためで、
+// Rust の再生 tick は `scrubbing` 中 `progress` / 時刻表示の上書きを止める（つまみが震える競合の
+// 予防）。コールバック名は使う側・Rust 側（`on_scrub_preview` / `on_seek_to_ratio`）と揃えている。
+component SeekBar inherits Rectangle {
+    // 使う側から渡される再生位置の比率（0.0〜1.0）。`scrubbing` 中はプレビュー比率が優先される。
+    in property <float> progress;
+    // 操作できるか。false ならクリック・ドラッグを受けず、つまみも出さない（表示専用に縮退）。
+    in property <bool> seekable;
+    // ドラッグ中か（上記の分担参照）。使う側の `out property` と `<=>` で束ねるため `in-out` に
+    // する（`out` は双方向束縛の対象にできない）。値の更新はこの部品内だけで行い、束ねた時点で
+    // 使う側と 1 つのプロパティになるため、ここに初期値は置かない。
+    in-out property <bool> scrubbing;
+    // ドラッグ中のプレビュー比率（0.0〜1.0）。`scrubbing` の間だけ塗り・つまみの位置に使う。
+    property <float> scrub-ratio;
+    // 塗り・つまみの位置に使う比率。ドラッグ中はプレビュー、それ以外は再生位置
+    // （使う側から来る値は範囲外に備えて丸める）。
+    property <float> ratio: root.scrubbing
+        ? root.scrub-ratio
+        : min(max(root.progress, 0.0), 1.0);
+    property <length> knob-size: 13px;
+
+    // ドラッグ中の時刻表示の更新依頼（比率）。シークはしない。
+    callback scrub-preview(float);
+    // クリック確定・ドラッグ終了（比率）。ここでシークする。
+    callback seek-to-ratio(float);
+
+    // 当たり判定の高さ。トラック・つまみはこの中央に置く。
+    height: 20px;
+
+    Rectangle {
+        y: (parent.height - self.height) / 2;
+        height: 5px;
+        border-radius: 3px;
+        background: Palette.border;
+        clip: true;
+        Rectangle {
+            x: 0;
+            width: parent.width * root.ratio;
+            height: parent.height;
+            border-radius: 3px;
+            background: Palette.accent-background;
+        }
+    }
+
+    // つまみは操作できるときだけ出す。中心を塗りの右端に合わせ、両端ではバー内へ収まるよう丸める。
+    if root.seekable: Rectangle {
+        width: root.knob-size;
+        height: self.width;
+        border-radius: self.width / 2;
+        x: min(max(root.width * root.ratio - self.width / 2, 0px), root.width - self.width);
+        y: (root.height - self.height) / 2;
+        background: Palette.accent-background;
+    }
+
+    TouchArea {
+        enabled: root.seekable;
+        // ポインタ位置をバー上の比率へ換算した値（バー外へドラッグしても 0.0〜1.0 に収める）。
+        property <float> pointer-ratio: min(max(self.mouse-x / self.width, 0.0), 1.0);
+        // 追従は scrubbing のときだけ（左ボタン以外のドラッグで表示だけがずれるのを防ぐ）。
+        moved => {
+            if (root.scrubbing) {
+                root.scrub-ratio = self.pointer-ratio;
+                root.scrub-preview(root.scrub-ratio);
+            }
+        }
+        // pointer-event はどのボタンでも来るため、開始・確定は左ボタンに限る
+        // （右クリックでシークさせない）。取り消しはボタンを問わない。
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.down
+                && event.button == PointerEventButton.left) {
+                root.scrub-ratio = self.pointer-ratio;
+                root.scrubbing = true;
+                root.scrub-preview(root.scrub-ratio);
+            } else if (event.kind == PointerEventKind.up
+                && event.button == PointerEventButton.left
+                && root.scrubbing) {
+                root.seek-to-ratio(root.scrub-ratio);
+                root.scrubbing = false;
+            } else if (event.kind == PointerEventKind.cancel) {
+                // 取り消し（ウィンドウ外へドラッグ等）はシークせず、プレビューを畳んで
+                // 再生位置の表示へ戻す。
+                root.scrubbing = false;
+            }
+        }
+    }
+}
+
 // トレイの「Recordings…」から開く録音一覧ウィンドウ。左＝セッション一覧、右＝再生と文字起こし。
 // 配色は Palette でライト/ダークに追従し、サイズ・淡色は共有の Style トークンを使う
 // （選択行の白文字はアクセント固定背景のため Style.on-accent-foreground）。
@@ -154,10 +247,17 @@ export component RecordingsWindow inherits Window {
     // 再生ボタンを無効化する。
     in property <bool> playable;
     // 再生状態。playing は Play/Pause ラベルの切替、time-text は "mm:ss / mm:ss"、
-    // progress は 0.0〜1.0 の進捗（表示のみ・ドラッグ不可）。
+    // progress は 0.0〜1.0 の進捗（シークバーの塗り・つまみの位置）。
     in property <bool> playing;
     in property <string> time-text;
     in property <float> progress;
+    // シークバーを操作できるか（再生可能かつ全体長が分かる）。Rust 側が選択時に計算して渡す
+    // （Slint 側で複合条件を組まない）。false なら表示専用に縮退する。
+    in property <bool> seekable;
+    // シークバーをドラッグ中か（分担は `SeekBar` の doc コメント参照）。Rust の再生 tick が
+    // 上書き抑止の判定に読む。UI が所有する状態なので out にして Rust から set させない
+    // （値は SeekBar 側と双方向で束ねる）。
+    out property <bool> scrubbing;
     // 削除の確認モーダルの表示状態。Delete 押下で開き、Cancel / 確定で閉じる（Slint 内で完結）。
     in-out property <bool> show-delete-confirm: false;
 
@@ -168,6 +268,10 @@ export component RecordingsWindow inherits Window {
     callback stop();
     // トランスクリプトのセグメントクリック。その開始秒へ再生位置をスキップする（index を渡す）。
     callback seek-to-segment(int);
+    // シークバーのドラッグ中のプレビュー通知（比率 0.0〜1.0）。時刻表示だけを更新する。
+    callback scrub-preview(float);
+    // シークバーのクリック確定・ドラッグ終了（比率 0.0〜1.0）。秒へ換算してシークする。
+    callback seek-to-ratio(float);
     // 「Transcribe」押下。選択中セッションの文字起こしを（再）実行する。インデックスを渡す。
     callback transcribe-session(int);
     // 確認モーダルの Delete 押下。選択中セッションをゴミ箱へ移動する（インデックスを渡す）。
@@ -404,18 +508,16 @@ export component RecordingsWindow inherits Window {
                             }
                         }
 
-                        // 進捗バー（表示のみ）。トラック＋アクセントの塗り。
-                        Rectangle {
-                            height: 5px;
-                            border-radius: 3px;
-                            background: Palette.border;
-                            clip: true;
-                            Rectangle {
-                                x: 0;
-                                width: parent.width * min(max(root.progress, 0.0), 1.0);
-                                height: parent.height;
-                                border-radius: 3px;
-                                background: Palette.accent-background;
+                        // 再生位置のシークバー（分担・仕様は SeekBar の doc コメント参照）。
+                        SeekBar {
+                            progress: root.progress;
+                            seekable: root.seekable;
+                            scrubbing <=> root.scrubbing;
+                            scrub-preview(ratio) => {
+                                root.scrub-preview(ratio);
+                            }
+                            seek-to-ratio(ratio) => {
+                                root.seek-to-ratio(ratio);
                             }
                         }
                     }

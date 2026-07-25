@@ -433,10 +433,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             rec.set_current_segment(-1);
             *transcript_segments.borrow_mut() = segments;
             rec.set_playing(false);
-            rec.set_progress(0.0);
             // 再生対象は事前生成の mix.mp3（両音源）か単一音源ファイル。両音源で mix.mp3 が
             // まだ無ければ再生不可（選択時にその場でミックスして UI を固めない）。
-            rec.set_playable(session.is_playable());
+            let playable = session.is_playable();
+            rec.set_playable(playable);
             let duration = match session.playback_path() {
                 Some(path) => match player.borrow_mut().as_mut() {
                     Some(p) => match p.load(&path) {
@@ -450,7 +450,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
                 None => None,
             };
-            rec.set_time_text(format_playback_time(Duration::ZERO, duration).into());
+            apply_playback_position(&rec, Duration::ZERO, duration);
+            // 全体長が分からないと比率→秒の換算ができないため、その場合はシークバーを
+            // 表示専用に縮退させる。
+            rec.set_seekable(playable && duration.is_some());
         });
     }
 
@@ -480,8 +483,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(p) = player.borrow().as_ref() {
                 p.stop();
                 rec.set_playing(false);
-                rec.set_progress(0.0);
-                rec.set_time_text(format_playback_time(Duration::ZERO, p.duration()).into());
+                apply_playback_position(&rec, Duration::ZERO, p.duration());
             }
         });
     }
@@ -504,6 +506,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             // クリックしたセグメントを即ハイライトする（次の tick で位置に追従する）。
             rec.set_current_segment(index);
+        });
+    }
+
+    // シークバーのドラッグ中のプレビュー: 時刻表示だけをドラッグ位置へ追従させる
+    // （分担は `.slint` の `SeekBar` の doc コメント参照）。
+    {
+        let player = Rc::clone(&player);
+        let rec_weak = recordings_ui.as_weak();
+        recordings_ui.on_scrub_preview(move |ratio| {
+            let Some(rec) = rec_weak.upgrade() else {
+                return;
+            };
+            let player = player.borrow();
+            let Some(p) = player.as_ref() else {
+                return;
+            };
+            let duration = p.duration();
+            let Some(position) = seek_position_from_ratio(ratio, duration) else {
+                return;
+            };
+            rec.set_time_text(format_playback_time(position, duration).into());
+        });
+    }
+
+    // シークバーのクリック確定・ドラッグ終了: その位置へ再生位置を移動する（再生/一時停止の
+    // 状態は変えない）。
+    {
+        let player = Rc::clone(&player);
+        let rec_weak = recordings_ui.as_weak();
+        recordings_ui.on_seek_to_ratio(move |ratio| {
+            let Some(rec) = rec_weak.upgrade() else {
+                return;
+            };
+            let player = player.borrow();
+            let Some(p) = player.as_ref() else {
+                return;
+            };
+            let duration = p.duration();
+            let Some(position) = seek_position_from_ratio(ratio, duration) else {
+                return;
+            };
+            p.seek(position);
+            // 離した位置で表示を即確定させる（次の tick を待たない）。
+            apply_playback_position(&rec, position, duration);
         });
     }
 
@@ -802,18 +848,19 @@ fn build_menu_event_handler(
         {
             let position = player.position();
             let duration = player.duration();
-            let secs = position.as_secs();
-            if last_play_secs != Some(secs) {
-                rec.set_time_text(format_playback_time(position, duration).into());
-                last_play_secs = Some(secs);
-            }
-            let progress = match duration {
-                Some(total) if total > Duration::ZERO => {
-                    (position.as_secs_f32() / total.as_secs_f32()).clamp(0.0, 1.0)
+            if rec.get_scrubbing() {
+                // シークバーのドラッグ中はプレビュー表示を上書きしない（分担は `.slint` の
+                // `SeekBar` の doc コメント参照）。経過秒の記録は捨てて、ドラッグ終了後の
+                // tick が必ず時刻表示を出し直すようにする。
+                last_play_secs = None;
+            } else {
+                let secs = position.as_secs();
+                if last_play_secs != Some(secs) {
+                    rec.set_time_text(format_playback_time(position, duration).into());
+                    last_play_secs = Some(secs);
                 }
-                _ => 0.0,
-            };
-            rec.set_progress(progress);
+                rec.set_progress(playback_progress(position, duration));
+            }
             rec.set_playing(player.is_playing());
             // 再生位置に対応するトランスクリプトのセグメントをハイライトする（該当なしは -1）。
             let current = transcript::current_index(
@@ -918,8 +965,8 @@ fn clear_recordings_selection(rec: &RecordingsWindow) {
     rec.set_selected_index(-1);
     rec.set_has_selection(false);
     rec.set_playing(false);
-    rec.set_progress(0.0);
-    rec.set_time_text(format_playback_time(Duration::ZERO, None).into());
+    rec.set_seekable(false);
+    apply_playback_position(rec, Duration::ZERO, None);
 }
 
 /// トレイの「Recordings…」で Recordings ウィンドウを開く。保存先を走査して一覧を更新し、
@@ -974,6 +1021,41 @@ fn transcript_rows(segments: &[transcript::TranscriptSegment]) -> Vec<Transcript
             text: seg.text.as_str().into(),
         })
         .collect()
+}
+
+/// 再生位置に対応する表示（シークバーの塗りと時刻テキスト）をまとめて更新する。片方だけ
+/// 更新して「塗りは新しい位置・時刻は古い位置」という食い違いを作らないよう、対の更新を
+/// 1 箇所で保証する。個別に set するのは意図的な 2 経路だけ: 再生 tick（時刻は秒が変わった
+/// ときだけ更新して無駄な再設定を避ける）と、ドラッグ中のプレビュー（塗りは Slint 側が
+/// プレビュー比率で描くため時刻だけを更新する）。
+fn apply_playback_position(rec: &RecordingsWindow, position: Duration, duration: Option<Duration>) {
+    rec.set_progress(playback_progress(position, duration));
+    rec.set_time_text(format_playback_time(position, duration).into());
+}
+
+/// シークバー上の比率（0.0〜1.0）を再生位置へ換算する。全体長が不明なら `None`（シークしない）。
+///
+/// 比率は Slint 側で丸めてから渡ってくるが、ここでも範囲外・NaN を 0.0〜1.0 に丸める
+/// （`Duration::mul_f64` は負値・NaN・オーバーフローでパニックするため、掛ける前に潰す）。
+fn seek_position_from_ratio(ratio: f32, duration: Option<Duration>) -> Option<Duration> {
+    let total = duration?;
+    // f32::clamp は NaN をそのまま返すため、先に 0.0 へ落とす（比率不明は先頭扱い）。
+    let ratio = if ratio.is_nan() {
+        0.0
+    } else {
+        ratio.clamp(0.0, 1.0)
+    };
+    Some(total.mul_f64(f64::from(ratio)))
+}
+
+/// 再生位置の進捗比率（0.0〜1.0。シークバーの塗り・つまみの位置）。全体長が不明・0 のときは 0.0。
+fn playback_progress(position: Duration, duration: Option<Duration>) -> f32 {
+    match duration {
+        Some(total) if total > Duration::ZERO => {
+            (position.as_secs_f32() / total.as_secs_f32()).clamp(0.0, 1.0)
+        }
+        _ => 0.0,
+    }
 }
 
 /// 再生時間の表示文字列（`mm:ss / mm:ss`）。全体長が不明なときは `--:--` を出す。
@@ -1321,8 +1403,9 @@ fn hide_dock_icon() {
 #[cfg(test)]
 mod tests {
     use super::{
-        TranscriptStatus, breathing_level, selected_model_status_text, transcript_display_status,
-        transcript_placeholder_text, transcript_status_text,
+        TranscriptStatus, breathing_level, playback_progress, seek_position_from_ratio,
+        selected_model_status_text, transcript_display_status, transcript_placeholder_text,
+        transcript_status_text,
     };
     use crate::transcribe::TranscribeStatus;
     use std::time::Duration;
@@ -1394,6 +1477,73 @@ mod tests {
         assert_eq!(
             transcript_placeholder_text(TranscriptStatus::Failed),
             "Transcription Failed"
+        );
+    }
+
+    /// シークバーの比率→再生位置。全体長に対する按分で、両端は境界そのものになる。
+    #[test]
+    fn seek_position_from_ratio_scales_within_the_duration() {
+        let total = Duration::from_secs(120);
+        assert_eq!(
+            seek_position_from_ratio(0.0, Some(total)),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            seek_position_from_ratio(0.25, Some(total)),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(seek_position_from_ratio(1.0, Some(total)), Some(total));
+        // 全体長が不明ならシークしない（バーは表示専用に縮退する）。
+        assert_eq!(seek_position_from_ratio(0.5, None), None);
+        // 長さ 0 のファイルでも 0 秒に落ちるだけでパニックしない。
+        assert_eq!(
+            seek_position_from_ratio(0.5, Some(Duration::ZERO)),
+            Some(Duration::ZERO)
+        );
+    }
+
+    /// 不正な比率（範囲外・NaN・無限・負値）でもパニックせず 0.0〜1.0 相当へ丸める。
+    #[test]
+    fn seek_position_from_ratio_clamps_invalid_ratios() {
+        let total = Duration::from_secs(60);
+        assert_eq!(
+            seek_position_from_ratio(-0.5, Some(total)),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(seek_position_from_ratio(1.5, Some(total)), Some(total));
+        assert_eq!(
+            seek_position_from_ratio(f32::NEG_INFINITY, Some(total)),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            seek_position_from_ratio(f32::INFINITY, Some(total)),
+            Some(total)
+        );
+        assert_eq!(
+            seek_position_from_ratio(f32::NAN, Some(total)),
+            Some(Duration::ZERO)
+        );
+    }
+
+    /// 再生位置→進捗比率。全体長が不明・0 のときは 0.0、行き過ぎても 1.0 を超えない。
+    #[test]
+    fn playback_progress_maps_position_to_ratio() {
+        let total = Duration::from_secs(200);
+        assert_eq!(playback_progress(Duration::ZERO, Some(total)), 0.0);
+        assert_eq!(
+            playback_progress(Duration::from_secs(50), Some(total)),
+            0.25
+        );
+        assert_eq!(playback_progress(total, Some(total)), 1.0);
+        // 全体長を超える位置（try_seek フォールバック後など）でも 1.0 で止まる。
+        assert_eq!(
+            playback_progress(Duration::from_secs(500), Some(total)),
+            1.0
+        );
+        assert_eq!(playback_progress(Duration::from_secs(10), None), 0.0);
+        assert_eq!(
+            playback_progress(Duration::from_secs(10), Some(Duration::ZERO)),
+            0.0
         );
     }
 
