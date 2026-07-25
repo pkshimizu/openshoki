@@ -5,11 +5,9 @@
 //! 見た目（レイアウト・配色）の確認は `examples/transcript_view.rs` ＋ screencapture
 //! （`docs/rules/slint.md`）。こちらは「操作したら何が起きるか」を担当する。
 //!
-//! 要素を探す `ElementHandle` は生成コードのデバッグ情報を要求する。`build.rs` が既定で
-//! 有効にしているので素の `cargo test` で通る（release を継承するプロファイルでは無効になり、
-//! 下の `slint_debug_info` cfg でテストごと切り替わる。`SLINT_EMIT_DEBUG_INFO=1` で有効化可）。
-
-#![cfg(slint_debug_info)]
+//! 要素を探す `ElementHandle` は生成コードのデバッグ情報を要求する。有無で各テストを
+//! ignore へ切り替えるので、無いプロファイルでは理由つきで「無視」と表示される
+//! （切り替えの条件と有効化方法は `docs/rules/slint.md`）。
 
 slint::include_modules!();
 
@@ -53,15 +51,15 @@ struct Probe {
 impl Probe {
     /// 操作できる状態（再生可能・全体長が分かる）のシークバー。
     fn seekable() -> Self {
-        Self::with_seekable(true)
+        Self::new(true)
     }
 
     /// 表示専用に縮退した状態（再生不可・全体長不明のセッション相当）のシークバー。
     fn display_only() -> Self {
-        Self::with_seekable(false)
+        Self::new(false)
     }
 
-    fn with_seekable(seekable: bool) -> Self {
+    fn new(seekable: bool) -> Self {
         ui_support::init_backend();
         let window = RecordingsWindow::new().expect("creating the window should succeed");
         window
@@ -137,13 +135,12 @@ impl Probe {
         });
     }
 
-    /// 指定位置で離す。
+    /// 指定位置で離す。`PointerMoved` は送らない（同座標でも `moved` が発火して比率が
+    /// 再設定されるため、押下位置が使われているかを検証できなくなる）。
     fn release_at(&self, ratio: f32) {
-        let position = self.point_at(ratio);
         let window = self.window.window();
-        window.dispatch_event(WindowEvent::PointerMoved { position });
         window.dispatch_event(WindowEvent::PointerReleased {
-            position,
+            position: self.point_at(ratio),
             button: PointerEventButton::Left,
         });
     }
@@ -159,9 +156,21 @@ impl Probe {
 
 /// 押した位置の比率でシークする（中央ではない位置で、ポインタ座標が使われていることを見る）。
 #[test]
+#[cfg_attr(
+    not(slint_debug_info),
+    ignore = "needs Slint debug info (see docs/rules/slint.md)"
+)]
 fn click_seeks_to_the_pressed_ratio() {
     let probe = Probe::seekable();
     probe.press_at(0.25);
+    // 押した時点でプレビューが押下位置で来る（`down` 分岐が押下座標を使っている）。
+    let pressed = probe.previews();
+    assert_eq!(pressed.len(), 1, "pressing must preview once: {pressed:?}");
+    assert!(
+        (pressed[0].ratio - 0.25).abs() < RATIO_TOLERANCE,
+        "the press must preview the pressed position, got {}",
+        pressed[0].ratio
+    );
     probe.release_at(0.25);
 
     let seeks = probe.seeks();
@@ -179,6 +188,10 @@ fn click_seeks_to_the_pressed_ratio() {
 
 /// ドラッグ中はプレビューだけが追従し、離した位置で 1 回だけシークする。
 #[test]
+#[cfg_attr(
+    not(slint_debug_info),
+    ignore = "needs Slint debug info (see docs/rules/slint.md)"
+)]
 fn drag_previews_and_seeks_only_on_release() {
     let probe = Probe::seekable();
     // `mock_drag` は要素の中央（比率 0.5）から始まる。右へバー幅の 90% の位置まで引く。
@@ -230,6 +243,10 @@ fn drag_previews_and_seeks_only_on_release() {
 
 /// バーの外へドラッグして離しても、比率は 0.0〜1.0 に収まる。
 #[test]
+#[cfg_attr(
+    not(slint_debug_info),
+    ignore = "needs Slint debug info (see docs/rules/slint.md)"
+)]
 fn dragging_outside_the_bar_clamps_the_ratio() {
     let probe = Probe::seekable();
     // 比率 -1.0 ＝ バー 1 本ぶん左（バーの外）。
@@ -255,6 +272,10 @@ fn dragging_outside_the_bar_clamps_the_ratio() {
 /// 取り消し（押したままウィンドウの外へ出る）はシークせず、`scrubbing` を畳む。畳み忘れると
 /// 再生 tick が表示を更新できないまま固まる。
 #[test]
+#[cfg_attr(
+    not(slint_debug_info),
+    ignore = "needs Slint debug info (see docs/rules/slint.md)"
+)]
 fn leaving_the_window_cancels_the_scrub_without_seeking() {
     let probe = Probe::seekable();
     probe.press_at(0.5);
@@ -281,6 +302,10 @@ fn leaving_the_window_cancels_the_scrub_without_seeking() {
 
 /// 左ボタン以外では何も起きない（右クリックでシークさせない）。
 #[test]
+#[cfg_attr(
+    not(slint_debug_info),
+    ignore = "needs Slint debug info (see docs/rules/slint.md)"
+)]
 fn right_button_neither_previews_nor_seeks() {
     let probe = Probe::seekable();
     probe.bar().mock_single_click(PointerEventButton::Right);
@@ -298,11 +323,18 @@ fn right_button_neither_previews_nor_seeks() {
         "a right-button drag must not seek: {:?}",
         probe.seeks()
     );
-    assert!(!probe.window.get_scrubbing());
+    assert!(
+        !probe.window.get_scrubbing(),
+        "a right-button press must never enter scrubbing"
+    );
 }
 
 /// `seekable` が false（再生不可・全体長不明のセッション）では表示専用に縮退する。
 #[test]
+#[cfg_attr(
+    not(slint_debug_info),
+    ignore = "needs Slint debug info (see docs/rules/slint.md)"
+)]
 fn not_seekable_ignores_click_and_drag() {
     let probe = Probe::display_only();
     probe.bar().mock_single_click(PointerEventButton::Left);
