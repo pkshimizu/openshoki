@@ -1,0 +1,4 @@
+<!-- 落款。朱の角丸正方形を一画の右上に置く（issue #89 のデザイン確定 B 案）。 -->
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
+<rect x="689" y="201" width="130" height="130" rx="26" fill="#D0342B"/>
+</svg>
