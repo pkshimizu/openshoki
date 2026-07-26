@@ -90,7 +90,7 @@ impl TranscribeWorker {
     /// スレッドは意図的に join しない（detach）: 文字起こしは数分かかりうるため、終了時に
     /// join するとアプリの終了がブロックされる。常駐終了時に処理中のジョブは中断される
     /// （ベストエフォート。#30 のスコープ）。
-    pub fn start(downloader: crate::whisper_model::ModelDownloader) -> Self {
+    pub fn start(downloader: crate::model_download::ModelDownloader) -> Self {
         // whisper.cpp / GGML が stderr へ出す冗長な内部ログを止める（ログ backend の feature を
         // 有効にしていないため、フック先が無く事実上の無効化になる）。複数回呼んでも安全。
         whisper_rs::install_logging_hooks();
@@ -182,7 +182,7 @@ enum JobOutcome {
 
 /// 1 ジョブ（1 回の録音停止分）を処理する。モデルはジョブ内で 1 回だけロードして
 /// 複数音源で使い回す（モデルのロードが重いため）。音源単位の失敗は他の音源へ波及させない。
-fn run_job(job: &TranscribeJob, downloader: &crate::whisper_model::ModelDownloader) -> JobOutcome {
+fn run_job(job: &TranscribeJob, downloader: &crate::model_download::ModelDownloader) -> JobOutcome {
     if job.audio_paths.is_empty() {
         // 対象なしでモデル（数百 MB〜）をロードしない防御。通常は投入側が空を渡さない。
         return JobOutcome::Skipped;
@@ -507,7 +507,7 @@ mod tests {
     /// 検証する。存在しないモデル上書きパスを渡すと、ネットワークに触れず即 Failed になる。
     #[test]
     fn submit_tracks_status_until_failure() {
-        let worker = TranscribeWorker::start(crate::whisper_model::ModelDownloader::new());
+        let worker = TranscribeWorker::start(crate::model_download::ModelDownloader::new());
         let dir = std::env::temp_dir().join(format!("shoki-status-{}", std::process::id()));
         worker.submit(TranscribeJob {
             session_dir: dir.clone(),
@@ -537,7 +537,7 @@ mod tests {
     /// 対象音源なし（Skipped）の投入は状態を残さない（「文字起こし中」のまま固まらない）。
     #[test]
     fn submit_with_no_audio_clears_status() {
-        let worker = TranscribeWorker::start(crate::whisper_model::ModelDownloader::new());
+        let worker = TranscribeWorker::start(crate::model_download::ModelDownloader::new());
         let dir = std::env::temp_dir().join(format!("shoki-skip-{}", std::process::id()));
         worker.submit(TranscribeJob {
             session_dir: dir.clone(),
@@ -715,7 +715,7 @@ mod tests {
                 model_override: Some(PathBuf::from(model_path)),
                 language: "en".to_owned(),
             },
-            &crate::whisper_model::ModelDownloader::new(),
+            &crate::model_download::ModelDownloader::new(),
         );
 
         let json_path = audio_path.with_extension("json");
