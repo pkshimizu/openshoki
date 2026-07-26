@@ -433,9 +433,17 @@ pub(crate) mod catalog_checks {
     /// 全カタログの登録簿。**種別を足したらここに 1 行足す**。下のテストが横断で一意性を見る。
     const ALL_CATALOGS: &[&[ModelSpec]] = &[crate::whisper_model::CATALOG];
 
-    /// ID とファイル名は種別をまたいで一意（状態マップのキーと保存先が種別で混ざらないように）。
+    /// 登録簿のカタログすべてが健全で、ID とファイル名は種別をまたいで一意
+    /// （状態マップのキーと保存先が種別で混ざらないように）。
+    ///
+    /// `assert_valid` もここで回すので、**カタログを足す側は登録簿へ 1 行足すだけでよい**
+    /// （各カタログのテストからも呼べるが、呼び忘れてもここで捕まる）。
     #[test]
-    fn ids_and_filenames_are_unique_across_catalogs() {
+    fn registered_catalogs_are_valid_and_globally_unique() {
+        for catalog in ALL_CATALOGS {
+            assert_valid(catalog);
+        }
+
         let specs: Vec<&ModelSpec> = ALL_CATALOGS.iter().flat_map(|c| c.iter()).collect();
         for (i, spec) in specs.iter().enumerate() {
             for other in specs.iter().skip(i + 1) {
