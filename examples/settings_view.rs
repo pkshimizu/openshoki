@@ -46,6 +46,9 @@ fn main() {
     let win =
         AppWindow::new().expect("creating the window should succeed in this verification binary");
 
+    // `src/main.rs` の `app_version_text` の複製（bin クレートなので import できない）。
+    // あちらを変えたらここも合わせること。
+    win.set_app_version(format!("shoki v{}", env!("CARGO_PKG_VERSION")).into());
     win.set_recording_dir("/Users/example/Recordings".into());
     win.set_auto_record_app(true);
     win.set_auto_stop_debounce_secs(4);
@@ -54,7 +57,7 @@ fn main() {
     win.window()
         .set_position(slint::LogicalPosition::new(60.0, 60.0));
     // 実アプリと同じ寸法で見る（`src/main.rs` の WINDOW_WIDTH/HEIGHT と一致させること）。
-    win.window().set_size(slint::LogicalSize::new(420.0, 790.0));
+    win.window().set_size(slint::LogicalSize::new(420.0, 760.0));
     win.show()
         .expect("showing the window should succeed in this verification binary");
 

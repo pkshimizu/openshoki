@@ -153,6 +153,23 @@ macOS では `screencapturekit` と `objc2` 系を使います。
 
 ## 開発
 
+- **バージョニングとリリース手順**: バージョンは **SemVer**で、**`Cargo.toml` の `version` が
+  唯一の正**とする方針です（二重管理や bot コミットによる自動注入はしません）。
+  現時点でここから導出しているのは**設定画面の表示だけ**で、タグとの整合チェックと
+  `Info.plist` への注入はリリースワークフロー（[#20](https://github.com/pkshimizu/openshoki/issues/20)、
+  未実装）で入ります。
+
+  リリースは次の順で行います。
+
+  1. `Cargo.toml` の `version` を上げるコミットを作る（例: `chore: v0.2.0 へバンプする`）
+  2. `main` へマージしたあと `git tag v0.2.0 && git push origin v0.2.0`
+  3. リリースワークフロー（#20）が `.app` バンドルを組む。タグと `Cargo.toml` の不一致は
+     ここで fail させる
+
+  配布は **Mac App Store に寄せる**方針（[#109](https://github.com/pkshimizu/openshoki/issues/109)）で、
+  GitHub Releases には添付しません。1.0.0 への引き上げは、署名・公証や機能の安定を目安に
+  後続で判断します。
+
 - **ホットリロード（自動再ビルド・再起動）**: `cargo dev` でソース（`src` / `ui` /
   `build.rs` / `Cargo.toml`）の変更を監視し、保存するたびに自動で再ビルドして起動し直します。
   事前に `cargo install cargo-watch` が必要です。

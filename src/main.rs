@@ -45,7 +45,7 @@ const BLINK_CYCLE_SECS: f32 = 2.0;
 /// 確定されないまま高さ 0 で表示される。初回表示時にこの値を明示してジオメトリを確定させる。
 /// 幅・高さは `ui/app-window.slint` の min/preferred と一致させること（片方だけ変えない）。
 const WINDOW_WIDTH: f32 = 420.0;
-const WINDOW_HEIGHT: f32 = 790.0;
+const WINDOW_HEIGHT: f32 = 760.0;
 /// 初回表示位置（画面左上からの暫定値）。中央寄せ等の調整は後続に回す。
 const WINDOW_X: f32 = 240.0;
 const WINDOW_Y: f32 = 160.0;
@@ -94,6 +94,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 文字起こしワーカーで同じ状態を共有し、同一モデルの二重ダウンロードを防ぐ。
     let model_downloader = whisper_model::ModelDownloader::new();
 
+    ui.set_app_version(app_version_text());
     ui.set_recording_dir(recording_dir_text(&config.borrow().recording_dir));
     ui.set_auto_record_app(config.borrow().auto_record_on_app_mic);
     // 保存値は load 時に範囲へ正規化済みなので、そのまま表示へ渡す。
@@ -1408,6 +1409,15 @@ fn recording_dir_text(dir: &std::path::Path) -> slint::SharedString {
     dir.display().to_string().into()
 }
 
+/// 設定画面に出すバージョン表記（例: `shoki v0.1.0`）。
+///
+/// バージョンの正は `Cargo.toml` の `version` 一本で、ここは `env!("CARGO_PKG_VERSION")`
+/// （コンパイル時定数）から組み立てる。実行時にファイルを読まないので、表示と動いている
+/// バイナリがずれることがない。
+fn app_version_text() -> slint::SharedString {
+    format!("shoki v{}", env!("CARGO_PKG_VERSION")).into()
+}
+
 /// 登録アプリ 1 件を設定画面の行にする。検知できないアプリには
 /// `app_audio_monitor::auto_record_limitation` の注記を添える。
 fn trigger_app_row(trigger: &config::AppTrigger) -> TriggerApp {
@@ -1469,12 +1479,32 @@ fn hide_dock_icon() {
 #[cfg(test)]
 mod tests {
     use super::{
-        TranscriptStatus, breathing_level, playback_progress, seek_position_from_ratio,
-        selected_model_status_text, transcript_display_status, transcript_placeholder_text,
-        transcript_status_text,
+        TranscriptStatus, app_version_text, breathing_level, playback_progress,
+        seek_position_from_ratio, selected_model_status_text, transcript_display_status,
+        transcript_placeholder_text, transcript_status_text,
     };
     use crate::transcribe::TranscribeStatus;
     use std::time::Duration;
+
+    /// バージョン表記が `Cargo.toml` の `version` と一致することを確かめる。
+    ///
+    /// 期待値を `env!("CARGO_PKG_VERSION")` で組むと実装と同じ式になるので、**別の出所**として
+    /// `Cargo.toml` を直接読む。これで「バンプしたのに表示が追随しない」形の崩れは捕まる。
+    ///
+    /// ただし「実装が `env!` を使っている」ことまでは検証できない。実装を現在の値のまま
+    /// ハードコードしても両辺が一致して通る（ミューテーションで確認済み）。`Cargo.toml` と
+    /// `env!("CARGO_PKG_VERSION")` の紐づきは cargo のコンパイル時保証で、実行時テストの
+    /// 守備範囲外。
+    #[test]
+    fn app_version_text_shows_the_version_from_cargo_toml() {
+        let version = include_str!("../Cargo.toml")
+            .lines()
+            .find_map(|line| line.strip_prefix("version = \""))
+            .and_then(|rest| rest.strip_suffix('"'))
+            .expect("Cargo.toml should declare a package version");
+
+        assert_eq!(app_version_text(), format!("shoki v{version}").as_str());
+    }
 
     /// 設定画面の行は、検知できないアプリにだけ注記を持つ（判定は `auto_record_limitation`）。
     /// バンドル ID → 注記の写像を渡し忘れる回帰を、ここで止める。
