@@ -1,0 +1,24 @@
+[00:00] System: Morning everyone. Let's start the weekly sync. Three topics today: the release decision, the incident review, and hiring.
+[00:13] Mic: Sounds good. Can we start with the release?
+[00:19] System: Sure. QA reports two open defects. Both are minor and have workarounds.
+[00:30] Mic: Is that the search sort order issue and the duplicate notification one?
+[00:39] System: Correct. The sort order is display only. We verified the stored data is correct.
+[00:51] Mic: The duplicate notifications worry me a bit. That tends to generate support tickets.
+[01:04] System: It only happens when the same device double taps within one second. We saw three cases last week.
+[01:19] Mic: That's acceptable then. Let's ship, on the condition that we fix it in the next patch.
+[01:30] System: Agreed. The release stays on Thursday at 3 PM. The rollback procedure is the same as last time.
+[01:44] Mic: I'd like us to agree on the rollback criteria though.
+[01:51] System: How about: roll back immediately if the error rate goes above one percent. That's what we used last time.
+[02:04] Mic: Works for me. I'll take monitoring duty on the day.
+[02:13] System: Thank you. Next, the incident review from last week.
+[02:21] Mic: The cause was a deployment config mistake, right? An environment variable was missing in production.
+[02:33] System: Yes. It was set in staging, so our tests didn't catch it.
+[02:45] Mic: A pre-deploy diff of the configuration would have caught it.
+[02:56] System: I agree. Let's add a config diff check to CI. Can Tanaka pick that up?
+[03:07] Mic: Tanaka's sprint is full right now, so it would start next week.
+[03:17] System: That's fine. Please put it in next week's sprint.
+[03:26] Mic: Will do. I'll also write the postmortem and share it before the end of the week.
+[03:37] System: Appreciated. Last topic is hiring, but we're short on time. Shall we push it?
+[03:49] Mic: Let's do that. We'll start with hiring next time.
+[03:57] System: Then that's everything. Thanks all.
+[04:01] Mic: Thanks everyone.

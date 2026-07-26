@@ -83,7 +83,8 @@
 
 - **Rust ツールチェーン**（edition 2024 を使うため Rust 1.85 以降）。
 - **C コンパイラ**: `mp3lame-encoder` が libmp3lame をビルドするために必要です。
-- **CMake**: `whisper-rs` が whisper.cpp をビルドするために必要です（`brew install cmake`）。
+- **CMake**: `whisper-rs` が whisper.cpp を、`llama-cpp-2`（検証プローブ用の dev-dependency）が
+  llama.cpp をビルドするために必要です（`brew install cmake`）。
 - **macOS**: 安定版の Xcode コマンドラインツール。ScreenCaptureKit の Swift ブリッジの
   ビルド・リンクに使います（ベータ版 Xcode では Swift 後方互換ライブラリを解決できず
   リンクに失敗することがあります）。
@@ -119,7 +120,9 @@ shoki/
 │   │   │                     Assets/mark-ink*.svg は mark.svg から生成する色違い）
 │   │   ├── tray.png          メニューバー常駐アイコン（36x36 RGBA。ビルド時に埋め込む。生成物）
 │   │   └── generated/        actool の生成物（shoki.icns。Assets.car は追跡しない）
-│   └── menu/             トレイメニュー項目のアイコン（PNG, 32x32 RGBA。ビルド時に埋め込む）
+│   ├── menu/             トレイメニュー項目のアイコン（PNG, 32x32 RGBA。ビルド時に埋め込む）
+│   └── samples/          検証プローブ用の架空トランスクリプト（summary_probe が埋め込む。
+│                         出荷バイナリには入らない）
 ├── scripts/
 │   ├── generate-icons.sh アイコン資産の再生成（.icon → Assets.car / .icns、SVG → tray.png）
 │   └── check-icons.sh    生成物がマスターと一致するかの検査（CI でも実行）
@@ -223,6 +226,21 @@ macOS では `screencapturekit` と `objc2` 系を使います。
   cargo run --example settings_view                     # 表示して screencapture で確認
   cargo run --example settings_view -- snapshot out.png # PNG に書き出す（画面収録の許可が不要）
   ```
+
+- **議事録要約の LLM 検証プローブ**: オンデバイス LLM で議事録を生成する方針
+  （[#78](https://github.com/pkshimizu/openshoki/issues/78)）の検証に使う
+  `examples/summary_probe.rs`。出荷バイナリには含まれません（`llama-cpp-2` は
+  dev-dependencies なので `cargo build` では llama.cpp をリンクしません。`cargo test` /
+  `cargo clippy --all-targets` ではビルドされ、コールドで約 1 分増えます）。
+
+  ```sh
+  cargo run --release --example summary_probe -- --model <path.gguf> --lang ja
+  cargo run --release --example summary_probe -- --model <path.gguf> --lang en
+  ```
+
+  サンプルのトランスクリプト（`assets/samples/meeting-{ja,en}.txt`）は架空の会議で、
+  実データを使わずに再現できるようにしてあります。計測値と採用モデルは
+  ローカルのプラン `docs/plans/` にあります（`docs/` は追跡対象外）。
 
 - **Mac App Store 可否の検証プローブ**: MAS 対応（[#77](https://github.com/pkshimizu/openshoki/issues/77)）の
   技術検証に使う `examples/mas_probe.rs` を、App Sandbox の有無を切り替えて実行します。
