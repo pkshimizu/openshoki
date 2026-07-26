@@ -92,7 +92,8 @@ export component AppWindow inherits Window {
     title: "shoki";
     // preferred だけだと中身の最小高さ（≒0）に引っ張られて潰れるため、min も指定する。
     // 幅・高さは src/main.rs の WINDOW_WIDTH/HEIGHT と一致させること（片方だけ変えない）。
-    // 幅は 420 固定。高さは 3 セクション＋Transcription の Language/Model 行と状態行に合わせた値。
+    // 幅は 420 固定。高さは 3 セクション＋Transcription の Language/Model 行と状態行、
+    // ＋末尾のバージョン行に合わせた値（実測で余白は約 36px。末尾に足すときはここを見直す）。
     min-width: 420px;
     min-height: 790px;
     preferred-width: 420px;
@@ -111,9 +112,6 @@ export component AppWindow inherits Window {
     // 「録音停止時に自動文字起こし」の ON/OFF。起動時に Rust 側が設定値で初期化し、以後は
     // トグル操作で Slint が状態を保持する（in-out。保存失敗時は Rust 側が書き戻す）。
     in-out property <bool> auto-transcribe;
-    // アプリのバージョン表示（例: `shoki v0.1.0`）。`Cargo.toml` の version が唯一の正で、
-    // Rust 側が `env!("CARGO_PKG_VERSION")` から組み立てて渡す（表示とバイナリがずれない）。
-    in property <string> app-version;
     // 文字起こしの言語の表示名一覧（Rust 側の TRANSCRIBE_LANGUAGES を反映。並び順も Rust が決める）。
     in property <[string]> transcribe-languages;
     // 選択中の言語のカタログ内インデックス。起動時に Rust 側が設定値で初期化し、以後は
@@ -127,6 +125,9 @@ export component AppWindow inherits Window {
     in-out property <int> whisper-model-index;
     // 選択中モデルの取得状況テキスト（Rust 側が定期的に更新する）。
     in property <string> whisper-model-status;
+    // 設定画面の末尾に出すバージョン表記（例: `shoki v0.1.0`）。組み立てと理由は Rust 側の
+    // `app_version_text` を参照。
+    in property <string> app-version;
     // 「フォルダを選択」押下。Rust 側でネイティブのフォルダ選択ダイアログを開く。
     callback choose-folder();
     // アプリのマイク使用 自動録音トグルの切り替え。新しい ON/OFF を渡し、Rust 側で設定へ永続化する。
