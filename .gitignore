@@ -1,2 +1,8 @@
 /target
 /docs/
+# actool の生成物のうち Assets.car は追跡しない: 入力が同じでも毎回バイト列が変わるため、
+# コミットすると意味のない 1.7MB の差分が毎回出る。使うのは .app のパッケージング（#20）
+# だけで、そこは Xcode 26 以降のある macOS 上なので `./scripts/generate-icons.sh` で作れば足りる。
+# 決定的な生成物（mark-ink*.svg / openshoki.icns / tray.png）はコミットする
+# （README「アイコン資産の再生成」参照）。
+/assets/icon/generated/Assets.car
