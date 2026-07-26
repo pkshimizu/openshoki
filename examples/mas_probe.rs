@@ -187,6 +187,10 @@ mod probe {
             flags.contains("--verbose"),
         );
 
+        if let Some(seconds) = value_of(&args, "--watch-mic").and_then(|v| v.parse::<u64>().ok()) {
+            watch_mic(Duration::from_secs(seconds));
+        }
+
         if flags.contains("--pick-folder") {
             report_bookmark_save(&bookmark_file, folder.as_deref());
         } else if flags.contains("--resolve-bookmark") {
@@ -235,6 +239,7 @@ mod probe {
         emit!("  --all-processes            Compare every running process, not only audio ones");
         emit!("  --verbose                  Print every resolved row");
         emit!("  --hold-mic                 Open the default microphone during the scan");
+        emit!("  --watch-mic <seconds>      Keep watching which processes hold the mic");
         emit!("  --skip-screen              Skip the ScreenCaptureKit check");
         emit!(
             "  --pick-folder              Open a folder panel and save a security-scoped bookmark"
@@ -348,6 +353,63 @@ mod probe {
         std::thread::sleep(MIC_SETTLE);
         emit!("  holding {name} open ({:?})", config.sample_format());
         Some(stream)
+    }
+
+    /// マイクを掴んでいるプロセスを一定時間見張り、顔ぶれが変わるたびに解決結果を出す。
+    ///
+    /// 「通話を始めた瞬間にどのプロセスが `IsRunningInput` になるか」を調べるための機能。
+    /// 1 回きりの走査だと、走らせる側と通話を始める側でタイミングを合わせる必要があり、
+    /// 会議アプリの検証が難しい。
+    fn watch_mic(duration: Duration) {
+        /// 見張りの間隔。本体の `POLL_INTERVAL` と同じにして、実運用と同じ粒度で観測する。
+        const POLL: Duration = Duration::from_millis(500);
+
+        section("Microphone watch");
+        emit!("  watching for {duration:?}; start your call now…");
+        let deadline = Instant::now() + duration;
+        let mut previous: BTreeSet<i32> = BTreeSet::new();
+        let mut changes = 0usize;
+        while Instant::now() < deadline {
+            let Some(entries) = audio_processes() else {
+                emit!("  CoreAudio process list became unavailable; stopping the watch");
+                return;
+            };
+            let rows: Vec<ResolvedProcess> = entries
+                .into_iter()
+                .filter(|entry| entry.running_input == Some(true))
+                .map(resolve)
+                .collect();
+            let current: BTreeSet<i32> = rows.iter().map(|row| row.pid).collect();
+            if current != previous {
+                changes += 1;
+                emit!("  [{changes}] processes holding the mic: {}", rows.len());
+                for row in &rows {
+                    emit!(
+                        "    pid {} → private={} path={} ppid={} coreaudio={} exec={}",
+                        row.pid,
+                        show_set(&row.private_ids()),
+                        show_set(&row.path_ids()),
+                        show_set(&row.ppid_ids()),
+                        show_set(&row.core_audio_ids()),
+                        show_path(row)
+                    );
+                    if !row.private_ids().is_subset(&row.public_ids()) {
+                        emit!(
+                            "      ⚠ the public APIs cannot attribute this process to {}",
+                            show_set(
+                                &row.private_ids()
+                                    .difference(&row.public_ids())
+                                    .cloned()
+                                    .collect()
+                            )
+                        );
+                    }
+                }
+                previous = current;
+            }
+            std::thread::sleep(POLL);
+        }
+        emit!("  watch finished ({changes} changes seen)");
     }
 
     // ------------------------------------------------- 解決方式の突き合わせ
