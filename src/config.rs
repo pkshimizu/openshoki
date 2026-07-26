@@ -136,7 +136,7 @@ pub struct Config {
     pub auto_stop_debounce_secs: u32,
     /// 録音停止時に保存した各音源を自動で文字起こしするか。whisper は CPU 負荷が大きいため
     /// オプトインの既定 OFF。モデルは内蔵（初回の文字起こし時に自動ダウンロード）なので、
-    /// ON にするだけで使える（`src/whisper_model.rs`）。
+    /// ON にするだけで使える（`src/model_download.rs`）。
     #[serde(default)]
     pub auto_transcribe: bool,
     /// 使用する内蔵 whisper モデルの識別子（`whisper_model::CATALOG` の `id`。既定 `small`）。

@@ -7,6 +7,7 @@
 mod app_audio_monitor;
 mod config;
 mod mixdown;
+mod model_download;
 mod player;
 mod recorder;
 mod recordings;
@@ -92,7 +93,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 内蔵 whisper モデルのダウンロード・状態管理。設定画面（モデル選択・DL 状況表示）と
     // 文字起こしワーカーで同じ状態を共有し、同一モデルの二重ダウンロードを防ぐ。
-    let model_downloader = whisper_model::ModelDownloader::new();
+    let model_downloader = model_download::ModelDownloader::new();
 
     ui.set_app_version(app_version_text());
     ui.set_recording_dir(recording_dir_text(&config.borrow().recording_dir));
@@ -125,7 +126,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     slint::SharedString::from(format!(
                         "{} — {} — {}",
                         spec.display_name,
-                        whisper_model::format_size(spec.size_bytes),
+                        model_download::format_size(spec.size_bytes),
                         spec.description
                     ))
                 })
@@ -767,7 +768,7 @@ fn build_menu_event_handler(
     tray: &Tray,
     config: Rc<RefCell<Config>>,
     postprocessor: mixdown::PostProcessWorker,
-    model_downloader: whisper_model::ModelDownloader,
+    model_downloader: model_download::ModelDownloader,
     #[cfg(target_os = "macos")] app_monitor: app_audio_monitor::AppAudioMonitor,
 ) -> impl FnMut() + 'static {
     // Recordings ウィンドウ・再生・一覧のハンドルは RecordingsHandles にまとめたまま使う
@@ -1437,24 +1438,24 @@ fn trigger_app_row(trigger: &config::AppTrigger) -> TriggerApp {
 /// カタログ外の手編集値は既定モデルの状況を表示する（表示位置のフォールバックと整合）。
 fn selected_model_status_text(
     model_id: &str,
-    downloader: &whisper_model::ModelDownloader,
+    downloader: &model_download::ModelDownloader,
 ) -> String {
     let spec = whisper_model::spec_for(model_id).unwrap_or_else(|| whisper_model::default_spec());
     match downloader.status_of(spec) {
-        whisper_model::DownloadStatus::NotDownloaded => format!(
+        model_download::DownloadStatus::NotDownloaded => format!(
             // 未取得モデルは「選択した時点」または「次の文字起こし時」に自動取得される。
             // どちらかに限定した文言にしない（両方の経路がある）。
             "Not downloaded — downloads automatically ({})",
-            whisper_model::format_size(spec.size_bytes)
+            model_download::format_size(spec.size_bytes)
         ),
-        whisper_model::DownloadStatus::Downloading { received, total } => {
+        model_download::DownloadStatus::Downloading { received, total } => {
             // total は Content-Length または既知サイズで常に正だが、防御的にゼロ除算を避ける。
             // Content-Length が実サイズより小さい異常時も 100% を超えて表示しない。
             let percent = (received.saturating_mul(100) / total.max(1)).min(100);
             format!("Downloading… {percent}%")
         }
-        whisper_model::DownloadStatus::Downloaded => "Downloaded".to_owned(),
-        whisper_model::DownloadStatus::Failed(reason) => format!("Download failed: {reason}"),
+        model_download::DownloadStatus::Downloaded => "Downloaded".to_owned(),
+        model_download::DownloadStatus::Failed(reason) => format!("Download failed: {reason}"),
     }
 }
 
@@ -1677,12 +1678,12 @@ mod tests {
     /// 2 秒周期なら 0s→0.5, 0.5s(1/4)→1.0, 1.0s(1/2)→0.5, 1.5s(3/4)→0.0, 2.0s(1周)→0.5。
     #[test]
     fn model_status_text_covers_all_states() {
-        let downloader = crate::whisper_model::ModelDownloader::new();
+        let downloader = crate::model_download::ModelDownloader::new();
         let spec = crate::whisper_model::spec_for("large-v3").expect("large-v3 is in the catalog");
 
         downloader.set_status_for_test(
             spec,
-            crate::whisper_model::DownloadStatus::Downloading {
+            crate::model_download::DownloadStatus::Downloading {
                 received: 25,
                 total: 100,
             },
@@ -1695,7 +1696,7 @@ mod tests {
         // Content-Length が実サイズより小さい異常時も 100% を超えない。
         downloader.set_status_for_test(
             spec,
-            crate::whisper_model::DownloadStatus::Downloading {
+            crate::model_download::DownloadStatus::Downloading {
                 received: 300,
                 total: 100,
             },
@@ -1705,7 +1706,7 @@ mod tests {
             "Downloading… 100%"
         );
 
-        downloader.set_status_for_test(spec, crate::whisper_model::DownloadStatus::Downloaded);
+        downloader.set_status_for_test(spec, crate::model_download::DownloadStatus::Downloaded);
         assert_eq!(
             selected_model_status_text("large-v3", &downloader),
             "Downloaded"
@@ -1713,14 +1714,14 @@ mod tests {
 
         downloader.set_status_for_test(
             spec,
-            crate::whisper_model::DownloadStatus::Failed("boom".into()),
+            crate::model_download::DownloadStatus::Failed("boom".into()),
         );
         assert_eq!(
             selected_model_status_text("large-v3", &downloader),
             "Download failed: boom"
         );
 
-        downloader.set_status_for_test(spec, crate::whisper_model::DownloadStatus::NotDownloaded);
+        downloader.set_status_for_test(spec, crate::model_download::DownloadStatus::NotDownloaded);
         assert_eq!(
             selected_model_status_text("large-v3", &downloader),
             "Not downloaded — downloads automatically (2.9 GB)"

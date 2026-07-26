@@ -133,7 +133,8 @@ shoki/
     ├── system_audio.rs   macOS のシステム音声キャプチャ（ScreenCaptureKit）
     ├── transcribe.rs     録音停止後の自動文字起こし（whisper.cpp、バックグラウンド）
     ├── transcript.rs     文字起こし JSON の読み込みと mic／system の時刻順マージ（表示用）
-    ├── whisper_model.rs  内蔵 whisper モデルの管理（初回ダウンロード・SHA-256 検証）
+    ├── model_download.rs 検証つきモデルダウンロードの共有基盤（SHA-256・原子的配置・状態管理）
+    ├── whisper_model.rs  内蔵 whisper モデルのカタログ（選べるモデルの一覧）
     ├── single_instance.rs 多重起動を防ぐ排他ロック（起動時に取得）
     └── config.rs         設定（保存先など）の読み込み・保存（TOML）
 ```
