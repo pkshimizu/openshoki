@@ -6,6 +6,13 @@ import { Style } from "style.slint";
 // RecordingsWindow / SessionRow を得る。
 export { RecordingsWindow, SessionRow } from "recordings-window.slint";
 
+// 自動録音のトリガーとして登録したアプリ 1 件。`limitation` が空でなければ、そのアプリは
+// 検知できない旨をリストに添えて出す（Rust 側の `auto_record_limitation` が文言を決める）。
+export struct TriggerApp {
+    name: string,
+    limitation: string,
+}
+
 // 設定項目のまとまりを表すセクション枠。GroupBox の既定描画ではなく「角丸・1px 枠線・塗りなし」の
 // 箱＋内側見出しで組み、配色は Palette でライト/ダークに追従させる（色をハードコードしない）。
 component SettingsSection inherits Rectangle {
@@ -46,8 +53,8 @@ export component AppWindow inherits Window {
     // 「登録アプリのマイク使用で自動録音」の ON/OFF。起動時に Rust 側が設定値で初期化し、以後は
     // トグル操作で Slint が状態を保持する（in-out）。
     in-out property <bool> auto-record-app;
-    // 登録アプリの表示名一覧（Rust 側の app_mic_triggers を反映）。
-    in property <[string]> app-list;
+    // 登録アプリの一覧（Rust 側の app_mic_triggers を反映）。
+    in property <[TriggerApp]> app-list;
     // 自動停止のデバウンス秒数。起動時に Rust 側が設定値で初期化し、以後は SpinBox で編集する（in-out）。
     // 範囲は minimum/maximum（下の SpinBox）で制限し、Rust 側の DEBOUNCE_MIN/MAX_SECS と一致させる。
     in-out property <int> auto-stop-debounce-secs;
@@ -207,7 +214,7 @@ export component AppWindow inherits Window {
                         ScrollView {
                             VerticalLayout {
                                 alignment: start;
-                                for name[i] in root.app-list: VerticalLayout {
+                                for app[i] in root.app-list: VerticalLayout {
                                     // 2 行目以降の先頭に行区切りの罫線を置く（先頭行は 0px で出さない）。
                                     Rectangle {
                                         height: i > 0 ? 1px : 0px;
@@ -220,13 +227,25 @@ export component AppWindow inherits Window {
                                         padding-top: 6px;
                                         padding-bottom: 6px;
                                         spacing: 8px;
-                                        Text {
-                                            text: name;
-                                            font-size: Style.body-size;
-                                            color: Palette.foreground;
-                                            vertical-alignment: center;
+                                        // 名前と、検知できないアプリの注記を縦に積む。注記が無いときは
+                                        // 行が空くだけにならないよう Text 自体を出さない。
+                                        VerticalLayout {
+                                            spacing: 2px;
                                             horizontal-stretch: 1;
-                                            overflow: elide;
+                                            Text {
+                                                text: app.name;
+                                                font-size: Style.body-size;
+                                                color: Palette.foreground;
+                                                vertical-alignment: center;
+                                                overflow: elide;
+                                            }
+
+                                            if app.limitation != "": Text {
+                                                text: app.limitation;
+                                                font-size: Style.caption-size;
+                                                color: Style.danger;
+                                                wrap: word-wrap;
+                                            }
                                         }
 
                                         Button {

@@ -122,13 +122,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ui.set_whisper_model_status(
         selected_model_status_text(&config.borrow().whisper_model, &model_downloader).into(),
     );
-    // 登録アプリの表示名一覧を Slint のモデルで持ち、追加/削除で更新する。
-    let app_list_model = Rc::new(slint::VecModel::<slint::SharedString>::from(
+    // 登録アプリの一覧を Slint のモデルで持ち、追加/削除で更新する。
+    let app_list_model = Rc::new(slint::VecModel::<TriggerApp>::from(
         config
             .borrow()
             .app_mic_triggers
             .iter()
-            .map(|trigger| slint::SharedString::from(trigger.name.as_str()))
+            .map(trigger_app_row)
             .collect::<Vec<_>>(),
     ));
     ui.set_app_list(app_list_model.clone().into());
@@ -340,13 +340,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             {
                 return; // 登録済み。
             }
-            let name = slint::SharedString::from(trigger.name.as_str());
+            let row = trigger_app_row(&trigger);
             candidate.app_mic_triggers.push(trigger);
             if let Err(err) = candidate.save() {
                 eprintln!("Not adding the app because saving the settings failed: {err}");
                 return;
             }
-            model_for_add.push(name);
+            model_for_add.push(row);
             *config_for_add.borrow_mut() = candidate;
         });
     }
@@ -1392,6 +1392,21 @@ fn refresh_detail_transcript_status(
 /// 保存先パスを画面表示用の文字列に変換する。
 fn recording_dir_text(dir: &std::path::Path) -> slint::SharedString {
     dir.display().to_string().into()
+}
+
+/// 登録アプリ 1 件を設定画面の行にする。検知できないアプリには理由を添える
+/// （`auto_record_limitation`。黙って発火しないのが一番分かりにくいため、登録一覧で伝える）。
+fn trigger_app_row(trigger: &config::AppTrigger) -> TriggerApp {
+    #[cfg(target_os = "macos")]
+    let limitation = app_audio_monitor::auto_record_limitation(&trigger.bundle_id).unwrap_or("");
+    // 自動録音は macOS 限定の機能なので、他 OS では注記も出さない。
+    #[cfg(not(target_os = "macos"))]
+    let limitation = "";
+
+    TriggerApp {
+        name: trigger.name.as_str().into(),
+        limitation: limitation.into(),
+    }
 }
 
 /// 設定で選択中の whisper モデルの取得状況を、設定画面の状態行テキストにする。
