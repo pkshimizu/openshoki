@@ -13,7 +13,8 @@
 # 生成物はコミットする（ビルド時生成にしない）。`src/tray.rs` は tray.png を include_bytes! で
 # 埋め込むため、資産を変えたらこのスクリプトを実行して差分をコミットすること。
 #
-# 必要なツール: Xcode（xcrun actool）、rsvg-convert、magick（ImageMagick）
+# 必要なツール: Xcode 26 以降（xcrun actool。Icon Composer 形式の .icon を扱えるバージョン）、
+#               rsvg-convert、magick（ImageMagick）
 set -euo pipefail
 
 # --skip-appicon: actool を使う工程（Assets.car / .icns）を飛ばし、決定的に再現できる生成物
@@ -27,7 +28,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --skip-appicon) skip_appicon=true; shift ;;
     --out-dir)
-      if [ $# -lt 2 ] || case "$2" in -*) true ;; *) false ;; esac; then
+      if [ $# -lt 2 ] || [ -z "$2" ] || case "$2" in -*) true ;; *) false ;; esac; then
         echo "--out-dir requires a directory" >&2
         exit 1
       fi

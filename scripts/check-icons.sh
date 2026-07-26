@@ -12,7 +12,8 @@
 # `assets/icon/generated/Assets.car` は actool が入力を変えなくても毎回違うバイト列を出すため
 # 検査しない（README の「アイコン資産の再生成」参照）。
 #
-# 必要なツール: rsvg-convert、magick（ImageMagick）。.icns まで見るなら Xcode（xcrun actool）。
+# 必要なツール: rsvg-convert、magick（ImageMagick）。.icns まで見るなら Xcode 26 以降
+# （xcrun actool。それ未満／未インストールなら .icns はスキップする）。
 set -euo pipefail
 
 # tray.png の比較設定。バイト比較にすると rsvg / ImageMagick のバージョン差で偽陽性になるため、
@@ -34,34 +35,50 @@ trap 'rm -rf "$regenerated"' EXIT
 # .icns まで検査できるのは、Icon Composer 形式の .icon を扱える actool があるときだけ
 # （Xcode 26 以降）。無ければ mark.svg 由来の生成物だけを見る。
 check_appicon=false
-xcode_version="$(xcodebuild -version 2>/dev/null | head -n1)"
-xcode_major="$(printf '%s' "$xcode_version" | sed -n 's/^Xcode \([0-9]*\).*/\1/p')"
+appicon_skip_reason=""
+xcode_version=""
+# `set -euo pipefail` 下では代入もパイプラインの終了ステータスを引き継ぐので、失敗しうる
+# コマンド置換は必ず `if` の条件に置く（素で書くと Xcode が無い環境で無言で死ぬ）。
 if ! xcrun --find actool >/dev/null 2>&1; then
   appicon_skip_reason="actool is not available"
-elif [ -z "$xcode_major" ]; then
+elif ! xcode_version="$(xcodebuild -version 2>/dev/null | head -n1)" || [ -z "$xcode_version" ]; then
   appicon_skip_reason="could not determine the Xcode version"
-elif [ "$xcode_major" -lt 26 ]; then
-  appicon_skip_reason="$xcode_version cannot compile .icon (Xcode 26 or later is required)"
 else
-  check_appicon=true
+  xcode_major="$(printf '%s' "$xcode_version" | sed -n 's/^Xcode \([0-9]*\).*/\1/p')"
+  if [ -z "$xcode_major" ]; then
+    appicon_skip_reason="could not read the version from \"$xcode_version\""
+  elif [ "$xcode_major" -lt 26 ]; then
+    appicon_skip_reason="$xcode_version cannot compile .icon (Xcode 26 or later is required)"
+  else
+    check_appicon=true
+  fi
 fi
 
 echo "Regenerating the icon artifacts into a temporary directory…"
-if [ "$check_appicon" = true ]; then
-  ./scripts/generate-icons.sh --out-dir "$regenerated" >/dev/null
-else
-  ./scripts/generate-icons.sh --skip-appicon --out-dir "$regenerated" >/dev/null
+generate_args=(--out-dir "$regenerated")
+if [ "$check_appicon" = false ]; then
+  generate_args=(--skip-appicon "${generate_args[@]}")
+fi
+# 成功時のログは出さないが、失敗したら原因（actool や rsvg のエラー）をそのまま見せる。
+if ! generate_log="$(./scripts/generate-icons.sh "${generate_args[@]}" 2>&1)"; then
+  echo "$generate_log" >&2
+  echo "Could not regenerate the icon artifacts (see the error above)." >&2
+  exit 1
 fi
 
 # 生成物が古い（＝再生成すれば直る）か、検査自体が失敗したか（＝再生成しても直らない）を
 # 分けて数える。直し方の案内は前者のときだけ、最後に 1 回出す。
 stale=false
 broken=false
+icns_mismatch=false
 
 # 一画のレイヤー（mark.svg の色違い）。sed の出力なので環境に依らず完全一致するはず。
 for layer in mark-ink.svg mark-ink-on-dark.svg; do
   committed="assets/icon/openshoki.icon/Assets/$layer"
-  if ! cmp -s "$committed" "$regenerated/$committed"; then
+  if [ ! -f "$committed" ]; then
+    echo "$committed is missing." >&2
+    stale=true
+  elif ! cmp -s "$committed" "$regenerated/$committed"; then
     # パスデータは 1 行が数 KB になるので、差分そのものは出さず行数だけ示す。
     changed_lines="$(diff "$committed" "$regenerated/$committed" | grep -c '^[<>]' || true)"
     echo "$committed does not match assets/icon/mark.svg ($changed_lines lines differ)." >&2
@@ -72,9 +89,19 @@ done
 # メニューバー用グリフ。まず形式（`decode_rgba_png` が要求する 36x36 8bit RGBA）を確かめ、
 # 次に画素を比べる（バイト比較にすると、rsvg / ImageMagick のバージョン差で偽陽性になる）。
 tray="assets/icon/tray.png"
-committed_format="$(magick identify -format '%wx%h %[bit-depth] %[channels]' "$tray")"
-regenerated_format="$(magick identify -format '%wx%h %[bit-depth] %[channels]' "$regenerated/$tray")"
-if [ "$committed_format" != "$regenerated_format" ]; then
+identify_error=""
+committed_format=""
+regenerated_format=""
+if ! committed_format="$(magick identify -format '%wx%h %[bit-depth] %[channels]' "$tray" 2>&1)" \
+   || ! regenerated_format="$(magick identify -format '%wx%h %[bit-depth] %[channels]' \
+        "$regenerated/$tray" 2>&1)"; then
+  identify_error=true
+fi
+if [ -n "$identify_error" ]; then
+  echo "Could not inspect $tray:" >&2
+  echo "$committed_format $regenerated_format" >&2
+  broken=true
+elif [ "$committed_format" != "$regenerated_format" ]; then
   echo "$tray has a different format than the regenerated one" >&2
   echo "  committed:   $committed_format" >&2
   echo "  regenerated: $regenerated_format" >&2
@@ -102,9 +129,11 @@ fi
 icns="assets/icon/generated/openshoki.icns"
 if [ "$check_appicon" = true ]; then
   if ! cmp -s "$icns" "$regenerated/$icns"; then
-    echo "$icns does not match the icon master (built here with $xcode_version)." >&2
-    echo "  A different actool version can also produce this difference." >&2
-    stale=true
+    echo "$icns does not match the icon master (rebuilt here with $xcode_version)." >&2
+    echo "  → If you changed the master, run ./scripts/generate-icons.sh and commit it." >&2
+    echo "    If you did not, a different actool version can also produce this difference." >&2
+    # 再生成では直らないこともあるので、mark.svg 由来の生成物とは分けて数える。
+    icns_mismatch=true
   fi
 else
   echo "Skipping $icns ($appicon_skip_reason)."
@@ -113,7 +142,7 @@ fi
 if [ "$stale" = true ]; then
   echo "→ Run ./scripts/generate-icons.sh and commit the regenerated artifacts." >&2
 fi
-if [ "$stale" = true ] || [ "$broken" = true ]; then
+if [ "$stale" = true ] || [ "$broken" = true ] || [ "$icns_mismatch" = true ]; then
   exit 1
 fi
 if [ "$check_appicon" = true ]; then
