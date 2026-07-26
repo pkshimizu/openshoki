@@ -8,7 +8,8 @@
 //! （セッションを `cp -r` した・バックアップや zip から戻した等）、上書きしてもそのモードが
 //! 残ってしまう。文字起こしのやり直しや議事録の再生成は既存ファイルを上書きする経路なので、
 //! 開いた**後**にモードを設定し直す。設定はファイルハンドル経由なので、開いた後に差し替えられても
-//! 別のファイルへ適用されることはない。
+//! 別のファイルへ適用されることはない。権限を表現できないファイルシステムでは設定に失敗するが、
+//! そこは書き出しを止めずログに留める（`create` のコメント参照）。
 
 use std::io::Write;
 use std::path::Path;
@@ -33,7 +34,14 @@ pub fn create(path: &Path) -> std::io::Result<std::fs::File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        // ここで失敗しても**書き出しごと落とさない**。保存先はユーザーが選べるので、
+        // 権限の概念を持たないファイルシステム（外付けの exFAT、SMB/NFS マウント等）が
+        // 対象になりうる。そこで `fchmod` が弾かれても、そもそも 0600 は表現できないので
+        // 落として守れるものが無い一方、落とすと後処理（ミックス・文字起こし・議事録）が
+        // まるごと失敗する。理由は残す（`docs/rules/error-handling.md`）。
+        if let Err(err) = file.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+            eprintln!("Could not restrict the file to the owner: {err}");
+        }
     }
     Ok(file)
 }
