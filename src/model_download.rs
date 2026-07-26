@@ -431,7 +431,8 @@ pub(crate) mod catalog_checks {
     }
 
     /// 全カタログの登録簿。**種別を足したらここに 1 行足す**。下のテストが横断で一意性を見る。
-    const ALL_CATALOGS: &[&[ModelSpec]] = &[crate::whisper_model::CATALOG];
+    const ALL_CATALOGS: &[&[ModelSpec]] =
+        &[crate::whisper_model::CATALOG, crate::summary_model::CATALOG];
 
     /// 登録簿のカタログすべてが健全で、ID とファイル名は種別をまたいで一意
     /// （状態マップのキーと保存先が種別で混ざらないように）。

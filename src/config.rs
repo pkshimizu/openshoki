@@ -60,6 +60,23 @@ fn default_whisper_model() -> String {
     crate::whisper_model::DEFAULT_MODEL_ID.to_owned()
 }
 
+/// 既定の内蔵要約 LLM の ID（カタログの既定と同じ値。`summary_model::DEFAULT_MODEL_ID`）。
+fn default_summary_model() -> String {
+    crate::summary_model::DEFAULT_MODEL_ID.to_owned()
+}
+
+/// `summary_model` を寛容にデシリアライズする（`deserialize_whisper_model` と同じ方針）。
+fn deserialize_summary_model<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = toml::Value::deserialize(deserializer)?;
+    Ok(value
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(default_summary_model))
+}
+
 /// `whisper_model` を寛容にデシリアライズする。非文字列の手編集値は当該項目のみ既定へ丸め、
 /// 他の設定を巻き添えでファイル全体フォールバックさせない（`docs/rules/error-handling.md`）。
 /// カタログ外の文字列はそのまま保持し、使用時に既定へフォールバックする（`spec_for` 側）。
@@ -164,6 +181,24 @@ pub struct Config {
         deserialize_with = "deserialize_transcribe_language"
     )]
     pub transcribe_language: String,
+    /// 文字起こしが終わったら議事録要約（`summary.md`）を自動生成するか。オンデバイス LLM は
+    /// CPU・メモリの負荷が大きい（既定モデルで実行時 8GB 級）ためオプトインの既定 OFF。
+    /// 文字起こしの完了が前提なので、`auto_transcribe` が OFF なら要約も走らない。
+    #[serde(default)]
+    pub auto_summarize: bool,
+    /// 使用する内蔵要約 LLM の識別子（`summary_model::CATALOG` の `id`。既定は 7B）。
+    /// 設定画面の選択 UI はまだ無く、切り替えは config の手編集で行う（軽い 3B を選べる）。
+    /// カタログ外の手編集値は使用時に既定へフォールバックする。
+    #[serde(
+        default = "default_summary_model",
+        deserialize_with = "deserialize_summary_model"
+    )]
+    pub summary_model: String,
+    /// 要約 LLM のモデルファイル（GGUF）のパスの上書き。通常は未指定でよく、内蔵モデル
+    /// （カタログから自動ダウンロード）を使う。指定すると内蔵モデルより優先する
+    /// （上級者向け。config.toml の手編集のみで、設定 UI は無い。`whisper_model_path` と同じ）。
+    #[serde(default)]
+    pub summary_model_path: Option<PathBuf>,
 }
 
 /// `auto_stop_debounce_secs` の serde 既定値。項目を持たない旧 config でも既定 4 秒で読める。
@@ -205,6 +240,9 @@ impl Default for Config {
             whisper_model: default_whisper_model(),
             whisper_model_path: None,
             transcribe_language: default_transcribe_language(),
+            auto_summarize: false,
+            summary_model: default_summary_model(),
+            summary_model_path: None,
         }
     }
 }
@@ -318,6 +356,9 @@ mod tests {
             whisper_model: "base".to_owned(),
             whisper_model_path: Some(PathBuf::from("/tmp/models/ggml-base.bin")),
             transcribe_language: "ja".to_owned(),
+            auto_summarize: true,
+            summary_model: "qwen2.5-3b-instruct-q4-k-m".to_owned(),
+            summary_model_path: Some(PathBuf::from("/tmp/models/qwen.gguf")),
         };
         let text = toml::to_string_pretty(&config).expect("serialization should succeed");
         let restored: Config = toml::from_str(&text).expect("deserialization should succeed");
@@ -335,6 +376,9 @@ mod tests {
         assert_eq!(restored.whisper_model, config.whisper_model);
         assert_eq!(restored.whisper_model_path, config.whisper_model_path);
         assert_eq!(restored.transcribe_language, config.transcribe_language);
+        assert_eq!(restored.auto_summarize, config.auto_summarize);
+        assert_eq!(restored.summary_model, config.summary_model);
+        assert_eq!(restored.summary_model_path, config.summary_model_path);
     }
 
     #[test]
@@ -353,6 +397,25 @@ mod tests {
         assert!(restored.whisper_model_path.is_none());
         // 言語未指定は既定の英語になる（従来も whisper の既定言語が en のため実挙動は不変）。
         assert_eq!(restored.transcribe_language, "en");
+        // 要約の項目を持たない旧 config でも既定（OFF・7B・上書きなし）で読める。
+        assert!(!restored.auto_summarize);
+        assert_eq!(
+            restored.summary_model,
+            crate::summary_model::DEFAULT_MODEL_ID
+        );
+        assert!(restored.summary_model_path.is_none());
+    }
+
+    #[test]
+    fn deserialize_rounds_non_string_summary_model() {
+        // 非文字列の手編集値は当該項目のみ既定へ丸まり、他フィールドを巻き添えにしない。
+        let bad = "recording_dir = \"/tmp/shoki-summary\"\nsummary_model = true\n";
+        let restored: Config = toml::from_str(bad).expect("non-string should not fail the file");
+        assert_eq!(restored.recording_dir, PathBuf::from("/tmp/shoki-summary"));
+        assert_eq!(
+            restored.summary_model,
+            crate::summary_model::DEFAULT_MODEL_ID
+        );
     }
 
     #[test]

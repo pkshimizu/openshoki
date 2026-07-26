@@ -12,6 +12,8 @@ mod player;
 mod recorder;
 mod recordings;
 mod single_instance;
+mod summarize;
+mod summary_model;
 #[cfg(target_os = "macos")]
 mod system_audio;
 mod transcribe;
@@ -46,7 +48,7 @@ const BLINK_CYCLE_SECS: f32 = 2.0;
 /// 確定されないまま高さ 0 で表示される。初回表示時にこの値を明示してジオメトリを確定させる。
 /// 幅・高さは `ui/app-window.slint` の min/preferred と一致させること（片方だけ変えない）。
 const WINDOW_WIDTH: f32 = 420.0;
-const WINDOW_HEIGHT: f32 = 760.0;
+const WINDOW_HEIGHT: f32 = 840.0;
 /// 初回表示位置（画面左上からの暫定値）。中央寄せ等の調整は後続に回す。
 const WINDOW_X: f32 = 240.0;
 const WINDOW_Y: f32 = 160.0;
@@ -136,7 +138,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     ui.set_whisper_model_index(whisper_model::model_index(&config.borrow().whisper_model) as i32);
     ui.set_whisper_model_status(
-        selected_model_status_text(&config.borrow().whisper_model, &model_downloader).into(),
+        model_status_text(
+            whisper_spec(&config.borrow().whisper_model),
+            &model_downloader,
+        )
+        .into(),
+    );
+    // 議事録要約: トグルと、使う LLM の取得状況。モデルの選択 UI はまだ無い（設定
+    // `summary_model` の手編集で切り替える）ので、名前とサイズを状態行に出して
+    // 「何が・どれだけダウンロードされるのか」が分かるようにする。
+    ui.set_auto_summarize(config.borrow().auto_summarize);
+    ui.set_summary_model_status(
+        summary_model_status_text(&config.borrow(), &model_downloader).into(),
     );
     // 登録アプリの一覧を Slint のモデルで持ち、追加/削除で更新する。
     let app_list_model = Rc::new(slint::VecModel::<TriggerApp>::from(
@@ -247,6 +260,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         *config_for_transcribe.borrow_mut() = candidate;
     });
 
+    // 「議事録要約を自動生成」トグル: 永続化に成功してから反映する（自動文字起こしトグルと対称）。
+    // モデルは内蔵（初回の要約時に自動ダウンロード）なので、ここでは取得を始めない
+    // （数 GB あり、ON にしただけで落とし始めると帯域とディスクを黙って使う）。
+    let config_for_summarize = Rc::clone(&config);
+    let ui_for_summarize = ui.as_weak();
+    ui.on_toggle_auto_summarize(move |enabled| {
+        let Some(ui) = ui_for_summarize.upgrade() else {
+            return;
+        };
+        let mut candidate = config_for_summarize.borrow().clone();
+        candidate.auto_summarize = enabled;
+        if let Err(err) = candidate.save() {
+            eprintln!(
+                "Not changing the auto-summarize setting because saving the settings failed: {err}"
+            );
+            ui.set_auto_summarize(config_for_summarize.borrow().auto_summarize);
+            return;
+        }
+        *config_for_summarize.borrow_mut() = candidate;
+    });
+
     // 文字起こし言語の変更: ComboBox のインデックスをカタログの言語コードへ変換して永続化する。
     // Slint 側は先に選択位置を新値へ更新するため、保存失敗時は表示を保存済みの値へ戻す
     // （docs/rules/slint.md）。
@@ -305,9 +339,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 選択したモデルが未取得（または直近失敗）なら取得を開始する（取得済み・DL 中は
         // request_download 側が早期 return する）。
         downloader_for_model.request_download(spec);
-        ui.set_whisper_model_status(
-            selected_model_status_text(spec.id, &downloader_for_model).into(),
-        );
+        ui.set_whisper_model_status(model_status_text(spec, &downloader_for_model).into());
     });
 
     // 登録アプリの削除: 一覧のインデックスで設定とモデルから取り除く（永続化成功後に反映）。
@@ -375,9 +407,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "macos")]
     let app_monitor = app_audio_monitor::AppAudioMonitor::new();
 
+    // 議事録要約のバックグラウンドワーカー。文字起こしワーカーが成功時に投入する（設定
+    // `auto_summarize` が ON のときだけ依頼が添えられる）。文字起こしとは別スレッドだが、
+    // 投入が完了後なので whisper と LLM が同時に走ることはない。
+    let summarizer = summarize::SummarizeWorker::start(model_downloader.clone());
+
     // 文字起こしのバックグラウンドワーカー。設定 OFF の間はジョブが来ないだけで、常駐コストは
     // アイドルなスレッド 1 本のみ。起動失敗時は文字起こしだけが無効化される（録音は無関係）。
-    let transcriber = transcribe::TranscribeWorker::start(model_downloader.clone());
+    let transcriber =
+        transcribe::TranscribeWorker::start(model_downloader.clone(), summarizer.clone());
 
     // 録音停止後の後処理（極小音量の正規化→ミックス生成→文字起こし投入）を直列に行う
     // バックグラウンドワーカー。自動経路の文字起こしは後処理ワーカーが完了後に投入する
@@ -615,6 +653,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 model_id: config_ref.whisper_model.clone(),
                 model_override: config_ref.whisper_model_path.clone(),
                 language: config_ref.transcribe_language.clone(),
+                // 手動の再実行でも、設定 ON なら要約を作り直す（作り直さないと `summary.md` が
+                // 古い文字起こしのまま残り、内容が食い違う）。
+                summarize: summarize_job_for(&config_ref, &session.dir),
             });
             // 投入結果（通常は「文字起こし中」）を詳細ペインへ即反映し、次の tick を待つ間の
             // 2 連クリックによる多重投入を防ぐ。一覧行のドットは tick の差分更新に任せる。
@@ -632,6 +673,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let sessions_model = Rc::clone(&sessions_model);
         let player = Rc::clone(&player);
         let transcriber = transcriber.clone();
+        let summarizer = summarizer.clone();
         let rec_weak = recordings_ui.as_weak();
         recordings_ui.on_delete_session(move |index| {
             let Some(rec) = rec_weak.upgrade() else {
@@ -691,6 +733,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             sessions_model.remove(i);
             // 進行状況マップに残ったエントリを掃除する（削除済みセッションの記録を残さない）。
             transcriber.forget(&dir);
+            summarizer.forget(&dir);
             clear_recordings_selection(&rec);
         });
     }
@@ -968,10 +1011,16 @@ fn build_menu_event_handler(
         if let Some(ui) = ui.upgrade()
             && ui.window().is_visible()
         {
-            let status =
-                selected_model_status_text(&config.borrow().whisper_model, &model_downloader);
+            let status = model_status_text(
+                whisper_spec(&config.borrow().whisper_model),
+                &model_downloader,
+            );
             if ui.get_whisper_model_status() != status.as_str() {
                 ui.set_whisper_model_status(status.into());
+            }
+            let summary_status = summary_model_status_text(&config.borrow(), &model_downloader);
+            if ui.get_summary_model_status() != summary_status.as_str() {
+                ui.set_summary_model_status(summary_status.into());
             }
         }
     }
@@ -1186,12 +1235,31 @@ fn submit_post_processing(
             model_id: config_ref.whisper_model.clone(),
             model_override: config_ref.whisper_model_path.clone(),
             language: config_ref.transcribe_language.clone(),
+            summarize: summarize_job_for(&config_ref, session_dir),
         });
     postprocessor.submit(mixdown::PostProcessJob {
         session_dir: session_dir.to_path_buf(),
         saved: saved.to_vec(),
         transcribe,
     });
+}
+
+/// 文字起こしに添える議事録要約の依頼を組み立てる。設定 OFF なら `None`（要約は走らない）。
+/// 設定値はここでスナップショットし、処理中の設定変更の影響を受けない。
+///
+/// 要約は文字起こし結果を入力にするため、必ず文字起こしジョブへぶら下げる（成功時のみ
+/// `TranscribeWorker` が要約ワーカーへ投入する）。エンジンはいまオンデバイスのみ。
+fn summarize_job_for(
+    config: &Config,
+    session_dir: &std::path::Path,
+) -> Option<summarize::SummarizeJob> {
+    config.auto_summarize.then(|| summarize::SummarizeJob {
+        session_dir: session_dir.to_path_buf(),
+        engine: summarize::SummaryEngine::OnDevice,
+        model_id: config.summary_model.clone(),
+        model_override: config.summary_model_path.clone(),
+        language: config.transcribe_language.clone(),
+    })
 }
 
 /// 録音セッションを開始する。手動トグルと自動開始（登録アプリのマイク使用検知）で共用する。
@@ -1434,13 +1502,38 @@ fn trigger_app_row(trigger: &config::AppTrigger) -> TriggerApp {
     }
 }
 
-/// 設定で選択中の whisper モデルの取得状況を、設定画面の状態行テキストにする。
-/// カタログ外の手編集値は既定モデルの状況を表示する（表示位置のフォールバックと整合）。
-fn selected_model_status_text(
-    model_id: &str,
+/// 設定で選択中の whisper モデル。カタログ外の手編集値は既定モデルの状況を表示する
+/// （ComboBox の表示位置のフォールバックと整合）。
+fn whisper_spec(model_id: &str) -> &'static model_download::ModelSpec {
+    whisper_model::spec_for(model_id).unwrap_or_else(whisper_model::default_spec)
+}
+
+/// 議事録要約に使う LLM の取得状況を、設定画面の状態行テキストにする。
+///
+/// whisper と違いモデルの選択 UI が無いため、状態だけでなく**どのモデルか**も出す
+/// （数 GB のダウンロードが黙って始まらないように）。モデルパスを手で上書きしている場合は
+/// ダウンロードが起きないので、その旨だけを示す。
+fn summary_model_status_text(
+    config: &Config,
     downloader: &model_download::ModelDownloader,
 ) -> String {
-    let spec = whisper_model::spec_for(model_id).unwrap_or_else(|| whisper_model::default_spec());
+    if config.summary_model_path.is_some() {
+        return "Using the model file set in config.toml".to_owned();
+    }
+    let spec =
+        summary_model::spec_for(&config.summary_model).unwrap_or_else(summary_model::default_spec);
+    format!(
+        "{} — {}",
+        spec.display_name,
+        model_status_text(spec, downloader)
+    )
+}
+
+/// モデルの取得状況を、設定画面の状態行テキストにする（whisper / 要約 LLM で共用）。
+fn model_status_text(
+    spec: &'static model_download::ModelSpec,
+    downloader: &model_download::ModelDownloader,
+) -> String {
     match downloader.status_of(spec) {
         model_download::DownloadStatus::NotDownloaded => format!(
             // 未取得モデルは「選択した時点」または「次の文字起こし時」に自動取得される。
@@ -1480,8 +1573,8 @@ fn hide_dock_icon() {
 #[cfg(test)]
 mod tests {
     use super::{
-        TranscriptStatus, app_version_text, breathing_level, playback_progress,
-        seek_position_from_ratio, selected_model_status_text, transcript_display_status,
+        TranscriptStatus, app_version_text, breathing_level, model_status_text, playback_progress,
+        seek_position_from_ratio, summary_model_status_text, transcript_display_status,
         transcript_placeholder_text, transcript_status_text,
     };
     use crate::transcribe::TranscribeStatus;
@@ -1674,8 +1767,7 @@ mod tests {
         );
     }
 
-    /// サイン波の代表的な位相で、期待どおりの明度レベルになることを確認する。
-    /// 2 秒周期なら 0s→0.5, 0.5s(1/4)→1.0, 1.0s(1/2)→0.5, 1.5s(3/4)→0.0, 2.0s(1周)→0.5。
+    /// 取得状況テキストが 4 状態すべてを言い分けること（進捗の丸め・上限も含む）。
     #[test]
     fn model_status_text_covers_all_states() {
         let downloader = crate::model_download::ModelDownloader::new();
@@ -1688,10 +1780,7 @@ mod tests {
                 total: 100,
             },
         );
-        assert_eq!(
-            selected_model_status_text("large-v3", &downloader),
-            "Downloading… 25%"
-        );
+        assert_eq!(model_status_text(spec, &downloader), "Downloading… 25%");
 
         // Content-Length が実サイズより小さい異常時も 100% を超えない。
         downloader.set_status_for_test(
@@ -1701,30 +1790,58 @@ mod tests {
                 total: 100,
             },
         );
-        assert_eq!(
-            selected_model_status_text("large-v3", &downloader),
-            "Downloading… 100%"
-        );
+        assert_eq!(model_status_text(spec, &downloader), "Downloading… 100%");
 
         downloader.set_status_for_test(spec, crate::model_download::DownloadStatus::Downloaded);
-        assert_eq!(
-            selected_model_status_text("large-v3", &downloader),
-            "Downloaded"
-        );
+        assert_eq!(model_status_text(spec, &downloader), "Downloaded");
 
         downloader.set_status_for_test(
             spec,
             crate::model_download::DownloadStatus::Failed("boom".into()),
         );
         assert_eq!(
-            selected_model_status_text("large-v3", &downloader),
+            model_status_text(spec, &downloader),
             "Download failed: boom"
         );
 
         downloader.set_status_for_test(spec, crate::model_download::DownloadStatus::NotDownloaded);
         assert_eq!(
-            selected_model_status_text("large-v3", &downloader),
+            model_status_text(spec, &downloader),
             "Not downloaded — downloads automatically (2.9 GB)"
+        );
+    }
+
+    /// 要約 LLM の状態行は、モデルの選択 UI が無いぶん**どのモデルか**も示す。
+    /// 手編集でモデルパスを上書きしている場合はダウンロードが起きないので、その旨だけを出す。
+    #[test]
+    fn summary_model_status_text_names_the_model() {
+        let downloader = crate::model_download::ModelDownloader::new();
+        let spec = crate::summary_model::default_spec();
+        downloader.set_status_for_test(spec, crate::model_download::DownloadStatus::NotDownloaded);
+
+        let config = crate::config::Config::default();
+        assert_eq!(
+            summary_model_status_text(&config, &downloader),
+            "Qwen2.5 7B Instruct — Not downloaded — downloads automatically (4.4 GB)"
+        );
+
+        // カタログ外の手編集値は既定モデルの状況を出す（使用時のフォールバックと整合）。
+        let unknown = crate::config::Config {
+            summary_model: "no-such-model".to_owned(),
+            ..crate::config::Config::default()
+        };
+        assert_eq!(
+            summary_model_status_text(&unknown, &downloader),
+            summary_model_status_text(&config, &downloader)
+        );
+
+        let overridden = crate::config::Config {
+            summary_model_path: Some(std::path::PathBuf::from("/tmp/model.gguf")),
+            ..crate::config::Config::default()
+        };
+        assert_eq!(
+            summary_model_status_text(&overridden, &downloader),
+            "Using the model file set in config.toml"
         );
     }
 

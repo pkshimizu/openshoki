@@ -8,6 +8,15 @@ chrono = "0.4.45"
 cpal = "0.18.1"
 directories = "6.0.0"
 fs2 = "0.4.3"
+# 議事録要約のオンデバイス LLM（`src/summarize/on_device.rs`）。whisper-rs と同居できることは
+# #78 で確認済み（どちらも ggml を同梱するが、CPU 構成ではシンボルが衝突しない）。
+#
+# **このバージョンでは Metal が効かない（CPU 実行になる）**。macOS aarch64 では
+# `llama-cpp-sys-2/metal` がターゲット依存で有効になり `libggml-metal.a` もビルドされるが、
+# `libggml-base.a` が `ggml_backend_metal_reg` を参照しないためリンカがアーカイブごと落とし、
+# GPU デバイスが登録されない（`nm` で確認）。結果 `with_n_gpu_layers` は黙って無視される。
+# #78 の計測はすべて CPU 実行の値。GPU を使うならクレート側の対応が要る。
+llama-cpp-2 = "0.1.152"
 mp3lame-encoder = { version = "0.2.4", features = ["std"] }
 png = "0.18"
 rfd = "0.17.2"
@@ -26,20 +35,6 @@ ureq = "3"
 whisper-rs = "0.16.0"
 
 [dev-dependencies]
-# 議事録要約のオンデバイス LLM（#78 の検証スパイク、`examples/summary_probe.rs`）。
-# 本実装は #80 なので、まだ出荷バイナリへは入れない（dev-dependencies なので
-# `cargo build` では llama.cpp をリンクしない。`nm` で確認済み）。#80 で通常依存へ移す。
-# 代償: `cargo test` / `cargo clippy --all-targets` では feature 合成で llama.cpp が
-# CMake ビルドされ、コールドで約 1 分増える（CI はキャッシュが効くので通常は乗らない）。
-# `default-features = false` では減らせない: `common` は llama-cpp-sys-2 自身の default
-# 経由で戻るため、切っても再ビルドすら起きない（実測）。
-#
-# **このバージョンでは Metal が効かない（CPU 実行になる）**。macOS aarch64 では
-# `llama-cpp-sys-2/metal` がターゲット依存で有効になり `libggml-metal.a` もビルドされるが、
-# `libggml-base.a` が `ggml_backend_metal_reg` を参照しないためリンカがアーカイブごと落とし、
-# GPU デバイスが登録されない（`nm` で確認）。結果 `with_n_gpu_layers` は黙って無視される。
-# #78 の計測はすべて CPU 実行の値。#80 で Metal を使うならクレート側の対応が要る。
-llama-cpp-2 = "0.1.152"
 # UI 操作（クリック・ドラッグ）を実際のポインタイベントで検証するテストバックエンド
 # （`tests/ui_*.rs`。使い方は `docs/rules/slint.md`）。テスト専用で出荷バイナリには入らない。
 # `i-slint-core` を厳密指定で依存するため、`slint` / `slint-build` とバージョンを揃えること。

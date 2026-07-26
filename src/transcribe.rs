@@ -51,6 +51,10 @@ pub struct TranscribeJob {
     pub model_override: Option<PathBuf>,
     /// 認識言語（whisper の言語コード。例: `en` / `ja`）。`auto` は自動判定。
     pub language: String,
+    /// 文字起こしが**全音源成功した**ときに続けて投入する議事録要約の依頼（設定
+    /// `auto_summarize` が OFF なら `None`）。要約は文字起こし結果を入力にするため、
+    /// ここで連結して直列に走らせる（whisper と LLM の CPU・メモリのピークを重ねない）。
+    pub summarize: Option<crate::summarize::SummarizeJob>,
 }
 
 /// セッション単位の文字起こしの進行状況。Recordings ウィンドウの状態表示に使う。
@@ -90,7 +94,14 @@ impl TranscribeWorker {
     /// スレッドは意図的に join しない（detach）: 文字起こしは数分かかりうるため、終了時に
     /// join するとアプリの終了がブロックされる。常駐終了時に処理中のジョブは中断される
     /// （ベストエフォート。#30 のスコープ）。
-    pub fn start(downloader: crate::model_download::ModelDownloader) -> Self {
+    ///
+    /// `summarizer` は文字起こし成功後の要約投入に使う（このワーカーが所有し、停止フックから
+    /// 直接投入しない。文字起こしの完了を待たずに要約を始めないための意図的な結合で、
+    /// `PostProcessWorker` が `TranscribeWorker` を持つのと同じ形）。
+    pub fn start(
+        downloader: crate::model_download::ModelDownloader,
+        summarizer: crate::summarize::SummarizeWorker,
+    ) -> Self {
         // whisper.cpp / GGML が stderr へ出す冗長な内部ログを止める（ログ backend の feature を
         // 有効にしていないため、フック先が無く事実上の無効化になる）。複数回呼んでも安全。
         whisper_rs::install_logging_hooks();
@@ -101,7 +112,7 @@ impl TranscribeWorker {
             .name("transcribe-worker".into())
             .spawn(move || {
                 // 送信側（アプリ本体）が落ちてチャネルが閉じたら自然に終了する。
-                while let Ok(job) = rx.recv() {
+                while let Ok(mut job) = rx.recv() {
                     // 処理開始でも「文字起こし中」を入れ直す。同一セッションが複数キューされて
                     // いる場合、先行ジョブの完了（Done/Failed）が後続の処理中表示を上書きした
                     // ままにならないようにする（単一ワーカーの逐次処理なので、先行完了→後続
@@ -109,14 +120,29 @@ impl TranscribeWorker {
                     lock_status(&status_for_worker)
                         .insert(job.session_dir.clone(), TranscribeStatus::Transcribing);
                     let outcome = run_job(&job, &downloader);
-                    let mut map = lock_status(&status_for_worker);
-                    match outcome {
-                        // 対象なしで何もしなかった場合は「投入済み」の痕跡を消し、
-                        // 表示を JSON の有無ベース（前/完了）へ戻す。
-                        JobOutcome::Skipped => map.remove(&job.session_dir),
-                        JobOutcome::Done => map.insert(job.session_dir, TranscribeStatus::Done),
-                        JobOutcome::Failed => map.insert(job.session_dir, TranscribeStatus::Failed),
+                    // 要約は「全音源の文字起こしに成功した」ときだけ続ける。部分的に失敗した
+                    // 文字起こしから議事録を作ると、欠けたまま完成品に見えてしまう。
+                    let summarize = match outcome {
+                        JobOutcome::Done => job.summarize.take(),
+                        JobOutcome::Failed | JobOutcome::Skipped => None,
                     };
+                    {
+                        let mut map = lock_status(&status_for_worker);
+                        match outcome {
+                            // 対象なしで何もしなかった場合は「投入済み」の痕跡を消し、
+                            // 表示を JSON の有無ベース（前/完了）へ戻す。
+                            JobOutcome::Skipped => map.remove(&job.session_dir),
+                            JobOutcome::Done => map.insert(job.session_dir, TranscribeStatus::Done),
+                            JobOutcome::Failed => {
+                                map.insert(job.session_dir, TranscribeStatus::Failed)
+                            }
+                        };
+                    }
+                    // 状態マップのロックを放してから投入する（要約ワーカー側も同じ流儀で
+                    // 自分の状態マップを触るため、ロックの入れ子を作らない）。
+                    if let Some(summarize_job) = summarize {
+                        summarizer.submit(summarize_job);
+                    }
                 }
             });
         match spawned {
@@ -502,12 +528,32 @@ fn write_transcription(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::summarize::{SummarizeWorker, SummaryEngine};
+
+    /// テスト用の要約ワーカー。ジョブが渡ったかどうかは状態マップの有無で判定する。
+    fn summarize_worker() -> SummarizeWorker {
+        SummarizeWorker::start(crate::model_download::ModelDownloader::new())
+    }
+
+    /// テスト用の要約依頼（存在しないモデル上書きパスなので、実行されても即失敗する）。
+    fn summarize_job(session_dir: &Path) -> crate::summarize::SummarizeJob {
+        crate::summarize::SummarizeJob {
+            session_dir: session_dir.to_path_buf(),
+            engine: SummaryEngine::OnDevice,
+            model_id: crate::summary_model::DEFAULT_MODEL_ID.to_owned(),
+            model_override: Some(session_dir.join("missing-model.gguf")),
+            language: "en".to_owned(),
+        }
+    }
 
     /// 手動再実行・状態表示の土台となる状態マップのライフサイクルを、whisper モデルなしで
     /// 検証する。存在しないモデル上書きパスを渡すと、ネットワークに触れず即 Failed になる。
     #[test]
     fn submit_tracks_status_until_failure() {
-        let worker = TranscribeWorker::start(crate::model_download::ModelDownloader::new());
+        let worker = TranscribeWorker::start(
+            crate::model_download::ModelDownloader::new(),
+            summarize_worker(),
+        );
         let dir = std::env::temp_dir().join(format!("shoki-status-{}", std::process::id()));
         worker.submit(TranscribeJob {
             session_dir: dir.clone(),
@@ -515,6 +561,7 @@ mod tests {
             model_id: "small".to_owned(),
             model_override: Some(dir.join("missing-model.bin")),
             language: "en".to_owned(),
+            summarize: None,
         });
         // 投入直後は「文字起こし中」（ワーカーが速ければもう Failed でもよい）。
         assert!(matches!(
@@ -535,16 +582,34 @@ mod tests {
     }
 
     /// 対象音源なし（Skipped）の投入は状態を残さない（「文字起こし中」のまま固まらない）。
+    /// あわせて、成功していない文字起こしから要約が始まらないことを確認する。
     #[test]
     fn submit_with_no_audio_clears_status() {
-        let worker = TranscribeWorker::start(crate::model_download::ModelDownloader::new());
+        let summarizer = summarize_worker();
+        let worker = TranscribeWorker::start(
+            crate::model_download::ModelDownloader::new(),
+            summarizer.clone(),
+        );
         let dir = std::env::temp_dir().join(format!("shoki-skip-{}", std::process::id()));
+        // 文字起こし JSON を置いておく。こうしておくと、もし要約が投入されてしまった場合は
+        // 「対象なしで状態を消す」経路ではなく Failed（＝消えない痕跡）に落ちるので、
+        // 下の「投入されていない」判定がタイミングに左右されなくなる。
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("the temp session dir should be creatable");
+        std::fs::write(
+            dir.join("mic.json"),
+            r#"{"segments":[{"start":0.0,"end":1.0,"text":"hello"}]}"#,
+        )
+        .expect("the transcript should be writable");
+
         worker.submit(TranscribeJob {
             session_dir: dir.clone(),
             audio_paths: Vec::new(),
             model_id: "small".to_owned(),
             model_override: None,
             language: "en".to_owned(),
+            // 要約の依頼は添えるが、文字起こしが成功していないので投入されてはいけない。
+            summarize: Some(summarize_job(&dir)),
         });
         for _ in 0..200 {
             if worker.status_of(&dir).is_none() {
@@ -553,6 +618,18 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert_eq!(worker.status_of(&dir), None);
+        // 要約ワーカーは触られていない（投入されていれば submit が同期的に Summarizing を
+        // 記録し、その後 Failed になる。どちらも消えない）。状態が「付かないこと」の確認なので、
+        // 文字起こし側の完了から少しだけ猶予を置いて見る。
+        for _ in 0..20 {
+            assert_eq!(
+                summarizer.status_of(&dir),
+                None,
+                "a skipped transcription must not start a summary"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -714,6 +791,7 @@ mod tests {
                 model_id: crate::whisper_model::DEFAULT_MODEL_ID.to_owned(),
                 model_override: Some(PathBuf::from(model_path)),
                 language: "en".to_owned(),
+                summarize: None,
             },
             &crate::model_download::ModelDownloader::new(),
         );

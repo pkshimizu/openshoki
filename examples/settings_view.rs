@@ -53,11 +53,25 @@ fn main() {
     win.set_auto_record_app(true);
     win.set_auto_stop_debounce_secs(4);
     win.set_app_list(ModelRc::from(Rc::new(VecModel::from(sample_apps()))));
+    // Transcription セクションは従属コントロールが多く、下端の余白を食い潰しやすい。
+    // 状態行は実アプリで出る最長の文言（未取得＋サイズ）で見る。
+    win.set_auto_transcribe(true);
+    win.set_transcribe_languages(ModelRc::from(Rc::new(VecModel::from(vec![
+        slint::SharedString::from("Japanese"),
+    ]))));
+    win.set_whisper_models(ModelRc::from(Rc::new(VecModel::from(vec![
+        slint::SharedString::from("Small — 465 MB — balanced speed and accuracy"),
+    ]))));
+    win.set_whisper_model_status("Not downloaded — downloads automatically (465 MB)".into());
+    win.set_auto_summarize(true);
+    win.set_summary_model_status(
+        "Qwen2.5 7B Instruct — Not downloaded — downloads automatically (4.4 GB)".into(),
+    );
 
     win.window()
         .set_position(slint::LogicalPosition::new(60.0, 60.0));
     // 実アプリと同じ寸法で見る（`src/main.rs` の WINDOW_WIDTH/HEIGHT と一致させること）。
-    win.window().set_size(slint::LogicalSize::new(420.0, 760.0));
+    win.window().set_size(slint::LogicalSize::new(420.0, 840.0));
     win.show()
         .expect("showing the window should succeed in this verification binary");
 

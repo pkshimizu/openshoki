@@ -48,6 +48,17 @@
   未取得のモデルは選択時に Hugging Face から自動ダウンロードしてデータディレクトリへ保存・
   再利用します（SHA-256 検証つき。進捗は設定画面に表示）。通信はこのダウンロード（受信）のみで、
   音声や文字起こし結果を送信することはありません。
+- **議事録の自動生成（オプトイン）**: 文字起こしが終わると、ローカルの llama.cpp で議事録
+  Markdown（議事概要・議題内容・決定事項・アクションアイテム）を生成し、セッションディレクトリへ
+  `summary.md` として保存します（文字起こしを外部送信しません）。設定画面のトグルで有効化します
+  （文字起こしの結果を使うため、自動文字起こしが ON のときだけ動きます）。要約の言語は認識言語の
+  設定に追従します。モデルは Qwen2.5 7B Instruct（Q4_K_M、4.4GB）で、初回の生成時に Hugging Face
+  から自動ダウンロードします（whisper と同じ SHA-256 検証つき）。**CPU で動くため 4 分の会議で
+  1 分弱・実行時 8GB 前後のメモリを使います**。長い会議はチャンクに分けた 2 段要約になり、
+  そのぶん時間がかかります。軽さを優先したい場合は、設定ファイル（`config.toml`）の
+  `summary_model` を `qwen2.5-3b-instruct-q4-k-m` にすると 3B（2.0GB）を使えます
+  （速度とメモリは半分ほどですが、細部を取り違えることがあります）。
+  生成した `summary.md` の表示は今後の対応です。
 - **録音の一覧と再生**: メニューの「Recordings…」から、録音済みセッションを新しい順に一覧し、
   選んで再生（Play / Pause / Stop、経過/全体時間の表示）できます。マイクとシステム音声の両方が
   あるセッションは、ミックスして同時に再生します。再生バーはクリックした位置へ再生位置が移動し、
@@ -83,8 +94,8 @@
 
 - **Rust ツールチェーン**（edition 2024 を使うため Rust 1.85 以降）。
 - **C コンパイラ**: `mp3lame-encoder` が libmp3lame をビルドするために必要です。
-- **CMake**: `whisper-rs` が whisper.cpp を、`llama-cpp-2`（検証プローブ用の dev-dependency）が
-  llama.cpp をビルドするために必要です（`brew install cmake`）。
+- **CMake**: `whisper-rs` が whisper.cpp を、`llama-cpp-2` が llama.cpp をビルドするために
+  必要です（`brew install cmake`）。どちらもソースからビルドするため、初回ビルドは数分かかります。
 - **macOS**: 安定版の Xcode コマンドラインツール。ScreenCaptureKit の Swift ブリッジの
   ビルド・リンクに使います（ベータ版 Xcode では Swift 後方互換ライブラリを解決できず
   リンクに失敗することがあります）。
@@ -136,8 +147,11 @@ shoki/
     ├── system_audio.rs   macOS のシステム音声キャプチャ（ScreenCaptureKit）
     ├── transcribe.rs     録音停止後の自動文字起こし（whisper.cpp、バックグラウンド）
     ├── transcript.rs     文字起こし JSON の読み込みと mic／system の時刻順マージ（表示用）
+    ├── summarize.rs      文字起こしから議事録（summary.md）を生成（バックグラウンド）
+    │   └── on_device.rs  議事録生成のオンデバイス実装（llama.cpp）
     ├── model_download.rs 検証つきモデルダウンロードの共有基盤（SHA-256・原子的配置・状態管理）
     ├── whisper_model.rs  内蔵 whisper モデルのカタログ（選べるモデルの一覧）
+    ├── summary_model.rs  議事録要約 LLM のカタログ（選べるモデルの一覧）
     ├── single_instance.rs 多重起動を防ぐ排他ロック（起動時に取得）
     └── config.rs         設定（保存先など）の読み込み・保存（TOML）
 ```
@@ -145,7 +159,8 @@ shoki/
 主な依存: GUI に [Slint](https://slint.dev/)、トレイ常駐に `tray-icon`、マイク取得に `cpal`、
 MP3 エンコードに `mp3lame-encoder`、再生に `rodio`、設定の永続化に `directories` / `serde` / `toml`、
 多重起動防止に `fs2`、
-文字起こしに `whisper-rs`（whisper.cpp）/ `symphonia`（MP3 デコード）/ `rubato`（リサンプル）。
+文字起こしに `whisper-rs`（whisper.cpp）/ `symphonia`（MP3 デコード）/ `rubato`（リサンプル）、
+議事録要約に `llama-cpp-2`（llama.cpp）。
 macOS では `screencapturekit` と `objc2` 系を使います。
 
 ## 現状と今後
