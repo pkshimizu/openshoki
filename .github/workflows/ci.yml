@@ -39,7 +39,53 @@ jobs:
     # macOS 優先のアプリで objc2 等の macOS 依存を含むため、macOS ランナーで検証する。
     runs-on: macos-latest
     steps:
+      # アイコン生成物の同期検査（下記）で base との差分を見るため、履歴ごと取得する
+      # （リポジトリは小さく、全履歴でも 10MB 未満）。
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # アイコン生成物の同期検査。`assets/icon/mark.svg`（形の正）を変えたのに生成物を再生成し
+      # 忘れると、メニューバーのアイコンだけ古い形のまま出荷される（tray.png は include_bytes!
+      # でバイナリに入る）。検査はラスタライズと actool を伴うので、コミット済みの生成物と同じ
+      # macOS 上で行う（このジョブ）。アイコン資産に触れた変更のときだけ走らせる（毎回
+      # brew install すると全 PR が遅くなる）。
+      #
+      # **この 3 ステップは下の「安定版 Xcode を選択」より前に置くこと**: Icon Composer 形式の
+      # `.icon` は Xcode 26 以降の actool でないと扱えず、Xcode 16 を選んだ後だと .icns の生成に
+      # 失敗する。Rust のビルドより先に置くのは、アイコンだけの変更を早く落とすため。
+      - name: アイコン資産の変更有無を判定
+        id: icons_changed
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          base="$BASE_SHA"
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            echo "比較元が取れないため検査する（ブランチ作成直後など）。"
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # パイプを使わず pathspec で判定する（`git diff | grep -q` は grep の早期終了で
+          # git が SIGPIPE 死し、pipefail のため「変更なし」と誤判定する）。
+          # ci.yml 自身も対象に含める（この検査を編集した PR で自己検証できるように）。
+          if git diff --quiet "$base" HEAD -- \
+               assets/icon scripts/generate-icons.sh scripts/check-icons.sh \
+               .github/workflows/ci.yml; then
+            echo "アイコン資産に変更が無いため検査をスキップする。"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "アイコン資産に変更があるため検査する。"
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: 検査に使うツールを用意（rsvg-convert / magick）
+        if: steps.icons_changed.outputs.run == 'true'
+        run: |
+          for formula in librsvg imagemagick; do
+            brew list "$formula" >/dev/null 2>&1 || brew install "$formula"
+          done
+      - name: アイコン生成物がマスターと一致するか
+        if: steps.icons_changed.outputs.run == 'true'
+        run: ./scripts/check-icons.sh
       # ランナー既定の Xcode がベータ版だと Swift 後方互換ライブラリ
       # （libswiftCompatibilityConcurrency.a・libswiftCompatibility56.a）を含まないことがあり、
       # screencapturekit / apple-* が Swift ブリッジに埋め込む force-load シンボルを

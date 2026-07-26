@@ -13,27 +13,61 @@
 # 生成物はコミットする（ビルド時生成にしない）。`src/tray.rs` は tray.png を include_bytes! で
 # 埋め込むため、資産を変えたらこのスクリプトを実行して差分をコミットすること。
 #
-# 必要なツール: Xcode（xcrun actool）、rsvg-convert、magick（ImageMagick）
+# 必要なツール: Xcode 26 以降（xcrun actool。Icon Composer 形式の .icon を扱えるバージョン）、
+#               rsvg-convert、magick（ImageMagick）
 set -euo pipefail
 
 # --skip-appicon: actool を使う工程（Assets.car / .icns）を飛ばし、決定的に再現できる生成物
-# （.icon の色違いレイヤーと tray.png）だけを作り直す。マスターと生成物のズレを
-# `git diff --exit-code` で検査したいときに使う（Assets.car は毎回バイト列が変わるため）。
+# （.icon の色違いレイヤーと tray.png）だけを作り直す。マスターと生成物のズレを検査したいとき
+# （`scripts/check-icons.sh`）に使う。Assets.car は入力が同じでも毎回バイト列が変わるため。
+# --out-dir DIR: 生成物をリポジトリではなく DIR 配下（同じ相対パス）へ書き出す。作業ツリーを
+# 汚さずに再生成して比べたいときに使う。
 skip_appicon=false
-for arg in "$@"; do
-  case "$arg" in
-    --skip-appicon) skip_appicon=true ;;
-    *) echo "Unknown option: $arg (usage: $0 [--skip-appicon])" >&2; exit 1 ;;
+out_root=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --skip-appicon) skip_appicon=true; shift ;;
+    --out-dir)
+      # 値の指定漏れ（次のフラグを食う・空文字）をここで弾く。
+      case "${2-}" in
+        '' | -*)
+          echo "--out-dir requires a directory" >&2
+          exit 1
+          ;;
+      esac
+      # 呼び出し元の cwd 基準で解釈する（この後 repo_root へ cd するため、相対のままだと
+      # リポジトリ内に書いてしまう）。
+      mkdir -p -- "$2"
+      out_root="$(cd -- "$2" && pwd)"
+      shift 2 ;;
+    *) echo "Unknown option: $1 (usage: $0 [--skip-appicon] [--out-dir DIR])" >&2; exit 1 ;;
   esac
 done
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
+# --out-dir が無ければリポジトリへ書く。以降は絶対パスで統一する（「リポジトリへ書いたか」を
+# 出力先の比較だけで判定できるようにする）。
+out_root="${out_root:-$repo_root}"
+
+# ログ表示用。リポジトリ内へ書くときは相対パスで見せる（同じ行に絶対と相対が混ざらないように）。
+display_path() {
+  case "$1" in
+    "$repo_root"/*) printf '%s' "${1#"$repo_root"/}" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
 
 icon_master="assets/icon/openshoki.icon"
 mark_svg="assets/icon/mark.svg"
 generated_dir="assets/icon/generated"
 tray_png="assets/icon/tray.png"
+
+# 出力先（--out-dir を付けるとリポジトリ外の同じ相対パスへ出す）。
+layers_out="$out_root/$icon_master/Assets"
+generated_out="$out_root/$generated_dir"
+tray_out="$out_root/$tray_png"
+mkdir -p "$layers_out" "$(dirname "$tray_out")"
 
 # 一画の色違い（.icon のレイヤー）。形は mark.svg 1 本に集約し、色だけを差し替えて生成する
 # （3 つの SVG に同じパスを複製すると、形を変えたときにアプリアイコンとメニューバーがずれる）。
@@ -92,31 +126,39 @@ tmp_dir="$(mktemp -d -t openshoki-icons-XXXXXX)"
 trap 'rm -rf "$tmp_dir"' EXIT
 
 echo "Generating the stroke layers from $mark_svg"
-generate_mark_layer "$icon_master/Assets/mark-ink.svg" "$ink_color"
-generate_mark_layer "$icon_master/Assets/mark-ink-on-dark.svg" "$ink_on_dark_color"
+generate_mark_layer "$layers_out/mark-ink.svg" "$ink_color"
+generate_mark_layer "$layers_out/mark-ink-on-dark.svg" "$ink_on_dark_color"
 
 if [ "$skip_appicon" = true ]; then
-  echo "Skipping $generated_dir (--skip-appicon)"
+  echo "Skipping $(display_path "$generated_out") (--skip-appicon)"
 else
-  echo "Generating $generated_dir from $icon_master"
+  echo "Generating $(display_path "$generated_out") from $icon_master"
   # actool は .icon から Tahoe 用の Assets.car と旧 macOS 用の .icns を同時に書き出す。
   # .icns を ictool で直接書き出すと Tahoe 規定の余白が入らず大きすぎる見た目になるため、
   # 必ず actool 経由で作る。まず一時ディレクトリへ出し、成功したときだけ差し替える
   # （失敗してコミット済みの生成物が消えた状態を残さない）。
-  mkdir -p "$tmp_dir/appicon"
-  xcrun actool "$icon_master" --compile "$tmp_dir/appicon" \
+  # actool には「いま生成したレイヤー」を渡す。マスターの .icon をそのまま渡すと、--out-dir を
+  # 使ったときにリポジトリ側の古いレイヤーからアプリアイコンが作られてしまう。
+  # ディレクトリ名は --app-icon の名前と一致させる必要があるため openshoki.icon にする。
+  staged="$tmp_dir/openshoki.icon"
+  mkdir -p "$staged" "$tmp_dir/appicon"
+  # マスターを丸ごと複製してから、いま生成したレイヤーで上書きする（中身を列挙すると、
+  # .icon にレイヤーを足したときにコピー漏れで actool が謎のエラーになる）。
+  cp -R "$icon_master/." "$staged/"
+  cp "$layers_out/mark-ink.svg" "$layers_out/mark-ink-on-dark.svg" "$staged/Assets/"
+  xcrun actool "$staged" --compile "$tmp_dir/appicon" \
     --output-format human-readable-text --notices --warnings --errors \
     --output-partial-info-plist /dev/null \
     --app-icon openshoki --include-all-app-icons \
     --enable-on-demand-resources NO --development-region en \
     --target-device mac --minimum-deployment-target 13.0 --platform macosx
-  mkdir -p "$generated_dir"
+  mkdir -p "$generated_out"
   # ファイル単位で差し替える（生成物は常にこの 2 つ。先にディレクトリを消すと、cp が失敗した
   # ときにコミット済みの生成物が消えたまま残る）。
-  mv "$tmp_dir/appicon/Assets.car" "$tmp_dir/appicon/openshoki.icns" "$generated_dir/"
+  mv "$tmp_dir/appicon/Assets.car" "$tmp_dir/appicon/openshoki.icns" "$generated_out/"
 fi
 
-echo "Generating $tray_png from $mark_svg"
+echo "Generating $(display_path "$tray_out") from $mark_svg"
 tmp_png="$tmp_dir/mark.png"
 rsvg-convert -w 1024 -h 1024 "$mark_svg" -o "$tmp_png"
 # 余白をトリムしてから 36x36 の中へ収める（縦横どちらが長くてもはみ出させない）。RGB は黒のまま
@@ -127,14 +169,14 @@ magick "$tmp_png" -trim +repage \
   -resize "$((tray_size - tray_margin * 2))x$((tray_size - tray_margin * 2))" \
   -background none -gravity center -extent "${tray_size}x${tray_size}" \
   -define png:color-type=6 -strip "$tmp_tray"
-mv "$tmp_tray" "$tray_png"
+mv "$tmp_tray" "$tray_out"
 
 echo "Done:"
 if [ "$skip_appicon" = false ]; then
-  ls -1 "$generated_dir" | sed 's/^/  /'
+  ls -1 "$generated_out" | sed 's/^/  /'
 fi
-echo "  $tray_png ($(magick identify -format '%wx%h %[bit-depth]bit %[channels]' "$tray_png"))"
-if [ "$skip_appicon" = false ]; then
+echo "  $(display_path "$tray_out") ($(magick identify -format '%wx%h %[bit-depth]bit %[channels]' "$tray_out"))"
+if [ "$skip_appicon" = false ] && [ "$out_root" = "$repo_root" ]; then
   # actool の Assets.car は入力が同じでも毎回バイト列が変わる（実測）。マスターを変えていない
   # のに差分が出たときは戻してよい、と分かるようにしておく。
   echo
