@@ -35,11 +35,13 @@ fn main() {
 mod probe {
     use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::{OsStr, c_char, c_int, c_void};
+    use std::fs::File;
     use std::mem::size_of;
     use std::os::unix::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
     use std::ptr::NonNull;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
     use objc2_app_kit::NSRunningApplication;
@@ -55,19 +57,24 @@ mod probe {
         NSURLBookmarkResolutionOptions,
     };
 
-    /// 出力バッファ。`--report <path>` を付けたときは、標準出力と同じ内容をここへ溜めてから書き出す。
-    /// LaunchServices（`open`）経由で起動すると標準出力が捨てられるため、TCC がアプリ本体を
-    /// 識別する起動方法でも結果を回収できるようにする。
-    static REPORT: Mutex<String> = Mutex::new(String::new());
+    /// `--report <path>` を指定したときの追記先。LaunchServices（`open`）経由で起動すると標準出力が
+    /// 捨てられるため、TCC がアプリ本体を識別する起動方法でも結果を回収できるようにする。
+    ///
+    /// 溜めずに 1 行ずつ書いて flush する。サンドボックス違反で殺される・途中でクラッシュする、
+    /// といったこのプローブが一番見たい失敗モードで、そこまでの出力が失われないため。
+    static REPORT: Mutex<Option<File>> = Mutex::new(None);
 
-    /// `println!` と同じ書式で、標準出力とレポートバッファの両方へ書く。
-    macro_rules! say {
+    /// `println!` と同じ書式で、標準出力と（開いていれば）レポートファイルの両方へ書く。
+    macro_rules! emit {
         ($($arg:tt)*) => {{
             let line = format!($($arg)*);
             println!("{line}");
-            if let Ok(mut report) = REPORT.lock() {
-                report.push_str(&line);
-                report.push('\n');
+            if let Ok(mut report) = REPORT.lock()
+                && let Some(file) = report.as_mut()
+            {
+                use std::io::Write;
+                let _ = writeln!(file, "{line}");
+                let _ = file.flush();
             }
         }};
     }
@@ -76,17 +83,21 @@ mod probe {
     const OS_STATUS_OK: i32 = 0;
     /// ScreenCaptureKit のサンプルが届くのを待つ上限。届かなければ「開始はできたがサンプル無し」と記録する。
     const AUDIO_WAIT: Duration = Duration::from_secs(3);
+    /// マイクを開いてから走査するまでの待ち。CoreAudio がプロセスオブジェクトへ反映するまで間があり、
+    /// 即座に走査すると自分自身が「マイク入力中」に乗らない。
+    const MIC_SETTLE: Duration = Duration::from_millis(1500);
 
-    /// 解決を試みる 1 プロセス。CoreAudio 由来の母集団だけ `running_input` / `ca_bundle` を持つ
-    /// （`--all-processes` の母集団は CoreAudio を経由しないため両方 `None`）。
-    struct ProcessSample {
+    /// 解決を試みる 1 プロセス。CoreAudio 由来の母集団だけ `running_input` /
+    /// `core_audio_bundle_id` を持つ（`--all-processes` の母集団は CoreAudio を経由しないため
+    /// 両方 `None`）。
+    struct ProcessEntry {
         pid: i32,
         running_input: Option<bool>,
-        ca_bundle: Option<String>,
+        core_audio_bundle_id: Option<String>,
     }
 
     /// 1 プロセスぶんの解決結果。private 方式と公開 API 方式を横並びで比べるための行。
-    struct Resolution {
+    struct ResolvedProcess {
         pid: i32,
         /// 実行ファイルのパス（`proc_pidpath`）。取得できなければ `None`。
         exec_path: Option<PathBuf>,
@@ -95,7 +106,7 @@ mod probe {
         /// `NSRunningApplication` が直接返すバンドル ID（ヘルパーでは `None` になりがち）。
         direct: Option<String>,
         /// 公開 API 案 3: CoreAudio 自身が持つ `kAudioProcessPropertyBundleID`。CoreAudio 由来の行だけ `Some`。
-        ca_bundle: Option<String>,
+        core_audio_bundle_id: Option<String>,
         /// private: responsible pid → バンドル ID。
         responsible: Option<String>,
         /// 公開 API 案 1: 実行パスの**外側**の `.app` → バンドル ID。
@@ -104,28 +115,41 @@ mod probe {
         by_ppid: Option<String>,
     }
 
-    impl Resolution {
-        /// 「そのプロセスをどのアプリに帰属させるか」の最終値。本体プロセスは直接のバンドル ID で
-        /// 足りるため、`app_audio_monitor::input_running_bundle_ids` と同じく直接 → 親の順で見る。
-        fn effective(direct: &Option<String>, parent: &Option<String>) -> Option<String> {
-            direct.clone().or_else(|| parent.clone())
+    impl ResolvedProcess {
+        /// 「そのプロセスをどのアプリに帰属させるか」の候補集合。
+        ///
+        /// 本体の `app_audio_monitor::input_running_bundle_ids` は、直接のバンドル ID と親から
+        /// 解決したバンドル ID の**両方**を集合へ入れて照合する（どちらか片方に畳まない）。
+        /// 方式の比較もそれに揃えないと、直接の ID が取れる行で両辺が自明に一致してしまい、
+        /// 本体が実際に使っている親解決の経路を検証できない。
+        fn ids(parts: [&Option<String>; 3]) -> BTreeSet<String> {
+            parts.iter().filter_map(|part| (*part).clone()).collect()
         }
 
-        fn private_effective(&self) -> Option<String> {
-            Self::effective(&self.direct, &self.responsible)
+        /// private 方式（現行実装）。
+        fn private_ids(&self) -> BTreeSet<String> {
+            Self::ids([&self.direct, &self.responsible, &None])
         }
 
-        fn path_effective(&self) -> Option<String> {
-            Self::effective(&self.direct, &self.by_path)
+        /// 公開 API 案 1（`proc_pidpath` の外側 `.app`）。
+        fn path_ids(&self) -> BTreeSet<String> {
+            Self::ids([&self.direct, &self.by_path, &None])
         }
 
-        fn ppid_effective(&self) -> Option<String> {
-            Self::effective(&self.direct, &self.by_ppid)
+        /// 公開 API 案 2（親 PID 辿り）。
+        fn ppid_ids(&self) -> BTreeSet<String> {
+            Self::ids([&self.direct, &self.by_ppid, &None])
         }
 
-        /// 案 3 は単独で「そのオーディオプロセスのアプリ」を返すので、直接のバンドル ID と併用しない。
-        fn ca_effective(&self) -> Option<String> {
-            self.ca_bundle.clone()
+        /// 公開 API 案 3（CoreAudio が持つバンドル ID）。private 側と同じ形にするため、
+        /// こちらも直接のバンドル ID と併せた集合で比べる。
+        fn core_audio_ids(&self) -> BTreeSet<String> {
+            Self::ids([&self.direct, &self.core_audio_bundle_id, &None])
+        }
+
+        /// 公開 API を全部併用したときの集合。置き換え可否の判定はこれと private の比較で行う。
+        fn public_ids(&self) -> BTreeSet<String> {
+            Self::ids([&self.direct, &self.by_path, &self.core_audio_bundle_id])
         }
     }
 
@@ -143,7 +167,9 @@ mod probe {
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join("mas-probe-bookmark.bin"));
         let folder = value_of(&args, "--folder").map(PathBuf::from);
-        let report_file = value_of(&args, "--report").map(PathBuf::from);
+        if let Some(report_file) = value_of(&args, "--report").map(PathBuf::from) {
+            open_report(&report_file);
+        }
 
         report_environment();
 
@@ -169,40 +195,56 @@ mod probe {
 
         if flags.contains("--skip-screen") {
             section("ScreenCaptureKit (system audio)");
-            say!("  skipped (--skip-screen)");
+            emit!("  skipped (--skip-screen)");
         } else {
             report_screen_capture();
         }
 
-        say!("");
-        say!("Done.");
+        emit!("");
+        emit!("Done.");
+    }
 
-        if let Some(report_file) = report_file {
-            let report = REPORT
-                .lock()
-                .map(|report| report.clone())
-                .unwrap_or_default();
-            match std::fs::write(&report_file, report) {
-                Ok(()) => println!("Report written to {}", report_file.display()),
-                Err(err) => eprintln!("Could not write {}: {err}", report_file.display()),
+    /// `--report` の書き込み先を開く。中身は「どのユーザーが何を動かしているか」の目録になるため、
+    /// `docs/rules/security.md` に従って所有者のみ読み書き可（0600）で作る。
+    fn open_report(path: &Path) {
+        match private_file(path) {
+            Ok(file) => {
+                if let Ok(mut report) = REPORT.lock() {
+                    *report = Some(file);
+                }
             }
+            Err(err) => eprintln!("Could not open {}: {err}", path.display()),
         }
     }
 
+    /// 所有者のみ読み書き可（0600）で新規作成する。既存があれば切り詰める。
+    fn private_file(path: &Path) -> std::io::Result<File> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+    }
+
     fn print_usage() {
-        say!("Usage: mas_probe [options]");
-        say!("");
-        say!("  --all-processes            Compare every running process, not only audio ones");
-        say!("  --verbose                  Print every resolved row");
-        say!("  --hold-mic                 Open the default microphone during the scan");
-        say!("  --skip-screen              Skip the ScreenCaptureKit check");
-        say!(
+        emit!("Usage: mas_probe [options]");
+        emit!("");
+        emit!("  --all-processes            Compare every running process, not only audio ones");
+        emit!("  --verbose                  Print every resolved row");
+        emit!("  --hold-mic                 Open the default microphone during the scan");
+        emit!("  --skip-screen              Skip the ScreenCaptureKit check");
+        emit!(
             "  --pick-folder              Open a folder panel and save a security-scoped bookmark"
         );
-        say!("  --resolve-bookmark         Resolve a saved bookmark and write a probe file there");
-        say!("  --bookmark-file <path>     Where the bookmark blob is stored");
-        say!("  --folder <path>            Use this folder instead of opening the panel");
-        say!("  --report <path>            Also write the report there (for `open`-launched runs)");
+        emit!("  --resolve-bookmark         Resolve a saved bookmark and write a probe file there");
+        emit!("  --bookmark-file <path>     Where the bookmark blob is stored");
+        emit!("  --folder <path>            Use this folder instead of opening the panel");
+        emit!(
+            "  --report <path>            Also write the report there (for `open`-launched runs)"
+        );
     }
 
     /// `--flag value` 形式の値を取り出す。検証用なので厳密なパーサは持たない。
@@ -212,8 +254,8 @@ mod probe {
     }
 
     fn section(title: &str) {
-        say!("");
-        say!("== {title} ==");
+        emit!("");
+        emit!("== {title} ==");
     }
 
     // ---------------------------------------------------------------- 環境
@@ -223,19 +265,21 @@ mod probe {
     fn report_environment() {
         section("Environment");
         let exec = current_exec_path();
-        say!("  pid: {}", std::process::id());
-        say!(
+        emit!("  pid: {}", std::process::id());
+        emit!(
             "  executable: {}",
             exec.as_deref()
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "<unknown>".to_owned())
         );
-        say!("  sandboxed: {}", if sandboxed() { "yes" } else { "no" });
-        say!(
-            "  container: {}",
+        let sandboxed = sandboxed();
+        emit!("  sandboxed: {}", if sandboxed { "yes" } else { "no" });
+        emit!(
+            "  {}: {}",
+            if sandboxed { "container" } else { "home" },
             std::env::var("HOME").unwrap_or_else(|_| "<unset>".to_owned())
         );
-        say!(
+        emit!(
             "  bundle id: {}",
             main_bundle_id().unwrap_or_else(|| "<none>".to_owned())
         );
@@ -268,7 +312,7 @@ mod probe {
         section("Microphone (held open for the scan)");
         let host = cpal::default_host();
         let Some(device) = host.default_input_device() else {
-            say!("  no default input device");
+            emit!("  no default input device");
             return None;
         };
         let name = device
@@ -278,7 +322,7 @@ mod probe {
         let config = match device.default_input_config() {
             Ok(config) => config,
             Err(err) => {
-                say!("  could not read the default input config: {err}");
+                emit!("  could not read the default input config: {err}");
                 return None;
             }
         };
@@ -293,17 +337,16 @@ mod probe {
         let stream = match stream {
             Ok(stream) => stream,
             Err(err) => {
-                say!("  could not open the input stream: {err}");
+                emit!("  could not open the input stream: {err}");
                 return None;
             }
         };
         if let Err(err) = stream.play() {
-            say!("  could not start the input stream: {err}");
+            emit!("  could not start the input stream: {err}");
             return None;
         }
-        // CoreAudio がプロセスオブジェクトへ反映するまで少し待つ（即座に走査すると乗らない）。
-        std::thread::sleep(Duration::from_millis(1500));
-        say!("  holding {name} open ({:?})", config.sample_format());
+        std::thread::sleep(MIC_SETTLE);
+        emit!("  holding {name} open ({:?})", config.sample_format());
         Some(stream)
     }
 
@@ -315,160 +358,244 @@ mod probe {
     /// `--all-processes` を付けると全プロセスへ広げ、標本を増やす。
     fn report_resolution(all_processes: bool, verbose: bool) {
         section("Bundle-id resolution (private vs public APIs)");
-        let (pids, source) = if all_processes {
-            (all_pids(), "all running processes")
+        let (samples, source) = if all_processes {
+            (all_processes_sample(), "all running processes")
         } else {
-            match audio_pids() {
-                Some(pids) => (pids, "CoreAudio process objects"),
+            match audio_processes() {
+                Some(samples) => (samples, "CoreAudio process objects"),
                 None => {
-                    say!("  CoreAudio process list is unavailable (needs macOS 14.4+).");
-                    say!(
+                    emit!("  CoreAudio process list is unavailable (needs macOS 14.4+).");
+                    emit!(
                         "  → auto-record cannot work here; rerun with --all-processes to still compare resolvers."
                     );
                     return;
                 }
             }
         };
-        say!("  population: {source} ({} pids)", pids.len());
+        emit!("  population: {source} ({} processes)", samples.len());
 
-        let rows: Vec<Resolution> = pids.into_iter().map(resolve).collect();
+        let rows: Vec<ResolvedProcess> = samples.into_iter().map(resolve).collect();
 
-        let input_running: Vec<&Resolution> = rows
-            .iter()
-            .filter(|row| row.running_input == Some(true))
-            .collect();
-        say!("  processes with the mic open: {}", input_running.len());
-        if !input_running.is_empty() {
-            for row in &input_running {
-                say!(
-                    "    pid {} → private={} path={} ppid={} coreaudio={} exec={}",
-                    row.pid,
-                    show(&row.private_effective()),
-                    show(&row.path_effective()),
-                    show(&row.ppid_effective()),
-                    show(&row.ca_effective()),
-                    row.exec_path
-                        .as_deref()
-                        .map(|path| path.display().to_string())
-                        .unwrap_or_else(|| "<unreadable>".to_owned())
-                );
-            }
-        }
-
-        // ヘルパープロセス（直接のバンドル ID が取れない）が本題。ここが private 方式と一致するかで
-        // go/no-go が決まる。
-        let helpers: Vec<&Resolution> = rows.iter().filter(|row| row.direct.is_none()).collect();
-        say!(
-            "  processes without a direct bundle id (helpers): {}",
-            helpers.len()
-        );
-
-        let mut path_agree = 0usize;
-        let mut ppid_agree = 0usize;
-        let mut ca_agree = 0usize;
-        let mut mismatches: Vec<&Resolution> = Vec::new();
-        for row in &rows {
-            let private = row.private_effective();
-            if private == row.path_effective() {
-                path_agree += 1;
-            } else {
-                mismatches.push(row);
-            }
-            if private == row.ppid_effective() {
-                ppid_agree += 1;
-            }
-            if private == row.ca_effective() {
-                ca_agree += 1;
-            }
-        }
-        say!(
-            "  agreement with the private API: proc_pidpath {}/{}, ppid chain {}/{}, CoreAudio bundle id {}/{}",
-            path_agree,
-            rows.len(),
-            ppid_agree,
-            rows.len(),
-            ca_agree,
-            rows.len()
-        );
-
-        if !mismatches.is_empty() {
-            say!("  mismatches (private vs proc_pidpath):");
-            for row in &mismatches {
-                say!(
-                    "    pid {} private={} path={} coreaudio={} exec={}",
-                    row.pid,
-                    show(&row.private_effective()),
-                    show(&row.path_effective()),
-                    show(&row.ca_effective()),
-                    row.exec_path
-                        .as_deref()
-                        .map(|path| path.display().to_string())
-                        .unwrap_or_else(|| "<unreadable>".to_owned())
-                );
-            }
-        }
-
+        report_mic_rows(&rows);
+        report_agreement(&rows, all_processes);
         if verbose {
-            say!("  all rows (pid / direct / private / path / ppid / coreaudio / exec):");
-            for row in &rows {
-                say!(
-                    "    {} | {} | {} | {} | {} | {} | {}",
-                    row.pid,
-                    show(&row.direct),
-                    show(&row.responsible),
-                    show(&row.by_path),
-                    show(&row.by_ppid),
-                    show(&row.ca_bundle),
-                    row.exec_path
-                        .as_deref()
-                        .map(|path| path.display().to_string())
-                        .unwrap_or_else(|| "<unreadable>".to_owned())
-                );
-            }
+            report_all_rows(&rows);
         }
-
         // 会議アプリごとの内訳。ヘルパーを親アプリへ畳めているかを目視できるようにする。
         report_per_app(&rows);
     }
 
+    /// いまマイクを掴んでいる行だけを詳しく出す。会議アプリが正しく解決できているかを直接見る箇所。
+    fn report_mic_rows(rows: &[ResolvedProcess]) {
+        let mic_rows: Vec<&ResolvedProcess> = rows
+            .iter()
+            .filter(|row| row.running_input == Some(true))
+            .collect();
+        emit!("  processes with the mic open: {}", mic_rows.len());
+        for row in mic_rows {
+            emit!(
+                "    pid {} → private={} path={} ppid={} coreaudio={} exec={}",
+                row.pid,
+                show_set(&row.private_ids()),
+                show_set(&row.path_ids()),
+                show_set(&row.ppid_ids()),
+                show_set(&row.core_audio_ids()),
+                show_path(row)
+            );
+        }
+    }
+
+    /// 解決方式 1 つ。名前と「その方式で得られるバンドル ID 集合」の組。
+    type Method = (&'static str, fn(&ResolvedProcess) -> BTreeSet<String>);
+
+    /// 1 方式ぶんの突き合わせ結果。
+    struct Agreement {
+        /// 比較した行数（private 側も方式側も空の行は「比較対象なし」として除く）。
+        compared: usize,
+        /// 集合が完全に一致した行数。
+        equal: usize,
+        /// private が持っていた ID を方式が取りこぼした行数（**代替可否の要**）。
+        missing: usize,
+        /// 方式だけが持っていた ID がある行数（帰属が広がる／狭まる差の裏返し）。
+        extra: usize,
+    }
+
+    /// private 方式と `ids` 方式を**集合**で突き合わせる。
+    ///
+    /// 本体の `app_audio_monitor::input_running_bundle_ids` は「直接のバンドル ID」と
+    /// 「親から解決したバンドル ID」の**両方**を集合へ入れる。1 値に畳んで比べると、直接の ID が
+    /// 取れる行で両辺が自明に一致してしまい、本体が依存している親解決の経路を検証できない。
+    /// そのため比較単位を集合に揃える。
+    fn compare_sets(
+        rows: &[&ResolvedProcess],
+        ids: impl Fn(&ResolvedProcess) -> BTreeSet<String>,
+    ) -> Agreement {
+        let mut agreement = Agreement {
+            compared: 0,
+            equal: 0,
+            missing: 0,
+            extra: 0,
+        };
+        for row in rows {
+            let private = row.private_ids();
+            let candidate = ids(row);
+            // 両方とも空の行は「どちらの方式でも解決できない」だけで、一致に数えると分母が
+            // 水増しされる（`.app` の外にいるデーモンなど、母集団の大半がこれになりうる）。
+            if private.is_empty() && candidate.is_empty() {
+                continue;
+            }
+            agreement.compared += 1;
+            if private == candidate {
+                agreement.equal += 1;
+                continue;
+            }
+            if !private.is_subset(&candidate) {
+                agreement.missing += 1;
+            }
+            if !candidate.is_subset(&private) {
+                agreement.extra += 1;
+            }
+        }
+        agreement
+    }
+
+    /// 方式ごとの一致率を出す。全行とヘルパー行（直接のバンドル ID が無い＝本題）を分けて示す。
+    fn report_agreement(rows: &[ResolvedProcess], all_processes: bool) {
+        let all: Vec<&ResolvedProcess> = rows.iter().collect();
+        let helpers: Vec<&ResolvedProcess> =
+            rows.iter().filter(|row| row.direct.is_none()).collect();
+        emit!(
+            "  processes without a direct bundle id (helpers): {}",
+            helpers.len()
+        );
+        emit!("  agreement with the private API (sets: direct ∪ parent, matching the real code):");
+        emit!(
+            "    method              all rows equal/compared missing extra | helpers equal/compared missing extra"
+        );
+
+        let mut methods: Vec<Method> = vec![
+            ("proc_pidpath", ResolvedProcess::path_ids),
+            ("ppid chain", ResolvedProcess::ppid_ids),
+        ];
+        // `--all-processes` は CoreAudio を経由しないので、この列は測れない（全行 None になり、
+        // 「private も None だった行」を数えるだけの無意味な数字になる）。
+        if !all_processes {
+            methods.push(("CoreAudio bundle id", ResolvedProcess::core_audio_ids));
+            methods.push(("all public combined", ResolvedProcess::public_ids));
+        } else {
+            methods.push(("all public combined", ResolvedProcess::public_ids));
+        }
+
+        for (name, ids) in methods {
+            let overall = compare_sets(&all, ids);
+            let helper = compare_sets(&helpers, ids);
+            emit!(
+                "    {name:<19} {}/{} {} {} | {}/{} {} {}",
+                overall.equal,
+                overall.compared,
+                overall.missing,
+                overall.extra,
+                helper.equal,
+                helper.compared,
+                helper.missing,
+                helper.extra
+            );
+        }
+        if all_processes {
+            emit!(
+                "    (CoreAudio bundle id is not measurable here; it needs the CoreAudio population)"
+            );
+        }
+
+        // 取りこぼし（private にあって公開 API に無い）は代替可否に直結するので、行ごとに見せる。
+        let dropped: Vec<&&ResolvedProcess> = all
+            .iter()
+            .filter(|row| !row.private_ids().is_subset(&row.public_ids()))
+            .collect();
+        if dropped.is_empty() {
+            emit!("  no row lost an id when switching to the public APIs.");
+        } else {
+            emit!("  rows where the public APIs lost an id the private API had:");
+            for row in dropped {
+                emit!(
+                    "    pid {} private={} public={} exec={}",
+                    row.pid,
+                    show_set(&row.private_ids()),
+                    show_set(&row.public_ids()),
+                    show_path(row)
+                );
+            }
+        }
+    }
+
+    fn report_all_rows(rows: &[ResolvedProcess]) {
+        emit!("  all rows (pid / direct / private / path / ppid / coreaudio / exec):");
+        for row in rows {
+            emit!(
+                "    {} | {} | {} | {} | {} | {} | {}",
+                row.pid,
+                show(&row.direct),
+                show(&row.responsible),
+                show(&row.by_path),
+                show(&row.by_ppid),
+                show(&row.core_audio_bundle_id),
+                show_path(row)
+            );
+        }
+    }
+
     /// 主要アプリ（Chrome / Zoom / Slack など）ごとに、ヘルパーを何件・どのバンドル ID に畳めたかを出す。
-    fn report_per_app(rows: &[Resolution]) {
+    fn report_per_app(rows: &[ResolvedProcess]) {
         let mut by_app: BTreeMap<String, (usize, usize, usize)> = BTreeMap::new();
         for row in rows {
-            let Some(app) = row.path_effective().or_else(|| row.private_effective()) else {
-                continue;
-            };
-            let entry = by_app.entry(app).or_insert((0, 0, 0));
-            entry.0 += 1;
-            if row.direct.is_none() {
-                entry.1 += 1;
-                if row.private_effective() == row.path_effective() {
-                    entry.2 += 1;
+            for app in row.private_ids().union(&row.public_ids()) {
+                let entry = by_app.entry(app.clone()).or_insert((0, 0, 0));
+                entry.0 += 1;
+                if row.direct.is_none() {
+                    entry.1 += 1;
+                    if row.private_ids() == row.public_ids() {
+                        entry.2 += 1;
+                    }
                 }
             }
         }
-        say!("  per app (total / helpers / helpers where both methods agree):");
+        emit!("  per app (rows / helper rows / helper rows where private and public agree):");
         for (app, (total, helpers, agree)) in by_app {
-            say!("    {app}: {total} / {helpers} / {agree}");
+            emit!("    {app}: {total} / {helpers} / {agree}");
         }
+    }
+
+    fn show_set(ids: &BTreeSet<String>) -> String {
+        if ids.is_empty() {
+            "-".to_owned()
+        } else {
+            ids.iter().cloned().collect::<Vec<_>>().join("+")
+        }
+    }
+
+    fn show_path(row: &ResolvedProcess) -> String {
+        row.exec_path
+            .as_deref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "<unreadable>".to_owned())
     }
 
     fn show(value: &Option<String>) -> String {
         value.clone().unwrap_or_else(|| "-".to_owned())
     }
 
-    fn resolve(sample: ProcessSample) -> Resolution {
-        let pid = sample.pid;
+    fn resolve(entry: ProcessEntry) -> ResolvedProcess {
+        let pid = entry.pid;
         let exec_path = proc_path(pid);
-        Resolution {
+        ResolvedProcess {
             pid,
-            ca_bundle: sample.ca_bundle,
+            core_audio_bundle_id: entry.core_audio_bundle_id,
             direct: bundle_id_for_pid(pid),
             responsible: responsible_pid(pid).and_then(bundle_id_for_pid),
             by_path: exec_path.as_deref().and_then(bundle_id_for_exec_path),
-            by_ppid: responsible_pid_via_parents(pid).and_then(bundle_id_for_pid),
+            by_ppid: responsible_pid_via_parents(pid),
             exec_path,
-            running_input: sample.running_input,
+            running_input: entry.running_input,
         }
     }
 
@@ -477,17 +604,17 @@ mod probe {
     /// CoreAudio のプロセスオブジェクト一覧を `(pid, マイク入力中か, CoreAudio が持つバンドル ID)` で
     /// 返す。macOS 14.4 未満やサンドボックスで照会できない場合は `None`
     /// （＝自動録音そのものが成立しない）。
-    fn audio_pids() -> Option<Vec<ProcessSample>> {
+    fn audio_processes() -> Option<Vec<ProcessEntry>> {
         let processes = process_object_list()?;
         let mut samples = Vec::new();
         for process in processes {
             let Some(pid) = process_pid(process) else {
                 continue;
             };
-            samples.push(ProcessSample {
+            samples.push(ProcessEntry {
                 pid,
                 running_input: process_is_running_input(process),
-                ca_bundle: process_bundle_id(process),
+                core_audio_bundle_id: process_bundle_id(process),
             });
         }
         Some(samples)
@@ -515,7 +642,7 @@ mod probe {
             )
         };
         if status != OS_STATUS_OK {
-            say!("  AudioObjectGetPropertyDataSize failed (OSStatus={status})");
+            emit!("  AudioObjectGetPropertyDataSize failed (OSStatus={status})");
             return None;
         }
         let count = size as usize / size_of::<AudioObjectID>();
@@ -533,7 +660,7 @@ mod probe {
             )
         };
         if status != OS_STATUS_OK {
-            say!("  AudioObjectGetPropertyData failed (OSStatus={status})");
+            emit!("  AudioObjectGetPropertyData failed (OSStatus={status})");
             return None;
         }
         processes.truncate(size as usize / size_of::<AudioObjectID>());
@@ -575,6 +702,9 @@ mod probe {
     fn process_bundle_id(process: AudioObjectID) -> Option<String> {
         use objc2::rc::Retained;
 
+        /// 失敗 status を 1 回だけ知らせるためのフラグ。
+        static BUNDLE_ID_STATUS_REPORTED: AtomicBool = AtomicBool::new(false);
+
         let address = global_address(kAudioProcessPropertyBundleID);
         let mut value: *mut NSString = std::ptr::null_mut();
         let mut size = size_of::<*mut NSString>() as u32;
@@ -590,11 +720,18 @@ mod probe {
             )
         };
         if status != OS_STATUS_OK {
+            // 「未対応（macOS 14 未満）」なのか「サンドボックスで拒否」なのかで結論が変わるので、
+            // status を捨てない。毎行だと騒がしいため最初の 1 件だけ知らせる。
+            if !BUNDLE_ID_STATUS_REPORTED.swap(true, Ordering::Relaxed) {
+                emit!("  kAudioProcessPropertyBundleID query failed (OSStatus={status})");
+            }
             return None;
         }
         let ptr = NonNull::new(value)?;
-        // SAFETY: CoreAudio は CFStringRef を +1（呼び出し側が解放する契約）で返す。CFString と
-        // NSString は toll-free bridge なので、その +1 をそのまま Retained に渡して解放を任せる。
+        // SAFETY: CoreAudio は CFStringRef を +1 で返す（AudioHardware.h の
+        // kAudioProcessPropertyBundleID: "The caller is responsible for releasing the returned
+        // CFObject."）。CFString と NSString は toll-free bridge なので、その +1 をそのまま
+        // Retained に渡して解放を任せる。
         let string = unsafe { Retained::from_raw(ptr.as_ptr()) }?;
         let bundle_id = string.to_string();
         (!bundle_id.is_empty()).then_some(bundle_id)
@@ -618,6 +755,7 @@ mod probe {
             unsafe extern "C" {
                 fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
             }
+            // RTLD_DEFAULT(-2): 現在のプロセスにロード済みの全イメージからシンボルを探す。
             let rtld_default = (-2isize) as *mut c_void;
             // SAFETY: シンボル名は有効な C 文字列。見つからなければ null が返るだけ。
             let sym = unsafe {
@@ -668,20 +806,29 @@ mod probe {
         None
     }
 
-    /// 公開 API 案 2: 親 PID を辿り、最初にバンドル ID を持つ祖先を返す。zygote 構成のように
-    /// ヘルパーの親がさらにヘルパーである場合に備えて多段で辿る（launchd = pid 1 で打ち切る）。
-    fn responsible_pid_via_parents(pid: i32) -> Option<i32> {
+    /// 公開 API 案 2: 親 PID を辿り、最初にバンドル ID を持つ祖先の**バンドル ID**を返す。
+    fn responsible_pid_via_parents(pid: i32) -> Option<String> {
+        /// zygote 構成のようにヘルパーの親がさらにヘルパーである場合に備えて多段で辿る上限。
         const MAX_DEPTH: usize = 8;
+        /// 深さ上限で打ち切った件数を 1 回だけ知らせるためのフラグ（上限が足りているかの判断材料）。
+        static DEPTH_EXCEEDED_REPORTED: AtomicBool = AtomicBool::new(false);
+
         let mut current = pid;
         for _ in 0..MAX_DEPTH {
             let parent = parent_pid(current)?;
+            // launchd（1）まで来たら、それ以上辿ってもアプリには行き着かない。
             if parent <= 1 {
                 return None;
             }
-            if bundle_id_for_pid(parent).is_some() {
-                return Some(parent);
+            if let Some(bundle_id) = bundle_id_for_pid(parent) {
+                return Some(bundle_id);
             }
             current = parent;
+        }
+        if !DEPTH_EXCEEDED_REPORTED.swap(true, Ordering::Relaxed) {
+            emit!(
+                "  note: the parent chain hit the depth limit ({MAX_DEPTH}) for at least one pid"
+            );
         }
         None
     }
@@ -804,15 +951,15 @@ mod probe {
         let content = match SCShareableContent::get() {
             Ok(content) => content,
             Err(err) => {
-                say!("  SCShareableContent::get failed: {err}");
-                say!("  → screen-recording permission (TCC) or the sandbox is blocking it.");
+                emit!("  SCShareableContent::get failed: {err}");
+                emit!("  → screen-recording permission (TCC) or the sandbox is blocking it.");
                 return;
             }
         };
         let displays = content.displays();
-        say!("  shareable displays: {}", displays.len());
+        emit!("  shareable displays: {}", displays.len());
         let Some(display) = displays.first() else {
-            say!("  no display found; cannot start a capture");
+            emit!("  no display found; cannot start a capture");
             return;
         };
 
@@ -837,21 +984,21 @@ mod probe {
             SCStreamOutputType::Audio,
         );
         if let Err(err) = stream.start_capture() {
-            say!("  start_capture failed: {err}");
+            emit!("  start_capture failed: {err}");
             return;
         }
-        say!("  capture started; waiting up to {AUDIO_WAIT:?} for audio buffers…");
+        emit!("  capture started; waiting up to {AUDIO_WAIT:?} for audio buffers…");
         let deadline = Instant::now() + AUDIO_WAIT;
         while Instant::now() < deadline && samples.load(Ordering::Relaxed) == 0 {
             std::thread::sleep(Duration::from_millis(100));
         }
         let received = samples.load(Ordering::Relaxed);
         if let Err(err) = stream.stop_capture() {
-            say!("  stop_capture failed: {err}");
+            emit!("  stop_capture failed: {err}");
         }
-        say!("  audio sample buffers received: {received}");
+        emit!("  audio sample buffers received: {received}");
         if received == 0 {
-            say!("  → the capture ran but nothing was playing; play audio and rerun to confirm.");
+            emit!("  → the capture ran but nothing was playing; play audio and rerun to confirm.");
         }
     }
 
@@ -861,7 +1008,7 @@ mod probe {
     /// サンドボックスでは、パネルで選んだ URL からしか bookmark を作れないためこの順になる。
     fn report_bookmark_save(bookmark_file: &Path, preset_folder: Option<&Path>) {
         section("Security-scoped bookmark (save)");
-        say!("  bookmark file: {}", bookmark_file.display());
+        emit!("  bookmark file: {}", bookmark_file.display());
         // `--folder` を渡すとパネルを出さずにそのパスを使う。サンドボックス内のコンテナに対して
         // bookmark の作成・解決の往復だけを（人手を介さず）確かめるための逃げ道で、
         // 「パネルで選んだコンテナ外のフォルダに書けるか」は `--folder` 無しでしか検証できない。
@@ -869,16 +1016,16 @@ mod probe {
             Some(folder) => folder.to_path_buf(),
             None => {
                 let Some(folder) = rfd::FileDialog::new().pick_folder() else {
-                    say!("  no folder was selected");
+                    emit!("  no folder was selected");
                     return;
                 };
                 folder
             }
         };
-        say!("  selected: {}", folder.display());
+        emit!("  selected: {}", folder.display());
 
         let Some(folder_str) = folder.to_str() else {
-            say!("  the selected path is not valid UTF-8");
+            emit!("  the selected path is not valid UTF-8");
             return;
         };
         let url = NSURL::fileURLWithPath(&NSString::from_str(folder_str));
@@ -890,32 +1037,38 @@ mod probe {
             ) {
             Ok(data) => data,
             Err(err) => {
-                say!("  bookmarkDataWithOptions failed: {err}");
+                emit!("  bookmarkDataWithOptions failed: {err}");
                 return;
             }
         };
         let bytes = data.to_vec();
-        if let Err(err) = std::fs::write(bookmark_file, &bytes) {
-            say!("  could not write {}: {err}", bookmark_file.display());
+        // bookmark はユーザーが選んだフォルダへのアクセス権そのものなので 0600 で置く
+        // （`docs/rules/security.md`）。
+        let write_result = private_file(bookmark_file).and_then(|mut file| {
+            use std::io::Write;
+            file.write_all(&bytes)
+        });
+        if let Err(err) = write_result {
+            emit!("  Could not write {}: {err}", bookmark_file.display());
             return;
         }
-        say!(
+        emit!(
             "  saved {} bytes to {}",
             bytes.len(),
             bookmark_file.display()
         );
-        say!("  → rerun with --resolve-bookmark to check access from a fresh launch.");
+        emit!("  → rerun with --resolve-bookmark to check access from a fresh launch.");
     }
 
     /// 保存済み bookmark を解決し、アクセス権を開いて実際に書けるかまで確かめる。
     /// 「再起動後もアクセスできるか」の検証なので、保存とは別プロセスで走らせる。
     fn report_bookmark_resolve(bookmark_file: &Path) {
         section("Security-scoped bookmark (resolve)");
-        say!("  bookmark file: {}", bookmark_file.display());
+        emit!("  bookmark file: {}", bookmark_file.display());
         let bytes = match std::fs::read(bookmark_file) {
             Ok(bytes) => bytes,
             Err(err) => {
-                say!("  could not read {}: {err}", bookmark_file.display());
+                emit!("  could not read {}: {err}", bookmark_file.display());
                 return;
             }
         };
@@ -933,19 +1086,19 @@ mod probe {
         let url = match url {
             Ok(url) => url,
             Err(err) => {
-                say!("  URLByResolvingBookmarkData failed: {err}");
+                emit!("  URLByResolvingBookmarkData failed: {err}");
                 return;
             }
         };
-        say!(
+        emit!(
             "  resolved: {}",
             url.path().map(|p| p.to_string()).unwrap_or_default()
         );
-        say!("  stale: {}", stale.as_bool());
+        emit!("  stale: {}", stale.as_bool());
 
         // SAFETY: 解決済みの security-scoped URL に対する呼び出し。stop と対で使う。
         let started = unsafe { url.startAccessingSecurityScopedResource() };
-        say!("  startAccessingSecurityScopedResource: {started}");
+        emit!("  startAccessingSecurityScopedResource: {started}");
 
         let write_result = url.path().map(|path| {
             let probe = PathBuf::from(path.to_string()).join("openshoki-mas-probe.txt");
@@ -956,9 +1109,9 @@ mod probe {
             result
         });
         match write_result {
-            Some(Ok(())) => say!("  write test: ok"),
-            Some(Err(err)) => say!("  write test failed: {err}"),
-            None => say!("  write test skipped (no path on the resolved URL)"),
+            Some(Ok(())) => emit!("  write test: ok"),
+            Some(Err(err)) => emit!("  write test failed: {err}"),
+            None => emit!("  write test skipped (no path on the resolved URL)"),
         }
 
         if started {
@@ -969,7 +1122,7 @@ mod probe {
 
     /// 全プロセスの pid を列挙する（`--all-processes` 用）。CoreAudio 由来ではないので、
     /// マイク入力の有無と CoreAudio のバンドル ID は分からず `None`。
-    fn all_pids() -> Vec<ProcessSample> {
+    fn all_processes_sample() -> Vec<ProcessEntry> {
         /// `libproc.h` の `PROC_ALL_PIDS`。
         const PROC_ALL_PIDS: u32 = 1;
 
@@ -982,22 +1135,36 @@ mod probe {
             ) -> c_int;
         }
 
-        // 余裕を持った固定長で 1 回だけ読む（検証用なので厳密な再試行は持たない）。
-        let mut pids = vec![0i32; 8192];
+        // まず必要バイト数を問い合わせる（buffer=null）。固定長で読むと、足りなかったときに
+        // proc_listpids はエラーを返さず埋まるだけなので、母集団が黙って縮む。
+        // SAFETY: buffer が null・buffersize が 0 のときは必要バイト数を返す仕様。
+        let needed = unsafe { proc_listpids(PROC_ALL_PIDS, 0, std::ptr::null_mut(), 0) };
+        if needed <= 0 {
+            emit!("  proc_listpids could not report the required size (returned {needed})");
+            return Vec::new();
+        }
+        // 問い合わせと実取得の間にプロセスが増えても切り捨てないよう、少し余裕を持たせる。
+        let capacity = needed as usize / size_of::<i32>() + 64;
+        let mut pids = vec![0i32; capacity];
         let size = (pids.len() * size_of::<i32>()) as c_int;
         // SAFETY: buffer は size バイトの有効な書き込み先。戻り値は書き込まれたバイト数。
         let written =
             unsafe { proc_listpids(PROC_ALL_PIDS, 0, pids.as_mut_ptr().cast::<c_void>(), size) };
         if written <= 0 {
+            emit!("  proc_listpids failed (returned {written})");
             return Vec::new();
+        }
+        if written == size {
+            // 埋まりきった＝入り切らなかった可能性がある。黙って縮めると一致率が歪むので知らせる。
+            emit!("  warning: the pid list may be truncated ({capacity} slots were all used)");
         }
         pids.truncate(written as usize / size_of::<i32>());
         pids.into_iter()
             .filter(|&pid| pid > 0)
-            .map(|pid| ProcessSample {
+            .map(|pid| ProcessEntry {
                 pid,
                 running_input: None,
-                ca_bundle: None,
+                core_audio_bundle_id: None,
             })
             .collect()
     }

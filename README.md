@@ -187,7 +187,6 @@ macOS では `screencapturekit` と `objc2` 系を使います。
 
 - **Mac App Store 可否の検証プローブ**: MAS 対応（[#77](https://github.com/pkshimizu/openshoki/issues/77)）の
   技術検証に使う `examples/mas_probe.rs` を、App Sandbox の有無を切り替えて実行します。
-  `.app` に包んで ad-hoc 署名するのは、サンドボックスが**署名の entitlements** で効くためです。
   出荷バイナリには含まれません（`cargo` の example）。
 
   ```sh
@@ -196,7 +195,15 @@ macOS では `screencapturekit` と `objc2` 系を使います。
   ./scripts/mas-probe.sh --sandbox --open                          # TCC を伴う検証
   ```
 
-  `--open` を付けると LaunchServices 経由で起動します。TCC（画面収録・マイク）とフォルダ選択
-  パネルは「どのアプリの要求か」を responsible process で見るため、シェルから実行ファイルを
-  直接叩くとターミナル側の権限として扱われ、`.app` の許可を試せません。検証結果は
-  `docs/plans/done/20260722-mac-app-store-submission.md` に記録しています。
+  `.app` に包んで ad-hoc 署名する理由と、`--open`（LaunchServices 経由の起動）が要る理由は
+  `scripts/mas-probe.sh` の冒頭コメントにあります。検証の結論は
+  「private API（responsible pid）は公開 API で置き換えられる」「App Sandbox 下でも
+  CoreAudio のプロセス照会・ScreenCaptureKit・security-scoped bookmark・マイク取得は動く」で、
+  後続作業は [#107](https://github.com/pkshimizu/openshoki/issues/107) /
+  [#108](https://github.com/pkshimizu/openshoki/issues/108) /
+  [#109](https://github.com/pkshimizu/openshoki/issues/109) に切り出してあります
+  （測定値の全文はローカルのプラン `docs/plans/`。`docs/` は追跡対象外です）。
+
+  `--open` を付けた実行では、プロセス一覧を含むレポートが
+  `~/Library/Containers/net.noncore.openshoki.masprobe/Data/` に一時的に作られます
+  （表示後にスクリプトが削除します）。
