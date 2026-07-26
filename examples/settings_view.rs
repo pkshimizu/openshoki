@@ -57,7 +57,7 @@ fn main() {
     win.window()
         .set_position(slint::LogicalPosition::new(60.0, 60.0));
     // 実アプリと同じ寸法で見る（`src/main.rs` の WINDOW_WIDTH/HEIGHT と一致させること）。
-    win.window().set_size(slint::LogicalSize::new(420.0, 790.0));
+    win.window().set_size(slint::LogicalSize::new(420.0, 760.0));
     win.show()
         .expect("showing the window should succeed in this verification binary");
 
