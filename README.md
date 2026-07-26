@@ -230,7 +230,8 @@ macOS では `screencapturekit` と `objc2` 系を使います。
 - **議事録要約の LLM 検証プローブ**: オンデバイス LLM で議事録を生成する方針
   （[#78](https://github.com/pkshimizu/openshoki/issues/78)）の検証に使う
   `examples/summary_probe.rs`。出荷バイナリには含まれません（`llama-cpp-2` は
-  dev-dependencies なので `cargo build` では llama.cpp をリンクしません）。
+  dev-dependencies なので `cargo build` では llama.cpp をリンクしません。`cargo test` /
+  `cargo clippy --all-targets` ではビルドされ、コールドで約 1 分増えます）。
 
   ```sh
   cargo run --release --example summary_probe -- --model <path.gguf> --lang ja
@@ -238,11 +239,8 @@ macOS では `screencapturekit` と `objc2` 系を使います。
   ```
 
   サンプルのトランスクリプト（`assets/samples/meeting-{ja,en}.txt`）は架空の会議で、
-  実データを使わずに再現できるようにしてあります。計測値と採用モデルの提案は
+  実データを使わずに再現できるようにしてあります。計測値と採用モデルは
   ローカルのプラン `docs/plans/` にあります（`docs/` は追跡対象外）。
-
-  `llama-cpp-2` は dev-dependency なので `cargo build` では llama.cpp をリンクしませんが、
-  `cargo test` / `cargo clippy --all-targets` ではビルドされます（コールドで約 1 分増）。
 
 - **Mac App Store 可否の検証プローブ**: MAS 対応（[#77](https://github.com/pkshimizu/openshoki/issues/77)）の
   技術検証に使う `examples/mas_probe.rs` を、App Sandbox の有無を切り替えて実行します。

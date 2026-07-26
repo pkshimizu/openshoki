@@ -367,7 +367,11 @@ mod probe {
                 "  peak RSS: {:.2} GB",
                 bytes as f64 / (1024.0 * 1024.0 * 1024.0)
             ),
-            None => println!("  peak RSS: <unavailable>"),
+            // ピークメモリはこのプローブが測るべき項目の一つなので、取れなかった理由を残す。
+            None => println!(
+                "  peak RSS: <unavailable> (getrusage failed: {})",
+                std::io::Error::last_os_error()
+            ),
         }
     }
 
@@ -384,7 +388,11 @@ mod probe {
         ///
         /// `ru_utime` / `ru_stime` は `struct timeval`（`tv_sec: i64` ＋ `tv_usec: i32` ＋
         /// パディング 4 の計 16 バイト）。値は読まないので、中身を写さず不透明な 16 バイトとして
-        /// 確保する（`[i64; 2]` は「i64 が 2 つ」という意味ではなく大きさ合わせ）。
+        /// 確保する。
+        ///
+        /// `libc::rusage` を使えばこの写しは不要（`libc` は screencapturekit 経由で既に依存
+        /// ツリーにある）。検証専用のプローブで、レイアウトの根拠を doc に残せば足りると判断して
+        /// 手書きのままにしている。本実装へ持ち込むなら `libc` に寄せること。
         #[repr(C)]
         struct Rusage {
             ru_utime: [u8; 16],
