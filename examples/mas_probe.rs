@@ -126,6 +126,15 @@ mod probe {
             parts.iter().filter_map(|part| (*part).clone()).collect()
         }
 
+        /// 親解決（responsible pid）が、直接のバンドル ID に無い ID を足した行か。
+        ///
+        /// 集合比較にした後の「本題」はここ。`direct.is_none()`（ヘルパー）で切ると、
+        /// 直接の ID を持ちつつ親解決が別の ID を足す行（Safari の WebKit GPU プロセス、
+        /// Slack/Claude のヘルパーなど、検証の核心）が漏れる。
+        fn parent_added_id(&self) -> bool {
+            self.private_ids().len() > self.direct.iter().count()
+        }
+
         /// private 方式（現行実装）。
         fn private_ids(&self) -> BTreeSet<String> {
             Self::ids([&self.direct, &self.responsible, &None])
@@ -147,8 +156,12 @@ mod probe {
             Self::ids([&self.direct, &self.core_audio_bundle_id, &None])
         }
 
-        /// 公開 API を全部併用したときの集合。置き換え可否の判定はこれと private の比較で行う。
-        fn public_ids(&self) -> BTreeSet<String> {
+        /// 置き換え後の実装が作る想定の集合。判定はこれと private の比較で行う。
+        ///
+        /// 案 2（親 PID 辿り）は**含めない**。案 1 に対する追加の解決力がほぼ無く（XPC サービスは
+        /// `launchd` の子なので辿れない）、採らない方針のため。名前を「公開 API 全部」にしないのは
+        /// この差を隠さないため。
+        fn planned_ids(&self) -> BTreeSet<String> {
             Self::ids([&self.direct, &self.by_path, &self.core_audio_bundle_id])
         }
     }
@@ -187,8 +200,12 @@ mod probe {
             flags.contains("--verbose"),
         );
 
-        if let Some(seconds) = value_of(&args, "--watch-mic").and_then(|v| v.parse::<u64>().ok()) {
-            watch_mic(Duration::from_secs(seconds));
+        if let Some(value) = value_of(&args, "--watch-mic") {
+            match value.parse::<u64>() {
+                Ok(seconds) => watch_mic(Duration::from_secs(seconds)),
+                // 黙って飛ばすと、検証者は「通話を始めろ」と言われないまま次の節へ進んでしまう。
+                Err(err) => emit!("  --watch-mic needs a number of seconds ({value:?}: {err})"),
+            }
         }
 
         if flags.contains("--pick-folder") {
@@ -393,12 +410,12 @@ mod probe {
                         show_set(&row.core_audio_ids()),
                         show_path(row)
                     );
-                    if !row.private_ids().is_subset(&row.public_ids()) {
+                    if !row.private_ids().is_subset(&row.planned_ids()) {
                         emit!(
                             "      ⚠ the public APIs cannot attribute this process to {}",
                             show_set(
                                 &row.private_ids()
-                                    .difference(&row.public_ids())
+                                    .difference(&row.planned_ids())
                                     .cloned()
                                     .collect()
                             )
@@ -524,33 +541,38 @@ mod probe {
     /// 方式ごとの一致率を出す。全行とヘルパー行（直接のバンドル ID が無い＝本題）を分けて示す。
     fn report_agreement(rows: &[ResolvedProcess], all_processes: bool) {
         let all: Vec<&ResolvedProcess> = rows.iter().collect();
-        let helpers: Vec<&ResolvedProcess> =
-            rows.iter().filter(|row| row.direct.is_none()).collect();
+        // 親解決が ID を足した行が本題。`direct` が無い行（ヘルパー）だけで切ると、直接の ID を
+        // 持ちつつ親解決が別の ID を足す行が漏れる。
+        let parent_resolved: Vec<&ResolvedProcess> =
+            rows.iter().filter(|row| row.parent_added_id()).collect();
         emit!(
-            "  processes without a direct bundle id (helpers): {}",
-            helpers.len()
+            "  processes without a direct bundle id: {}",
+            rows.iter().filter(|row| row.direct.is_none()).count()
+        );
+        emit!(
+            "  processes where the parent resolver added an id: {}",
+            parent_resolved.len()
         );
         emit!("  agreement with the private API (sets: direct ∪ parent, matching the real code):");
         emit!(
-            "    method              all rows equal/compared missing extra | helpers equal/compared missing extra"
+            "    method              all rows equal/compared missing extra | parent-resolved equal/compared missing extra"
         );
 
         let mut methods: Vec<Method> = vec![
             ("proc_pidpath", ResolvedProcess::path_ids),
             ("ppid chain", ResolvedProcess::ppid_ids),
         ];
-        // `--all-processes` は CoreAudio を経由しないので、この列は測れない（全行 None になり、
-        // 「private も None だった行」を数えるだけの無意味な数字になる）。
+        // `--all-processes` は CoreAudio を経由しないので、CoreAudio 由来の列は測れない
+        // （全行 None になり「private も None だった行」を数えるだけの無意味な数字になる）。
+        // 置き換え想定の集合もこのとき proc_pidpath と恒等になるため、同じ行を 2 本出さない。
         if !all_processes {
             methods.push(("CoreAudio bundle id", ResolvedProcess::core_audio_ids));
-            methods.push(("all public combined", ResolvedProcess::public_ids));
-        } else {
-            methods.push(("all public combined", ResolvedProcess::public_ids));
+            methods.push(("direct+path+coreaudio", ResolvedProcess::planned_ids));
         }
 
         for (name, ids) in methods {
             let overall = compare_sets(&all, ids);
-            let helper = compare_sets(&helpers, ids);
+            let helper = compare_sets(&parent_resolved, ids);
             emit!(
                 "    {name:<19} {}/{} {} {} | {}/{} {} {}",
                 overall.equal,
@@ -565,25 +587,25 @@ mod probe {
         }
         if all_processes {
             emit!(
-                "    (CoreAudio bundle id is not measurable here; it needs the CoreAudio population)"
+                "    (CoreAudio bundle id needs the CoreAudio population; without it the planned set equals proc_pidpath)"
             );
         }
 
         // 取りこぼし（private にあって公開 API に無い）は代替可否に直結するので、行ごとに見せる。
         let dropped: Vec<&&ResolvedProcess> = all
             .iter()
-            .filter(|row| !row.private_ids().is_subset(&row.public_ids()))
+            .filter(|row| !row.private_ids().is_subset(&row.planned_ids()))
             .collect();
         if dropped.is_empty() {
-            emit!("  no row lost an id when switching to the public APIs.");
+            emit!("  no row lost an id when switching to the planned public-API set.");
         } else {
-            emit!("  rows where the public APIs lost an id the private API had:");
+            emit!("  rows where the planned public-API set lost an id the private API had:");
             for row in dropped {
                 emit!(
-                    "    pid {} private={} public={} exec={}",
+                    "    pid {} private={} planned={} exec={}",
                     row.pid,
                     show_set(&row.private_ids()),
-                    show_set(&row.public_ids()),
+                    show_set(&row.planned_ids()),
                     show_path(row)
                 );
             }
@@ -610,20 +632,22 @@ mod probe {
     fn report_per_app(rows: &[ResolvedProcess]) {
         let mut by_app: BTreeMap<String, (usize, usize, usize)> = BTreeMap::new();
         for row in rows {
-            for app in row.private_ids().union(&row.public_ids()) {
+            for app in row.private_ids().union(&row.planned_ids()) {
                 let entry = by_app.entry(app.clone()).or_insert((0, 0, 0));
                 entry.0 += 1;
-                if row.direct.is_none() {
+                if row.parent_added_id() {
                     entry.1 += 1;
-                    if row.private_ids() == row.public_ids() {
+                    // 完全一致ではなく「取りこぼしが無い」で数える。公開 API 側はヘルパー自身の
+                    // ID（`….helper`）を余分に持つことがあり、完全一致で見ると常に 0 になる。
+                    if row.private_ids().is_subset(&row.planned_ids()) {
                         entry.2 += 1;
                     }
                 }
             }
         }
-        emit!("  per app (rows / helper rows / helper rows where private and public agree):");
-        for (app, (total, helpers, agree)) in by_app {
-            emit!("    {app}: {total} / {helpers} / {agree}");
+        emit!("  per app (rows / parent-resolved rows / parent-resolved rows that lost no id):");
+        for (app, (total, parent_resolved, kept)) in by_app {
+            emit!("    {app}: {total} / {parent_resolved} / {kept}");
         }
     }
 
@@ -668,8 +692,10 @@ mod probe {
     /// （＝自動録音そのものが成立しない）。
     fn audio_processes() -> Option<Vec<ProcessEntry>> {
         let processes = process_object_list()?;
+        let total = processes.len();
         let mut samples = Vec::new();
         for process in processes {
+            // pid が読めない行は母集団から落ちる。測定値なので、黙って縮めず件数を知らせる。
             let Some(pid) = process_pid(process) else {
                 continue;
             };
@@ -678,6 +704,12 @@ mod probe {
                 running_input: process_is_running_input(process),
                 core_audio_bundle_id: process_bundle_id(process),
             });
+        }
+        if samples.len() != total {
+            emit!(
+                "  note: {} of {total} audio process objects did not return a pid",
+                total - samples.len()
+            );
         }
         Some(samples)
     }
