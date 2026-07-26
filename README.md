@@ -196,13 +196,18 @@ macOS では `screencapturekit` と `objc2` 系を使います。
   ```
 
   `.app` に包んで ad-hoc 署名する理由と、`--open`（LaunchServices 経由の起動）が要る理由は
-  `scripts/mas-probe.sh` の冒頭コメントにあります。検証の結論は
-  「private API（responsible pid）は公開 API で置き換えられる」「App Sandbox 下でも
-  CoreAudio のプロセス照会・ScreenCaptureKit・security-scoped bookmark・マイク取得は動く」で、
-  後続作業は [#107](https://github.com/pkshimizu/openshoki/issues/107) /
+  `scripts/mas-probe.sh` の冒頭コメントにあります。検証の結論は次のとおりで、後続作業は
+  [#107](https://github.com/pkshimizu/openshoki/issues/107) /
   [#108](https://github.com/pkshimizu/openshoki/issues/108) /
   [#109](https://github.com/pkshimizu/openshoki/issues/109) に切り出してあります
   （測定値の全文はローカルのプラン `docs/plans/`。`docs/` は追跡対象外です）。
+
+  - App Sandbox 下でも、CoreAudio のプロセス照会・ScreenCaptureKit・security-scoped bookmark・
+    マイク取得はすべて動く。
+  - 自動録音が使っている private API（responsible pid）は、Chrome / Zen / Slack / Zoom については
+    公開 API で置き換えられる。
+  - **Safari（WebKit ベース）だけは置き換えられない**。マイクを掴むのが WebKit の GPU プロセスで、
+    そこから Safari へ辿れるのは private API だけのため。Safari は自動録音の対象外とする方針。
 
   `--open` を付けた実行では、プロセス一覧を含むレポートが
   `~/Library/Containers/net.noncore.openshoki.masprobe/Data/` に一時的に作られます
