@@ -46,6 +46,7 @@ fn main() {
     let win =
         AppWindow::new().expect("creating the window should succeed in this verification binary");
 
+    win.set_app_version(format!("shoki v{}", env!("CARGO_PKG_VERSION")).into());
     win.set_recording_dir("/Users/example/Recordings".into());
     win.set_auto_record_app(true);
     win.set_auto_stop_debounce_secs(4);

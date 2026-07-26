@@ -94,6 +94,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 文字起こしワーカーで同じ状態を共有し、同一モデルの二重ダウンロードを防ぐ。
     let model_downloader = whisper_model::ModelDownloader::new();
 
+    ui.set_app_version(app_version_text().into());
     ui.set_recording_dir(recording_dir_text(&config.borrow().recording_dir));
     ui.set_auto_record_app(config.borrow().auto_record_on_app_mic);
     // 保存値は load 時に範囲へ正規化済みなので、そのまま表示へ渡す。
@@ -1408,6 +1409,15 @@ fn recording_dir_text(dir: &std::path::Path) -> slint::SharedString {
     dir.display().to_string().into()
 }
 
+/// 設定画面に出すバージョン表記（例: `shoki v0.1.0`）。
+///
+/// バージョンの正は `Cargo.toml` の `version` 一本で、ここは `env!("CARGO_PKG_VERSION")`
+/// （コンパイル時定数）から組み立てる。実行時にファイルを読まないので、表示と動いている
+/// バイナリがずれることがない。
+fn app_version_text() -> String {
+    format!("shoki v{}", env!("CARGO_PKG_VERSION"))
+}
+
 /// 登録アプリ 1 件を設定画面の行にする。検知できないアプリには
 /// `app_audio_monitor::auto_record_limitation` の注記を添える。
 fn trigger_app_row(trigger: &config::AppTrigger) -> TriggerApp {
@@ -1469,12 +1479,27 @@ fn hide_dock_icon() {
 #[cfg(test)]
 mod tests {
     use super::{
-        TranscriptStatus, breathing_level, playback_progress, seek_position_from_ratio,
-        selected_model_status_text, transcript_display_status, transcript_placeholder_text,
-        transcript_status_text,
+        TranscriptStatus, app_version_text, breathing_level, playback_progress,
+        seek_position_from_ratio, selected_model_status_text, transcript_display_status,
+        transcript_placeholder_text, transcript_status_text,
     };
     use crate::transcribe::TranscribeStatus;
     use std::time::Duration;
+
+    /// バージョン表記は `Cargo.toml` の `version` から組む。表示だけの文字列だが、製品名を
+    /// 落とす・`v` を落とすといった崩れは目視でしか気づけないので形を固定する。
+    #[test]
+    fn app_version_text_shows_the_crate_version() {
+        let text = app_version_text();
+        assert_eq!(text, format!("shoki v{}", env!("CARGO_PKG_VERSION")));
+        // 期待値の組み立てを間違えても通ってしまわないよう、形も直接見る。
+        assert!(text.starts_with("shoki v"), "{text}");
+        assert!(
+            text.trim_start_matches("shoki v")
+                .starts_with(|c: char| c.is_ascii_digit()),
+            "{text}"
+        );
+    }
 
     /// 設定画面の行は、検知できないアプリにだけ注記を持つ（判定は `auto_record_limitation`）。
     /// バンドル ID → 注記の写像を渡し忘れる回帰を、ここで止める。
