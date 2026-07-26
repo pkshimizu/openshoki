@@ -152,7 +152,7 @@ macOS では `screencapturekit` と `objc2` 系を使います。
 - **アイコン資産の再生成**: 筆の一画の形は `assets/icon/mark.svg` 1 本が正で、アプリアイコンの
   色違いレイヤーもメニューバーのグリフもここから生成します。マスター（`mark.svg` /
   `openshoki.icon/icon.json` / `openshoki.icon/Assets/seal.svg`）を変えたら次を実行し、
-  生成物ごとコミットしてください。
+  生成物ごとコミットしてください（`Assets.car` は例外。後述）。
 
   ```sh
   ./scripts/generate-icons.sh

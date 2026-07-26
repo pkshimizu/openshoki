@@ -11,9 +11,10 @@
 #             assets/icon/generated/openshoki.icns … 旧 macOS 用のフォールバック
 #             assets/icon/tray.png                 … メニューバー常駐アイコン（36x36 8bit RGBA）
 #
-# 生成物のうち openshoki.icns と tray.png はコミットする（ビルド時生成にしない）。`src/tray.rs` は
-# tray.png を include_bytes! で埋め込むため、資産を変えたらこのスクリプトを実行して差分を
-# コミットすること。Assets.car だけは追跡しない（入力が同じでも毎回バイト列が変わり、意味の
+# 生成物は Assets.car を除いてすべてコミットする（mark-ink*.svg / openshoki.icns / tray.png。
+# ビルド時生成にしない）。`src/tray.rs` は tray.png を include_bytes! で埋め込むため、資産を
+# 変えたらこのスクリプトを実行して差分をコミットすること（コミット漏れは check-icons.sh と
+# CI が検出する）。Assets.car だけは追跡しない（入力が同じでも毎回バイト列が変わり、意味の
 # ない差分が毎回出るため）。使うのは .app のパッケージングだけなので、そこでこのスクリプトを
 # 実行して作る。
 #
