@@ -137,8 +137,10 @@ impl ModelDownloader {
     /// 取得済み・ダウンロード中ならスレッドを立てずに戻る（DL 中の完了待ちは `ensure_model` を
     /// 呼ぶ利用側だけが行えばよい）。結果は状態マップとログに残る。
     ///
-    /// 同時ダウンロード数の上限は持たない。設定画面から選べるのが 1 種別 1 つずつなので今は
-    /// 実質 1 本だが、種別が増えると別種別の大きなモデルが並走しうる（要検討）。
+    /// 同時ダウンロード数の上限は持たない。whisper（最大 2.9GB）と要約 LLM（最大 4.4GB）の
+    /// 2 種別があり、UI 起点の whisper 取得とワーカー起点の要約 LLM 取得は**並走しうる**
+    /// （推論を直列化する `crate::inference_slot` は、待たせても意味が無いダウンロードを
+    /// 対象にしていない）。合計 7GB 超の同時受信になるが、上限を設けるかは未検討。
     pub fn request_download(&self, spec: &'static ModelSpec) {
         match self.status_of(spec) {
             DownloadStatus::Downloaded | DownloadStatus::Downloading { .. } => return,

@@ -13,8 +13,9 @@ use crate::model_download::ModelSpec;
 /// ように使う（whisper 側の `Whisper speech` と見分けるための語）。
 const KIND: &str = "Summary LLM";
 
-/// 選べるモデルの一覧（小さい順）。設定画面に選択 UI はまだ無く（後続 issue）、現状は
-/// 設定 `summary_model` の手編集で切り替える。
+/// 選べるモデルの一覧（小さい順）。設定画面の選択 UI はまだ無く（issue 未起票。#81 は
+/// Recordings ウィンドウでの表示・手動生成なので別件）、現状は設定 `summary_model` の
+/// 手編集で切り替える。
 ///
 /// URL・SHA-256 は HuggingFace の LFS メタデータより。モデルを追加・差し替えるときは
 /// URL と SHA-256 を必ずペアで更新する。
@@ -97,7 +98,7 @@ mod tests {
 
     #[test]
     fn unknown_id_has_no_spec() {
-        // カタログ外の手編集値は解決できない（利用側が `default_spec` へフォールバックする）。
+        // カタログ外の手編集値は解決できない（利用側は `spec_or_default` で既定へ丸める）。
         assert!(spec_for("no-such-model").is_none());
     }
 }

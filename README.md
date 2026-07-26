@@ -132,8 +132,8 @@ shoki/
 │   │   ├── tray.png          メニューバー常駐アイコン（36x36 RGBA。ビルド時に埋め込む。生成物）
 │   │   └── generated/        actool の生成物（shoki.icns。Assets.car は追跡しない）
 │   ├── menu/             トレイメニュー項目のアイコン（PNG, 32x32 RGBA。ビルド時に埋め込む）
-│   └── samples/          検証プローブ用の架空トランスクリプト（summary_probe が埋め込む。
-│                         出荷バイナリには入らない）
+│   └── samples/          検証用の架空トランスクリプト（summary_probe と要約の通しスモーク
+│                         テストが埋め込む。出荷バイナリには入らない）
 ├── scripts/
 │   ├── generate-icons.sh アイコン資産の再生成（.icon → Assets.car / .icns、SVG → tray.png）
 │   └── check-icons.sh    生成物がマスターと一致するかの検査（CI でも実行）
@@ -149,6 +149,7 @@ shoki/
     ├── transcript.rs     文字起こし JSON の読み込みと mic／system の時刻順マージ（表示用）
     ├── summarize.rs      文字起こしから議事録（summary.md）を生成（バックグラウンド）
     │   └── on_device.rs  議事録生成のオンデバイス実装（llama.cpp）
+    ├── inference_slot.rs 重い ML 推論（whisper／要約 LLM）を同時に 1 本しか走らせない共有スロット
     ├── model_download.rs 検証つきモデルダウンロードの共有基盤（SHA-256・原子的配置・状態管理）
     ├── whisper_model.rs  内蔵 whisper モデルのカタログ（選べるモデルの一覧）
     ├── summary_model.rs  議事録要約 LLM のカタログ（選べるモデルの一覧）
@@ -244,9 +245,10 @@ macOS では `screencapturekit` と `objc2` 系を使います。
 
 - **議事録要約の LLM 検証プローブ**: オンデバイス LLM で議事録を生成する方針
   （[#78](https://github.com/pkshimizu/openshoki/issues/78)）の検証に使う
-  `examples/summary_probe.rs`。出荷バイナリには含まれません（`llama-cpp-2` は
-  dev-dependencies なので `cargo build` では llama.cpp をリンクしません。`cargo test` /
-  `cargo clippy --all-targets` ではビルドされ、コールドで約 1 分増えます）。
+  `examples/summary_probe.rs`。example なので出荷バイナリには含まれません
+  （`llama-cpp-2` 自体は本体の依存なので、`cargo build` でも llama.cpp はビルド・リンク
+  されます）。プロンプトの正は本実装（`src/summarize.rs`）側で、このプローブが持つ文面は
+  #78 当時のスナップショットです。
 
   ```sh
   cargo run --release --example summary_probe -- --model <path.gguf> --lang ja

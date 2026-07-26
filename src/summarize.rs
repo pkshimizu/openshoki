@@ -33,7 +33,7 @@ pub const SUMMARY_FILENAME: &str = "summary.md";
 /// 1 チャンクに入れるトランスクリプト本文のトークン概算の上限。
 ///
 /// コンテキスト長（Qwen2.5 は 32,768）ではなく **prefill が超線形に伸びること**が理由の閾値
-/// （#78: 3B でトークン 4.4 倍に対し時間 7.3 倍）。約 4,000 トークンは本文で日本語 5,800 文字
+/// （#78 の確定プロンプトでの実測: 3B でトークン 4.29 倍に対し時間 6.97 倍）。約 4,000 トークンは本文で日本語 5,800 文字
 /// （約 19 分）・英語 12,800 文字（約 25 分）に相当する。
 const CHUNK_TOKEN_BUDGET: usize = 4_000;
 
@@ -216,22 +216,20 @@ fn run_job(
         return JobOutcome::Skipped;
     }
 
-    // 既にある `summary.md` は、ここへ来た時点で**古い文字起こしの議事録**（このジョブは
-    // 文字起こしが成功した直後にしか走らない）。先に消しておかないと、生成に失敗したときに
-    // 古い議事録が残り、失敗の記録はメモリのみで再起動すると消えるため、表示側は「新しい
-    // 文字起こしの議事録」として読んでしまう。消せなかった場合は上書きに賭けて先へ進む。
     let path = job.session_dir.join(SUMMARY_FILENAME);
-    if let Err(err) = std::fs::remove_file(&path)
-        && err.kind() != std::io::ErrorKind::NotFound
-    {
-        eprintln!("Could not remove the previous meeting summary before regenerating it: {err}");
-    }
-
     let generated = match job.engine {
         SummaryEngine::OnDevice => {
             let Some(model_path) = resolve_model(job, downloader) else {
                 return JobOutcome::Failed;
             };
+            // 既にある `summary.md` は、ここへ来た時点で**古い文字起こしの議事録**（このジョブは
+            // 文字起こしが成功した直後にしか走らない）。残したまま生成に失敗すると、失敗の記録は
+            // メモリのみで再起動すると消えるため、表示側は古い議事録を「新しい文字起こしの
+            // 議事録」として読んでしまう。消せなかった場合は上書きに賭けて先へ進む。
+            //
+            // 消すのは**生成に入ることが確定してから**（モデルを用意できずに即失敗する経路で
+            // 過去の議事録を巻き添えにしない）。
+            remove_stale_summary(&path);
             // ここから先が重い区間。文字起こしと同時に走らせない（`crate::inference_slot`）。
             // モデルの準備（ダウンロード）はスロットの外で済ませてある。
             let _slot = slot.acquire();
@@ -267,6 +265,15 @@ fn run_job(
     }
 }
 
+/// 再生成の前に、古い（＝ひとつ前の文字起こしから作った）議事録を消す。無ければ何もしない。
+fn remove_stale_summary(path: &Path) {
+    if let Err(err) = std::fs::remove_file(path)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("Could not remove the previous meeting summary before regenerating it: {err}");
+    }
+}
+
 /// 使うモデルファイルを決める。上書き指定があればそれを、無ければ設定で選ばれた内蔵モデルを
 /// 使う（未取得ならここで自動ダウンロードする。UI 起点のダウンロード中なら完了を待つ。
 /// ワーカースレッド上なので分オーダーかかっても UI は塞がない）。
@@ -299,27 +306,10 @@ fn resolve_model(
     Some(path)
 }
 
-/// 議事録を保存する。録音・文字起こしと同じ機微データなので Unix では 0600 で作成する
-/// （`docs/rules/security.md`。セッションディレクトリ自体は録音側が 0700 で作成済み）。
-///
-/// `OpenOptions::mode` は**新規作成時にしか効かない**ので、開いた後にモードを明示し直す
-/// （セッションを `cp -r` した／バックアップから戻した等で 0644 の `summary.md` が在ると、
-/// 上書きしてもそのモードが残ってしまう）。ファイルハンドル経由で設定するので、開いた後に
-/// 差し替えられても別のファイルへ適用されることはない。
+/// 議事録を保存する。録音・文字起こしと同じ機微データなので所有者のみ読み書き可で作る
+/// （`crate::private_file`）。
 fn write_summary(path: &Path, markdown: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    }
+    let mut file = crate::private_file::create(path)?;
     file.write_all(markdown.as_bytes())?;
     // Markdown ファイルとして扱いやすいよう末尾を改行で終える。
     file.write_all(b"\n")?;
@@ -763,6 +753,10 @@ mod tests {
         let blocks: Vec<String> =
             vec!["あいうえお".to_owned(), "hello".to_owned(), "か".to_owned()];
         assert!(estimate_joined(&blocks, "\n") >= estimate_tokens(&blocks.join("\n")));
+        // 区切り文字ぶんを足さないと**下回る**入力。ASCII 20 文字 × 2 は各 7 トークン概算
+        // （和 14）だが、連結すると 41 文字で 15 になる。ここで不等式が効く。
+        let tight: Vec<String> = vec!["a".repeat(20), "a".repeat(20)];
+        assert!(estimate_joined(&tight, "\n") >= estimate_tokens(&tight.join("\n")));
         // 区切りは要素数 - 1 個ぶんだけ数える（空・単数で過大にしない）。
         assert_eq!(estimate_joined(&[], "\n"), 0);
         assert_eq!(
@@ -782,6 +776,10 @@ mod tests {
         // 収まるならそのまま返す。
         assert_eq!(truncate_to_budget(text, 1_000), text);
         assert_eq!(truncate_to_budget("", 10), "");
+        // 予算 0 では 1 文字も入らない。`split_oversized` はこれをガードして前へ進む
+        // （ガードを外すと無限ループになるので、テストで固定しておく）。
+        assert_eq!(truncate_to_budget("あ", 0), "");
+        assert_eq!(split_oversized("ab", 0), vec!["ab".to_owned()]);
     }
 
     #[test]
@@ -1063,6 +1061,57 @@ mod tests {
         format!("{{\"segments\":[{}]}}", segments.join(","))
     }
 
+    /// 再生成のとき、古い議事録が残ったままにならないこと。失敗の記録はメモリのみ（再起動で
+    /// 消える）なので、古いファイルが残ると表示側が「新しい文字起こしの議事録」として読む。
+    #[test]
+    fn regenerating_removes_the_previous_summary_even_when_it_fails() {
+        let worker = SummarizeWorker::start(
+            crate::model_download::ModelDownloader::new(),
+            crate::inference_slot::InferenceSlot::new(),
+        );
+        let dir = std::env::temp_dir().join(format!("shoki-summary-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("the temp session dir should be creatable");
+        std::fs::write(
+            dir.join("mic.json"),
+            r#"{"segments":[{"start":0.0,"end":1.0,"text":"hello"}]}"#,
+        )
+        .expect("the transcript should be writable");
+        std::fs::write(dir.join(SUMMARY_FILENAME), "# stale minutes\n")
+            .expect("the stale summary should be writable");
+
+        // モデルの上書きパスは実在するファイルにする（存在しないと `resolve_model` が先に
+        // 失敗し、削除まで到達しない＝この経路の検証にならない）。GGUF ではないのでロードは
+        // 失敗し、ジョブは Failed へ落ちる。
+        let fake_model = dir.join("not-a-model.gguf");
+        std::fs::write(&fake_model, b"not a gguf").expect("the fake model should be writable");
+
+        worker.submit(SummarizeJob {
+            session_dir: dir.clone(),
+            engine: SummaryEngine::OnDevice,
+            model_id: crate::summary_model::DEFAULT_MODEL_ID.to_owned(),
+            model_override: Some(fake_model),
+            language: "en".to_owned(),
+        });
+        let mut settled = false;
+        for _ in 0..600 {
+            if worker.status_of(&dir) == Some(SummarizeStatus::Failed) {
+                settled = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            settled,
+            "the job should fail within 6s (the model file is not a gguf)"
+        );
+        assert!(
+            !dir.join(SUMMARY_FILENAME).exists(),
+            "the stale summary must not survive a failed regeneration"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn write_summary_creates_an_owner_only_file_with_a_trailing_newline() {
         let dir = std::env::temp_dir().join(format!("shoki-summary-w-{}", std::process::id()));
@@ -1077,11 +1126,21 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&path)
-                .expect("metadata")
-                .permissions()
-                .mode();
-            assert_eq!(mode & 0o777, 0o600, "the summary must be owner-only");
+            let mode = |path: &Path| {
+                std::fs::metadata(path)
+                    .expect("metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777
+            };
+            assert_eq!(mode(&path), 0o600, "the summary must be owner-only");
+
+            // 緩いモードの `summary.md` が在る状態で上書きしても 0600 へ揃うこと
+            // （`OpenOptions::mode` は新規作成時にしか効かない。`crate::private_file`）。
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+                .expect("the fixture mode should be settable");
+            write_summary(&path, "## Summary\nStill good.").expect("overwriting should succeed");
+            assert_eq!(mode(&path), 0o600, "overwriting must tighten the mode");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

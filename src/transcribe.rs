@@ -11,7 +11,6 @@
 //! 他音源・アプリ・録音を巻き込まない（`docs/rules/error-handling.md`）。
 
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -229,8 +228,7 @@ fn run_job(
     let model_path = match &job.model_override {
         Some(path) => path.clone(),
         None => {
-            let spec = crate::whisper_model::spec_for(&job.model_id)
-                .unwrap_or_else(crate::whisper_model::default_spec);
+            let spec = crate::whisper_model::spec_or_default(&job.model_id);
             match downloader.ensure_model(spec) {
                 Ok(path) => path,
                 Err(err) => {
@@ -518,22 +516,15 @@ fn resample_to_whisper_rate(
     Ok(output.take_data())
 }
 
-/// 文字起こし結果を JSON で保存する。録音と同じ機微データなので Unix では 0600 で作成する
-/// （`docs/rules/security.md`。セッションディレクトリ自体は録音側が 0700 で作成済み）。
+/// 文字起こし結果を JSON で保存する。録音と同じ機微データなので所有者のみ読み書き可で作る
+/// （`crate::private_file`。やり直しで既存ファイルを上書きする経路があるため、モードを
+/// 揃え直す必要がある）。
 fn write_transcription(
     path: &Path,
     result: &Transcription,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let json = serde_json::to_string_pretty(result)?;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path)?;
-    file.write_all(json.as_bytes())?;
+    crate::private_file::write(path, json.as_bytes())?;
     Ok(())
 }
 

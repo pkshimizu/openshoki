@@ -10,6 +10,7 @@ mod inference_slot;
 mod mixdown;
 mod model_download;
 mod player;
+mod private_file;
 mod recorder;
 mod recordings;
 mod single_instance;
@@ -1537,8 +1538,9 @@ fn model_status_text(
 ) -> String {
     match downloader.status_of(spec) {
         model_download::DownloadStatus::NotDownloaded => format!(
-            // 未取得モデルは「選択した時点」または「次の文字起こし時」に自動取得される。
-            // どちらかに限定した文言にしない（両方の経路がある）。
+            // 自動取得の契機は種別で違う（whisper は選択した時点または次の文字起こし時、
+            // 要約 LLM は選択 UI が無いので次の要約時）。共用の文言なので、どれかに
+            // 限定した書き方にしない。
             "Not downloaded — downloads automatically ({})",
             model_download::format_size(spec.size_bytes)
         ),

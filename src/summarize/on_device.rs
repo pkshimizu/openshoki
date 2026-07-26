@@ -272,12 +272,77 @@ impl Pass<'_, '_, '_> {
 /// どちらも `?` で伝播させると、**1 トークンのために数分〜十数分かけた要約が丸ごと失敗する**。
 /// 制御トークンの文字列そのものは議事録へ出したくないので `special = true` にはしない。
 fn token_bytes(model: &LlamaModel, token: LlamaToken) -> Result<Vec<u8>, TokenToStringError> {
-    match model.token_to_piece_bytes(token, TOKEN_PIECE_BUF, false, None) {
+    token_bytes_with(|buffer_size| model.token_to_piece_bytes(token, buffer_size, false, None))
+}
+
+/// `token_bytes` の分岐だけを取り出したもの（モデル無しでテストできるようにするため）。
+/// `fetch` は「このバッファサイズで表記を取ってくる」関数。
+fn token_bytes_with(
+    mut fetch: impl FnMut(usize) -> Result<Vec<u8>, TokenToStringError>,
+) -> Result<Vec<u8>, TokenToStringError> {
+    match fetch(TOKEN_PIECE_BUF) {
         Ok(bytes) => Ok(bytes),
         Err(TokenToStringError::UnknownTokenType) => Ok(Vec::new()),
+        // `InsufficientBufferSpace` は「あと何バイト要るか」を**負値**で返す（クレートが
+        // llama.cpp の戻り値をそのまま包んでいる）ので、絶対値を取ってもう一度だけ引く。
         Err(TokenToStringError::InsufficientBufferSpace(needed)) => {
-            model.token_to_piece_bytes(token, needed.unsigned_abs() as usize, false, None)
+            fetch(needed.unsigned_abs() as usize)
         }
         Err(err) => Err(err),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 表記が最初のバッファに収まるトークンは、そのまま 1 回で返る。
+    #[test]
+    fn token_bytes_returns_the_first_attempt() {
+        let mut sizes = Vec::new();
+        let bytes = token_bytes_with(|size| {
+            sizes.push(size);
+            Ok(b"hi".to_vec())
+        })
+        .expect("a fitting token should succeed");
+        assert_eq!(bytes, b"hi");
+        assert_eq!(sizes, vec![TOKEN_PIECE_BUF]);
+    }
+
+    /// バッファ不足は**必要サイズで 1 回だけ**引き直す（`?` で伝播させると、1 トークンのために
+    /// 数分かけた要約が丸ごと失敗する）。
+    #[test]
+    fn token_bytes_retries_with_the_requested_size() {
+        let mut sizes = Vec::new();
+        let bytes = token_bytes_with(|size| {
+            sizes.push(size);
+            if size == TOKEN_PIECE_BUF {
+                Err(TokenToStringError::InsufficientBufferSpace(-64))
+            } else {
+                Ok(vec![b'x'; size])
+            }
+        })
+        .expect("the retry should succeed");
+        assert_eq!(bytes.len(), 64);
+        assert_eq!(sizes, vec![TOKEN_PIECE_BUF, 64]);
+    }
+
+    /// 表記の無い制御トークン（EOG ではないので生成ループでは止まらない）は読み飛ばす。
+    #[test]
+    fn token_bytes_skips_tokens_without_a_piece() {
+        let bytes = token_bytes_with(|_| Err(TokenToStringError::UnknownTokenType))
+            .expect("an unprintable token should not fail the job");
+        assert!(bytes.is_empty());
+    }
+
+    /// それ以外のエラーは握りつぶさず伝播する。
+    #[test]
+    fn token_bytes_propagates_other_errors() {
+        let result = token_bytes_with(|_| {
+            Err(TokenToStringError::FromUtf8Error(
+                String::from_utf8(vec![0xff]).expect_err("invalid utf-8"),
+            ))
+        });
+        assert!(result.is_err());
     }
 }

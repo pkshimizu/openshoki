@@ -17,7 +17,6 @@
 //! 常駐を続ける（`docs/rules/error-handling.md`）。
 
 use std::fs::File;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
 
@@ -186,7 +185,8 @@ fn normalize_if_quiet(path: &Path) -> Result<NormalizeOutcome, Box<dyn std::erro
 
     // 一時ファイルへ書いてから rename で置き換える（途中で失敗しても元ファイルが壊れない）。
     let part = path.with_extension(format!("mp3.part.{}", std::process::id()));
-    let result = write_owner_only(&part, &mp3).and_then(|()| std::fs::rename(&part, path));
+    let result =
+        crate::private_file::write(&part, &mp3).and_then(|()| std::fs::rename(&part, path));
     if let Err(err) = result {
         // 後始末の失敗も黙って捨てない（docs/rules/error-handling.md）。
         if let Err(remove_err) = std::fs::remove_file(&part)
@@ -251,7 +251,7 @@ fn generate_mix(session_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
         mix_into(system_pcm, &mic_pcm)
     };
     let mp3 = encode_mp3(&to_i16(mixed), channels, sample_rate)?;
-    write_owner_only(&session_dir.join(MIX_FILENAME), &mp3)?;
+    crate::private_file::write(&session_dir.join(MIX_FILENAME), &mp3)?;
     Ok(())
 }
 
@@ -345,19 +345,6 @@ pub(crate) fn encode_mp3(
     mp3.reserve(mp3lame_encoder::max_required_buffer_size(0));
     encoder.flush_to_vec::<FlushNoGap>(&mut mp3)?;
     Ok(mp3)
-}
-
-/// 機微ファイル（録音データ由来）として所有者のみ読み書き可（Unix 0600）で書き出す。
-fn write_owner_only(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path)?;
-    file.write_all(data)
 }
 
 #[cfg(test)]

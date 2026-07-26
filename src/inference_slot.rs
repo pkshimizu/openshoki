@@ -10,8 +10,12 @@
 //! スロットを取るのは**モデルを実際に動かす区間だけ**にする。モデルのダウンロード（数 GB・
 //! 分オーダー）は CPU もメモリも食わないので、待たせても誰の得にもならない。
 //!
-//! 後処理（正規化・ミックス生成。`src/mixdown.rs`）はここに含めない。ML ではなく、
-//! 音源 1 本ぶんのデコード／再エンコードで完結するため。
+//! 後処理（正規化・ミックス生成。`src/mixdown.rs`）は**あえて含めない**。ミックス生成は
+//! 2 音源を f32 PCM へ全展開するので軽くはない（1 時間・48kHz ステレオで 1 本あたり約 1.4GB）
+//! が、`mix.mp3` ができるまで**そのセッションは再生できない**。直前の会議の要約（分オーダー）に
+//! 引きずられて、録り終わった録音がいつまでも聴けなくなるほうが体感の害が大きい、という判断。
+//! この PR 以前から後処理と文字起こしは並走しており、ここは挙動を変えていない。
+//! ピークが問題になるなら、後処理側にも枠を広げるのは自然な次の一手。
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -42,25 +46,40 @@ impl InferenceSlot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     /// クローンした 2 つのハンドルが同じ枠を取り合う（＝一方が占有中は他方が待つ）こと。
-    /// 待ちを直接観測すると sleep 依存になるので、`try` 相当の代わりに「占有を手放したあとは
-    /// 取れる」ことと「別スレッドが取れるまで進まない」ことを、完了順で確かめる。
+    ///
+    /// 「待たされている」ことを固定 sleep で作らない（`docs/rules/testing.md`）。ワーカーが
+    /// `acquire` の直前まで到達したことをフラグで確かめてから記録するので、排他が無くなれば
+    /// ワーカーの記録が先に入り、CI の負荷に関わらず落ちる。
     #[test]
     fn clones_share_one_slot() {
         let slot = InferenceSlot::new();
         let other = slot.clone();
         let order = Arc::new(Mutex::new(Vec::new()));
+        let at_gate = Arc::new(AtomicBool::new(false));
 
         let held = slot.acquire();
         let worker_order = Arc::clone(&order);
+        let worker_gate = Arc::clone(&at_gate);
         let worker = std::thread::spawn(move || {
+            worker_gate.store(true, Ordering::SeqCst);
             let _slot = other.acquire();
             worker_order.lock().expect("not poisoned").push("worker");
         });
 
-        // 占有中は worker が先へ進めない。ここで記録した "main" は必ず先に入る。
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        // ワーカーが acquire の手前まで来るのを上限つきで待つ。
+        let mut reached = false;
+        for _ in 0..1_000 {
+            if at_gate.load(Ordering::SeqCst) {
+                reached = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(reached, "the worker thread should reach the slot within 1s");
+        // ここでワーカーは acquire で止まっている。占有を手放すまで記録できない。
         order.lock().expect("not poisoned").push("main");
         drop(held);
 
