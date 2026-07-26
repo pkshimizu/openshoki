@@ -9,8 +9,8 @@
 #   assets/icon/tray.png … ラスタライズを挟むので画素で比較（下記 TRAY_MAX_DIFF_PIXELS 参照）
 #   assets/icon/generated/openshoki.icns … actool の出力だが決定的（実測）。完全一致。
 #     これだけは actool（Xcode）が要る。無ければその旨を出してスキップする。
-# `assets/icon/generated/Assets.car` は actool が入力を変えなくても毎回違うバイト列を出すため
-# 検査しない（README の「アイコン資産の再生成」参照）。
+# `assets/icon/generated/Assets.car` は検査しない。actool が入力を変えなくても毎回違うバイト列を
+# 出すため、そもそも git で追跡していない（README の「アイコン資産の再生成」参照）。
 #
 # 必要なツール: rsvg-convert、magick（ImageMagick）。.icns まで見るなら Xcode 26 以降
 # （xcrun actool。それ未満／未インストールなら .icns はスキップする）。

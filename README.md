@@ -105,7 +105,7 @@ openshoki/
 │   │   ├── openshoki.icon/   Icon Composer 形式のマスター（icon.json と Assets/seal.svg。
 │   │   │                     Assets/mark-ink*.svg は mark.svg から生成する色違い）
 │   │   ├── tray.png          メニューバー常駐アイコン（36x36 RGBA。ビルド時に埋め込む。生成物）
-│   │   └── generated/        actool の生成物（Assets.car / openshoki.icns）
+│   │   └── generated/        actool の生成物（openshoki.icns。Assets.car は追跡しない）
 │   └── menu/             トレイメニュー項目のアイコン（PNG, 32x32 RGBA。ビルド時に埋め込む）
 ├── scripts/
 │   ├── generate-icons.sh アイコン資産の再生成（.icon → Assets.car / .icns、SVG → tray.png）
@@ -160,8 +160,10 @@ macOS では `screencapturekit` と `objc2` 系を使います。
 
   Xcode 26 以降（`xcrun actool`。Icon Composer 形式の `.icon` を扱えるバージョン）、
   `rsvg-convert`、ImageMagick（`magick`）が必要です。
-  `actool` が出す `Assets.car` は入力が同じでも毎回バイト列が変わるため、マスターを変えていない
-  のに差分が出たときは `git checkout -- assets/icon/generated/Assets.car` で戻してください。
+
+  `actool` が出す `Assets.car`（macOS 26 のレイヤードアイコン）だけは**コミットしません**。
+  入力が同じでも毎回バイト列が変わり、意味のない差分が毎回出るためです（`.gitignore` 済み）。
+  使うのは `.app` のパッケージングのときだけなので、その場でこのスクリプトを実行して生成します。
 
   生成物がマスターと一致しているかの確認だけなら次を実行します（作業ツリーは変更しません）。
   Xcode 26 以降があれば `openshoki.icns` まで、無ければ `mark.svg` 由来の生成物だけを検査します

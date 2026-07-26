@@ -7,19 +7,23 @@
 #   生成物:   assets/icon/openshoki.icon/Assets/mark-ink.svg        … 一画（墨・ライト用）
 #             assets/icon/openshoki.icon/Assets/mark-ink-on-dark.svg … 一画（白・ダーク用）
 #             assets/icon/generated/Assets.car     … macOS 26（Tahoe）のレイヤードアイコン
+#                                                     （**コミットしない**。下記参照）
 #             assets/icon/generated/openshoki.icns … 旧 macOS 用のフォールバック
 #             assets/icon/tray.png                 … メニューバー常駐アイコン（36x36 8bit RGBA）
 #
-# 生成物はコミットする（ビルド時生成にしない）。`src/tray.rs` は tray.png を include_bytes! で
-# 埋め込むため、資産を変えたらこのスクリプトを実行して差分をコミットすること。
+# 生成物のうち openshoki.icns と tray.png はコミットする（ビルド時生成にしない）。`src/tray.rs` は
+# tray.png を include_bytes! で埋め込むため、資産を変えたらこのスクリプトを実行して差分を
+# コミットすること。Assets.car だけは追跡しない（入力が同じでも毎回バイト列が変わり、意味の
+# ない差分が毎回出るため）。使うのは .app のパッケージングだけなので、そこでこのスクリプトを
+# 実行して作る。
 #
 # 必要なツール: Xcode 26 以降（xcrun actool。Icon Composer 形式の .icon を扱えるバージョン）、
 #               rsvg-convert、magick（ImageMagick）
 set -euo pipefail
 
-# --skip-appicon: actool を使う工程（Assets.car / .icns）を飛ばし、決定的に再現できる生成物
+# --skip-appicon: actool を使う工程（Assets.car / .icns）を飛ばし、Xcode 無しでも作れる生成物
 # （.icon の色違いレイヤーと tray.png）だけを作り直す。マスターと生成物のズレを検査したいとき
-# （`scripts/check-icons.sh`）に使う。Assets.car は入力が同じでも毎回バイト列が変わるため。
+# （`scripts/check-icons.sh`）に使う。
 # --out-dir DIR: 生成物をリポジトリではなく DIR 配下（同じ相対パス）へ書き出す。作業ツリーを
 # 汚さずに再生成して比べたいときに使う。
 skip_appicon=false
@@ -177,10 +181,9 @@ if [ "$skip_appicon" = false ]; then
 fi
 echo "  $(display_path "$tray_out") ($(magick identify -format '%wx%h %[bit-depth]bit %[channels]' "$tray_out"))"
 if [ "$skip_appicon" = false ] && [ "$out_root" = "$repo_root" ]; then
-  # actool の Assets.car は入力が同じでも毎回バイト列が変わる（実測）。マスターを変えていない
-  # のに差分が出たときは戻してよい、と分かるようにしておく。
+  # Assets.car は毎回バイト列が変わるため追跡していない（.gitignore）。ここで作ったものは
+  # .app のパッケージングで使う。
   echo
-  echo "Note: Assets.car changes on every run even with identical input."
-  echo "      If you did not change the master, restore it with:"
-  echo "      git checkout -- $generated_dir/Assets.car"
+  echo "Note: Assets.car is not tracked by git (it changes on every run)."
+  echo "      Use the one generated here when packaging the .app."
 fi
