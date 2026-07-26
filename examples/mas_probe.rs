@@ -574,7 +574,7 @@ mod probe {
             let overall = compare_sets(&all, ids);
             let helper = compare_sets(&parent_resolved, ids);
             emit!(
-                "    {name:<19} {}/{} {} {} | {}/{} {} {}",
+                "    {name:<21} {}/{} {} {} | {}/{} {} {}",
                 overall.equal,
                 overall.compared,
                 overall.missing,
@@ -637,15 +637,17 @@ mod probe {
                 entry.0 += 1;
                 if row.parent_added_id() {
                     entry.1 += 1;
-                    // 完全一致ではなく「取りこぼしが無い」で数える。公開 API 側はヘルパー自身の
-                    // ID（`….helper`）を余分に持つことがあり、完全一致で見ると常に 0 になる。
-                    if row.private_ids().is_subset(&row.planned_ids()) {
+                    // 「その行を**このアプリに**帰属できたか」で数える。集合の完全一致で見ると、
+                    // 公開 API 側が持つヘルパー自身の ID（`….helper`）のせいで常に 0 になる。
+                    if row.planned_ids().contains(app) {
                         entry.2 += 1;
                     }
                 }
             }
         }
-        emit!("  per app (rows / parent-resolved rows / parent-resolved rows that lost no id):");
+        emit!(
+            "  per app (rows / parent-resolved rows / parent-resolved rows the public APIs still attribute here):"
+        );
         for (app, (total, parent_resolved, kept)) in by_app {
             emit!("    {app}: {total} / {parent_resolved} / {kept}");
         }
@@ -691,6 +693,9 @@ mod probe {
     /// 返す。macOS 14.4 未満やサンドボックスで照会できない場合は `None`
     /// （＝自動録音そのものが成立しない）。
     fn audio_processes() -> Option<Vec<ProcessEntry>> {
+        /// pid を返さないプロセスオブジェクトがあったことを 1 回だけ知らせるためのフラグ。
+        static MISSING_PID_REPORTED: AtomicBool = AtomicBool::new(false);
+
         let processes = process_object_list()?;
         let total = processes.len();
         let mut samples = Vec::new();
@@ -705,7 +710,8 @@ mod probe {
                 core_audio_bundle_id: process_bundle_id(process),
             });
         }
-        if samples.len() != total {
+        // `--watch-mic` は 500ms ごとにここを通るので、毎回出すと監視ログが埋まる。1 回だけ知らせる。
+        if samples.len() != total && !MISSING_PID_REPORTED.swap(true, Ordering::Relaxed) {
             emit!(
                 "  note: {} of {total} audio process objects did not return a pid",
                 total - samples.len()
