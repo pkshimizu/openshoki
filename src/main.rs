@@ -1395,7 +1395,7 @@ fn recording_dir_text(dir: &std::path::Path) -> slint::SharedString {
 }
 
 /// 登録アプリ 1 件を設定画面の行にする。検知できないアプリには
-/// `app_audio_monitor::auto_record_limitation` の理由を添える。
+/// `app_audio_monitor::auto_record_limitation` の注記を添える。
 fn trigger_app_row(trigger: &config::AppTrigger) -> TriggerApp {
     #[cfg(target_os = "macos")]
     let note = app_audio_monitor::auto_record_limitation(&trigger.bundle_id).unwrap_or("");
@@ -1464,7 +1464,10 @@ mod tests {
 
     /// 設定画面の行は、検知できないアプリにだけ注記を持つ（判定は `auto_record_limitation`）。
     /// バンドル ID → 注記の写像を渡し忘れる回帰を、ここで止める。
+    ///
+    /// 自動録音は macOS 限定なので、他 OS では注記が常に空になる（`trigger_app_row` の `cfg`）。
     #[test]
+    #[cfg(target_os = "macos")]
     fn trigger_app_row_notes_undetectable_apps() {
         use crate::config::AppTrigger;
 

@@ -19,6 +19,8 @@ use slint::{ComponentHandle, ModelRc, VecModel};
 
 /// 注記つきの行がどれだけ縦を食うかを見たいので、対象外アプリを混ぜた並びを既定にする。
 fn sample_apps() -> Vec<TriggerApp> {
+    // `app_audio_monitor::auto_record_limitation` の文言の複製（bin クレートなので import
+    // できない）。あちらを変えたらここも合わせること。長さが見え方に効くのが確認の主目的。
     let note = "Not detected — record manually";
     vec![
         TriggerApp {
@@ -51,6 +53,8 @@ fn main() {
 
     win.window()
         .set_position(slint::LogicalPosition::new(60.0, 60.0));
+    // 実アプリと同じ寸法で見る（`src/main.rs` の WINDOW_WIDTH/HEIGHT と一致させること）。
+    win.window().set_size(slint::LogicalSize::new(420.0, 790.0));
     win.show()
         .expect("showing the window should succeed in this verification binary");
 

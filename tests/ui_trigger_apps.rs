@@ -47,7 +47,7 @@ fn trigger_app(name: &str, limitation_note: &str) -> TriggerApp {
     not(slint_debug_info),
     ignore = "needs Slint debug info (SLINT_EMIT_DEBUG_INFO=1)"
 )]
-fn unsupported_app_shows_the_limitation() {
+fn unsupported_app_shows_the_note() {
     let note = "Not detected — record manually";
     let window = open_window(vec![trigger_app("Safari", note)]);
 

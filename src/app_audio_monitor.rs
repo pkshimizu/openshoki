@@ -260,7 +260,7 @@ pub fn input_running_bundle_ids() -> Option<HashSet<String>> {
     Some(ids)
 }
 
-/// 自動録音で検知できないアプリなら、その理由（ユーザーへ見せる 1 文）を返す。
+/// 自動録音で検知できないアプリなら、一覧に添える 1 文（状態と対処）を返す。
 ///
 /// マイクを掴むのがアプリ自身ではなく、フレームワーク同梱の共有 XPC サービスになる構成は、
 /// 公開 API ではホストアプリへ辿れない（#77 で実測。WebKit は `com.apple.WebKit.GPU.xpc` が
@@ -611,14 +611,15 @@ mod tests {
             outermost_app_bundle(Path::new("/Applications/Slack.app/Contents/MacOS/Slack")),
             Some(PathBuf::from("/Applications/Slack.app"))
         );
-        // 拡張子は最終コンポーネントだけを見るので、`.app` を途中に含む別名は誤検出しない。
+        // `Path::extension` は最後のドット以降を返すので、`Foo.app.backup` の拡張子は `backup`。
+        // `.app` を名前の途中に含むディレクトリは誤検出しない。
         assert_eq!(
             outermost_app_bundle(Path::new(
                 "/Applications/Foo.app.backup/Bar.app/Contents/MacOS/Bar"
             )),
             Some(PathBuf::from("/Applications/Foo.app.backup/Bar.app"))
         );
-        // 大文字の拡張子も同じ扱い（HFS+ は既定で大文字小文字を区別しない）。
+        // 大文字の拡張子も同じ扱い（APFS は既定で大文字小文字を区別しない）。
         assert_eq!(
             outermost_app_bundle(Path::new("/Applications/Foo.APP/Contents/MacOS/Foo")),
             Some(PathBuf::from("/Applications/Foo.APP"))
