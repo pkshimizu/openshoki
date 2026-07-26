@@ -76,6 +76,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 失敗時は load() がデフォルトを返す。
     let config = Rc::new(RefCell::new(Config::load()));
 
+    // 保存先が無いまま録音すると、`create_session_dir` が黙って作り直す（外付けディスクの
+    // 未マウント・フォルダの移動/改名など）。一覧には出ない場所へ録り続けて気づけないので、
+    // 起動時に 1 回だけ知らせる。作成も選び直しもしない（次の録音で意図どおり作られる場合が
+    // あり、勝手に既定へ戻すと利用者の設定を失う）。
+    {
+        let recording_dir = &config.borrow().recording_dir;
+        if !recording_dir.exists() {
+            eprintln!(
+                "The recording folder does not exist yet and will be created on the next recording: {}",
+                recording_dir.display()
+            );
+        }
+    }
+
     // 内蔵 whisper モデルのダウンロード・状態管理。設定画面（モデル選択・DL 状況表示）と
     // 文字起こしワーカーで同じ状態を共有し、同一モデルの二重ダウンロードを防ぐ。
     let model_downloader = whisper_model::ModelDownloader::new();
