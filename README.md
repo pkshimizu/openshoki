@@ -224,6 +224,20 @@ macOS では `screencapturekit` と `objc2` 系を使います。
   cargo run --example settings_view -- snapshot out.png # PNG に書き出す（画面収録の許可が不要）
   ```
 
+- **議事録要約の LLM 検証プローブ**: オンデバイス LLM で議事録を生成する方針
+  （[#78](https://github.com/pkshimizu/openshoki/issues/78)）の検証に使う
+  `examples/summary_probe.rs`。出荷バイナリには含まれません（`llama-cpp-2` は
+  dev-dependencies なので `cargo build` では llama.cpp をリンクしません）。
+
+  ```sh
+  cargo run --release --example summary_probe -- --model <path.gguf> --lang ja
+  cargo run --release --example summary_probe -- --model <path.gguf> --lang en
+  ```
+
+  サンプルのトランスクリプト（`assets/samples/meeting-{ja,en}.txt`）は架空の会議で、
+  実データを使わずに再現できるようにしてあります。計測値と採用モデルの提案は
+  ローカルのプラン `docs/plans/` にあります（`docs/` は追跡対象外）。
+
 - **Mac App Store 可否の検証プローブ**: MAS 対応（[#77](https://github.com/pkshimizu/openshoki/issues/77)）の
   技術検証に使う `examples/mas_probe.rs` を、App Sandbox の有無を切り替えて実行します。
   出荷バイナリには含まれません（`cargo` の example）。
