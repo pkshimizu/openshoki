@@ -22,7 +22,7 @@ set -euo pipefail
 # --out-dir DIR: 生成物をリポジトリではなく DIR 配下（同じ相対パス）へ書き出す。作業ツリーを
 # 汚さずに再生成して比べたいときに使う。
 skip_appicon=false
-out_root="."
+out_root=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --skip-appicon) skip_appicon=true; shift ;;
@@ -42,6 +42,9 @@ done
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
+# --out-dir が無ければリポジトリへ書く。以降は絶対パスで統一する（「リポジトリへ書いたか」を
+# 出力先の比較だけで判定できるようにする）。
+out_root="${out_root:-$repo_root}"
 
 icon_master="assets/icon/openshoki.icon"
 mark_svg="assets/icon/mark.svg"
@@ -126,9 +129,10 @@ else
   # 使ったときにリポジトリ側の古いレイヤーからアプリアイコンが作られてしまう。
   # ディレクトリ名は --app-icon の名前と一致させる必要があるため openshoki.icon にする。
   staged="$tmp_dir/openshoki.icon"
-  mkdir -p "$staged/Assets" "$tmp_dir/appicon"
-  cp "$icon_master/icon.json" "$staged/"
-  cp "$icon_master/Assets/seal.svg" "$staged/Assets/"
+  mkdir -p "$staged" "$tmp_dir/appicon"
+  # マスターを丸ごと複製してから、いま生成したレイヤーで上書きする（中身を列挙すると、
+  # .icon にレイヤーを足したときにコピー漏れで actool が謎のエラーになる）。
+  cp -R "$icon_master/." "$staged/"
   cp "$layers_out/mark-ink.svg" "$layers_out/mark-ink-on-dark.svg" "$staged/Assets/"
   xcrun actool "$staged" --compile "$tmp_dir/appicon" \
     --output-format human-readable-text --notices --warnings --errors \
@@ -160,7 +164,7 @@ if [ "$skip_appicon" = false ]; then
   ls -1 "$generated_out" | sed 's/^/  /'
 fi
 echo "  $tray_out ($(magick identify -format '%wx%h %[bit-depth]bit %[channels]' "$tray_out"))"
-if [ "$skip_appicon" = false ] && [ "$out_root" = "." ]; then
+if [ "$skip_appicon" = false ] && [ "$out_root" = "$repo_root" ]; then
   # actool の Assets.car は入力が同じでも毎回バイト列が変わる（実測）。マスターを変えていない
   # のに差分が出たときは戻してよい、と分かるようにしておく。
   echo

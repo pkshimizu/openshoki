@@ -40,15 +40,21 @@ fi
 
 echo "Regenerating the icon artifacts into a temporary directory…"
 if [ "$check_appicon" = true ]; then
-  ./scripts/generate-icons.sh --out-dir "$regenerated" >/dev/null
+  # Icon Composer 形式の .icon は Xcode 26 以降の actool でないと扱えない。失敗したら
+  # 「生成物が古い」ではなくツールチェーンの問題なので、そう分かるように案内する。
+  if ! ./scripts/generate-icons.sh --out-dir "$regenerated" >/dev/null; then
+    echo "Could not rebuild the app icon with $(xcodebuild -version 2>/dev/null | head -n1)." >&2
+    echo "  .icon requires actool from Xcode 26 or later." >&2
+    exit 1
+  fi
 else
   ./scripts/generate-icons.sh --skip-appicon --out-dir "$regenerated" >/dev/null
 fi
 
 failed=false
 
+# 不一致を記録する（直し方の案内は最後に 1 回だけ出す）。
 report_stale() {
-  echo "  → Run ./scripts/generate-icons.sh and commit the regenerated artifacts." >&2
   failed=true
 }
 
@@ -104,6 +110,7 @@ else
 fi
 
 if [ "$failed" = true ]; then
+  echo "→ Run ./scripts/generate-icons.sh and commit the regenerated artifacts." >&2
   exit 1
 fi
 if [ "$check_appicon" = true ]; then
