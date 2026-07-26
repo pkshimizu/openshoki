@@ -1,9 +1,13 @@
 //! 登録アプリのマイク入力（使用）を検知するモニタ（macOS 14.4+）。
 //!
 //! macOS 14 で追加された CoreAudio のプロセスオブジェクト API を使い、各プロセスがマイク入力を
-//! 使っているか（`kAudioProcessPropertyIsRunningInput`）と PID（`kAudioProcessPropertyPID`）を
-//! 読み、PID→バンドル ID は `NSRunningApplication` で解決する。これにより「いまマイクを使って
-//! いるアプリのバンドル ID 集合」を得て、ユーザーが登録した `.app` のバンドル ID と照合する。
+//! 使っているか（`kAudioProcessPropertyIsRunningInput`）を読む。そのプロセスをどのアプリに
+//! 帰属させるかは**公開 API だけ**で解決する（`input_running_bundle_ids` 参照）。これにより
+//! 「いまマイクを使っているアプリのバンドル ID 集合」を得て、ユーザーが登録した `.app` の
+//! バンドル ID と照合する。
+//!
+//! **既知の限界**: WebKit を音声ホストに使うアプリ（Safari など）は検知できない
+//! （理由は `auto_record_limitation` の doc）。
 //!
 //! 判定は録音ループ（100ms タイマー）に相乗りしたポーリングで行い、`POLL_INTERVAL` に間引く。
 //! 登録アプリのいずれかが「非使用→使用」へ変化した立ち上がりを `take_activated()` が返す。
@@ -14,8 +18,10 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::mem::size_of;
-use std::path::Path;
+use std::os::unix::ffi::OsStringExt;
+use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::time::{Duration, Instant};
 
@@ -24,8 +30,8 @@ use objc2_core_audio::{
     AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize, AudioObjectID,
     AudioObjectPropertyAddress, AudioObjectPropertySelector,
     kAudioHardwarePropertyProcessObjectList, kAudioObjectPropertyElementMain,
-    kAudioObjectPropertyScopeGlobal, kAudioObjectSystemObject, kAudioProcessPropertyIsRunningInput,
-    kAudioProcessPropertyPID,
+    kAudioObjectPropertyScopeGlobal, kAudioObjectSystemObject, kAudioProcessPropertyBundleID,
+    kAudioProcessPropertyIsRunningInput, kAudioProcessPropertyPID,
 };
 use objc2_foundation::{NSBundle, NSString};
 
@@ -207,6 +213,30 @@ fn trigger_matches(base: &str, running: &HashSet<String>) -> bool {
 
 /// いまマイク入力を使っているアプリのバンドル ID 集合を返す。macOS 14.4 未満や照会失敗時は `None`
 /// （呼び出し側は自動開始・自動停止を行わない）。自動停止（#26）でも再利用する。
+///
+/// 1 プロセスにつき、**公開 API で得られたバンドル ID をすべて**集合へ入れる（どれか 1 つに
+/// 畳まない）。マルチプロセスのアプリは、マイクを掴むのが本体ではなくヘルパープロセスで、
+/// 経路によって「ヘルパー自身の ID」と「親アプリの ID」のどちらが得られるかが変わるため:
+///
+/// 1. `kAudioProcessPropertyBundleID` — オーディオ HAL が持つ値。本体プロセスなら本体の ID、
+///    ヘルパーなら `com.google.Chrome.helper` のようにヘルパー自身の ID になることがある。
+/// 2. `NSRunningApplication` の直接の ID — 本体プロセスならこれで取れる（例: Zen/Firefox 系）。
+///    ヘルパーでは nil になることがある。
+/// 3. 実行パスの**最も外側**の `.app` の ID（`exec_path` → `bundle_id_for_exec_path`）—
+///    Chrome/Slack/Electron 系のヘルパーを親アプリ（`com.google.Chrome` 等）へ畳む。
+///
+/// ヘルパー自身の ID しか得られない場合も、`trigger_matches` の前方一致（`base` + `.`）で親アプリ
+/// 登録から拾える。
+///
+/// かつては responsible pid（そのプロセスに責任を持つ親アプリの pid）を返す private シンボルを
+/// 実行時解決して使っていたが、Mac App Store が private API を禁じているため公開 API へ
+/// 置き換えた（#107）。
+/// これに伴う挙動の変化:
+///
+/// - ターミナル等から起動した CLI のマイク使用が、その**起動元アプリ**に帰属しなくなった
+///   （帰属範囲が狭まる方向。コンテナ的なアプリを登録したときの巻き込みが無くなる）。
+/// - WebKit を音声ホストに使うアプリ（Safari 等）が**検知できなくなった**。理由と扱いは
+///   `auto_record_limitation` を参照。
 pub fn input_running_bundle_ids() -> Option<HashSet<String>> {
     let processes = process_object_list()?;
     let mut ids = HashSet::new();
@@ -214,23 +244,43 @@ pub fn input_running_bundle_ids() -> Option<HashSet<String>> {
         if process_is_running_input(process) != Some(true) {
             continue;
         }
+        if let Some(bundle) = process_bundle_id(process) {
+            ids.insert(bundle);
+        }
         let Some(pid) = process_pid(process) else {
             continue;
         };
-        // 直接のバンドル ID（本体プロセスならこれで取れる。例: Zen/Firefox 系）。
         if let Some(bundle) = bundle_id_for_pid(pid) {
             ids.insert(bundle);
         }
-        // マルチプロセスのアプリ（Chrome 等）は、マイクを掴むのが本体ではなくヘルパープロセスで、
-        // ヘルパーは `NSRunningApplication` のバンドル ID が nil になることがある。responsible pid を
-        // 辿って親アプリのバンドル ID（例: `com.google.Chrome`）でも照合できるようにする。
-        if let Some(parent) = responsible_pid(pid)
-            && let Some(bundle) = bundle_id_for_pid(parent)
-        {
+        if let Some(bundle) = exec_path(pid).as_deref().and_then(bundle_id_for_exec_path) {
             ids.insert(bundle);
         }
     }
     Some(ids)
+}
+
+/// 自動録音で検知できないアプリなら、一覧に添える 1 文（状態と対処）を返す。
+///
+/// マイクを掴むのがアプリ自身ではなく、フレームワーク同梱の共有 XPC サービスになる構成は、
+/// 公開 API ではホストアプリへ辿れない（#77 で実測。WebKit は `com.apple.WebKit.GPU.xpc` が
+/// マイクを扱い、実行パスに `.app` を含まず親も `launchd`、CoreAudio も XPC サービス自身の
+/// ID を返す）。登録自体は許すが、**黙って発火しない**のが一番分かりにくいので設定画面で伝える。
+///
+/// 判定は既知のバンドル ID の列挙で行う。WKWebView を使う任意のアプリが同じ構成になりうるが、
+/// 登録時点でそれを見分ける公開 API が無いため、確実に該当するものだけを挙げる。列挙で拾えない
+/// アプリのために、設定画面には一覧全体への注意書きも別途置いてある（`ui/app-window.slint`）。
+///
+/// 返す文言が短いのは、一覧が固定高さで折り返すと行が潰れるため（`examples/settings_view.rs` で
+/// 確認できる）。**なぜ**検知できないかはその注意書きと README が持ち、ここは「どのアプリが
+/// 該当するか」と「どうすればよいか」だけを伝える。
+pub fn auto_record_limitation(bundle_id: &str) -> Option<&'static str> {
+    const WEBKIT_AUDIO_HOSTED_APPS: &[&str] =
+        &["com.apple.Safari", "com.apple.SafariTechnologyPreview"];
+
+    WEBKIT_AUDIO_HOSTED_APPS
+        .contains(&bundle_id)
+        .then_some("Not detected — record manually")
 }
 
 /// `.app` のパスからバンドル ID と表示名を読む（設定画面でのアプリ登録に使う）。
@@ -347,53 +397,105 @@ fn bundle_id_for_pid(pid: i32) -> Option<String> {
     Some(bundle_id.to_string())
 }
 
-/// プロセスの「responsible pid」（そのプロセスに責任を持つ親アプリの pid）を返す。ヘルパーや
-/// XPC 子プロセスなら親アプリの pid、本体プロセスなら自分自身になる。**親アプリの pid が得られた
-/// ときだけ** `Some(親pid)` を返す。次のいずれも `None`（親解決なし）に畳む: (1) 本体プロセスで
-/// responsible が自分自身（＝直接のバンドル ID で足りる）、(2) 照会失敗（負値等）、(3) シンボル未解決。
-///
-/// 注意: responsible pid は「子プロセスのマイク使用を責任アプリに帰属させる」ため、コンテナ的な
-/// アプリ（ターミナルやランチャ等）を登録すると、そこから起動した CLI 等のマイク使用も拾いうる。
-/// 想定ユースケース（ブラウザ helper → 親ブラウザ）では正しいが、帰属範囲が広がる副作用がある。
-///
-/// `responsibility_get_pid_responsible_for_pid` は TCC やブラウザ（Chromium の `base/process` 等）が
-/// 使う挙動安定の関数だが公開ヘッダに無い private シンボルのため、`dlsym` で実行時に解決する。
-/// 見つからなければ（将来の OS 変更等）親解決を諦めて `None` にフォールバックする（アプリは落とさない）。
-fn responsible_pid(pid: i32) -> Option<i32> {
-    use std::ffi::{c_char, c_int, c_void};
-    use std::sync::OnceLock;
+/// CoreAudio が持つ、そのオーディオプロセスのバンドル ID（`kAudioProcessPropertyBundleID`、
+/// macOS 14+）。プロセス側から推測せず、オーディオ HAL が知っている値をそのまま読む。
+/// 取得失敗（未対応・バンドルを持たないプロセス）は `None`。
+fn process_bundle_id(process: AudioObjectID) -> Option<String> {
+    use objc2::rc::Retained;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
-    type ResponsibleFn = unsafe extern "C" fn(c_int) -> c_int;
-    static RESOLVER: OnceLock<Option<ResponsibleFn>> = OnceLock::new();
+    /// 失敗 status を 1 回だけ知らせるためのフラグ（500ms ごとのログ氾濫を避ける）。
+    static STATUS_REPORTED: AtomicBool = AtomicBool::new(false);
 
-    let resolver = RESOLVER.get_or_init(|| {
-        unsafe extern "C" {
-            fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+    let address = global_address(kAudioProcessPropertyBundleID);
+    let mut value: *mut NSString = std::ptr::null_mut();
+    let mut size = size_of::<*mut NSString>() as u32;
+    // SAFETY: value はポインタ 1 個ぶんの有効な書き込み先で、size もその大きさを伝えている。
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            process,
+            NonNull::from(&address),
+            0,
+            std::ptr::null(),
+            NonNull::from(&mut size),
+            NonNull::from(&mut value).cast(),
+        )
+    };
+    if status != OS_STATUS_OK {
+        // この経路だけが黙って死んでも、他の 2 経路が生きている限り「照会不能」の警告は出ない。
+        // 未対応（macOS 14 未満）とサンドボックスでの拒否を切り分けられるよう status を残す。
+        if !STATUS_REPORTED.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "Continuing without the CoreAudio bundle id because the query failed (OSStatus={status})"
+            );
         }
-        // RTLD_DEFAULT(-2): 現在のプロセスにロード済みの全イメージからシンボルを探す。
-        let rtld_default = (-2isize) as *mut c_void;
-        // SAFETY: シンボル名は有効な C 文字列。dlsym は見つからなければ null を返すだけ。
-        let sym = unsafe {
-            dlsym(
-                rtld_default,
-                c"responsibility_get_pid_responsible_for_pid".as_ptr(),
-            )
-        };
-        if sym.is_null() {
-            None
-        } else {
-            // SAFETY: 非 null を確認済み。対象シンボルの実シグネチャは
-            // `pid_t responsibility_get_pid_responsible_for_pid(pid_t)`（TCC・Chromium 等での
-            // 既知利用による。pid_t は c_int = i32）で、`ResponsibleFn` と一致する。
-            Some(unsafe { std::mem::transmute::<*mut c_void, ResponsibleFn>(sym) })
-        }
-    });
+        return None;
+    }
+    // バンドルを持たないプロセスでは noErr のまま何も書かれずに戻るため、null チェックは必須。
+    let ptr = NonNull::new(value)?;
+    // SAFETY: CoreAudio は CFStringRef を +1 で返す（AudioHardware.h の
+    // kAudioProcessPropertyBundleID: "The caller is responsible for releasing the returned
+    // CFObject."）。CFString と NSString は toll-free bridge なので、その +1 をそのまま
+    // Retained に渡して解放を任せる。
+    let string = unsafe { Retained::from_raw(ptr.as_ptr()) }?;
+    let bundle_id = string.to_string();
+    (!bundle_id.is_empty()).then_some(bundle_id)
+}
 
-    let func = (*resolver)?;
-    // SAFETY: 解決済みの C 関数を pid_t 引数で呼ぶだけ。メモリを触らず responsible pid を照会して
-    // 返すのみで、安全性に影響する副作用は無い。
-    let responsible = unsafe { func(pid) };
-    (responsible > 0 && responsible != pid).then_some(responsible)
+/// PID から実行ファイルの絶対パスを読む（`libproc.h` の `proc_pidpath`。公開 API）。
+fn exec_path(pid: i32) -> Option<PathBuf> {
+    use std::ffi::{c_int, c_void};
+
+    /// `libproc.h` の `PROC_PIDPATHINFO_MAXSIZE`（4 * MAXPATHLEN）。
+    const PROC_PIDPATHINFO_MAXSIZE: usize = 4 * 1024;
+
+    unsafe extern "C" {
+        fn proc_pidpath(pid: c_int, buffer: *mut c_void, buffersize: u32) -> c_int;
+    }
+
+    let mut buffer = vec![0u8; PROC_PIDPATHINFO_MAXSIZE];
+    // SAFETY: buffer は buffersize バイトの有効な書き込み先。戻り値は書き込まれた長さ（0 以下は失敗）で、
+    // 終端 NUL を含まない文字数を返す。
+    let len = unsafe {
+        proc_pidpath(
+            pid,
+            buffer.as_mut_ptr().cast::<c_void>(),
+            buffer.len() as u32,
+        )
+    };
+    if len <= 0 {
+        return None;
+    }
+    buffer.truncate(len as usize);
+    Some(PathBuf::from(std::ffi::OsString::from_vec(buffer)))
+}
+
+/// 実行パスから**最も外側**の `.app` を切り出し、そのバンドル ID を読む。
+///
+/// ヘルパープロセスを親アプリへ畳むための経路。`.app` は入れ子になりうるため、内側ではなく
+/// 外側を採る（Chrome のヘルパーは
+/// `/Applications/Google Chrome.app/…/Helpers/Google Chrome Helper.app/Contents/MacOS/…` にあり、
+/// 内側を採ると親アプリ登録と一致しない）。
+fn bundle_id_for_exec_path(exec_path: &Path) -> Option<String> {
+    let app_path = outermost_app_bundle(exec_path)?;
+    let path_str = app_path.to_str()?;
+    let bundle = NSBundle::bundleWithPath(&NSString::from_str(path_str))?;
+    Some(bundle.bundleIdentifier()?.to_string())
+}
+
+/// パスに含まれる `.app` のうち、最も外側（先頭側）のものまでを返す。含まなければ `None`。
+fn outermost_app_bundle(exec_path: &Path) -> Option<PathBuf> {
+    let mut prefix = PathBuf::new();
+    for component in exec_path.components() {
+        prefix.push(component);
+        if prefix
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case(OsStr::new("app")))
+        {
+            return Some(prefix);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -477,10 +579,74 @@ mod tests {
     }
 
     #[test]
-    fn responsible_pid_ffi_does_not_crash() {
-        // dlsym + private シンボル呼び出しの FFI 経路が例外なく Option を返すことのスモークテスト
-        // （値は環境依存なので、パニックせず戻ることだけを確認する）。
-        let _ = super::responsible_pid(std::process::id() as i32);
+    fn input_running_bundle_ids_does_not_crash() {
+        // CoreAudio の照会と CFString の所有権受け渡し（`process_bundle_id`）を通すスモークテスト。
+        // 中身は環境依存なので値は見ない。二重解放が起きていれば繰り返しで落ちる。
+        for _ in 0..3 {
+            let _ = super::input_running_bundle_ids();
+        }
+    }
+
+    #[test]
+    fn exec_path_ffi_returns_own_path() {
+        // proc_pidpath の FFI 経路のスモークテスト。自分自身の pid なら必ずパスが取れる。
+        let path = super::exec_path(std::process::id() as i32).expect("own exec path");
+        assert!(path.is_absolute(), "{path:?} should be absolute");
+    }
+
+    #[test]
+    fn outermost_app_bundle_picks_the_outer_app() {
+        use super::outermost_app_bundle;
+        use std::path::{Path, PathBuf};
+
+        // Chrome のヘルパーは .app が入れ子になる。内側（ヘルパー自身）ではなく外側を採る。
+        assert_eq!(
+            outermost_app_bundle(Path::new(
+                "/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Versions/1/Helpers/Google Chrome Helper.app/Contents/MacOS/Google Chrome Helper"
+            )),
+            Some(PathBuf::from("/Applications/Google Chrome.app"))
+        );
+        // 本体プロセスはその .app 自身。
+        assert_eq!(
+            outermost_app_bundle(Path::new("/Applications/Slack.app/Contents/MacOS/Slack")),
+            Some(PathBuf::from("/Applications/Slack.app"))
+        );
+        // `Path::extension` は最後のドット以降を返すので、`Foo.app.backup` の拡張子は `backup`。
+        // `.app` を名前の途中に含むディレクトリは誤検出しない。
+        assert_eq!(
+            outermost_app_bundle(Path::new(
+                "/Applications/Foo.app.backup/Bar.app/Contents/MacOS/Bar"
+            )),
+            Some(PathBuf::from("/Applications/Foo.app.backup/Bar.app"))
+        );
+        // 大文字の拡張子も同じ扱い（APFS は既定で大文字小文字を区別しない）。
+        assert_eq!(
+            outermost_app_bundle(Path::new("/Applications/Foo.APP/Contents/MacOS/Foo")),
+            Some(PathBuf::from("/Applications/Foo.APP"))
+        );
+        // 末尾スラッシュ付きの `.app` 自身。
+        assert_eq!(
+            outermost_app_bundle(Path::new("/Applications/Slack.app/")),
+            Some(PathBuf::from("/Applications/Slack.app"))
+        );
+        // .app を含まないパス（CLI やフレームワーク内の XPC サービス）は解決しない。
+        assert_eq!(
+            outermost_app_bundle(Path::new(
+                "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.GPU.xpc/Contents/MacOS/com.apple.WebKit.GPU"
+            )),
+            None
+        );
+        assert_eq!(outermost_app_bundle(Path::new("/bin/zsh")), None);
+    }
+
+    #[test]
+    fn auto_record_limitation_flags_webkit_hosts() {
+        use super::auto_record_limitation;
+        // Safari は WebKit の GPU プロセスがマイクを掴むため検知できない。
+        assert!(auto_record_limitation("com.apple.Safari").is_some());
+        // ヘルパーを自前の .app に持つブラウザ・会議アプリは検知できる。
+        assert!(auto_record_limitation("com.google.Chrome").is_none());
+        assert!(auto_record_limitation("us.zoom.xos").is_none());
     }
 
     #[test]

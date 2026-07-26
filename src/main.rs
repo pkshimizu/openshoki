@@ -122,13 +122,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ui.set_whisper_model_status(
         selected_model_status_text(&config.borrow().whisper_model, &model_downloader).into(),
     );
-    // 登録アプリの表示名一覧を Slint のモデルで持ち、追加/削除で更新する。
-    let app_list_model = Rc::new(slint::VecModel::<slint::SharedString>::from(
+    // 登録アプリの一覧を Slint のモデルで持ち、追加/削除で更新する。
+    let app_list_model = Rc::new(slint::VecModel::<TriggerApp>::from(
         config
             .borrow()
             .app_mic_triggers
             .iter()
-            .map(|trigger| slint::SharedString::from(trigger.name.as_str()))
+            .map(trigger_app_row)
             .collect::<Vec<_>>(),
     ));
     ui.set_app_list(app_list_model.clone().into());
@@ -340,13 +340,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             {
                 return; // 登録済み。
             }
-            let name = slint::SharedString::from(trigger.name.as_str());
+            let row = trigger_app_row(&trigger);
             candidate.app_mic_triggers.push(trigger);
             if let Err(err) = candidate.save() {
                 eprintln!("Not adding the app because saving the settings failed: {err}");
                 return;
             }
-            model_for_add.push(name);
+            model_for_add.push(row);
             *config_for_add.borrow_mut() = candidate;
         });
     }
@@ -1394,6 +1394,21 @@ fn recording_dir_text(dir: &std::path::Path) -> slint::SharedString {
     dir.display().to_string().into()
 }
 
+/// 登録アプリ 1 件を設定画面の行にする。検知できないアプリには
+/// `app_audio_monitor::auto_record_limitation` の注記を添える。
+fn trigger_app_row(trigger: &config::AppTrigger) -> TriggerApp {
+    #[cfg(target_os = "macos")]
+    let note = app_audio_monitor::auto_record_limitation(&trigger.bundle_id).unwrap_or("");
+    // 自動録音は macOS 限定の機能なので、他 OS では注記も出さない。
+    #[cfg(not(target_os = "macos"))]
+    let note = "";
+
+    TriggerApp {
+        name: trigger.name.as_str().into(),
+        limitation_note: note.into(),
+    }
+}
+
 /// 設定で選択中の whisper モデルの取得状況を、設定画面の状態行テキストにする。
 /// カタログ外の手編集値は既定モデルの状況を表示する（表示位置のフォールバックと整合）。
 fn selected_model_status_text(
@@ -1446,6 +1461,36 @@ mod tests {
     };
     use crate::transcribe::TranscribeStatus;
     use std::time::Duration;
+
+    /// 設定画面の行は、検知できないアプリにだけ注記を持つ（判定は `auto_record_limitation`）。
+    /// バンドル ID → 注記の写像を渡し忘れる回帰を、ここで止める。
+    ///
+    /// 自動録音は macOS 限定なので、他 OS では注記が常に空になる（`trigger_app_row` の `cfg`）。
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn trigger_app_row_notes_undetectable_apps() {
+        // 非 macOS では item ごと落ちるので、import も関数の中に置く（外に出すと未使用になる）。
+        use super::trigger_app_row;
+        use crate::config::AppTrigger;
+
+        let row = trigger_app_row(&AppTrigger {
+            bundle_id: "com.apple.Safari".to_owned(),
+            name: "Safari".to_owned(),
+        });
+        assert_eq!(row.name, "Safari");
+        // 文言そのものは `auto_record_limitation` が持つので、ここでは有無だけを見る。
+        assert!(
+            !row.limitation_note.is_empty(),
+            "Safari should carry a note about not being detected"
+        );
+
+        let row = trigger_app_row(&AppTrigger {
+            bundle_id: "com.google.Chrome".to_owned(),
+            name: "Google Chrome".to_owned(),
+        });
+        assert_eq!(row.name, "Google Chrome");
+        assert!(row.limitation_note.is_empty());
+    }
 
     /// ワーカーの進行状況（メモリ）があればそれを優先し、無ければ JSON の有無で解決する。
     #[test]
