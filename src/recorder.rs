@@ -325,17 +325,10 @@ fn create_session_dir(session_dir: &Path) -> std::io::Result<()> {
     builder.create(session_dir)
 }
 
-/// 録音ファイルを作成する。録音は機微データのため、Unix では所有者のみ読み書き可(0600)で作る。
-/// マイク・システム両音源で共用する。
+/// 録音ファイルを作成する。録音は機微データのため所有者のみ読み書き可で作る
+/// （`crate::private_file`）。マイク・システム両音源で共用する。
 pub(crate) fn create_recording_file(path: &Path) -> std::io::Result<File> {
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    options.open(path)
+    crate::private_file::create(path)
 }
 
 /// 開始失敗時の後始末: writer スレッドを終了・回収し、作成済みの空ファイルを消す。

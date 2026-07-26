@@ -137,8 +137,10 @@ impl ModelDownloader {
     /// 取得済み・ダウンロード中ならスレッドを立てずに戻る（DL 中の完了待ちは `ensure_model` を
     /// 呼ぶ利用側だけが行えばよい）。結果は状態マップとログに残る。
     ///
-    /// 同時ダウンロード数の上限は持たない。設定画面から選べるのが 1 種別 1 つずつなので今は
-    /// 実質 1 本だが、種別が増えると別種別の大きなモデルが並走しうる（要検討）。
+    /// 同時ダウンロード数の上限は持たない。whisper（最大 2.9GB）と要約 LLM（最大 4.4GB）の
+    /// 2 種別があり、UI 起点の whisper 取得とワーカー起点の要約 LLM 取得は**並走しうる**
+    /// （推論を直列化する `crate::inference_slot` は、待たせても意味が無いダウンロードを
+    /// 対象にしていない）。合計 7GB 超の同時受信になるが、上限を設けるかは未検討。
     pub fn request_download(&self, spec: &'static ModelSpec) {
         match self.status_of(spec) {
             DownloadStatus::Downloaded | DownloadStatus::Downloading { .. } => return,
@@ -244,7 +246,8 @@ const PROGRESS_STEP_BYTES: u64 = 1024 * 1024;
 /// 接続確立・応答ヘッダ受信のタイムアウト。
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// ボディ受信全体のタイムアウト。低速回線でも最大モデル（約 3GB）を受け切れる長さにしつつ、
+/// ボディ受信全体のタイムアウト。低速回線でもカタログ中の最大モデル（現状は要約 LLM の
+/// 約 4.4GB）を受け切れる長さにしつつ、
 /// 無応答の接続（half-open 等）で呼び出しスレッドが恒久にハングしないようにする。
 /// 超過時は失敗し、次の要求で再試行する。
 const RECV_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120 * 60);
@@ -431,7 +434,8 @@ pub(crate) mod catalog_checks {
     }
 
     /// 全カタログの登録簿。**種別を足したらここに 1 行足す**。下のテストが横断で一意性を見る。
-    const ALL_CATALOGS: &[&[ModelSpec]] = &[crate::whisper_model::CATALOG];
+    const ALL_CATALOGS: &[&[ModelSpec]] =
+        &[crate::whisper_model::CATALOG, crate::summary_model::CATALOG];
 
     /// 登録簿のカタログすべてが健全で、ID とファイル名は種別をまたいで一意
     /// （状態マップのキーと保存先が種別で混ざらないように）。

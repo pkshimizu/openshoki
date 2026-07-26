@@ -74,6 +74,34 @@ where
         .unwrap_or_else(default_whisper_model))
 }
 
+/// 真偽値を寛容にデシリアライズする（既定は `false`）。設定 TOML は手編集されうる信頼境界外で、
+/// `bool` で直接受けると型不一致でファイル全体が既定へ落ち、無関係な設定（保存先・登録アプリ）
+/// まで失わせる（`docs/rules/error-handling.md`）。トグル系のフィールドはすべてこれを通す。
+fn deserialize_bool_or_false<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = toml::Value::deserialize(deserializer)?;
+    Ok(value.as_bool().unwrap_or(false))
+}
+
+/// 既定の内蔵要約 LLM の ID（カタログの既定と同じ値。`summary_model::DEFAULT_MODEL_ID`）。
+fn default_summary_model() -> String {
+    crate::summary_model::DEFAULT_MODEL_ID.to_owned()
+}
+
+/// `summary_model` を寛容にデシリアライズする（`deserialize_whisper_model` と同じ方針）。
+fn deserialize_summary_model<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = toml::Value::deserialize(deserializer)?;
+    Ok(value
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(default_summary_model))
+}
+
 /// `transcribe_language` を寛容にデシリアライズする。設定 TOML は手編集されうる信頼境界外で、
 /// 非文字列（数値・真偽値等）が入っても当該項目だけ既定へ丸め、他の設定（保存先・登録アプリ）を
 /// 巻き添えで失わせない（`String` で直接受けると型不一致でファイル全体が既定へ落ちてしまう。
@@ -120,7 +148,11 @@ pub struct Config {
     /// （macOS 14.4+ のみ有効）。会議アプリ（ブラウザの Google Meet・Zoom.app 等）は通話中だけ
     /// マイク入力を掴むため、これを合図に通話の開始/終了へ連動できる。オプトインの既定 OFF。
     /// 旧項目名 `auto_record_on_app_playback`（出力ベース時代）からエイリアスで互換を保つ。
-    #[serde(default, alias = "auto_record_on_app_playback")]
+    #[serde(
+        default,
+        alias = "auto_record_on_app_playback",
+        deserialize_with = "deserialize_bool_or_false"
+    )]
     pub auto_record_on_app_mic: bool,
     /// マイク使用での自動録音トリガーにする登録アプリ一覧。旧名 `app_playback_triggers` と互換。
     #[serde(default, alias = "app_playback_triggers")]
@@ -137,7 +169,7 @@ pub struct Config {
     /// 録音停止時に保存した各音源を自動で文字起こしするか。whisper は CPU 負荷が大きいため
     /// オプトインの既定 OFF。モデルは内蔵（初回の文字起こし時に自動ダウンロード）なので、
     /// ON にするだけで使える（`src/model_download.rs`）。
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_bool_or_false")]
     pub auto_transcribe: bool,
     /// 使用する内蔵 whisper モデルの識別子（`whisper_model::CATALOG` の `id`。既定 `small`）。
     /// 設定画面の ComboBox で選び、選択時に未取得ならダウンロードが始まる。カタログ外の
@@ -164,6 +196,24 @@ pub struct Config {
         deserialize_with = "deserialize_transcribe_language"
     )]
     pub transcribe_language: String,
+    /// 文字起こしが終わったら議事録要約（`summary.md`）を自動生成するか。オンデバイス LLM は
+    /// CPU・メモリの負荷が大きい（既定モデルで実行時 8GB 級）ためオプトインの既定 OFF。
+    /// 文字起こしの完了が前提なので、`auto_transcribe` が OFF なら要約も走らない。
+    #[serde(default, deserialize_with = "deserialize_bool_or_false")]
+    pub auto_summarize: bool,
+    /// 使用する内蔵要約 LLM の識別子（`summary_model::CATALOG` の `id`。既定は 7B）。
+    /// 設定画面の選択 UI はまだ無く、切り替えは config の手編集で行う（軽い 3B を選べる）。
+    /// カタログ外の手編集値は使用時に既定へフォールバックする。
+    #[serde(
+        default = "default_summary_model",
+        deserialize_with = "deserialize_summary_model"
+    )]
+    pub summary_model: String,
+    /// 要約 LLM のモデルファイル（GGUF）のパスの上書き。通常は未指定でよく、内蔵モデル
+    /// （カタログから自動ダウンロード）を使う。指定すると内蔵モデルより優先する
+    /// （上級者向け。config.toml の手編集のみで、設定 UI は無い。`whisper_model_path` と同じ）。
+    #[serde(default)]
+    pub summary_model_path: Option<PathBuf>,
 }
 
 /// `auto_stop_debounce_secs` の serde 既定値。項目を持たない旧 config でも既定 4 秒で読める。
@@ -205,6 +255,9 @@ impl Default for Config {
             whisper_model: default_whisper_model(),
             whisper_model_path: None,
             transcribe_language: default_transcribe_language(),
+            auto_summarize: false,
+            summary_model: default_summary_model(),
+            summary_model_path: None,
         }
     }
 }
@@ -318,6 +371,9 @@ mod tests {
             whisper_model: "base".to_owned(),
             whisper_model_path: Some(PathBuf::from("/tmp/models/ggml-base.bin")),
             transcribe_language: "ja".to_owned(),
+            auto_summarize: true,
+            summary_model: "qwen2.5-3b-instruct-q4-k-m".to_owned(),
+            summary_model_path: Some(PathBuf::from("/tmp/models/qwen.gguf")),
         };
         let text = toml::to_string_pretty(&config).expect("serialization should succeed");
         let restored: Config = toml::from_str(&text).expect("deserialization should succeed");
@@ -335,6 +391,9 @@ mod tests {
         assert_eq!(restored.whisper_model, config.whisper_model);
         assert_eq!(restored.whisper_model_path, config.whisper_model_path);
         assert_eq!(restored.transcribe_language, config.transcribe_language);
+        assert_eq!(restored.auto_summarize, config.auto_summarize);
+        assert_eq!(restored.summary_model, config.summary_model);
+        assert_eq!(restored.summary_model_path, config.summary_model_path);
     }
 
     #[test]
@@ -353,6 +412,42 @@ mod tests {
         assert!(restored.whisper_model_path.is_none());
         // 言語未指定は既定の英語になる（従来も whisper の既定言語が en のため実挙動は不変）。
         assert_eq!(restored.transcribe_language, "en");
+        // 要約の項目を持たない旧 config でも既定（OFF・7B・上書きなし）で読める。
+        assert!(!restored.auto_summarize);
+        assert_eq!(
+            restored.summary_model,
+            crate::summary_model::DEFAULT_MODEL_ID
+        );
+        assert!(restored.summary_model_path.is_none());
+    }
+
+    #[test]
+    fn deserialize_rounds_non_bool_toggles() {
+        // トグル系に非 bool が入っても、当該項目だけ OFF へ丸まり、他の設定を巻き添えにしない
+        // （bool で直接受けると型不一致でファイル全体が既定へ落ちる）。
+        let text = concat!(
+            "recording_dir = \"/tmp/shoki-toggles\"\n",
+            "auto_record_on_app_mic = \"yes\"\n",
+            "auto_transcribe = 1\n",
+            "auto_summarize = \"on\"\n",
+        );
+        let restored: Config = toml::from_str(text).expect("non-bool should not fail the file");
+        assert_eq!(restored.recording_dir, PathBuf::from("/tmp/shoki-toggles"));
+        assert!(!restored.auto_record_on_app_mic);
+        assert!(!restored.auto_transcribe);
+        assert!(!restored.auto_summarize);
+    }
+
+    #[test]
+    fn deserialize_rounds_non_string_summary_model() {
+        // 非文字列の手編集値は当該項目のみ既定へ丸まり、他フィールドを巻き添えにしない。
+        let bad = "recording_dir = \"/tmp/shoki-summary\"\nsummary_model = true\n";
+        let restored: Config = toml::from_str(bad).expect("non-string should not fail the file");
+        assert_eq!(restored.recording_dir, PathBuf::from("/tmp/shoki-summary"));
+        assert_eq!(
+            restored.summary_model,
+            crate::summary_model::DEFAULT_MODEL_ID
+        );
     }
 
     #[test]
