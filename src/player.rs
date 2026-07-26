@@ -262,7 +262,7 @@ mod tests {
     impl TempDir {
         /// プロセス固有の名前で作る（前回の残骸は先に消す）。
         fn new(name: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!("openshoki-{name}-{}", std::process::id()));
+            let dir = std::env::temp_dir().join(format!("shoki-{name}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).expect("creating the temp dir should succeed");
             Self(dir)

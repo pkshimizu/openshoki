@@ -1,4 +1,4 @@
-//! openshoki — メニューバー／タスクバーに常駐する録音アプリ（基盤）。
+//! shoki — メニューバー／タスクバーに常駐する録音アプリ（基盤）。
 //!
 //! 起動時はウィンドウを表示せずトレイに常駐し、トレイメニューから Slint ウィンドウの
 //! 表示/非表示とアプリ終了を行う。録音機能は後続の issue で実装する。
@@ -63,7 +63,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _instance_lock = match single_instance::acquire() {
         single_instance::Acquire::Acquired(lock) => Some(lock),
         single_instance::Acquire::AlreadyRunning => {
-            eprintln!("Exiting because another instance of openshoki is already running.");
+            eprintln!("Exiting because another instance of shoki is already running.");
             return Ok(());
         }
         single_instance::Acquire::Unavailable => None,
@@ -75,6 +75,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 設定を読み込み、現在の保存先・自動録音トグル・登録アプリ一覧を画面へ反映する。
     // 失敗時は load() がデフォルトを返す。
     let config = Rc::new(RefCell::new(Config::load()));
+
+    // 保存先が無いまま録音を始めると、`create_session_dir` が黙って作り直すか（フォルダの
+    // 移動・改名）、作成に失敗して録音そのものが始まらない（外付けディスクの未マウントなど。
+    // `/Volumes` は書き込めない）。どちらも気づきにくいので、起動時に 1 回だけ知らせる。
+    // 作成も選び直しもしない（勝手に既定へ戻すと利用者の設定を失う）。
+    {
+        let recording_dir = &config.borrow().recording_dir;
+        if !recording_dir.exists() {
+            eprintln!(
+                "The configured recording folder is missing: {}",
+                recording_dir.display()
+            );
+        }
+    }
 
     // 内蔵 whisper モデルのダウンロード・状態管理。設定画面（モデル選択・DL 状況表示）と
     // 文字起こしワーカーで同じ状態を共有し、同一モデルの二重ダウンロードを防ぐ。

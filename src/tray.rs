@@ -24,8 +24,8 @@ pub const RECORD_LABEL_START: &str = "Start Recording";
 pub const RECORD_LABEL_STOP: &str = "Stop Recording";
 
 /// トレイのツールチップ。待機中と録音中で切り替える。
-const TOOLTIP_IDLE: &str = "openshoki";
-const TOOLTIP_RECORDING: &str = "openshoki — Recording…";
+const TOOLTIP_IDLE: &str = "shoki";
+const TOOLTIP_RECORDING: &str = "shoki — Recording…";
 
 /// メニュー項目アイコンの PNG 素材（ビルド時に埋め込む）。`assets/menu/` に置いた 32x32・8bit RGBA。
 /// 実行時のファイル読み込み（`.app` の Resources パス解決）に依存させないため埋め込む

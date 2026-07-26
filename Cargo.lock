@@ -4150,39 +4150,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "openshoki"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "cpal 0.18.1",
- "directories",
- "fs2",
- "i-slint-backend-testing",
- "mp3lame-encoder",
- "objc2 0.6.4",
- "objc2-app-kit 0.3.2",
- "objc2-core-audio",
- "objc2-foundation 0.3.2",
- "png",
- "raw-window-handle",
- "rfd",
- "rodio",
- "rubato",
- "screencapturekit",
- "serde",
- "serde_json",
- "sha2",
- "slint",
- "slint-build",
- "symphonia 0.6.0",
- "toml 1.1.2+spec-1.1.0",
- "trash",
- "tray-icon",
- "ureq",
- "whisper-rs",
-]
-
-[[package]]
 name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5302,6 +5269,39 @@ name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
+
+[[package]]
+name = "shoki"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "cpal 0.18.1",
+ "directories",
+ "fs2",
+ "i-slint-backend-testing",
+ "mp3lame-encoder",
+ "objc2 0.6.4",
+ "objc2-app-kit 0.3.2",
+ "objc2-core-audio",
+ "objc2-foundation 0.3.2",
+ "png",
+ "raw-window-handle",
+ "rfd",
+ "rodio",
+ "rubato",
+ "screencapturekit",
+ "serde",
+ "serde_json",
+ "sha2",
+ "slint",
+ "slint-build",
+ "symphonia 0.6.0",
+ "toml 1.1.2+spec-1.1.0",
+ "trash",
+ "tray-icon",
+ "ureq",
+ "whisper-rs",
+]
 
 [[package]]
 name = "signal-hook-registry"

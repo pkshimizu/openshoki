@@ -439,7 +439,7 @@ mod tests {
     const TEST_MAX: u64 = u64::MAX;
 
     fn temp_path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("openshoki-model-{}-{name}", std::process::id()))
+        std::env::temp_dir().join(format!("shoki-model-{}-{name}", std::process::id()))
     }
 
     #[test]

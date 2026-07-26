@@ -5,9 +5,9 @@
 #   使い方: ./scripts/check-icons.sh
 #
 # 検査するのは決定的に再現できる生成物だけ:
-#   assets/icon/openshoki.icon/Assets/mark-ink.svg / mark-ink-on-dark.svg … sed の出力なので完全一致
+#   assets/icon/shoki.icon/Assets/mark-ink.svg / mark-ink-on-dark.svg … sed の出力なので完全一致
 #   assets/icon/tray.png … ラスタライズを挟むので画素で比較（下記 TRAY_MAX_DIFF_PIXELS 参照）
-#   assets/icon/generated/openshoki.icns … actool の出力だが決定的（実測）。完全一致。
+#   assets/icon/generated/shoki.icns … actool の出力だが決定的（実測）。完全一致。
 #     これだけは actool（Xcode）が要る。無ければその旨を出してスキップする。
 # `assets/icon/generated/Assets.car` は検査しない。actool が入力を変えなくても毎回違うバイト列を
 # 出すため、そもそも git で追跡していない（README の「アイコン資産の再生成」参照）。
@@ -29,7 +29,7 @@ TRAY_FUZZ=10%
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-regenerated="$(mktemp -d -t openshoki-icon-check-XXXXXX)"
+regenerated="$(mktemp -d -t shoki-icon-check-XXXXXX)"
 trap 'rm -rf "$regenerated"' EXIT
 
 # .icns まで検査できるのは、Icon Composer 形式の .icon を扱える actool があるときだけ
@@ -74,7 +74,7 @@ icns_mismatch=false
 
 # 一画のレイヤー（mark.svg の色違い）。sed の出力なので環境に依らず完全一致するはず。
 for layer in mark-ink.svg mark-ink-on-dark.svg; do
-  committed="assets/icon/openshoki.icon/Assets/$layer"
+  committed="assets/icon/shoki.icon/Assets/$layer"
   if [ ! -f "$committed" ]; then
     echo "$committed is missing." >&2
     stale=true
@@ -136,7 +136,7 @@ else
 fi
 
 # アプリアイコン（.icns）。icon.json / seal.svg を変えて再生成し忘れた場合もここで捕まる。
-icns="assets/icon/generated/openshoki.icns"
+icns="assets/icon/generated/shoki.icns"
 if [ "$check_appicon" = true ]; then
   if [ ! -f "$icns" ]; then
     echo "$icns is missing." >&2

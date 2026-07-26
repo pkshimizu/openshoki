@@ -508,7 +508,7 @@ mod tests {
     #[test]
     fn submit_tracks_status_until_failure() {
         let worker = TranscribeWorker::start(crate::whisper_model::ModelDownloader::new());
-        let dir = std::env::temp_dir().join(format!("openshoki-status-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("shoki-status-{}", std::process::id()));
         worker.submit(TranscribeJob {
             session_dir: dir.clone(),
             audio_paths: vec![dir.join("mic.mp3")],
@@ -538,7 +538,7 @@ mod tests {
     #[test]
     fn submit_with_no_audio_clears_status() {
         let worker = TranscribeWorker::start(crate::whisper_model::ModelDownloader::new());
-        let dir = std::env::temp_dir().join(format!("openshoki-skip-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("shoki-skip-{}", std::process::id()));
         worker.submit(TranscribeJob {
             session_dir: dir.clone(),
             audio_paths: Vec::new(),
@@ -625,7 +625,7 @@ mod tests {
     fn decode_mp3_fails_on_empty_file() {
         // 壊れた/空の入力ではエラーを返す（黙って空の音声にしない）。
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("openshoki-empty-{}.mp3", std::process::id()));
+        let path = dir.join(format!("shoki-empty-{}.mp3", std::process::id()));
         std::fs::write(&path, b"").expect("writing the empty file should succeed");
         let result = decode_mp3(&path);
         let _ = std::fs::remove_file(&path);
@@ -637,10 +637,7 @@ mod tests {
         // 文字起こしは録音と同じ機微データ。JSON の内容と 0600（Unix）を whisper なしで検証する
         // （E2E は #[ignore] のため、この安全性は CI ではここで担保する）。
         let dir = std::env::temp_dir();
-        let path = dir.join(format!(
-            "openshoki-transcription-{}.json",
-            std::process::id()
-        ));
+        let path = dir.join(format!("shoki-transcription-{}.json", std::process::id()));
         let result = Transcription {
             source: "mic".to_owned(),
             model: "ggml-base.bin".to_owned(),
@@ -671,14 +668,14 @@ mod tests {
 
     /// パイプライン全体（MP3 デコード→リサンプル→whisper→JSON 保存）のスモークテスト。
     /// whisper モデルが必要なため通常は実行しない。ローカルでモデルを用意して
-    /// `OPENSHOKI_WHISPER_MODEL=<path> cargo test -- --ignored` で実行する。
+    /// `SHOKI_WHISPER_MODEL=<path> cargo test -- --ignored` で実行する。
     /// 入力は合成サイン波（発話なし）なので、認識テキストではなく「JSON が既定の形・0600 で
     /// 生成される」ことだけを確認する。
     #[test]
-    #[ignore = "requires a whisper model; set OPENSHOKI_WHISPER_MODEL and run with --ignored"]
+    #[ignore = "requires a whisper model; set SHOKI_WHISPER_MODEL and run with --ignored"]
     fn end_to_end_writes_transcription_json_for_generated_mp3() {
-        let model_path = std::env::var("OPENSHOKI_WHISPER_MODEL")
-            .expect("OPENSHOKI_WHISPER_MODEL must point to a ggml whisper model");
+        let model_path = std::env::var("SHOKI_WHISPER_MODEL")
+            .expect("SHOKI_WHISPER_MODEL must point to a ggml whisper model");
 
         // 2 秒の 440Hz サイン波（48kHz モノラル）を MP3 にエンコードする。
         let sample_rate = 48_000u32;
@@ -705,7 +702,7 @@ mod tests {
             .expect("flushing should succeed");
 
         let dir =
-            std::env::temp_dir().join(format!("openshoki-transcribe-test-{}", std::process::id()));
+            std::env::temp_dir().join(format!("shoki-transcribe-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("creating the temp dir should succeed");
         let audio_path = dir.join("mic.mp3");
         std::fs::write(&audio_path, &mp3).expect("writing the test MP3 should succeed");
