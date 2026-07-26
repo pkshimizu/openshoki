@@ -76,15 +76,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 失敗時は load() がデフォルトを返す。
     let config = Rc::new(RefCell::new(Config::load()));
 
-    // 保存先が無いまま録音すると、`create_session_dir` が黙って作り直す（外付けディスクの
-    // 未マウント・フォルダの移動/改名など）。一覧には出ない場所へ録り続けて気づけないので、
-    // 起動時に 1 回だけ知らせる。作成も選び直しもしない（次の録音で意図どおり作られる場合が
-    // あり、勝手に既定へ戻すと利用者の設定を失う）。
+    // 保存先が無いまま録音を始めると、`create_session_dir` が黙って作り直すか（フォルダの
+    // 移動・改名）、作成に失敗して録音そのものが始まらない（外付けディスクの未マウントなど。
+    // `/Volumes` は書き込めない）。どちらも気づきにくいので、起動時に 1 回だけ知らせる。
+    // 作成も選び直しもしない（勝手に既定へ戻すと利用者の設定を失う）。
     {
         let recording_dir = &config.borrow().recording_dir;
         if !recording_dir.exists() {
             eprintln!(
-                "The recording folder does not exist yet and will be created on the next recording: {}",
+                "The configured recording folder is missing: {}",
                 recording_dir.display()
             );
         }
