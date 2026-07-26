@@ -184,3 +184,19 @@ macOS では `screencapturekit` と `objc2` 系を使います。
 
 - CI（GitHub Actions）で上記の build／fmt／clippy／test と `cargo audit`（依存の脆弱性検査）を
   実行しています。
+
+- **Mac App Store 可否の検証プローブ**: MAS 対応（[#77](https://github.com/pkshimizu/openshoki/issues/77)）の
+  技術検証に使う `examples/mas_probe.rs` を、App Sandbox の有無を切り替えて実行します。
+  `.app` に包んで ad-hoc 署名するのは、サンドボックスが**署名の entitlements** で効くためです。
+  出荷バイナリには含まれません（`cargo` の example）。
+
+  ```sh
+  ./scripts/mas-probe.sh --sandbox    -- --verbose --skip-screen   # サンドボックス有り
+  ./scripts/mas-probe.sh --no-sandbox -- --verbose --skip-screen   # 比較用
+  ./scripts/mas-probe.sh --sandbox --open                          # TCC を伴う検証
+  ```
+
+  `--open` を付けると LaunchServices 経由で起動します。TCC（画面収録・マイク）とフォルダ選択
+  パネルは「どのアプリの要求か」を responsible process で見るため、シェルから実行ファイルを
+  直接叩くとターミナル側の権限として扱われ、`.app` の許可を試せません。検証結果は
+  `docs/plans/done/20260722-mac-app-store-submission.md` に記録しています。

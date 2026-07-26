@@ -34,6 +34,13 @@ i-slint-backend-testing = "1.17.0"
 [build-dependencies]
 slint-build = "1.17.0"
 
+# MAS 可否の技術検証プローブ（#77、`examples/mas_probe.rs`）専用。security-scoped bookmark を
+# 扱う NSURL 系 API に要る feature を、出荷バイナリの feature を増やさずに足すため
+# dev-dependencies 側で指定する（examples は dev-dependencies を使える）。
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+objc2 = "0.6.4"
+objc2-foundation = { version = "0.3.2", features = ["NSURL", "NSData", "NSError", "NSArray"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.4"
 objc2-app-kit = "0.3.2"
