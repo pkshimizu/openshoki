@@ -28,10 +28,13 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --skip-appicon) skip_appicon=true; shift ;;
     --out-dir)
-      if [ $# -lt 2 ] || [ -z "$2" ] || case "$2" in -*) true ;; *) false ;; esac; then
-        echo "--out-dir requires a directory" >&2
-        exit 1
-      fi
+      # 値の指定漏れ（次のフラグを食う・空文字）をここで弾く。
+      case "${2-}" in
+        '' | -*)
+          echo "--out-dir requires a directory" >&2
+          exit 1
+          ;;
+      esac
       # 呼び出し元の cwd 基準で解釈する（この後 repo_root へ cd するため、相対のままだと
       # リポジトリ内に書いてしまう）。
       mkdir -p -- "$2"

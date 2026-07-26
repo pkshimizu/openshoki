@@ -89,18 +89,28 @@ done
 # メニューバー用グリフ。まず形式（`decode_rgba_png` が要求する 36x36 8bit RGBA）を確かめ、
 # 次に画素を比べる（バイト比較にすると、rsvg / ImageMagick のバージョン差で偽陽性になる）。
 tray="assets/icon/tray.png"
-identify_error=""
 committed_format=""
 regenerated_format=""
-if ! committed_format="$(magick identify -format '%wx%h %[bit-depth] %[channels]' "$tray" 2>&1)" \
-   || ! regenerated_format="$(magick identify -format '%wx%h %[bit-depth] %[channels]' \
-        "$regenerated/$tray" 2>&1)"; then
-  identify_error=true
-fi
-if [ -n "$identify_error" ]; then
-  echo "Could not inspect $tray:" >&2
-  echo "$committed_format $regenerated_format" >&2
+tray_unreadable=false
+if [ ! -f "$tray" ]; then
+  # 欠落は再生成で直るので stale 側。
+  echo "$tray is missing." >&2
+  stale=true
+  tray_unreadable=true
+elif ! committed_format="$(magick identify -format '%wx%h %[bit-depth] %[channels]' "$tray" 2>&1)"; then
+  # コミット済みの側が読めない（壊れている）のも再生成で直る。
+  echo "Could not inspect the committed $tray: $committed_format" >&2
+  stale=true
+  tray_unreadable=true
+elif ! regenerated_format="$(magick identify -format '%wx%h %[bit-depth] %[channels]' \
+      "$regenerated/$tray" 2>&1)"; then
+  # 再生成した側が読めないのは検査環境の問題で、再生成しても直らない。
+  echo "Could not inspect the regenerated $tray: $regenerated_format" >&2
   broken=true
+  tray_unreadable=true
+fi
+if [ "$tray_unreadable" = true ]; then
+  : # 比較はできないので飛ばす
 elif [ "$committed_format" != "$regenerated_format" ]; then
   echo "$tray has a different format than the regenerated one" >&2
   echo "  committed:   $committed_format" >&2
@@ -128,7 +138,10 @@ fi
 # アプリアイコン（.icns）。icon.json / seal.svg を変えて再生成し忘れた場合もここで捕まる。
 icns="assets/icon/generated/openshoki.icns"
 if [ "$check_appicon" = true ]; then
-  if ! cmp -s "$icns" "$regenerated/$icns"; then
+  if [ ! -f "$icns" ]; then
+    echo "$icns is missing." >&2
+    stale=true
+  elif ! cmp -s "$icns" "$regenerated/$icns"; then
     echo "$icns does not match the icon master (rebuilt here with $xcode_version)." >&2
     echo "  → If you changed the master, run ./scripts/generate-icons.sh and commit it." >&2
     echo "    If you did not, a different actool version can also produce this difference." >&2
