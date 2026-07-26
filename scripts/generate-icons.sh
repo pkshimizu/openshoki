@@ -2,16 +2,16 @@
 # アプリアイコンとメニューバー用アイコンを、1 つのマスター資産から再生成する。
 #
 #   マスター: assets/icon/mark.svg   … 筆の一画（黒）。**形の正はこの 1 本だけ**
-#             assets/icon/openshoki.icon/icon.json … レイヤー構成・背景・質感
-#             assets/icon/openshoki.icon/Assets/seal.svg … 落款（一画とは別の形）
-#   生成物:   assets/icon/openshoki.icon/Assets/mark-ink.svg        … 一画（墨・ライト用）
-#             assets/icon/openshoki.icon/Assets/mark-ink-on-dark.svg … 一画（白・ダーク用）
+#             assets/icon/shoki.icon/icon.json … レイヤー構成・背景・質感
+#             assets/icon/shoki.icon/Assets/seal.svg … 落款（一画とは別の形）
+#   生成物:   assets/icon/shoki.icon/Assets/mark-ink.svg        … 一画（墨・ライト用）
+#             assets/icon/shoki.icon/Assets/mark-ink-on-dark.svg … 一画（白・ダーク用）
 #             assets/icon/generated/Assets.car     … macOS 26（Tahoe）のレイヤードアイコン
 #                                                     （**コミットしない**。下記参照）
-#             assets/icon/generated/openshoki.icns … 旧 macOS 用のフォールバック
+#             assets/icon/generated/shoki.icns … 旧 macOS 用のフォールバック
 #             assets/icon/tray.png                 … メニューバー常駐アイコン（36x36 8bit RGBA）
 #
-# 生成物は Assets.car を除いてすべてコミットする（mark-ink*.svg / openshoki.icns / tray.png。
+# 生成物は Assets.car を除いてすべてコミットする（mark-ink*.svg / shoki.icns / tray.png。
 # ビルド時生成にしない）。`src/tray.rs` は tray.png を include_bytes! で埋め込むため、資産を
 # 変えたらこのスクリプトを実行して差分をコミットすること（コミット漏れは check-icons.sh と
 # CI が検出する）。Assets.car だけは追跡しない（入力が同じでも毎回バイト列が変わり、意味の
@@ -63,7 +63,7 @@ display_path() {
   esac
 }
 
-icon_master="assets/icon/openshoki.icon"
+icon_master="assets/icon/shoki.icon"
 mark_svg="assets/icon/mark.svg"
 generated_dir="assets/icon/generated"
 tray_png="assets/icon/tray.png"
@@ -127,7 +127,7 @@ generate_mark_layer() {
   mv "$tmp" "$out"
 }
 
-tmp_dir="$(mktemp -d -t openshoki-icons-XXXXXX)"
+tmp_dir="$(mktemp -d -t shoki-icons-XXXXXX)"
 trap 'rm -rf "$tmp_dir"' EXIT
 
 echo "Generating the stroke layers from $mark_svg"
@@ -144,8 +144,8 @@ else
   # （失敗してコミット済みの生成物が消えた状態を残さない）。
   # actool には「いま生成したレイヤー」を渡す。マスターの .icon をそのまま渡すと、--out-dir を
   # 使ったときにリポジトリ側の古いレイヤーからアプリアイコンが作られてしまう。
-  # ディレクトリ名は --app-icon の名前と一致させる必要があるため openshoki.icon にする。
-  staged="$tmp_dir/openshoki.icon"
+  # ディレクトリ名は --app-icon の名前と一致させる必要があるため shoki.icon にする。
+  staged="$tmp_dir/shoki.icon"
   mkdir -p "$staged" "$tmp_dir/appicon"
   # マスターを丸ごと複製してから、いま生成したレイヤーで上書きする（中身を列挙すると、
   # .icon にレイヤーを足したときにコピー漏れで actool が謎のエラーになる）。
@@ -154,13 +154,13 @@ else
   xcrun actool "$staged" --compile "$tmp_dir/appicon" \
     --output-format human-readable-text --notices --warnings --errors \
     --output-partial-info-plist /dev/null \
-    --app-icon openshoki --include-all-app-icons \
+    --app-icon shoki --include-all-app-icons \
     --enable-on-demand-resources NO --development-region en \
     --target-device mac --minimum-deployment-target 13.0 --platform macosx
   mkdir -p "$generated_out"
   # ファイル単位で差し替える（生成物は常にこの 2 つ。先にディレクトリを消すと、cp が失敗した
   # ときにコミット済みの生成物が消えたまま残る）。
-  mv "$tmp_dir/appicon/Assets.car" "$tmp_dir/appicon/openshoki.icns" "$generated_out/"
+  mv "$tmp_dir/appicon/Assets.car" "$tmp_dir/appicon/shoki.icns" "$generated_out/"
 fi
 
 echo "Generating $(display_path "$tray_out") from $mark_svg"

@@ -1,4 +1,4 @@
-# openshoki
+# shoki
 
 メニューバー／タスクバーに**常駐**して音声を録音する、Rust 製のデスクトップアプリです。
 ウィンドウを主役にせず、常駐したまま素早く録音を開始・停止できることを狙っています。
@@ -106,7 +106,7 @@ cargo build --release
 ## プロジェクト構成
 
 ```
-openshoki/
+shoki/
 ├── Cargo.toml            クレート定義・依存
 ├── build.rs              Slint UI のコンパイルと macOS 向けリンク設定
 ├── ui/
@@ -115,10 +115,10 @@ openshoki/
 ├── assets/
 │   ├── icon/             アプリアイコンの資産（マスターと生成物。scripts/generate-icons.sh 参照）
 │   │   ├── mark.svg          筆の一画のマスター（形の正はこの 1 本だけ）
-│   │   ├── openshoki.icon/   Icon Composer 形式のマスター（icon.json と Assets/seal.svg。
+│   │   ├── shoki.icon/   Icon Composer 形式のマスター（icon.json と Assets/seal.svg。
 │   │   │                     Assets/mark-ink*.svg は mark.svg から生成する色違い）
 │   │   ├── tray.png          メニューバー常駐アイコン（36x36 RGBA。ビルド時に埋め込む。生成物）
-│   │   └── generated/        actool の生成物（openshoki.icns。Assets.car は追跡しない）
+│   │   └── generated/        actool の生成物（shoki.icns。Assets.car は追跡しない）
 │   └── menu/             トレイメニュー項目のアイコン（PNG, 32x32 RGBA。ビルド時に埋め込む）
 ├── scripts/
 │   ├── generate-icons.sh アイコン資産の再生成（.icon → Assets.car / .icns、SVG → tray.png）
@@ -164,7 +164,7 @@ macOS では `screencapturekit` と `objc2` 系を使います。
 
 - **アイコン資産の再生成**: 筆の一画の形は `assets/icon/mark.svg` 1 本が正で、アプリアイコンの
   色違いレイヤーもメニューバーのグリフもここから生成します。マスター（`mark.svg` /
-  `openshoki.icon/icon.json` / `openshoki.icon/Assets/seal.svg`）を変えたら次を実行し、
+  `shoki.icon/icon.json` / `shoki.icon/Assets/seal.svg`）を変えたら次を実行し、
   生成物ごとコミットしてください（`Assets.car` は例外。後述）。
 
   ```sh
@@ -179,7 +179,7 @@ macOS では `screencapturekit` と `objc2` 系を使います。
   使うのは `.app` のパッケージングのときだけなので、その場でこのスクリプトを実行して生成します。
 
   生成物がマスターと一致しているかの確認だけなら次を実行します（作業ツリーは変更しません）。
-  Xcode 26 以降があれば `openshoki.icns` まで、無ければ `mark.svg` 由来の生成物だけを検査します
+  Xcode 26 以降があれば `shoki.icns` まで、無ければ `mark.svg` 由来の生成物だけを検査します
   （`Assets.car` は毎回変わるので対象外）。アイコン資産を変更した PR では CI でも同じ検査が走ります。
 
   ```sh
@@ -231,5 +231,5 @@ macOS では `screencapturekit` と `objc2` 系を使います。
     そこから Safari へ辿れるのは private API だけのため。Safari は自動録音の対象外とした。
 
   `--open` を付けた実行では、プロセス一覧を含むレポートが
-  `~/Library/Containers/net.noncore.openshoki.masprobe/Data/` に一時的に作られます
+  `~/Library/Containers/net.noncore.shoki.masprobe/Data/` に一時的に作られます
   （表示後にスクリプトが削除します）。

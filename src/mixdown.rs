@@ -3,7 +3,7 @@
 //! 1. **音量の正規化**: 会議アプリ（ブラウザの Google Meet 等）の自動ゲイン調整（AGC）が
 //!    マイクデバイスの OS 入力ボリュームを下げることがあり、録音が極端に小さく「無音に聞こえる」
 //!    ことがある（実測でピーク -35dBFS / RMS -61dBFS の実例）。極端に小さい音源だけを
-//!    ピーク正規化して保存し直す（正常な音源は無加工）。デバイスゲインを openshoki 側から
+//!    ピーク正規化して保存し直す（正常な音源は無加工）。デバイスゲインを shoki 側から
 //!    操作するのは会議アプリと奪い合いになるため行わない。
 //! 2. **文字起こしの投入**: 設定 ON のとき `TranscribeWorker` へ投入する。正規化の**後**に
 //!    投入することで文字起こしは正規化済みの音声を使う。ミックスは文字起こしの入力ではない
@@ -468,7 +468,7 @@ mod tests {
             std::num::NonZero::new(sample_rate).unwrap(),
         )
         .expect("encoding the quiet test tone should succeed");
-        let dir = std::env::temp_dir().join(format!("openshoki-normalize-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("shoki-normalize-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("creating the temp dir should succeed");
         let path = dir.join("mic.mp3");
         std::fs::write(&path, &mp3).expect("writing the test MP3 should succeed");
@@ -525,7 +525,7 @@ mod tests {
         // 破損した入力ではエラーを返し（run_job がログして続行する縮退経路）、
         // 元ファイルはそのまま残る。
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("openshoki-broken-{}.mp3", std::process::id()));
+        let path = dir.join(format!("shoki-broken-{}.mp3", std::process::id()));
         std::fs::write(&path, b"not an mp3").expect("writing the broken file should succeed");
         let result = super::normalize_if_quiet(&path);
         assert!(result.is_err());

@@ -166,7 +166,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn unique_dir(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("openshoki-transcript-{tag}-{}", std::process::id()))
+        std::env::temp_dir().join(format!("shoki-transcript-{tag}-{}", std::process::id()))
     }
 
     #[test]

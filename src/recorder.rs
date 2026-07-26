@@ -159,7 +159,7 @@ impl MicSource {
         // 滞留時はメモリが増える。問題が出たら上限付き＋超過時ドロップへ見直す（TODO）。
         let (tx, rx) = std::sync::mpsc::channel::<Vec<i16>>();
         let writer = std::thread::Builder::new()
-            .name("openshoki-mic-writer".to_owned())
+            .name("shoki-mic-writer".to_owned())
             .spawn(move || run_writer(rx, sample_rate, output_channels, file))?;
 
         // ストリームを構築して再生開始する。冒頭で対応形式に絞っているため match は網羅済み。

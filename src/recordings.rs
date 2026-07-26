@@ -165,7 +165,7 @@ mod tests {
     }
 
     fn unique_root(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("openshoki-recordings-{tag}-{}", std::process::id()))
+        std::env::temp_dir().join(format!("shoki-recordings-{tag}-{}", std::process::id()))
     }
 
     #[test]

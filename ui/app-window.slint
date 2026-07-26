@@ -89,7 +89,7 @@ component SettingsSection inherits Rectangle {
 // 「録音ファイルの保存先」「登録アプリのマイク使用で自動録音」「自動停止の待ち時間」
 // 「録音停止時の自動文字起こし」を、意味のまとまりでセクション化して設定できる。
 export component AppWindow inherits Window {
-    title: "openshoki";
+    title: "shoki";
     // preferred だけだと中身の最小高さ（≒0）に引っ張られて潰れるため、min も指定する。
     // 幅・高さは src/main.rs の WINDOW_WIDTH/HEIGHT と一致させること（片方だけ変えない）。
     // 幅は 420 固定。高さは 3 セクション＋Transcription の Language/Model 行と状態行に合わせた値。
@@ -151,7 +151,7 @@ export component AppWindow inherits Window {
         padding-bottom: 22px;
 
         Text {
-            text: "openshoki Settings";
+            text: "shoki Settings";
             font-size: Style.title-size;
             font-weight: Style.semibold;
             horizontal-alignment: center;

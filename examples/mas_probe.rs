@@ -1201,8 +1201,8 @@ mod probe {
         emit!("  startAccessingSecurityScopedResource: {started}");
 
         let write_result = url.path().map(|path| {
-            let probe = PathBuf::from(path.to_string()).join("openshoki-mas-probe.txt");
-            let result = std::fs::write(&probe, b"openshoki MAS probe\n");
+            let probe = PathBuf::from(path.to_string()).join("shoki-mas-probe.txt");
+            let result = std::fs::write(&probe, b"shoki MAS probe\n");
             if result.is_ok() {
                 let _ = std::fs::remove_file(&probe);
             }

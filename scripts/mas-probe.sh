@@ -40,8 +40,8 @@ done
 
 # バンドル ID は検証専用のものにする（本体 #20 の CFBundleIdentifier と混ざると、TCC の許可が
 # 検証ビルドに引きずられて結果を誤読する）。
-bundle_id="net.noncore.openshoki.masprobe"
-app_name="openshoki-mas-probe"
+bundle_id="net.noncore.shoki.masprobe"
+app_name="shoki-mas-probe"
 
 # CARGO_TARGET_DIR が設定されていると cargo の出力先が target/ ではなくなる。固定で参照すると、
 # 古い実行ファイルが残っていた場合にそれを署名・起動してしまう。
@@ -69,14 +69,14 @@ cat > "$app_dir/Contents/Info.plist" <<PLIST
   <key>CFBundleVersion</key><string>0</string>
   <key>LSMinimumSystemVersion</key><string>14.4</string>
   <key>NSMicrophoneUsageDescription</key>
-  <string>openshoki MAS probe checks whether audio APIs work inside the App Sandbox.</string>
+  <string>shoki MAS probe checks whether audio APIs work inside the App Sandbox.</string>
 </dict>
 </plist>
 PLIST
 
 # mktemp が作った実体とは別のパスへ書かないよう、ディレクトリを掘ってその中に置く
 # （macOS の mktemp -t は引数を接頭辞として扱うため、末尾に拡張子を足すと別ファイルになる）。
-tmp_dir="$(mktemp -d -t openshoki-mas-probe)"
+tmp_dir="$(mktemp -d -t shoki-mas-probe)"
 trap 'rm -rf "$tmp_dir"' EXIT
 entitlements="$tmp_dir/entitlements.plist"
 if [ "$sandbox" = true ]; then

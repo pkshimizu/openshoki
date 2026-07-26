@@ -82,7 +82,7 @@ impl SystemAudioSource {
 
         let (tx, rx) = std::sync::mpsc::channel::<Vec<i16>>();
         let writer = std::thread::Builder::new()
-            .name("openshoki-system-writer".to_owned())
+            .name("shoki-system-writer".to_owned())
             .spawn(move || run_writer(rx, SAMPLE_RATE, CHANNELS, file))?;
         let sender: SharedSender = Arc::new(Mutex::new(Some(tx)));
 
@@ -110,7 +110,7 @@ impl SystemAudioSource {
             .with_captures_audio(true)
             .with_sample_rate(AudioSampleRate::Rate48000)
             .with_channel_count(AudioChannelCount::Stereo)
-            // 自プロセス（openshoki）の音は拾わない（フィードバック防止）。
+            // 自プロセス（shoki）の音は拾わない（フィードバック防止）。
             .with_excludes_current_process_audio(true);
 
         let mut stream = SCStream::new(&filter, &config);

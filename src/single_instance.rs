@@ -1,6 +1,6 @@
 //! アプリの多重起動を防ぐ排他ロック。
 //!
-//! 常駐（メニューバー）アプリの openshoki が複数プロセス同時に動くと、トレイアイコンが重複し、
+//! 常駐（メニューバー）アプリの shoki が複数プロセス同時に動くと、トレイアイコンが重複し、
 //! 自動録音が複数プロセスで同時発火して同じ音を二重録音する・保存先を奪い合う、といった不整合を
 //! 招く。起動時にロックファイルへ排他ロックを取り、既に別インスタンスが保持していればこのプロセスは
 //! 常駐を始めずに終了する。
@@ -91,10 +91,8 @@ mod tests {
     #[test]
     fn second_lock_on_same_path_reports_already_running() {
         // 並列テスト間で衝突しないよう、プロセス固有名の一時ファイルを使う。
-        let path = std::env::temp_dir().join(format!(
-            "openshoki-instance-test-{}.lock",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("shoki-instance-test-{}.lock", std::process::id()));
 
         let first = acquire_at(&path);
         assert!(
@@ -127,7 +125,7 @@ mod tests {
     #[test]
     fn missing_parent_directory_reports_unavailable() {
         let path = std::env::temp_dir()
-            .join(format!("openshoki-missing-{}", std::process::id()))
+            .join(format!("shoki-missing-{}", std::process::id()))
             .join("nested")
             .join("instance.lock");
 

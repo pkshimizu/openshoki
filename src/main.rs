@@ -1,4 +1,4 @@
-//! openshoki — メニューバー／タスクバーに常駐する録音アプリ（基盤）。
+//! shoki — メニューバー／タスクバーに常駐する録音アプリ（基盤）。
 //!
 //! 起動時はウィンドウを表示せずトレイに常駐し、トレイメニューから Slint ウィンドウの
 //! 表示/非表示とアプリ終了を行う。録音機能は後続の issue で実装する。
@@ -63,7 +63,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _instance_lock = match single_instance::acquire() {
         single_instance::Acquire::Acquired(lock) => Some(lock),
         single_instance::Acquire::AlreadyRunning => {
-            eprintln!("Exiting because another instance of openshoki is already running.");
+            eprintln!("Exiting because another instance of shoki is already running.");
             return Ok(());
         }
         single_instance::Acquire::Unavailable => None,

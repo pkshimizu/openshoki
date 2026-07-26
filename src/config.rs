@@ -13,13 +13,13 @@ use serde::{Deserialize, Serialize};
 /// （変えると過去の設定ファイルを見失う）。
 const QUALIFIER: &str = "net";
 const ORGANIZATION: &str = "noncore";
-const APPLICATION: &str = "openshoki";
+const APPLICATION: &str = "shoki";
 
 /// 設定ファイル名。
 const CONFIG_FILE: &str = "config.toml";
 
 /// デフォルト保存先のフォルダ名（Documents もしくはホーム配下に作る想定）。
-const DEFAULT_DIR_NAME: &str = "openshoki";
+const DEFAULT_DIR_NAME: &str = "shoki";
 
 /// 自動停止デバウンスの既定秒数。登録アプリのマイク使用が途絶えてから自動停止するまでの待ち時間。
 const DEFAULT_DEBOUNCE_SECS: u32 = 4;
@@ -302,7 +302,7 @@ mod tests {
     #[test]
     fn toml_roundtrip_preserves_fields() {
         let config = Config {
-            recording_dir: PathBuf::from("/tmp/openshoki-test"),
+            recording_dir: PathBuf::from("/tmp/shoki-test"),
             auto_record_on_app_mic: true,
             app_mic_triggers: vec![AppTrigger {
                 bundle_id: "com.apple.Music".to_owned(),
@@ -336,10 +336,10 @@ mod tests {
     fn deserialize_old_config_without_new_field_defaults_false() {
         // 新項目を持たない旧 config.toml を読んでも失敗せず、recording_dir は保持され、
         // 新項目は既定（OFF・空リスト）になる（#[serde(default)]）。
-        let text = "recording_dir = \"/tmp/openshoki-old\"\n";
+        let text = "recording_dir = \"/tmp/shoki-old\"\n";
         let restored: Config =
             toml::from_str(text).expect("loading the old settings should succeed");
-        assert_eq!(restored.recording_dir, PathBuf::from("/tmp/openshoki-old"));
+        assert_eq!(restored.recording_dir, PathBuf::from("/tmp/shoki-old"));
         assert!(!restored.auto_record_on_app_mic);
         assert!(restored.app_mic_triggers.is_empty());
         assert_eq!(restored.auto_stop_debounce_secs, DEFAULT_DEBOUNCE_SECS);
@@ -358,21 +358,18 @@ mod tests {
         let restored: Config = toml::from_str(auto).expect("auto should load");
         assert_eq!(restored.transcribe_language, "auto");
 
-        let bad = "recording_dir = \"/tmp/openshoki-lang\"\ntranscribe_language = 123\n";
+        let bad = "recording_dir = \"/tmp/shoki-lang\"\ntranscribe_language = 123\n";
         let restored: Config = toml::from_str(bad).expect("non-string should not fail the file");
-        assert_eq!(restored.recording_dir, PathBuf::from("/tmp/openshoki-lang"));
+        assert_eq!(restored.recording_dir, PathBuf::from("/tmp/shoki-lang"));
         assert_eq!(restored.transcribe_language, "en");
     }
 
     #[test]
     fn deserialize_rounds_non_string_whisper_model() {
         // 非文字列の手編集値は当該項目のみ既定へ丸まり、他フィールドを巻き添えにしない。
-        let bad = "recording_dir = \"/tmp/openshoki-model\"\nwhisper_model = 5\n";
+        let bad = "recording_dir = \"/tmp/shoki-model\"\nwhisper_model = 5\n";
         let restored: Config = toml::from_str(bad).expect("non-string should not fail the file");
-        assert_eq!(
-            restored.recording_dir,
-            PathBuf::from("/tmp/openshoki-model")
-        );
+        assert_eq!(restored.recording_dir, PathBuf::from("/tmp/shoki-model"));
         assert_eq!(restored.whisper_model, "small");
     }
 
@@ -392,7 +389,7 @@ mod tests {
     fn deserialize_reads_configured_debounce_secs() {
         // 設定された自動停止デバウンス秒数がそのまま読める。
         let text = concat!(
-            "recording_dir = \"/tmp/openshoki-debounce\"\n",
+            "recording_dir = \"/tmp/shoki-debounce\"\n",
             "auto_stop_debounce_secs = 10\n",
         );
         let restored: Config = toml::from_str(text).expect("loading the settings should succeed");
@@ -432,12 +429,11 @@ mod tests {
         // 手編集で負値・u32 範囲外・非数値でもパース失敗させず、当該項目のみ既定へ丸め、
         // 他設定（保存先）を巻き添えで失わない（deserialize_debounce_secs）。
         for bad in ["-5", "999999999999", "\"abc\"", "1.5"] {
-            let text = format!(
-                "recording_dir = \"/tmp/openshoki-bad\"\nauto_stop_debounce_secs = {bad}\n"
-            );
+            let text =
+                format!("recording_dir = \"/tmp/shoki-bad\"\nauto_stop_debounce_secs = {bad}\n");
             let restored: Config =
                 toml::from_str(&text).expect("loading should not fail on a bad debounce value");
-            assert_eq!(restored.recording_dir, PathBuf::from("/tmp/openshoki-bad"));
+            assert_eq!(restored.recording_dir, PathBuf::from("/tmp/shoki-bad"));
             assert_eq!(restored.auto_stop_debounce_secs, DEFAULT_DEBOUNCE_SECS);
         }
     }
@@ -468,15 +464,12 @@ mod tests {
         // 削除した項目 auto_record_on_mic_active が残る旧 config.toml を読んでも、未知項目として
         // 無視され失敗しない（serde 既定で未知フィールドは無視）。
         let text = concat!(
-            "recording_dir = \"/tmp/openshoki-removed\"\n",
+            "recording_dir = \"/tmp/shoki-removed\"\n",
             "auto_record_on_mic_active = true\n",
         );
         let restored: Config =
             toml::from_str(text).expect("loading a config with the removed field should succeed");
-        assert_eq!(
-            restored.recording_dir,
-            PathBuf::from("/tmp/openshoki-removed")
-        );
+        assert_eq!(restored.recording_dir, PathBuf::from("/tmp/shoki-removed"));
         assert!(!restored.auto_record_on_app_mic);
     }
 
@@ -485,7 +478,7 @@ mod tests {
         // 出力ベース時代の旧項目名（auto_record_on_app_playback / app_playback_triggers）も
         // serde alias で読めること（互換）。
         let text = concat!(
-            "recording_dir = \"/tmp/openshoki-legacy\"\n",
+            "recording_dir = \"/tmp/shoki-legacy\"\n",
             "auto_record_on_app_playback = true\n",
             "[[app_playback_triggers]]\n",
             "bundle_id = \"com.apple.Music\"\n",
@@ -500,8 +493,8 @@ mod tests {
 
     #[test]
     fn default_recording_dir_uses_app_folder() {
-        // デフォルト保存先は openshoki 用フォルダで終わる。
+        // デフォルト保存先は shoki 用フォルダで終わる。
         let dir = default_recording_dir();
-        assert_eq!(dir.file_name().and_then(|n| n.to_str()), Some("openshoki"));
+        assert_eq!(dir.file_name().and_then(|n| n.to_str()), Some("shoki"));
     }
 }
