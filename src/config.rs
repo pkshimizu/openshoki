@@ -9,8 +9,12 @@ use std::path::PathBuf;
 use directories::{ProjectDirs, UserDirs};
 use serde::{Deserialize, Serialize};
 
-/// `ProjectDirs` の識別子。設定ファイルの保存パスを決めるため、一度決めたら変えない
-/// （変えると過去の設定ファイルを見失う）。
+/// `ProjectDirs` の識別子。設定ファイルと whisper モデルの保存パスを決めるため、
+/// 一度決めたら変えない（変えると過去の設定・モデルを見失う）。
+///
+/// 例外は #111 の改名 1 回だけ（`openshoki` → `shoki`）。旧 `net.noncore.openshoki` 配下は
+/// 手作業で移した（自動移行コードは持たない。使うのは開発者本人だけで、旧フォルダは残るため
+/// 失敗しても破壊的ではない、という判断）。**以後は変えない。**
 const QUALIFIER: &str = "net";
 const ORGANIZATION: &str = "noncore";
 const APPLICATION: &str = "shoki";
@@ -19,6 +23,7 @@ const APPLICATION: &str = "shoki";
 const CONFIG_FILE: &str = "config.toml";
 
 /// デフォルト保存先のフォルダ名（Documents もしくはホーム配下に作る想定）。
+/// `APPLICATION` と同じく #111 で一度だけ改名した（既存の録音は手作業で移した）。
 const DEFAULT_DIR_NAME: &str = "shoki";
 
 /// 自動停止デバウンスの既定秒数。登録アプリのマイク使用が途絶えてから自動停止するまでの待ち時間。
@@ -495,6 +500,9 @@ mod tests {
     fn default_recording_dir_uses_app_folder() {
         // デフォルト保存先は shoki 用フォルダで終わる。
         let dir = default_recording_dir();
-        assert_eq!(dir.file_name().and_then(|n| n.to_str()), Some("shoki"));
+        assert_eq!(
+            dir.file_name().and_then(|n| n.to_str()),
+            Some(DEFAULT_DIR_NAME)
+        );
     }
 }
