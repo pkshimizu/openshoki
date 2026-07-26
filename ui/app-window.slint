@@ -328,7 +328,7 @@ export component AppWindow inherits Window {
                 }
             }
 
-            // 従属コントロール（Language）を左インデントし、文字起こし OFF のときは
+            // 文字起こしに従属するコントロール群を左インデントし、文字起こし OFF のときは
             // 淡色化＋無効化で従属関係を示す（Auto-record セクションの deps と同じ流儀）。
             transcribe-deps := Rectangle {
                 property <bool> enabled-gate: root.auto-transcribe;

@@ -52,8 +52,11 @@ pub struct TranscribeJob {
     /// 認識言語（whisper の言語コード。例: `en` / `ja`）。`auto` は自動判定。
     pub language: String,
     /// 文字起こしが**全音源成功した**ときに続けて投入する議事録要約の依頼（設定
-    /// `auto_summarize` が OFF なら `None`）。要約は文字起こし結果を入力にするため、
-    /// ここで連結して直列に走らせる（whisper と LLM の CPU・メモリのピークを重ねない）。
+    /// `auto_summarize` が OFF なら `None`）。要約は文字起こし結果を入力にするので、
+    /// このセッションの文字起こしが終わってから投入する。
+    ///
+    /// 投入先は別スレッドの逐次ワーカーなので、**別セッションの**文字起こしとは並走しうる。
+    /// whisper と LLM のピークを重ねないための直列化は `crate::inference_slot` が担う。
     pub summarize: Option<crate::summarize::SummarizeJob>,
 }
 
@@ -98,9 +101,11 @@ impl TranscribeWorker {
     /// `summarizer` は文字起こし成功後の要約投入に使う（このワーカーが所有し、停止フックから
     /// 直接投入しない。文字起こしの完了を待たずに要約を始めないための意図的な結合で、
     /// `PostProcessWorker` が `TranscribeWorker` を持つのと同じ形）。
+    /// `slot` は要約ワーカーと共有する重い推論の実行権（`crate::inference_slot`）。
     pub fn start(
         downloader: crate::model_download::ModelDownloader,
         summarizer: crate::summarize::SummarizeWorker,
+        slot: crate::inference_slot::InferenceSlot,
     ) -> Self {
         // whisper.cpp / GGML が stderr へ出す冗長な内部ログを止める（ログ backend の feature を
         // 有効にしていないため、フック先が無く事実上の無効化になる）。複数回呼んでも安全。
@@ -119,7 +124,7 @@ impl TranscribeWorker {
                     // デキューの隙間はごく短い）。
                     lock_status(&status_for_worker)
                         .insert(job.session_dir.clone(), TranscribeStatus::Transcribing);
-                    let outcome = run_job(&job, &downloader);
+                    let outcome = run_job(&job, &downloader, &slot);
                     // 要約は「全音源の文字起こしに成功した」ときだけ続ける。部分的に失敗した
                     // 文字起こしから議事録を作ると、欠けたまま完成品に見えてしまう。
                     let summarize = match outcome {
@@ -208,7 +213,11 @@ enum JobOutcome {
 
 /// 1 ジョブ（1 回の録音停止分）を処理する。モデルはジョブ内で 1 回だけロードして
 /// 複数音源で使い回す（モデルのロードが重いため）。音源単位の失敗は他の音源へ波及させない。
-fn run_job(job: &TranscribeJob, downloader: &crate::model_download::ModelDownloader) -> JobOutcome {
+fn run_job(
+    job: &TranscribeJob,
+    downloader: &crate::model_download::ModelDownloader,
+    slot: &crate::inference_slot::InferenceSlot,
+) -> JobOutcome {
     if job.audio_paths.is_empty() {
         // 対象なしでモデル（数百 MB〜）をロードしない防御。通常は投入側が空を渡さない。
         return JobOutcome::Skipped;
@@ -244,6 +253,9 @@ fn run_job(job: &TranscribeJob, downloader: &crate::model_download::ModelDownloa
         eprintln!("Skipping transcription because the Whisper model path is not valid UTF-8");
         return JobOutcome::Failed;
     };
+    // ここから先が重い区間。要約 LLM と同時に走らせない（`crate::inference_slot`）。
+    // モデルの準備（ダウンロード）はスロットの外で済ませてある。
+    let _slot = slot.acquire();
     let ctx = match WhisperContext::new_with_params(
         model_path_str,
         WhisperContextParameters::default(),
@@ -532,7 +544,10 @@ mod tests {
 
     /// テスト用の要約ワーカー。ジョブが渡ったかどうかは状態マップの有無で判定する。
     fn summarize_worker() -> SummarizeWorker {
-        SummarizeWorker::start(crate::model_download::ModelDownloader::new())
+        SummarizeWorker::start(
+            crate::model_download::ModelDownloader::new(),
+            crate::inference_slot::InferenceSlot::new(),
+        )
     }
 
     /// テスト用の要約依頼（存在しないモデル上書きパスなので、実行されても即失敗する）。
@@ -553,6 +568,7 @@ mod tests {
         let worker = TranscribeWorker::start(
             crate::model_download::ModelDownloader::new(),
             summarize_worker(),
+            crate::inference_slot::InferenceSlot::new(),
         );
         let dir = std::env::temp_dir().join(format!("shoki-status-{}", std::process::id()));
         worker.submit(TranscribeJob {
@@ -589,6 +605,7 @@ mod tests {
         let worker = TranscribeWorker::start(
             crate::model_download::ModelDownloader::new(),
             summarizer.clone(),
+            crate::inference_slot::InferenceSlot::new(),
         );
         let dir = std::env::temp_dir().join(format!("shoki-skip-{}", std::process::id()));
         // 文字起こし JSON を置いておく。こうしておくと、もし要約が投入されてしまった場合は
@@ -794,6 +811,7 @@ mod tests {
                 summarize: None,
             },
             &crate::model_download::ModelDownloader::new(),
+            &crate::inference_slot::InferenceSlot::new(),
         );
 
         let json_path = audio_path.with_extension("json");

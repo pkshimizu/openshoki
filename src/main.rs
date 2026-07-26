@@ -6,6 +6,7 @@
 #[cfg(target_os = "macos")]
 mod app_audio_monitor;
 mod config;
+mod inference_slot;
 mod mixdown;
 mod model_download;
 mod player;
@@ -139,7 +140,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ui.set_whisper_model_index(whisper_model::model_index(&config.borrow().whisper_model) as i32);
     ui.set_whisper_model_status(
         model_status_text(
-            whisper_spec(&config.borrow().whisper_model),
+            whisper_model::spec_or_default(&config.borrow().whisper_model),
             &model_downloader,
         )
         .into(),
@@ -407,15 +408,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "macos")]
     let app_monitor = app_audio_monitor::AppAudioMonitor::new();
 
+    // 重い ML 推論（whisper / 要約 LLM）の実行権。両ワーカーで 1 枠を共有し、ピークが
+    // 加算されないようにする（理由は `src/inference_slot.rs`）。
+    let inference_slot = inference_slot::InferenceSlot::new();
+
     // 議事録要約のバックグラウンドワーカー。文字起こしワーカーが成功時に投入する（設定
-    // `auto_summarize` が ON のときだけ依頼が添えられる）。文字起こしとは別スレッドだが、
-    // 投入が完了後なので whisper と LLM が同時に走ることはない。
-    let summarizer = summarize::SummarizeWorker::start(model_downloader.clone());
+    // `auto_summarize` が ON のときだけ依頼が添えられる）。
+    let summarizer =
+        summarize::SummarizeWorker::start(model_downloader.clone(), inference_slot.clone());
 
     // 文字起こしのバックグラウンドワーカー。設定 OFF の間はジョブが来ないだけで、常駐コストは
     // アイドルなスレッド 1 本のみ。起動失敗時は文字起こしだけが無効化される（録音は無関係）。
-    let transcriber =
-        transcribe::TranscribeWorker::start(model_downloader.clone(), summarizer.clone());
+    let transcriber = transcribe::TranscribeWorker::start(
+        model_downloader.clone(),
+        summarizer.clone(),
+        inference_slot,
+    );
 
     // 録音停止後の後処理（極小音量の正規化→ミックス生成→文字起こし投入）を直列に行う
     // バックグラウンドワーカー。自動経路の文字起こしは後処理ワーカーが完了後に投入する
@@ -1012,7 +1020,7 @@ fn build_menu_event_handler(
             && ui.window().is_visible()
         {
             let status = model_status_text(
-                whisper_spec(&config.borrow().whisper_model),
+                whisper_model::spec_or_default(&config.borrow().whisper_model),
                 &model_downloader,
             );
             if ui.get_whisper_model_status() != status.as_str() {
@@ -1502,12 +1510,6 @@ fn trigger_app_row(trigger: &config::AppTrigger) -> TriggerApp {
     }
 }
 
-/// 設定で選択中の whisper モデル。カタログ外の手編集値は既定モデルの状況を表示する
-/// （ComboBox の表示位置のフォールバックと整合）。
-fn whisper_spec(model_id: &str) -> &'static model_download::ModelSpec {
-    whisper_model::spec_for(model_id).unwrap_or_else(whisper_model::default_spec)
-}
-
 /// 議事録要約に使う LLM の取得状況を、設定画面の状態行テキストにする。
 ///
 /// whisper と違いモデルの選択 UI が無いため、状態だけでなく**どのモデルか**も出す
@@ -1520,8 +1522,7 @@ fn summary_model_status_text(
     if config.summary_model_path.is_some() {
         return "Using the model file set in config.toml".to_owned();
     }
-    let spec =
-        summary_model::spec_for(&config.summary_model).unwrap_or_else(summary_model::default_spec);
+    let spec = summary_model::spec_or_default(&config.summary_model);
     format!(
         "{} — {}",
         spec.display_name,
@@ -1845,6 +1846,8 @@ mod tests {
         );
     }
 
+    /// サイン波の代表的な位相で、期待どおりの明度レベルになることを確認する。
+    /// 2 秒周期なら 0s→0.5, 0.5s(1/4)→1.0, 1.0s(1/2)→0.5, 1.5s(3/4)→0.0, 2.0s(1周)→0.5。
     #[test]
     fn breathing_level_matches_sine_phases() {
         const CYCLE: f32 = 2.0;

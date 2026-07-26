@@ -60,6 +60,31 @@ fn default_whisper_model() -> String {
     crate::whisper_model::DEFAULT_MODEL_ID.to_owned()
 }
 
+/// `whisper_model` を寛容にデシリアライズする。非文字列の手編集値は当該項目のみ既定へ丸め、
+/// 他の設定を巻き添えでファイル全体フォールバックさせない（`docs/rules/error-handling.md`）。
+/// カタログ外の文字列はそのまま保持し、使用時に既定へフォールバックする（`spec_for` 側）。
+fn deserialize_whisper_model<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = toml::Value::deserialize(deserializer)?;
+    Ok(value
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(default_whisper_model))
+}
+
+/// 真偽値を寛容にデシリアライズする（既定は `false`）。設定 TOML は手編集されうる信頼境界外で、
+/// `bool` で直接受けると型不一致でファイル全体が既定へ落ち、無関係な設定（保存先・登録アプリ）
+/// まで失わせる（`docs/rules/error-handling.md`）。トグル系のフィールドはすべてこれを通す。
+fn deserialize_bool_or_false<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = toml::Value::deserialize(deserializer)?;
+    Ok(value.as_bool().unwrap_or(false))
+}
+
 /// 既定の内蔵要約 LLM の ID（カタログの既定と同じ値。`summary_model::DEFAULT_MODEL_ID`）。
 fn default_summary_model() -> String {
     crate::summary_model::DEFAULT_MODEL_ID.to_owned()
@@ -75,20 +100,6 @@ where
         .as_str()
         .map(str::to_owned)
         .unwrap_or_else(default_summary_model))
-}
-
-/// `whisper_model` を寛容にデシリアライズする。非文字列の手編集値は当該項目のみ既定へ丸め、
-/// 他の設定を巻き添えでファイル全体フォールバックさせない（`docs/rules/error-handling.md`）。
-/// カタログ外の文字列はそのまま保持し、使用時に既定へフォールバックする（`spec_for` 側）。
-fn deserialize_whisper_model<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = toml::Value::deserialize(deserializer)?;
-    Ok(value
-        .as_str()
-        .map(str::to_owned)
-        .unwrap_or_else(default_whisper_model))
 }
 
 /// `transcribe_language` を寛容にデシリアライズする。設定 TOML は手編集されうる信頼境界外で、
@@ -137,7 +148,11 @@ pub struct Config {
     /// （macOS 14.4+ のみ有効）。会議アプリ（ブラウザの Google Meet・Zoom.app 等）は通話中だけ
     /// マイク入力を掴むため、これを合図に通話の開始/終了へ連動できる。オプトインの既定 OFF。
     /// 旧項目名 `auto_record_on_app_playback`（出力ベース時代）からエイリアスで互換を保つ。
-    #[serde(default, alias = "auto_record_on_app_playback")]
+    #[serde(
+        default,
+        alias = "auto_record_on_app_playback",
+        deserialize_with = "deserialize_bool_or_false"
+    )]
     pub auto_record_on_app_mic: bool,
     /// マイク使用での自動録音トリガーにする登録アプリ一覧。旧名 `app_playback_triggers` と互換。
     #[serde(default, alias = "app_playback_triggers")]
@@ -154,7 +169,7 @@ pub struct Config {
     /// 録音停止時に保存した各音源を自動で文字起こしするか。whisper は CPU 負荷が大きいため
     /// オプトインの既定 OFF。モデルは内蔵（初回の文字起こし時に自動ダウンロード）なので、
     /// ON にするだけで使える（`src/model_download.rs`）。
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_bool_or_false")]
     pub auto_transcribe: bool,
     /// 使用する内蔵 whisper モデルの識別子（`whisper_model::CATALOG` の `id`。既定 `small`）。
     /// 設定画面の ComboBox で選び、選択時に未取得ならダウンロードが始まる。カタログ外の
@@ -184,7 +199,7 @@ pub struct Config {
     /// 文字起こしが終わったら議事録要約（`summary.md`）を自動生成するか。オンデバイス LLM は
     /// CPU・メモリの負荷が大きい（既定モデルで実行時 8GB 級）ためオプトインの既定 OFF。
     /// 文字起こしの完了が前提なので、`auto_transcribe` が OFF なら要約も走らない。
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_bool_or_false")]
     pub auto_summarize: bool,
     /// 使用する内蔵要約 LLM の識別子（`summary_model::CATALOG` の `id`。既定は 7B）。
     /// 設定画面の選択 UI はまだ無く、切り替えは config の手編集で行う（軽い 3B を選べる）。
@@ -404,6 +419,23 @@ mod tests {
             crate::summary_model::DEFAULT_MODEL_ID
         );
         assert!(restored.summary_model_path.is_none());
+    }
+
+    #[test]
+    fn deserialize_rounds_non_bool_toggles() {
+        // トグル系に非 bool が入っても、当該項目だけ OFF へ丸まり、他の設定を巻き添えにしない
+        // （bool で直接受けると型不一致でファイル全体が既定へ落ちる）。
+        let text = concat!(
+            "recording_dir = \"/tmp/shoki-toggles\"\n",
+            "auto_record_on_app_mic = \"yes\"\n",
+            "auto_transcribe = 1\n",
+            "auto_summarize = \"on\"\n",
+        );
+        let restored: Config = toml::from_str(text).expect("non-bool should not fail the file");
+        assert_eq!(restored.recording_dir, PathBuf::from("/tmp/shoki-toggles"));
+        assert!(!restored.auto_record_on_app_mic);
+        assert!(!restored.auto_transcribe);
+        assert!(!restored.auto_summarize);
     }
 
     #[test]

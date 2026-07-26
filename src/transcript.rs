@@ -32,7 +32,10 @@ pub enum Speaker {
 }
 
 impl Speaker {
-    /// UI の話者バッジに出す英語ラベル。
+    /// 話者の英語ラベル。UI の話者バッジに出すほか、**議事録要約のプロンプトに渡す
+    /// トランスクリプトの話者表記も兼ねる**（`src/summarize.rs` の `MINUTES_SYSTEM_*` /
+    /// `NOTES_SYSTEM_*` が `Mic` / `System` という文字列を前提に書かれている）。
+    /// 表記を変えるときはプロンプト側も同時に直すこと。
     pub fn label(self) -> &'static str {
         match self {
             Speaker::Mic => "Mic",

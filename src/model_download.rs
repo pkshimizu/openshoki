@@ -244,7 +244,8 @@ const PROGRESS_STEP_BYTES: u64 = 1024 * 1024;
 /// 接続確立・応答ヘッダ受信のタイムアウト。
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// ボディ受信全体のタイムアウト。低速回線でも最大モデル（約 3GB）を受け切れる長さにしつつ、
+/// ボディ受信全体のタイムアウト。低速回線でもカタログ中の最大モデル（現状は要約 LLM の
+/// 約 4.4GB）を受け切れる長さにしつつ、
 /// 無応答の接続（half-open 等）で呼び出しスレッドが恒久にハングしないようにする。
 /// 超過時は失敗し、次の要求で再試行する。
 const RECV_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120 * 60);

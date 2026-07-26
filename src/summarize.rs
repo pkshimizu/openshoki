@@ -37,8 +37,13 @@ pub const SUMMARY_FILENAME: &str = "summary.md";
 /// （約 19 分）・英語 12,800 文字（約 25 分）に相当する。
 const CHUNK_TOKEN_BUDGET: usize = 4_000;
 
-/// メモを畳み直す最大回数。1 回で件数が約 1/3 になるので通常は 0〜1 回で収まる。
-/// 収まらなくても無限に回さないための上限（超えたぶんは末尾を切り詰める）。
+/// 中間メモを畳み直す最大回数。**畳み直しの収束に関する説明の正はここ**（`on_device` 側は
+/// ここを参照する）。
+///
+/// 1 本のメモは生成上限（`on_device::MAX_NOTES_TOKENS` = 800）以下、詰め先は
+/// `CHUNK_TOKEN_BUDGET`（4,000）なので、1 ラウンドで件数はおよそ 1/5 になる。2 時間の会議
+/// （6〜7 チャンク）なら 1 ラウンドで収まる。上限があるのは、想定外の入力で無限に回さない
+/// ための保険（超えたぶんは末尾を切り詰める）。
 const MAX_REDUCE_ROUNDS: usize = 4;
 
 /// 要約の実行エンジン。いまはオンデバイスのみで、オンライン LLM（Claude / OpenAI / Gemini）は
@@ -51,6 +56,7 @@ pub enum SummaryEngine {
 
 /// 要約ジョブ。1 セッション分の入力と、投入時点の設定スナップショット
 /// （処理中に設定が変わっても影響しない。`TranscribeJob` と同じ方針）。
+#[derive(Debug)]
 pub struct SummarizeJob {
     /// 対象の録音セッションディレクトリ。文字起こし JSON の読み元・`summary.md` の書き先・
     /// 状態表示（`SummarizeStatus`）のキーを兼ねる。
@@ -99,7 +105,11 @@ impl SummarizeWorker {
     /// スレッドは意図的に join しない（detach）: 生成は数分かかりうるため、終了時に join すると
     /// アプリの終了がブロックされる。常駐終了時に処理中のジョブは中断される（ベストエフォート。
     /// 次回に手動で再生成できる）。
-    pub fn start(downloader: crate::model_download::ModelDownloader) -> Self {
+    /// `slot` は文字起こしワーカーと共有する重い推論の実行権（`crate::inference_slot`）。
+    pub fn start(
+        downloader: crate::model_download::ModelDownloader,
+        slot: crate::inference_slot::InferenceSlot,
+    ) -> Self {
         let status: Arc<Mutex<StatusMap>> = Arc::new(Mutex::new(HashMap::new()));
         let status_for_worker = Arc::clone(&status);
         let (tx, rx) = mpsc::channel::<SummarizeJob>();
@@ -112,7 +122,7 @@ impl SummarizeWorker {
                     // 上書きしたままにならないように。`TranscribeWorker` と同じ）。
                     lock_status(&status_for_worker)
                         .insert(job.session_dir.clone(), SummarizeStatus::Summarizing);
-                    let outcome = run_job(&job, &downloader);
+                    let outcome = run_job(&job, &downloader, &slot);
                     let mut map = lock_status(&status_for_worker);
                     match outcome {
                         // 対象なしで何もしなかった場合は「投入済み」の痕跡を消す。
@@ -128,7 +138,9 @@ impl SummarizeWorker {
                 status,
             },
             Err(err) => {
-                eprintln!("Disabling summaries because the worker thread failed to start: {err}");
+                eprintln!(
+                    "Disabling summarization because the worker thread failed to start: {err}"
+                );
                 Self { tx: None, status }
             }
         }
@@ -138,14 +150,14 @@ impl SummarizeWorker {
     /// ワーカーが動いていない場合はログのみ（文字起こしまでは保存済み）。
     pub fn submit(&self, job: SummarizeJob) {
         let Some(tx) = &self.tx else {
-            eprintln!("Skipping the summary because the summary worker is not running");
+            eprintln!("Skipping summarization because the summary worker is not running");
             return;
         };
         lock_status(&self.status).insert(job.session_dir.clone(), SummarizeStatus::Summarizing);
         // 送信失敗 = ワーカースレッドが（panic 等で）終了しレシーバが閉じた状態。記録した
         // 「生成中」を取り消す（永遠に進行中表示のままにしない）。
         if let Err(mpsc::SendError(job)) = tx.send(job) {
-            eprintln!("Skipping the summary because the summary worker is not running");
+            eprintln!("Skipping summarization because the summary worker is not running");
             lock_status(&self.status).remove(&job.session_dir);
         }
     }
@@ -187,13 +199,32 @@ enum JobOutcome {
 
 /// 1 セッション分の要約を生成して保存する。モデルはジョブ内で 1 回だけロードする
 /// （`docs/rules/performance.md`）。対象が無ければロードもダウンロードもしない。
-fn run_job(job: &SummarizeJob, downloader: &crate::model_download::ModelDownloader) -> JobOutcome {
-    let segments = crate::transcript::load_transcript(&job.session_dir);
-    let lines = transcript_lines(&segments);
+fn run_job(
+    job: &SummarizeJob,
+    downloader: &crate::model_download::ModelDownloader,
+    slot: &crate::inference_slot::InferenceSlot,
+) -> JobOutcome {
+    // トランスクリプトは行へ整形したら手放す（数分かかる推論の間、同じ内容を 2 重に抱えない。
+    // `docs/rules/performance.md`）。
+    let lines = {
+        let segments = crate::transcript::load_transcript(&job.session_dir);
+        transcript_lines(&segments)
+    };
     if lines.is_empty() {
         // 文字起こしが未生成・欠落・破損・全行空。GB 級のモデルをロードしない防御でもある。
-        println!("Skipping the summary because the session has no transcript");
+        println!("Skipping summarization because the session has no transcript");
         return JobOutcome::Skipped;
+    }
+
+    // 既にある `summary.md` は、ここへ来た時点で**古い文字起こしの議事録**（このジョブは
+    // 文字起こしが成功した直後にしか走らない）。先に消しておかないと、生成に失敗したときに
+    // 古い議事録が残り、失敗の記録はメモリのみで再起動すると消えるため、表示側は「新しい
+    // 文字起こしの議事録」として読んでしまう。消せなかった場合は上書きに賭けて先へ進む。
+    let path = job.session_dir.join(SUMMARY_FILENAME);
+    if let Err(err) = std::fs::remove_file(&path)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("Could not remove the previous meeting summary before regenerating it: {err}");
     }
 
     let generated = match job.engine {
@@ -201,13 +232,16 @@ fn run_job(job: &SummarizeJob, downloader: &crate::model_download::ModelDownload
             let Some(model_path) = resolve_model(job, downloader) else {
                 return JobOutcome::Failed;
             };
+            // ここから先が重い区間。文字起こしと同時に走らせない（`crate::inference_slot`）。
+            // モデルの準備（ダウンロード）はスロットの外で済ませてある。
+            let _slot = slot.acquire();
             on_device::generate(&model_path, &job.language, &lines)
         }
     };
     let generated = match generated {
         Ok(text) => text,
         Err(err) => {
-            eprintln!("Skipping the summary because generating it failed: {err}");
+            eprintln!("Skipping summarization because generating the summary failed: {err}");
             return JobOutcome::Failed;
         }
     };
@@ -215,11 +249,10 @@ fn run_job(job: &SummarizeJob, downloader: &crate::model_download::ModelDownload
     // 「生成済み」と読んで白紙を出してしまう。
     let generated = generated.trim();
     if generated.is_empty() {
-        eprintln!("Skipping the summary because the model produced no text");
+        eprintln!("Skipping summarization because the model produced no text");
         return JobOutcome::Failed;
     }
 
-    let path = job.session_dir.join(SUMMARY_FILENAME);
     match write_summary(&path, generated) {
         Ok(()) => {
             // 保存先のフルパス（＝録音の所在）と本文（＝発話内容）はログへ出さない
@@ -228,7 +261,7 @@ fn run_job(job: &SummarizeJob, downloader: &crate::model_download::ModelDownload
             JobOutcome::Done
         }
         Err(err) => {
-            eprintln!("Skipping the summary because writing it failed: {err}");
+            eprintln!("Skipping summarization because writing the summary failed: {err}");
             JobOutcome::Failed
         }
     }
@@ -244,13 +277,12 @@ fn resolve_model(
     let path = match &job.model_override {
         Some(path) => path.clone(),
         None => {
-            let spec = crate::summary_model::spec_for(&job.model_id)
-                .unwrap_or_else(crate::summary_model::default_spec);
+            let spec = crate::summary_model::spec_or_default(&job.model_id);
             match downloader.ensure_model(spec) {
                 Ok(path) => path,
                 Err(err) => {
                     eprintln!(
-                        "Skipping the summary because the summary model could not be prepared: {err}"
+                        "Skipping summarization because the summary model could not be prepared: {err}"
                     );
                     return None;
                 }
@@ -259,7 +291,7 @@ fn resolve_model(
     };
     if !path.is_file() {
         eprintln!(
-            "Skipping the summary because the summary model file was not found: {}",
+            "Skipping summarization because the summary model file was not found: {}",
             path.display()
         );
         return None;
@@ -269,6 +301,11 @@ fn resolve_model(
 
 /// 議事録を保存する。録音・文字起こしと同じ機微データなので Unix では 0600 で作成する
 /// （`docs/rules/security.md`。セッションディレクトリ自体は録音側が 0700 で作成済み）。
+///
+/// `OpenOptions::mode` は**新規作成時にしか効かない**ので、開いた後にモードを明示し直す
+/// （セッションを `cp -r` した／バックアップから戻した等で 0644 の `summary.md` が在ると、
+/// 上書きしてもそのモードが残ってしまう）。ファイルハンドル経由で設定するので、開いた後に
+/// 差し替えられても別のファイルへ適用されることはない。
 fn write_summary(path: &Path, markdown: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
@@ -278,6 +315,11 @@ fn write_summary(path: &Path, markdown: &str) -> Result<(), Box<dyn std::error::
         options.mode(0o600);
     }
     let mut file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
     file.write_all(markdown.as_bytes())?;
     // Markdown ファイルとして扱いやすいよう末尾を改行で終える。
     file.write_all(b"\n")?;
@@ -289,8 +331,12 @@ fn write_summary(path: &Path, markdown: &str) -> Result<(), Box<dyn std::error::
 // ---------------------------------------------------------------------------
 
 /// マージ済みトランスクリプトを、モデルへ渡す 1 発話 1 行のテキストにする。
-/// 形式は #78 の検証サンプル（`assets/samples/meeting-*.txt`）と同じ `[mm:ss] Speaker: text`。
-/// 空の発話（whisper が無音区間に付けることがある）は落とす。
+/// 形式は #78 の検証サンプル（`assets/samples/meeting-*.txt`）と同じ `[mm:ss] Speaker: text`
+/// （1 時間を超える録音では `[h:mm:ss]`）。空の発話（whisper が無音区間に付けることがある）は落とす。
+///
+/// 時刻の整形は表示側と同じ `tray::format_elapsed` を使う（同じ表記の実装を 2 つ持つと、
+/// 片方だけ直したときに文字起こし表示とプロンプト内の時刻がずれる）。開始秒は信頼境界外の
+/// JSON 由来なので、丸めも表示側と同じ `TranscriptSegment::start_duration` に任せる。
 fn transcript_lines(segments: &[TranscriptSegment]) -> Vec<String> {
     segments
         .iter()
@@ -301,23 +347,11 @@ fn transcript_lines(segments: &[TranscriptSegment]) -> Vec<String> {
             }
             Some(format!(
                 "[{}] {}: {text}",
-                timestamp(segment.start_secs),
+                crate::tray::format_elapsed(segment.start_duration()),
                 segment.speaker.label()
             ))
         })
         .collect()
-}
-
-/// 開始秒を `mm:ss`（1 時間を超えたら `hh:mm:ss`）にする。信頼境界外の JSON 由来の値なので、
-/// 負・非有限は 0 として扱う（`TranscriptSegment::start_duration` と同じ丸め方針）。
-fn timestamp(start_secs: f64) -> String {
-    let total = start_secs.max(0.0).min(u32::MAX as f64) as u32;
-    let (hours, minutes, seconds) = (total / 3600, (total % 3600) / 60, total % 60);
-    if hours > 0 {
-        format!("{hours}:{minutes:02}:{seconds:02}")
-    } else {
-        format!("{minutes:02}:{seconds:02}")
-    }
 }
 
 /// テキストのトークン数を概算する。
@@ -338,6 +372,20 @@ fn estimate_tokens(text: &str) -> usize {
     wide.saturating_mul(70)
         .saturating_add(narrow.saturating_mul(35))
         .div_ceil(100)
+}
+
+/// ブロック列を `separator` で連結したときのトークン概算。**連結はしない**
+/// （長い会議のトランスクリプトは MB 級になりうるので、測るためだけに全文をコピーしない）。
+///
+/// 各要素の概算の和なので、`estimate_tokens(&blocks.join(sep))` より最大でブロック数ぶん
+/// 大きくなる。判定は常に安全側（＝多めに見る側）へ倒したいので、この差は許容する。
+fn estimate_joined(blocks: &[String], separator: &str) -> usize {
+    let separators = blocks.len().saturating_sub(1);
+    blocks
+        .iter()
+        .map(|block| estimate_tokens(block))
+        .sum::<usize>()
+        .saturating_add(separators.saturating_mul(estimate_tokens(separator)))
 }
 
 /// ブロック（発話行・中間メモ）を順序を保ったまま詰めて、1 つが `max_tokens` の概算に
@@ -376,32 +424,51 @@ fn group_blocks(blocks: &[String], separator: &str, max_tokens: usize) -> Vec<St
 /// 単体で上限を超えるブロックを、文字境界で上限以下の断片へ切り分ける。
 fn split_oversized(block: &str, max_tokens: usize) -> Vec<String> {
     let mut pieces = Vec::new();
-    let mut piece = String::new();
-    let mut tokens = 0usize;
-    for c in block.chars() {
-        let cost = if c.is_ascii() { 35 } else { 70 };
-        // 100 で割り切れない端数の扱いを `estimate_tokens` と揃えるため、同じ切り上げで比べる。
-        if (tokens + cost).div_ceil(100) > max_tokens && !piece.is_empty() {
-            pieces.push(std::mem::take(&mut piece));
-            tokens = 0;
+    let mut rest = block;
+    while !rest.is_empty() {
+        let head = truncate_to_budget(rest, max_tokens);
+        // 予算 0 だと 1 文字も入らず無限ループになる。呼び出し側は正の予算しか渡さないが、
+        // 静かに回り続けるより残り全部を 1 断片にして抜ける。
+        if head.is_empty() {
+            pieces.push(rest.to_owned());
+            break;
         }
-        piece.push(c);
-        tokens += cost;
-    }
-    if !piece.is_empty() {
-        pieces.push(piece);
+        pieces.push(head.to_owned());
+        rest = &rest[head.len()..];
     }
     pieces
 }
 
+/// 先頭から、トークン概算が `max_tokens` に収まるところまでを返す（文字境界で切る）。
+/// 全体が収まるならそのまま返す。
+fn truncate_to_budget(text: &str, max_tokens: usize) -> &str {
+    let mut tokens = 0usize;
+    for (offset, c) in text.char_indices() {
+        let cost = if c.is_ascii() { 35 } else { 70 };
+        // 端数の扱いを `estimate_tokens` と揃えるため、同じ切り上げで比べる。
+        if (tokens + cost).div_ceil(100) > max_tokens {
+            return &text[..offset];
+        }
+        tokens += cost;
+    }
+    text
+}
+
+/// 出力言語を特定できないときにプロンプトへ埋め込む指定（`auto`・カタログ外の手編集値）。
+const SAME_LANGUAGE_AS_TRANSCRIPT: &str = "the same language as the transcript";
+
 /// 要約の出力言語の決め方。認識言語設定（`transcribe_language`）から決まる。
+/// **プロンプトの分岐はこの enum だけで決める**（表示名の文字列比較で再導出しない。
+/// 表示名は ComboBox 用の UI 文言なので、変えるとプロンプトの挙動が黙って変わってしまう）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OutputLanguage {
     /// 日本語。#78 で検証済みの専用プロンプト（見出しも日本語）を使う。
     Japanese,
-    /// 英語のプロンプト骨組みを使い、出力言語をこの語で指定する
-    /// （`English` / `Chinese` / `the same language as the transcript`）。
-    ViaEnglishPrompt(&'static str),
+    /// 英語。#78 で検証済みの骨組みをそのまま使う（見出しも英語のまま）。
+    English,
+    /// それ以外。英語の骨組みに出力言語をこの語で指定し、見出しも訳させる
+    /// （例: `Chinese` / `the same language as the transcript`）。
+    Other(&'static str),
 }
 
 /// 認識言語コードから出力言語を決める。
@@ -410,22 +477,21 @@ enum OutputLanguage {
 /// 出力言語を指定して渡す（見出しも訳させる）。`auto` とカタログ外の手編集値は
 /// 「文字起こしと同じ言語」を指示する（コードから表示名を決められないため）。
 fn output_language(code: &str) -> OutputLanguage {
-    if code == "ja" {
-        return OutputLanguage::Japanese;
+    match code {
+        "ja" => return OutputLanguage::Japanese,
+        "en" => return OutputLanguage::English,
+        _ => {}
     }
     match crate::config::TRANSCRIBE_LANGUAGES
         .iter()
         .find(|(c, _)| *c == code)
     {
         // `auto` はカタログにあるが、表示名（`Auto detect`）は出力言語の指定に使えない。
-        Some((c, _)) if *c == "auto" => OutputLanguage::ViaEnglishPrompt(TRANSCRIPT_LANGUAGE),
-        Some((_, display)) => OutputLanguage::ViaEnglishPrompt(display),
-        None => OutputLanguage::ViaEnglishPrompt(TRANSCRIPT_LANGUAGE),
+        Some((c, _)) if *c == "auto" => OutputLanguage::Other(SAME_LANGUAGE_AS_TRANSCRIPT),
+        Some((_, display)) => OutputLanguage::Other(display),
+        None => OutputLanguage::Other(SAME_LANGUAGE_AS_TRANSCRIPT),
     }
 }
-
-/// 出力言語を特定できないときの指定（`auto`・カタログ外の手編集値）。
-const TRANSCRIPT_LANGUAGE: &str = "the same language as the transcript";
 
 /// 議事録生成の system プロンプト（日本語）。#78 の検証で確定したもの。
 ///
@@ -535,21 +601,19 @@ enum MinutesSource {
 
 /// 議事録生成の system プロンプトを、出力言語に合わせて組み立てる。
 fn minutes_system_prompt(language: &str) -> String {
-    match output_language(language) {
-        OutputLanguage::Japanese => MINUTES_SYSTEM_JA.to_owned(),
-        OutputLanguage::ViaEnglishPrompt(name) => {
-            // 英語出力なら見出しは骨組みのまま。それ以外は見出しも訳させる（要約の言語は
-            // 認識言語に追従させる、という要件のため）。
-            let headings = if name == "English" {
-                "Keep the headings exactly as written."
-            } else {
-                "Translate the four headings into that language, keeping this order and meaning."
-            };
-            MINUTES_SYSTEM_EN
-                .replace("{0}", name)
-                .replace("{1}", headings)
-        }
-    }
+    // 英語出力なら見出しは骨組みのまま。それ以外は見出しも訳させる（要約の言語は認識言語に
+    // 追従させる、という要件のため）。
+    let (name, headings) = match output_language(language) {
+        OutputLanguage::Japanese => return MINUTES_SYSTEM_JA.to_owned(),
+        OutputLanguage::English => ("English", "Keep the headings exactly as written."),
+        OutputLanguage::Other(name) => (
+            name,
+            "Translate the four headings into that language, keeping this order and meaning.",
+        ),
+    };
+    MINUTES_SYSTEM_EN
+        .replace("{0}", name)
+        .replace("{1}", headings)
 }
 
 /// 議事録生成の user プロンプトを組み立てる。
@@ -564,10 +628,10 @@ fn minutes_user_prompt(language: &str, source: MinutesSource, body: &str) -> Str
                  これらをまとめて議事録を作成してください。\n\n{body}"
             )
         }
-        (OutputLanguage::ViaEnglishPrompt(_), MinutesSource::Transcript) => {
+        (OutputLanguage::English | OutputLanguage::Other(_), MinutesSource::Transcript) => {
             format!("Write the minutes for the following transcript.\n\n{body}")
         }
-        (OutputLanguage::ViaEnglishPrompt(_), MinutesSource::Notes) => {
+        (OutputLanguage::English | OutputLanguage::Other(_), MinutesSource::Notes) => {
             format!(
                 "The following are notes taken from consecutive parts of one meeting, in order. \
                  Write the minutes for the meeting as a whole.\n\n{body}"
@@ -580,7 +644,8 @@ fn minutes_user_prompt(language: &str, source: MinutesSource, body: &str) -> Str
 fn notes_system_prompt(language: &str) -> String {
     match output_language(language) {
         OutputLanguage::Japanese => NOTES_SYSTEM_JA.to_owned(),
-        OutputLanguage::ViaEnglishPrompt(name) => NOTES_SYSTEM_EN.replace("{0}", name),
+        OutputLanguage::English => NOTES_SYSTEM_EN.replace("{0}", "English"),
+        OutputLanguage::Other(name) => NOTES_SYSTEM_EN.replace("{0}", name),
     }
 }
 
@@ -592,7 +657,7 @@ fn notes_user_prompt(language: &str, part: usize, total: usize, body: &str) -> S
             "次は会議の文字起こしの一部（全 {total} 部中の {part} 部目）です。\
              メモを作成してください。\n\n{body}"
         ),
-        OutputLanguage::ViaEnglishPrompt(_) => format!(
+        OutputLanguage::English | OutputLanguage::Other(_) => format!(
             "The following is part {part} of {total} of a meeting transcript. \
              Take notes on it.\n\n{body}"
         ),
@@ -634,17 +699,21 @@ mod tests {
 
     #[test]
     fn transcript_lines_tolerate_broken_timestamps() {
-        // 開始秒は手編集されうる JSON 由来。負・非有限でもパニックせず 0 として扱う。
+        // 開始秒は手編集されうる JSON 由来。負・非有限・巨大値でもパニックせず 0 になる
+        // （丸めは表示側と同じ `TranscriptSegment::start_duration`）。
         let segments = vec![
             segment(-3.0, Speaker::Mic, "negative"),
             segment(f64::NAN, Speaker::Mic, "nan"),
             segment(f64::INFINITY, Speaker::Mic, "inf"),
         ];
-        let lines = transcript_lines(&segments);
-        assert_eq!(lines[0], "[00:00] Mic: negative");
-        assert_eq!(lines[1], "[00:00] Mic: nan");
-        // 巨大値は u32 の上限で頭打ちになる（パニックしないことが要点）。
-        assert!(lines[2].starts_with('['));
+        assert_eq!(
+            transcript_lines(&segments),
+            vec![
+                "[00:00] Mic: negative".to_owned(),
+                "[00:00] Mic: nan".to_owned(),
+                "[00:00] Mic: inf".to_owned(),
+            ]
+        );
     }
 
     #[test]
@@ -689,25 +758,46 @@ mod tests {
     }
 
     #[test]
+    fn estimate_joined_never_underestimates_the_join() {
+        // 連結せずに測る近似。**下回らない**ことが要点（下回るとチャンクが n_ctx を超える）。
+        let blocks: Vec<String> =
+            vec!["あいうえお".to_owned(), "hello".to_owned(), "か".to_owned()];
+        assert!(estimate_joined(&blocks, "\n") >= estimate_tokens(&blocks.join("\n")));
+        // 区切りは要素数 - 1 個ぶんだけ数える（空・単数で過大にしない）。
+        assert_eq!(estimate_joined(&[], "\n"), 0);
+        assert_eq!(
+            estimate_joined(std::slice::from_ref(&blocks[0]), "\n"),
+            estimate_tokens(&blocks[0])
+        );
+    }
+
+    #[test]
+    fn truncate_to_budget_cuts_on_char_boundaries() {
+        let text = "あいうえおかきくけこ";
+        let head = truncate_to_budget(text, 3);
+        assert!(estimate_tokens(head) <= 3);
+        // 文字境界で切れている（切れていればそのまま部分文字列として一致する）。
+        assert!(text.starts_with(head));
+        assert!(!head.is_empty());
+        // 収まるならそのまま返す。
+        assert_eq!(truncate_to_budget(text, 1_000), text);
+        assert_eq!(truncate_to_budget("", 10), "");
+    }
+
+    #[test]
     fn output_language_follows_the_transcription_setting() {
         assert_eq!(output_language("ja"), OutputLanguage::Japanese);
-        assert_eq!(
-            output_language("en"),
-            OutputLanguage::ViaEnglishPrompt("English")
-        );
+        assert_eq!(output_language("en"), OutputLanguage::English);
         // カタログにある他の言語は表示名で指定する。
-        assert_eq!(
-            output_language("ko"),
-            OutputLanguage::ViaEnglishPrompt("Korean")
-        );
+        assert_eq!(output_language("ko"), OutputLanguage::Other("Korean"));
         // `auto` とカタログ外（手編集値）は「文字起こしと同じ言語」を指示する。
         assert_eq!(
             output_language("auto"),
-            OutputLanguage::ViaEnglishPrompt(TRANSCRIPT_LANGUAGE)
+            OutputLanguage::Other(SAME_LANGUAGE_AS_TRANSCRIPT)
         );
         assert_eq!(
             output_language("xx"),
-            OutputLanguage::ViaEnglishPrompt(TRANSCRIPT_LANGUAGE)
+            OutputLanguage::Other(SAME_LANGUAGE_AS_TRANSCRIPT)
         );
     }
 
@@ -791,7 +881,10 @@ mod tests {
     /// ネットワークにもモデルにも触れず即 Failed になる。
     #[test]
     fn submit_tracks_status_until_failure() {
-        let worker = SummarizeWorker::start(crate::model_download::ModelDownloader::new());
+        let worker = SummarizeWorker::start(
+            crate::model_download::ModelDownloader::new(),
+            crate::inference_slot::InferenceSlot::new(),
+        );
         let dir = std::env::temp_dir().join(format!("shoki-summary-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("the temp session dir should be creatable");
@@ -837,7 +930,10 @@ mod tests {
     /// 文字起こしが無いセッションは、モデルに触れずスキップされる（状態も残さない）。
     #[test]
     fn a_session_without_a_transcript_is_skipped() {
-        let worker = SummarizeWorker::start(crate::model_download::ModelDownloader::new());
+        let worker = SummarizeWorker::start(
+            crate::model_download::ModelDownloader::new(),
+            crate::inference_slot::InferenceSlot::new(),
+        );
         let dir = std::env::temp_dir().join(format!("shoki-summary-empty-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("the temp session dir should be creatable");
@@ -903,7 +999,10 @@ mod tests {
             .expect("the transcript should be writable");
         }
 
-        let worker = SummarizeWorker::start(crate::model_download::ModelDownloader::new());
+        let worker = SummarizeWorker::start(
+            crate::model_download::ModelDownloader::new(),
+            crate::inference_slot::InferenceSlot::new(),
+        );
         worker.submit(SummarizeJob {
             session_dir: dir.clone(),
             engine: SummaryEngine::OnDevice,

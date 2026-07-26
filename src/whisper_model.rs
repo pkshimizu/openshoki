@@ -97,6 +97,12 @@ pub fn default_spec() -> &'static ModelSpec {
     spec_for(DEFAULT_MODEL_ID).expect("the default model id is always in the catalog")
 }
 
+/// 設定値からエントリを引く。カタログ外の手編集値は既定モデルへフォールバックする
+/// （利用側と設定画面の表示で同じ解決をするための単一の口）。
+pub fn spec_or_default(id: &str) -> &'static ModelSpec {
+    spec_for(id).unwrap_or_else(default_spec)
+}
+
 /// 識別子 → カタログ内インデックス。カタログ外（手編集値）は既定モデルの位置へ
 /// フォールバックする（値自体は書き換えず、表示だけ既定位置になる）。
 pub fn model_index(id: &str) -> usize {
