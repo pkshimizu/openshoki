@@ -9,16 +9,18 @@
 mod ui_support;
 
 use i_slint_backend_testing::ElementHandle;
-use slint::{Model, SharedString, VecModel};
+use slint::{SharedString, VecModel};
 
 slint::include_modules!();
 
-/// 一覧に出ているテキストを全部集める（要素の種類を問わず `text` を持つものを拾う）。
-fn visible_texts(window: &AppWindow) -> Vec<String> {
-    i_slint_backend_testing::ElementQuery::from_root(window)
-        .match_predicate(|element| element.accessible_label().is_some())
-        .find_all()
-        .into_iter()
+/// 「Trigger apps」一覧の行が持つアクセシブルラベルを、上から順に集める。
+///
+/// 一覧の外（セクション見出しやチェックボックス等）を拾わないよう、行の部品
+/// `TriggerAppRow` の配下だけを見る。注記の**不在**を等値でアサートしたいので、
+/// 空ラベルも落とさずそのまま入れる。
+fn row_labels(window: &AppWindow) -> Vec<String> {
+    ElementHandle::find_by_element_type_name(window, "TriggerAppRow")
+        .flat_map(|row| row.query_descendants().find_all())
         .filter_map(|element| element.accessible_label().map(|label| label.to_string()))
         .collect()
 }
@@ -33,10 +35,10 @@ fn open_window(apps: Vec<TriggerApp>) -> AppWindow {
     window
 }
 
-fn app(name: &str, limitation: &str) -> TriggerApp {
+fn trigger_app(name: &str, limitation_note: &str) -> TriggerApp {
     TriggerApp {
         name: SharedString::from(name),
-        limitation: SharedString::from(limitation),
+        limitation_note: SharedString::from(limitation_note),
     }
 }
 
@@ -46,17 +48,13 @@ fn app(name: &str, limitation: &str) -> TriggerApp {
     ignore = "needs Slint debug info (SLINT_EMIT_DEBUG_INFO=1)"
 )]
 fn unsupported_app_shows_the_limitation() {
-    let limitation = "Auto-record cannot detect this app because WebKit opens the mic in a shared system process.";
-    let window = open_window(vec![app("Safari", limitation)]);
+    let note = "Not detected — record manually";
+    let window = open_window(vec![trigger_app("Safari", note)]);
 
-    let texts = visible_texts(&window);
-    assert!(
-        texts.iter().any(|text| text == "Safari"),
-        "the app name should be listed: {texts:?}"
-    );
-    assert!(
-        texts.iter().any(|text| text == limitation),
-        "the limitation should be shown next to it: {texts:?}"
+    // 行に出るのは「名前・注記・Remove」の 3 つだけ。等値で見て、余計なものが出ないことも固定する。
+    assert_eq!(
+        row_labels(&window),
+        vec!["Safari".to_owned(), note.to_owned(), "Remove".to_owned()]
     );
 }
 
@@ -66,19 +64,13 @@ fn unsupported_app_shows_the_limitation() {
     ignore = "needs Slint debug info (SLINT_EMIT_DEBUG_INFO=1)"
 )]
 fn supported_app_shows_no_note() {
-    let limitation = "Auto-record cannot detect this app because WebKit opens the mic in a shared system process.";
-    let window = open_window(vec![app("Google Chrome", ""), app("Safari", limitation)]);
+    let window = open_window(vec![trigger_app("Google Chrome", "")]);
 
-    let texts = visible_texts(&window);
-    // 対応しているアプリには注記を出さない（1 件だけ = Safari のぶん）。
+    // 注記が空のときは Text 自体を出さない（空ラベルの要素も残さない）。件数で見ると、
+    // 条件表示（`if`）を外して空文字を描画する実装でも通ってしまうため、等値で固定する。
     assert_eq!(
-        texts.iter().filter(|text| *text == limitation).count(),
-        1,
-        "only the unsupported app should carry a note: {texts:?}"
-    );
-    assert!(
-        texts.iter().any(|text| text == "Google Chrome"),
-        "the supported app should still be listed: {texts:?}"
+        row_labels(&window),
+        vec!["Google Chrome".to_owned(), "Remove".to_owned()]
     );
 }
 
@@ -88,7 +80,10 @@ fn supported_app_shows_no_note() {
     ignore = "needs Slint debug info (SLINT_EMIT_DEBUG_INFO=1)"
 )]
 fn removing_reports_the_index() {
-    let window = open_window(vec![app("Google Chrome", ""), app("Safari", "note")]);
+    let window = open_window(vec![
+        trigger_app("Google Chrome", ""),
+        trigger_app("Safari", "note"),
+    ]);
     let removed = std::rc::Rc::new(std::cell::Cell::new(None));
     let sink = std::rc::Rc::clone(&removed);
     window.on_remove_app(move |index| sink.set(Some(index)));
@@ -101,7 +96,7 @@ fn removing_reports_the_index() {
     assert_eq!(removed.get(), Some(1));
 }
 
-/// `app_list` が空でも一覧が壊れないこと（枠だけ残る想定）。
+/// `app_list` が空なら行を 1 つも作らないこと（枠だけ残る想定）。
 #[test]
 #[cfg_attr(
     not(slint_debug_info),
@@ -109,7 +104,7 @@ fn removing_reports_the_index() {
 )]
 fn empty_list_has_no_rows() {
     let window = open_window(Vec::new());
-    assert_eq!(window.get_app_list().row_count(), 0);
+    assert!(row_labels(&window).is_empty());
     assert_eq!(
         ElementHandle::find_by_accessible_label(&window, "Remove").count(),
         0

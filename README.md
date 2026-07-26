@@ -34,7 +34,9 @@
   - **Safari（および WebKit ベースのアプリ）は対象外**です。マイクを掴むのがアプリ自身ではなく
     OS 共有のプロセス（`com.apple.WebKit.GPU`）で、そこから元のアプリを特定する手段が公開 API に
     無いためです（private API なら可能ですが、Mac App Store が禁じているため使いません）。
-    設定画面でも登録時に注記が出ます。Safari で会議に出る場合は手動で録音を開始してください。
+    Safari で会議に出る場合は手動で録音を開始してください。設定画面の登録一覧にも同じ注意書きを
+    常時出しています（アプリ名の下に出る個別の注記は Safari / Safari Technology Preview のみです。
+    WKWebView を使う他のアプリも同じ制約を受けますが、登録時に見分ける手段が無いためです）。
 - **極小音量の自動リカバリ**: 会議アプリ（ブラウザの Google Meet 等）の自動ゲイン調整で
   マイク録音が極端に小さくなった場合（再生すると無音に聞こえる）、録音停止後に自動で音量を
   正規化して保存し直します。正常な音量の録音には手を加えません。
@@ -196,6 +198,14 @@ macOS では `screencapturekit` と `objc2` 系を使います。
 - CI（GitHub Actions）で上記の build／fmt／clippy／test と `cargo audit`（依存の脆弱性検査）を
   実行しています。
 
+- **設定画面の描画確認**: Trigger apps の一覧は固定高さで clip されるため、折り返す注記を入れると
+  潰れます。ビルドやテストでは検出できないので、確認用バイナリで目視します。
+
+  ```sh
+  cargo run --example settings_view                     # 表示して screencapture で確認
+  cargo run --example settings_view -- snapshot out.png # PNG に書き出す（画面収録の許可が不要）
+  ```
+
 - **Mac App Store 可否の検証プローブ**: MAS 対応（[#77](https://github.com/pkshimizu/openshoki/issues/77)）の
   技術検証に使う `examples/mas_probe.rs` を、App Sandbox の有無を切り替えて実行します。
   出荷バイナリには含まれません（`cargo` の example）。
@@ -215,10 +225,10 @@ macOS では `screencapturekit` と `objc2` 系を使います。
 
   - App Sandbox 下でも、CoreAudio のプロセス照会・ScreenCaptureKit・security-scoped bookmark・
     マイク取得はすべて動く。
-  - 自動録音が使っている private API（responsible pid）は、Chrome / Zen / Slack / Zoom については
-    公開 API で置き換えられる。
+  - 自動録音が使っていた private API（responsible pid）は、Chrome / Zen / Slack / Zoom について
+    公開 API で置き換えられる（[#107](https://github.com/pkshimizu/openshoki/issues/107) で実施済み）。
   - **Safari（WebKit ベース）だけは置き換えられない**。マイクを掴むのが WebKit の GPU プロセスで、
-    そこから Safari へ辿れるのは private API だけのため。Safari は自動録音の対象外とする方針。
+    そこから Safari へ辿れるのは private API だけのため。Safari は自動録音の対象外とした。
 
   `--open` を付けた実行では、プロセス一覧を含むレポートが
   `~/Library/Containers/net.noncore.openshoki.masprobe/Data/` に一時的に作られます

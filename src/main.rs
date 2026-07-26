@@ -1394,18 +1394,18 @@ fn recording_dir_text(dir: &std::path::Path) -> slint::SharedString {
     dir.display().to_string().into()
 }
 
-/// 登録アプリ 1 件を設定画面の行にする。検知できないアプリには理由を添える
-/// （`auto_record_limitation`。黙って発火しないのが一番分かりにくいため、登録一覧で伝える）。
+/// 登録アプリ 1 件を設定画面の行にする。検知できないアプリには
+/// `app_audio_monitor::auto_record_limitation` の理由を添える。
 fn trigger_app_row(trigger: &config::AppTrigger) -> TriggerApp {
     #[cfg(target_os = "macos")]
-    let limitation = app_audio_monitor::auto_record_limitation(&trigger.bundle_id).unwrap_or("");
+    let note = app_audio_monitor::auto_record_limitation(&trigger.bundle_id).unwrap_or("");
     // 自動録音は macOS 限定の機能なので、他 OS では注記も出さない。
     #[cfg(not(target_os = "macos"))]
-    let limitation = "";
+    let note = "";
 
     TriggerApp {
         name: trigger.name.as_str().into(),
-        limitation: limitation.into(),
+        limitation_note: note.into(),
     }
 }
 
@@ -1457,10 +1457,35 @@ mod tests {
     use super::{
         TranscriptStatus, breathing_level, playback_progress, seek_position_from_ratio,
         selected_model_status_text, transcript_display_status, transcript_placeholder_text,
-        transcript_status_text,
+        transcript_status_text, trigger_app_row,
     };
     use crate::transcribe::TranscribeStatus;
     use std::time::Duration;
+
+    /// 設定画面の行は、検知できないアプリにだけ注記を持つ（判定は `auto_record_limitation`）。
+    /// バンドル ID → 注記の写像を渡し忘れる回帰を、ここで止める。
+    #[test]
+    fn trigger_app_row_notes_undetectable_apps() {
+        use crate::config::AppTrigger;
+
+        let row = trigger_app_row(&AppTrigger {
+            bundle_id: "com.apple.Safari".to_owned(),
+            name: "Safari".to_owned(),
+        });
+        assert_eq!(row.name, "Safari");
+        // 文言そのものは `auto_record_limitation` が持つので、ここでは有無だけを見る。
+        assert!(
+            !row.limitation_note.is_empty(),
+            "Safari should carry a note about not being detected"
+        );
+
+        let row = trigger_app_row(&AppTrigger {
+            bundle_id: "com.google.Chrome".to_owned(),
+            name: "Google Chrome".to_owned(),
+        });
+        assert_eq!(row.name, "Google Chrome");
+        assert!(row.limitation_note.is_empty());
+    }
 
     /// ワーカーの進行状況（メモリ）があればそれを優先し、無ければ JSON の有無で解決する。
     #[test]

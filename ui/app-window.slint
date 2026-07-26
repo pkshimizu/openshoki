@@ -6,11 +6,61 @@ import { Style } from "style.slint";
 // RecordingsWindow / SessionRow を得る。
 export { RecordingsWindow, SessionRow } from "recordings-window.slint";
 
-// 自動録音のトリガーとして登録したアプリ 1 件。`limitation` が空でなければ、そのアプリは
-// 検知できない旨をリストに添えて出す（Rust 側の `auto_record_limitation` が文言を決める）。
+// 自動録音のトリガーとして登録したアプリ 1 件。`limitation-note` が空でなければ、そのアプリを
+// 検知できない旨をリストに添えて出す（文言と判定は Rust 側の `auto_record_limitation`）。
 export struct TriggerApp {
     name: string,
-    limitation: string,
+    limitation-note: string,
+}
+
+// 「Trigger apps」一覧の 1 行。名前と、検知できないアプリの注記、削除ボタンを持つ。
+// 行の中身が入れ子のレイアウトになるため、for の中へ直書きせず部品にする。
+component TriggerAppRow inherits VerticalLayout {
+    in property <TriggerApp> app;
+    // 2 行目以降の先頭に行区切りの罫線を置くか（先頭行では出さない）。
+    in property <bool> separated;
+    in property <bool> removable;
+    callback remove();
+
+    Rectangle {
+        height: root.separated ? 1px : 0px;
+        background: Palette.border;
+    }
+
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        padding-top: 6px;
+        padding-bottom: 6px;
+        spacing: 8px;
+        // 名前と注記を縦に積む。注記が無いときは行が空くだけにならないよう Text 自体を出さない。
+        VerticalLayout {
+            spacing: 2px;
+            horizontal-stretch: 1;
+            Text {
+                text: root.app.name;
+                font-size: Style.body-size;
+                color: Palette.foreground;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+
+            if root.app.limitation-note != "": Text {
+                text: root.app.limitation-note;
+                font-size: Style.caption-size;
+                color: Style.caution;
+                wrap: word-wrap;
+            }
+        }
+
+        Button {
+            text: "Remove";
+            enabled: root.removable;
+            clicked => {
+                root.remove();
+            }
+        }
+    }
 }
 
 // 設定項目のまとまりを表すセクション枠。GroupBox の既定描画ではなく「角丸・1px 枠線・塗りなし」の
@@ -214,51 +264,25 @@ export component AppWindow inherits Window {
                         ScrollView {
                             VerticalLayout {
                                 alignment: start;
-                                for app[i] in root.app-list: VerticalLayout {
-                                    // 2 行目以降の先頭に行区切りの罫線を置く（先頭行は 0px で出さない）。
-                                    Rectangle {
-                                        height: i > 0 ? 1px : 0px;
-                                        background: Palette.border;
-                                    }
-
-                                    HorizontalLayout {
-                                        padding-left: 12px;
-                                        padding-right: 12px;
-                                        padding-top: 6px;
-                                        padding-bottom: 6px;
-                                        spacing: 8px;
-                                        // 名前と、検知できないアプリの注記を縦に積む。注記が無いときは
-                                        // 行が空くだけにならないよう Text 自体を出さない。
-                                        VerticalLayout {
-                                            spacing: 2px;
-                                            horizontal-stretch: 1;
-                                            Text {
-                                                text: app.name;
-                                                font-size: Style.body-size;
-                                                color: Palette.foreground;
-                                                vertical-alignment: center;
-                                                overflow: elide;
-                                            }
-
-                                            if app.limitation != "": Text {
-                                                text: app.limitation;
-                                                font-size: Style.caption-size;
-                                                color: Style.danger;
-                                                wrap: word-wrap;
-                                            }
-                                        }
-
-                                        Button {
-                                            text: "Remove";
-                                            enabled: deps.enabled-gate;
-                                            clicked => {
-                                                root.remove-app(i);
-                                            }
-                                        }
+                                for app[i] in root.app-list: TriggerAppRow {
+                                    app: app;
+                                    separated: i > 0;
+                                    removable: deps.enabled-gate;
+                                    remove => {
+                                        root.remove-app(i);
                                     }
                                 }
                             }
                         }
+                    }
+
+                    // 注記は既知のアプリ（Safari 等）にしか出せないため、一覧全体への注意書きも置く
+                    // （WKWebView を使う任意のアプリが同じ制約を受けるが、登録時に見分けられない）。
+                    Text {
+                        text: "Safari and other WebKit-based apps can't be detected — record those manually";
+                        font-size: Style.caption-size;
+                        color: Palette.foreground.transparentize(Style.muted-alpha);
+                        wrap: word-wrap;
                     }
 
                     HorizontalLayout {

@@ -6,10 +6,8 @@
 //! 「いまマイクを使っているアプリのバンドル ID 集合」を得て、ユーザーが登録した `.app` の
 //! バンドル ID と照合する。
 //!
-//! **既知の限界**: WebKit を音声ホストに使うアプリ（Safari など）は検知できない。マイクを
-//! 掴むのがアプリ自身ではなくフレームワーク同梱の XPC サービス
-//! （`WebKit.framework/…/com.apple.WebKit.GPU.xpc`）で、そこからホストアプリへ辿る手段が
-//! 公開 API に無いため（実測は #77。`auto_record_limitation` も参照）。
+//! **既知の限界**: WebKit を音声ホストに使うアプリ（Safari など）は検知できない
+//! （理由は `auto_record_limitation` の doc）。
 //!
 //! 判定は録音ループ（100ms タイマー）に相乗りしたポーリングで行い、`POLL_INTERVAL` に間引く。
 //! 登録アプリのいずれかが「非使用→使用」へ変化した立ち上がりを `take_activated()` が返す。
@@ -22,7 +20,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::mem::size_of;
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::time::{Duration, Instant};
@@ -270,13 +268,19 @@ pub fn input_running_bundle_ids() -> Option<HashSet<String>> {
 /// ID を返す）。登録自体は許すが、**黙って発火しない**のが一番分かりにくいので設定画面で伝える。
 ///
 /// 判定は既知のバンドル ID の列挙で行う。WKWebView を使う任意のアプリが同じ構成になりうるが、
-/// 登録時点でそれを見分ける公開 API が無いため、確実に該当するものだけを挙げる。
+/// 登録時点でそれを見分ける公開 API が無いため、確実に該当するものだけを挙げる。列挙で拾えない
+/// アプリのために、設定画面には一覧全体への注意書きも別途置いてある（`ui/app-window.slint`）。
+///
+/// 返す文言が短いのは、一覧が固定高さで折り返すと行が潰れるため（`examples/settings_view.rs` で
+/// 確認できる）。**なぜ**検知できないかはその注意書きと README が持ち、ここは「どのアプリが
+/// 該当するか」と「どうすればよいか」だけを伝える。
 pub fn auto_record_limitation(bundle_id: &str) -> Option<&'static str> {
-    const WEBKIT_HOSTED: &[&str] = &["com.apple.Safari", "com.apple.SafariTechnologyPreview"];
+    const WEBKIT_AUDIO_HOSTED_APPS: &[&str] =
+        &["com.apple.Safari", "com.apple.SafariTechnologyPreview"];
 
-    WEBKIT_HOSTED.contains(&bundle_id).then_some(
-        "Auto-record cannot detect this app because WebKit opens the mic in a shared system process.",
-    )
+    WEBKIT_AUDIO_HOSTED_APPS
+        .contains(&bundle_id)
+        .then_some("Not detected — record manually")
 }
 
 /// `.app` のパスからバンドル ID と表示名を読む（設定画面でのアプリ登録に使う）。
@@ -398,6 +402,10 @@ fn bundle_id_for_pid(pid: i32) -> Option<String> {
 /// 取得失敗（未対応・バンドルを持たないプロセス）は `None`。
 fn process_bundle_id(process: AudioObjectID) -> Option<String> {
     use objc2::rc::Retained;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// 失敗 status を 1 回だけ知らせるためのフラグ（500ms ごとのログ氾濫を避ける）。
+    static STATUS_REPORTED: AtomicBool = AtomicBool::new(false);
 
     let address = global_address(kAudioProcessPropertyBundleID);
     let mut value: *mut NSString = std::ptr::null_mut();
@@ -414,8 +422,16 @@ fn process_bundle_id(process: AudioObjectID) -> Option<String> {
         )
     };
     if status != OS_STATUS_OK {
+        // この経路だけが黙って死んでも、他の 2 経路が生きている限り「照会不能」の警告は出ない。
+        // 未対応（macOS 14 未満）とサンドボックスでの拒否を切り分けられるよう status を残す。
+        if !STATUS_REPORTED.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "Continuing without the CoreAudio bundle id because the query failed (OSStatus={status})"
+            );
+        }
         return None;
     }
+    // バンドルを持たないプロセスでは noErr のまま何も書かれずに戻るため、null チェックは必須。
     let ptr = NonNull::new(value)?;
     // SAFETY: CoreAudio は CFStringRef を +1 で返す（AudioHardware.h の
     // kAudioProcessPropertyBundleID: "The caller is responsible for releasing the returned
@@ -451,7 +467,7 @@ fn exec_path(pid: i32) -> Option<PathBuf> {
         return None;
     }
     buffer.truncate(len as usize);
-    Some(PathBuf::from(OsStr::from_bytes(&buffer).to_owned()))
+    Some(PathBuf::from(std::ffi::OsString::from_vec(buffer)))
 }
 
 /// 実行パスから**最も外側**の `.app` を切り出し、そのバンドル ID を読む。
@@ -593,6 +609,23 @@ mod tests {
         // 本体プロセスはその .app 自身。
         assert_eq!(
             outermost_app_bundle(Path::new("/Applications/Slack.app/Contents/MacOS/Slack")),
+            Some(PathBuf::from("/Applications/Slack.app"))
+        );
+        // 拡張子は最終コンポーネントだけを見るので、`.app` を途中に含む別名は誤検出しない。
+        assert_eq!(
+            outermost_app_bundle(Path::new(
+                "/Applications/Foo.app.backup/Bar.app/Contents/MacOS/Bar"
+            )),
+            Some(PathBuf::from("/Applications/Foo.app.backup/Bar.app"))
+        );
+        // 大文字の拡張子も同じ扱い（HFS+ は既定で大文字小文字を区別しない）。
+        assert_eq!(
+            outermost_app_bundle(Path::new("/Applications/Foo.APP/Contents/MacOS/Foo")),
+            Some(PathBuf::from("/Applications/Foo.APP"))
+        );
+        // 末尾スラッシュ付きの `.app` 自身。
+        assert_eq!(
+            outermost_app_bundle(Path::new("/Applications/Slack.app/")),
             Some(PathBuf::from("/Applications/Slack.app"))
         );
         // .app を含まないパス（CLI やフレームワーク内の XPC サービス）は解決しない。
