@@ -67,8 +67,10 @@ jobs:
           fi
           # パイプを使わず pathspec で判定する（`git diff | grep -q` は grep の早期終了で
           # git が SIGPIPE 死し、pipefail のため「変更なし」と誤判定する）。
+          # ci.yml 自身も対象に含める（この検査を編集した PR で自己検証できるように）。
           if git diff --quiet "$base" HEAD -- \
-               assets/icon scripts/generate-icons.sh scripts/check-icons.sh; then
+               assets/icon scripts/generate-icons.sh scripts/check-icons.sh \
+               .github/workflows/ci.yml; then
             echo "アイコン資産に変更が無いため検査をスキップする。"
             echo "run=false" >> "$GITHUB_OUTPUT"
           else

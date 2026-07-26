@@ -31,32 +31,32 @@ cd "$repo_root"
 regenerated="$(mktemp -d -t openshoki-icon-check-XXXXXX)"
 trap 'rm -rf "$regenerated"' EXIT
 
-# .icns まで検査できるのは actool があるときだけ。無ければ mark.svg 由来の生成物だけを見る。
-if xcrun --find actool >/dev/null 2>&1; then
-  check_appicon=true
+# .icns まで検査できるのは、Icon Composer 形式の .icon を扱える actool があるときだけ
+# （Xcode 26 以降）。無ければ mark.svg 由来の生成物だけを見る。
+check_appicon=false
+xcode_version="$(xcodebuild -version 2>/dev/null | head -n1)"
+xcode_major="$(printf '%s' "$xcode_version" | sed -n 's/^Xcode \([0-9]*\).*/\1/p')"
+if ! xcrun --find actool >/dev/null 2>&1; then
+  appicon_skip_reason="actool is not available"
+elif [ -z "$xcode_major" ]; then
+  appicon_skip_reason="could not determine the Xcode version"
+elif [ "$xcode_major" -lt 26 ]; then
+  appicon_skip_reason="$xcode_version cannot compile .icon (Xcode 26 or later is required)"
 else
-  check_appicon=false
+  check_appicon=true
 fi
 
 echo "Regenerating the icon artifacts into a temporary directory…"
 if [ "$check_appicon" = true ]; then
-  # Icon Composer 形式の .icon は Xcode 26 以降の actool でないと扱えない。失敗したら
-  # 「生成物が古い」ではなくツールチェーンの問題なので、そう分かるように案内する。
-  if ! ./scripts/generate-icons.sh --out-dir "$regenerated" >/dev/null; then
-    echo "Could not rebuild the app icon with $(xcodebuild -version 2>/dev/null | head -n1)." >&2
-    echo "  .icon requires actool from Xcode 26 or later." >&2
-    exit 1
-  fi
+  ./scripts/generate-icons.sh --out-dir "$regenerated" >/dev/null
 else
   ./scripts/generate-icons.sh --skip-appicon --out-dir "$regenerated" >/dev/null
 fi
 
-failed=false
-
-# 不一致を記録する（直し方の案内は最後に 1 回だけ出す）。
-report_stale() {
-  failed=true
-}
+# 生成物が古い（＝再生成すれば直る）か、検査自体が失敗したか（＝再生成しても直らない）を
+# 分けて数える。直し方の案内は前者のときだけ、最後に 1 回出す。
+stale=false
+broken=false
 
 # 一画のレイヤー（mark.svg の色違い）。sed の出力なので環境に依らず完全一致するはず。
 for layer in mark-ink.svg mark-ink-on-dark.svg; do
@@ -65,7 +65,7 @@ for layer in mark-ink.svg mark-ink-on-dark.svg; do
     # パスデータは 1 行が数 KB になるので、差分そのものは出さず行数だけ示す。
     changed_lines="$(diff "$committed" "$regenerated/$committed" | grep -c '^[<>]' || true)"
     echo "$committed does not match assets/icon/mark.svg ($changed_lines lines differ)." >&2
-    report_stale
+    stale=true
   fi
 done
 
@@ -78,7 +78,7 @@ if [ "$committed_format" != "$regenerated_format" ]; then
   echo "$tray has a different format than the regenerated one" >&2
   echo "  committed:   $committed_format" >&2
   echo "  regenerated: $regenerated_format" >&2
-  report_stale
+  stale=true
 else
   # compare は「差があると 1」「エラーだと 2」で終了し、指標は stderr に出す。1 は差があるだけ
   # なので自分で判定し、2（と想定外の値）はエラーとして生の出力ごと見せる。
@@ -91,10 +91,10 @@ else
   if [ "$compare_status" -gt 1 ] || ! [[ "$diff_pixels" =~ ^[0-9]+$ ]]; then
     echo "Could not compare $tray with the regenerated one (status $compare_status):" >&2
     echo "$compare_output" >&2
-    failed=true
+    broken=true
   elif [ "$diff_pixels" -gt "$TRAY_MAX_DIFF_PIXELS" ]; then
     echo "$tray differs from assets/icon/mark.svg ($diff_pixels pixels, allowed $TRAY_MAX_DIFF_PIXELS)." >&2
-    report_stale
+    stale=true
   fi
 fi
 
@@ -102,15 +102,18 @@ fi
 icns="assets/icon/generated/openshoki.icns"
 if [ "$check_appicon" = true ]; then
   if ! cmp -s "$icns" "$regenerated/$icns"; then
-    echo "$icns does not match the icon master." >&2
-    report_stale
+    echo "$icns does not match the icon master (built here with $xcode_version)." >&2
+    echo "  A different actool version can also produce this difference." >&2
+    stale=true
   fi
 else
-  echo "Skipping $icns (actool is not available; install Xcode to check it)."
+  echo "Skipping $icns ($appicon_skip_reason)."
 fi
 
-if [ "$failed" = true ]; then
+if [ "$stale" = true ]; then
   echo "→ Run ./scripts/generate-icons.sh and commit the regenerated artifacts." >&2
+fi
+if [ "$stale" = true ] || [ "$broken" = true ]; then
   exit 1
 fi
 if [ "$check_appicon" = true ]; then

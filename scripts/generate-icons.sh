@@ -27,14 +27,14 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --skip-appicon) skip_appicon=true; shift ;;
     --out-dir)
-      if [ $# -lt 2 ]; then
+      if [ $# -lt 2 ] || case "$2" in -*) true ;; *) false ;; esac; then
         echo "--out-dir requires a directory" >&2
         exit 1
       fi
       # 呼び出し元の cwd 基準で解釈する（この後 repo_root へ cd するため、相対のままだと
       # リポジトリ内に書いてしまう）。
-      mkdir -p "$2"
-      out_root="$(cd "$2" && pwd)"
+      mkdir -p -- "$2"
+      out_root="$(cd -- "$2" && pwd)"
       shift 2 ;;
     *) echo "Unknown option: $1 (usage: $0 [--skip-appicon] [--out-dir DIR])" >&2; exit 1 ;;
   esac
@@ -45,6 +45,14 @@ cd "$repo_root"
 # --out-dir が無ければリポジトリへ書く。以降は絶対パスで統一する（「リポジトリへ書いたか」を
 # 出力先の比較だけで判定できるようにする）。
 out_root="${out_root:-$repo_root}"
+
+# ログ表示用。リポジトリ内へ書くときは相対パスで見せる（同じ行に絶対と相対が混ざらないように）。
+display_path() {
+  case "$1" in
+    "$repo_root"/*) printf '%s' "${1#"$repo_root"/}" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
 
 icon_master="assets/icon/openshoki.icon"
 mark_svg="assets/icon/mark.svg"
@@ -118,9 +126,9 @@ generate_mark_layer "$layers_out/mark-ink.svg" "$ink_color"
 generate_mark_layer "$layers_out/mark-ink-on-dark.svg" "$ink_on_dark_color"
 
 if [ "$skip_appicon" = true ]; then
-  echo "Skipping $generated_out (--skip-appicon)"
+  echo "Skipping $(display_path "$generated_out") (--skip-appicon)"
 else
-  echo "Generating $generated_out from $icon_master"
+  echo "Generating $(display_path "$generated_out") from $icon_master"
   # actool は .icon から Tahoe 用の Assets.car と旧 macOS 用の .icns を同時に書き出す。
   # .icns を ictool で直接書き出すと Tahoe 規定の余白が入らず大きすぎる見た目になるため、
   # 必ず actool 経由で作る。まず一時ディレクトリへ出し、成功したときだけ差し替える
@@ -146,7 +154,7 @@ else
   mv "$tmp_dir/appicon/Assets.car" "$tmp_dir/appicon/openshoki.icns" "$generated_out/"
 fi
 
-echo "Generating $tray_out from $mark_svg"
+echo "Generating $(display_path "$tray_out") from $mark_svg"
 tmp_png="$tmp_dir/mark.png"
 rsvg-convert -w 1024 -h 1024 "$mark_svg" -o "$tmp_png"
 # 余白をトリムしてから 36x36 の中へ収める（縦横どちらが長くてもはみ出させない）。RGB は黒のまま
@@ -163,7 +171,7 @@ echo "Done:"
 if [ "$skip_appicon" = false ]; then
   ls -1 "$generated_out" | sed 's/^/  /'
 fi
-echo "  $tray_out ($(magick identify -format '%wx%h %[bit-depth]bit %[channels]' "$tray_out"))"
+echo "  $(display_path "$tray_out") ($(magick identify -format '%wx%h %[bit-depth]bit %[channels]' "$tray_out"))"
 if [ "$skip_appicon" = false ] && [ "$out_root" = "$repo_root" ]; then
   # actool の Assets.car は入力が同じでも毎回バイト列が変わる（実測）。マスターを変えていない
   # のに差分が出たときは戻してよい、と分かるようにしておく。
