@@ -28,6 +28,20 @@ use sha2::{Digest, Sha256};
 ///
 /// URL と SHA-256 は配布元（HuggingFace の LFS メタデータ等）から取る。モデルを追加・
 /// 差し替えるときは **URL と SHA-256 を必ずペアで**更新する。
+///
+/// **`url` / `sha256` は必ずソースコード上の定数にする**。設定ファイルやネットワーク応答など
+/// 実行時の値から `ModelSpec` を組み立ててはいけない。取得 API が `&'static ModelSpec` を
+/// 要求しているのはそのためで（`const` / `static` 宣言でしか作れない）、取得内容の信頼は
+/// この `sha256` のピン留めだけに依存している。
+///
+/// **カタログに載せられるのは、単一ファイルで・認証なしに取得できる配布物だけ**。
+/// 分割された gguf（`*-00001-of-000NN.gguf`）や、ライセンス同意が要る gated repo は
+/// この構造では表現できない（対応するなら基盤側の拡張が要る）。モデル選定の段階で避けること。
+///
+/// 種別**固有**の表示項目（context 長・量子化ラベル等）が要るときは、このフィールドを
+/// 増やさずカタログ側で包む（`struct LlmEntry { spec: ModelSpec, context_tokens: u32 }`）。
+/// ここに置くのは種別をまたいで共通のものだけにする。
+#[derive(Debug)]
 pub struct ModelSpec {
     /// ログに出す種別（例: `Whisper speech`）。モデル種別が増えたとき、どちらの
     /// ダウンロードかをログで見分けるために使う。
@@ -41,7 +55,10 @@ pub struct ModelSpec {
     pub description: &'static str,
     /// 正確なファイルサイズ（バイト）。進捗の分母と受信上限の基準に使う。
     pub size_bytes: u64,
-    /// データディレクトリ配下の保存ファイル名。
+    /// データディレクトリ配下の保存ファイル名。全種別を同じ `models/` へ混ぜて置くので、
+    /// **種別をまたいで一意**にすること。衝突すると `ensure_model` の存在確認が他種別の
+    /// ファイルを掴み、**検証を経ずに別モデルを「取得済み」として返す**（SHA-256 の検証は
+    /// ダウンロード時にしか走らない）。パス要素を含まない素のファイル名にすること。
     pub filename: &'static str,
     /// 取得元 URL。
     pub url: &'static str,
@@ -68,7 +85,8 @@ pub enum DownloadStatus {
     NotDownloaded,
     /// ダウンロード中（`received` / `total` バイト。キュー待ちは無く即開始される）。
     Downloading { received: u64, total: u64 },
-    /// 取得済み（ディスクに検証済みモデルがある）。
+    /// 取得済み（ディスクにファイルが在る。**存在確認のみで、既存ファイルの再検証はしない**。
+    /// 検証済みが保証されるのは、このプロセスがこの起動で置いたものに限る）。
     Downloaded,
     /// 直近のダウンロードが失敗した（理由つき。メモリのみで、再試行でクリアされる）。
     Failed(String),
@@ -118,6 +136,9 @@ impl ModelDownloader {
     /// UI 起点: 未取得（または直近失敗）ならバックグラウンドスレッドでダウンロードを開始する。
     /// 取得済み・ダウンロード中ならスレッドを立てずに戻る（DL 中の完了待ちは `ensure_model` を
     /// 呼ぶ利用側だけが行えばよい）。結果は状態マップとログに残る。
+    ///
+    /// 同時ダウンロード数の上限は持たない。設定画面から選べるのが 1 種別 1 つずつなので今は
+    /// 実質 1 本だが、種別が増えると別種別の大きなモデルが並走しうる（要検討）。
     pub fn request_download(&self, spec: &'static ModelSpec) {
         match self.status_of(spec) {
             DownloadStatus::Downloaded | DownloadStatus::Downloading { .. } => return,
@@ -185,7 +206,7 @@ impl ModelDownloader {
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
 
-        let result = download_model(spec, &path, &self.status);
+        let result = download_model(spec, &path, self);
         let mut status = self.lock();
         match result {
             Ok(()) => {
@@ -235,8 +256,26 @@ const WAIT_FOR_OTHER_DOWNLOAD_TIMEOUT: std::time::Duration =
 
 /// モデルの保存先（`<データディレクトリ>/models/<ファイル名>`）。種別を問わず同じディレクトリに
 /// 置く（ファイル名がモデルを一意に表すため。混在しても衝突しない）。
+///
+/// `filename` が単一のファイル名でなければ `None`（`models/` の外へ書かせない）。カタログは
+/// ソース上の定数なので通常は起こらないが、`pub` フィールドなので種別が増えたときの書き損じを
+/// ここで止める（静的な検査は `catalog_checks::assert_valid`）。
 fn model_path(spec: &ModelSpec) -> Option<PathBuf> {
+    if !is_plain_filename(spec.filename) {
+        eprintln!(
+            "Skipping the model because its filename is not a plain file name: {}",
+            spec.filename
+        );
+        return None;
+    }
     crate::config::data_dir().map(|dir| dir.join("models").join(spec.filename))
+}
+
+/// パス要素を持たない素のファイル名か（`/` や `..`、絶対パスを弾く）。
+fn is_plain_filename(filename: &str) -> bool {
+    let mut components = Path::new(filename).components();
+    matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none()
 }
 
 /// 受信サイズの上限。既知のモデルサイズ＋1 割の余裕。配信元の故障・想定外の応答で
@@ -249,7 +288,7 @@ fn max_download_bytes(spec: &ModelSpec) -> u64 {
 fn download_model(
     spec: &'static ModelSpec,
     dest: &Path,
-    status: &Arc<Mutex<HashMap<&'static str, DownloadStatus>>>,
+    downloader: &ModelDownloader,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(parent) = dest.parent() {
         // モデルは公開配布物で機微データではないため、権限は OS 既定でよい
@@ -286,10 +325,9 @@ fn download_model(
     // どちらも検証済みなので安全になる（同一プロセス内は状態マップで二重取得を防いでいる）。
     let part = dest.with_extension(format!("part.{}", std::process::id()));
     let on_progress = |received: u64| {
-        let mut map = status
+        downloader
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        map.insert(spec.id, DownloadStatus::Downloading { received, total });
+            .insert(spec.id, DownloadStatus::Downloading { received, total });
     };
     let result = write_verified(
         reader,
@@ -354,6 +392,64 @@ fn write_verified(
     Ok(())
 }
 
+/// カタログの静的な健全性チェック。**正はここ 1 箇所**にして、種別が増えても同じ検査が
+/// 効くようにする（各カタログのテストから呼ぶ）。
+#[cfg(test)]
+pub(crate) mod catalog_checks {
+    use super::{ModelSpec, is_plain_filename};
+
+    /// 種別を問わず満たすべき条件。カタログ**内**の重複と、各エントリの形を見る。
+    pub(crate) fn assert_valid(catalog: &[ModelSpec]) {
+        for (i, spec) in catalog.iter().enumerate() {
+            assert!(
+                catalog.iter().skip(i + 1).all(|other| other.id != spec.id),
+                "duplicate id {}",
+                spec.id
+            );
+            assert!(
+                catalog
+                    .iter()
+                    .skip(i + 1)
+                    .all(|other| other.filename != spec.filename),
+                "duplicate filename {}",
+                spec.filename
+            );
+            assert_eq!(spec.sha256.len(), 64, "bad sha256 for {}", spec.id);
+            assert!(
+                spec.sha256.chars().all(|c| c.is_ascii_hexdigit()),
+                "bad sha256 for {}",
+                spec.id
+            );
+            assert!(spec.size_bytes > 0, "zero size for {}", spec.id);
+            // `models/` の外へ書かせない（`model_path` が実行時にも弾くが、ここで先に落とす）。
+            assert!(
+                is_plain_filename(spec.filename),
+                "filename must be a plain file name: {}",
+                spec.filename
+            );
+        }
+    }
+
+    /// 全カタログの登録簿。**種別を足したらここに 1 行足す**。下のテストが横断で一意性を見る。
+    const ALL_CATALOGS: &[&[ModelSpec]] = &[crate::whisper_model::CATALOG];
+
+    /// ID とファイル名は種別をまたいで一意（状態マップのキーと保存先が種別で混ざらないように）。
+    #[test]
+    fn ids_and_filenames_are_unique_across_catalogs() {
+        let specs: Vec<&ModelSpec> = ALL_CATALOGS.iter().flat_map(|c| c.iter()).collect();
+        for (i, spec) in specs.iter().enumerate() {
+            for other in specs.iter().skip(i + 1) {
+                assert_ne!(spec.id, other.id, "id {} is used by two catalogs", spec.id);
+                assert_ne!(
+                    spec.filename, other.filename,
+                    "filename {} is used by two catalogs",
+                    spec.filename
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -364,8 +460,12 @@ mod tests {
     /// テスト用の緩い上限。
     const TEST_MAX: u64 = u64::MAX;
 
-    /// whisper 以外の種別を足しても基盤が動くことを見るための、**カタログに無い**架空の定義。
-    /// ネットワークへは出ない経路（状態マップ・保存先の組み立て）だけで使う。
+    /// ダウンロード経路を通らないダミー定義で使う SHA-256。値に意味は無く、形式
+    /// （64 桁の 16 進）だけを満たす。
+    const UNUSED_SHA256: &str = "00000000000000000000000000000000000000000000000000000000000000ff";
+
+    /// **カタログに無い**架空の定義 2 つ。基盤が種別を知らずに動くことを、実カタログや
+    /// ディスクの状態に依存せず確かめるために使う（ネットワークへは出ない経路のみ）。
     static FAKE_LLM_MODEL: ModelSpec = ModelSpec {
         kind: "Test summary",
         id: "test-llm",
@@ -374,7 +474,18 @@ mod tests {
         size_bytes: 1_024,
         filename: "test-llm.gguf",
         url: "https://example.invalid/test-llm.gguf",
-        sha256: HELLO_SHA256,
+        sha256: UNUSED_SHA256,
+    };
+
+    static FAKE_SPEECH_MODEL: ModelSpec = ModelSpec {
+        kind: "Test speech",
+        id: "test-speech",
+        display_name: "Test Speech",
+        description: "used only by tests",
+        size_bytes: 2_048,
+        filename: "test-speech.bin",
+        url: "https://example.invalid/test-speech.bin",
+        sha256: UNUSED_SHA256,
     };
 
     fn temp_path(name: &str) -> PathBuf {
@@ -465,7 +576,7 @@ mod tests {
         // ディスクフォールバック自体は実環境のデータディレクトリに依存するためここでは
         // 検証しない（実 DL の #[ignore] スモークが Downloaded への遷移を確認する）。
         let downloader = ModelDownloader::new();
-        let spec = crate::whisper_model::spec_for("medium").expect("medium is in the catalog");
+        let spec = &FAKE_LLM_MODEL;
         downloader.set_status_for_test(
             spec,
             DownloadStatus::Downloading {
@@ -485,64 +596,68 @@ mod tests {
     }
 
     /// 第 2 のモデル種別を足しても基盤がそのまま使えること。状態は ID をキーにするので
-    /// whisper のエントリと混ざらず、保存先はファイル名で分かれる。
+    /// 互いに混ざらず、保存先はファイル名で分かれる。
+    ///
+    /// 実カタログ・実ディスクに依存しないよう、両方ともダミー定義で見る（実カタログを
+    /// 混ぜると「マップに無い側は Downloaded か NotDownloaded」という自明な条件しか
+    /// 書けず、汚染しても落ちないテストになる）。
     #[test]
     fn a_second_model_kind_is_tracked_independently() {
         let downloader = ModelDownloader::new();
-        let whisper = crate::whisper_model::spec_for("tiny").expect("tiny is in the catalog");
-
         downloader.set_status_for_test(&FAKE_LLM_MODEL, DownloadStatus::Failed("boom".into()));
-        // whisper 側は影響を受けない（マップに無いのでディスク判定へ落ちる）。
-        assert!(matches!(
-            downloader.status_of(whisper),
-            DownloadStatus::Downloaded | DownloadStatus::NotDownloaded
-        ));
+        downloader.set_status_for_test(
+            &FAKE_SPEECH_MODEL,
+            DownloadStatus::Downloading {
+                received: 1,
+                total: 2_048,
+            },
+        );
+
+        // 片方の状態がもう片方へ漏れない（ID が衝突していればここで落ちる）。
         assert_eq!(
             downloader.status_of(&FAKE_LLM_MODEL),
             DownloadStatus::Failed("boom".into())
         );
+        assert_eq!(
+            downloader.status_of(&FAKE_SPEECH_MODEL),
+            DownloadStatus::Downloading {
+                received: 1,
+                total: 2_048,
+            }
+        );
 
         // 保存先はファイル名だけが違う（同じ models/ 配下）。
-        let (Some(llm_path), Some(whisper_path)) =
-            (model_path(&FAKE_LLM_MODEL), model_path(whisper))
+        let (Some(llm_path), Some(speech_path)) =
+            (model_path(&FAKE_LLM_MODEL), model_path(&FAKE_SPEECH_MODEL))
         else {
-            // データディレクトリを解決できない環境ではこの確認を飛ばす。
+            // データディレクトリを解決できない環境ではこの確認だけ飛ばす（黙って通さない）。
+            eprintln!("Skipping the path comparison because the data directory is unavailable");
             return;
         };
-        assert_eq!(llm_path.parent(), whisper_path.parent());
+        assert_eq!(llm_path.parent(), speech_path.parent());
         assert_eq!(
             llm_path.file_name().and_then(|n| n.to_str()),
             Some(FAKE_LLM_MODEL.filename)
         );
-        assert_ne!(llm_path, whisper_path);
+        assert_ne!(llm_path, speech_path);
     }
 
-    /// カタログ経由の実ダウンロードのスモーク（Tiny 約 74MB・要ネットワーク）。ローカルで
-    /// `cargo test ensure_model_downloads_tiny -- --ignored` により実行する。取得済みなら即成功。
+    /// パス要素を含むファイル名は `models/` の外を指しうるので解決しない。
     #[test]
-    #[ignore = "downloads ~74MB; run manually with --ignored"]
-    fn ensure_model_downloads_tiny_with_progress() {
-        let downloader = ModelDownloader::new();
-        let spec = crate::whisper_model::spec_for("tiny").expect("tiny is in the catalog");
-        let path = downloader
-            .ensure_model(spec)
-            .expect("the tiny model should download and verify");
-        assert!(path.is_file());
-        assert_eq!(downloader.status_of(spec), DownloadStatus::Downloaded);
-    }
-
-    /// 実ダウンロードのスモーク（既定モデル約 465MB・要ネットワーク）。ローカルで
-    /// `cargo test ensure_model -- --ignored` により実行する。取得済みなら即成功する
-    /// （実アプリの初回文字起こしと同じ経路・同じ保存先）。
-    #[test]
-    #[ignore = "downloads ~465MB; run manually with --ignored"]
-    fn ensure_model_downloads_and_verifies() {
-        let downloader = ModelDownloader::new();
-        let spec = crate::whisper_model::default_spec();
-        let path = downloader
-            .ensure_model(spec)
-            .expect("the model should download and verify");
-        assert!(path.is_file());
-        assert_eq!(downloader.status_of(spec), DownloadStatus::Downloaded);
+    fn model_path_rejects_non_plain_filenames() {
+        static ESCAPING: ModelSpec = ModelSpec {
+            kind: "Test",
+            id: "test-escaping",
+            display_name: "Escaping",
+            description: "used only by tests",
+            size_bytes: 1,
+            filename: "../outside.bin",
+            url: "https://example.invalid/outside.bin",
+            sha256: UNUSED_SHA256,
+        };
+        assert!(model_path(&ESCAPING).is_none());
+        assert!(!is_plain_filename("a/b.bin"));
+        assert!(!is_plain_filename("/abs.bin"));
+        assert!(is_plain_filename("ggml-tiny.bin"));
     }
 }

@@ -4,12 +4,16 @@
 //! （`crate::model_download`）が持つ。このモジュールは「whisper としてどのモデルを選べるか」
 //! だけを定義する（議事録要約 LLM のカタログは別モジュールが同じ形で持つ想定）。
 //!
-//! 使用モデルは設定画面のカタログ（`CATALOG`）から選べ、選択時に即バックグラウンドで
-//! ダウンロードを開始し、進捗は共有状態（`ModelDownloader`）経由で設定画面に表示する。
+//! 使用モデルは設定画面のカタログ（`CATALOG`）から選べる。選択後の取得・進捗表示の挙動は
+//! `crate::model_download` の doc を参照。
 
 use crate::model_download::ModelSpec;
 
 /// ログに出す種別。`Downloading the Whisper speech model Small (about 465 MB)` のように使う。
+///
+/// カタログ単位の属性をエントリごとに複写している（揃っていることは下のテストが見る）。
+/// 種別が 3 つ以上になって文言が揺れるようなら、`ModelKind` の enum か
+/// `struct ModelCatalog { kind, specs }` へ寄せる。
 const KIND: &str = "Whisper speech";
 
 /// 選べるモデルの一覧（小さい順）。設定画面の ComboBox はこの順で並ぶため、
@@ -110,33 +114,54 @@ pub fn model_index(id: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model_download::{DownloadStatus, ModelDownloader};
 
     #[test]
     fn catalog_is_consistent() {
-        // 既定 ID がカタログにあり、ID の重複が無く、SHA-256 は 64 桁の 16 進、URL はファイル名と
-        // 対応している（追加・差し替え時の取り違えを検知する）。
+        // 種別を問わない検査（ID・ファイル名の重複、SHA-256 の形式、サイズ）は共有基盤の
+        // 正を呼ぶ。ここには whisper 固有の条件だけ書く。
+        crate::model_download::catalog_checks::assert_valid(CATALOG);
+
         assert!(spec_for(DEFAULT_MODEL_ID).is_some());
-        for (i, spec) in CATALOG.iter().enumerate() {
-            assert!(
-                CATALOG.iter().skip(i + 1).all(|other| other.id != spec.id),
-                "duplicate id {}",
-                spec.id
-            );
-            assert_eq!(spec.sha256.len(), 64, "bad sha256 for {}", spec.id);
-            assert!(
-                spec.sha256.chars().all(|c| c.is_ascii_hexdigit()),
-                "bad sha256 for {}",
-                spec.id
-            );
+        for spec in CATALOG {
+            // 配布元の URL は保存ファイル名で終わる（追加・差し替え時の取り違えを検知する）。
             assert!(
                 spec.url.ends_with(spec.filename),
                 "url mismatch for {}",
                 spec.id
             );
-            assert!(spec.size_bytes > 0);
             // 種別はログの見分けに使うので、カタログ内で揃っていること。
             assert_eq!(spec.kind, KIND, "unexpected kind for {}", spec.id);
         }
+    }
+
+    /// カタログ経由の実ダウンロードのスモーク（Tiny 約 74MB・要ネットワーク）。ローカルで
+    /// `cargo test ensure_model_downloads_tiny -- --ignored` により実行する。取得済みなら即成功。
+    #[test]
+    #[ignore = "downloads ~74MB; run manually with --ignored"]
+    fn ensure_model_downloads_tiny_with_progress() {
+        let downloader = ModelDownloader::new();
+        let spec = spec_for("tiny").expect("tiny is in the catalog");
+        let path = downloader
+            .ensure_model(spec)
+            .expect("the tiny model should download and verify");
+        assert!(path.is_file());
+        assert_eq!(downloader.status_of(spec), DownloadStatus::Downloaded);
+    }
+
+    /// 実ダウンロードのスモーク（既定モデル約 465MB・要ネットワーク）。ローカルで
+    /// `cargo test ensure_model -- --ignored` により実行する。取得済みなら即成功する
+    /// （実アプリの初回文字起こしと同じ経路・同じ保存先）。
+    #[test]
+    #[ignore = "downloads ~465MB; run manually with --ignored"]
+    fn ensure_model_downloads_and_verifies() {
+        let downloader = ModelDownloader::new();
+        let spec = default_spec();
+        let path = downloader
+            .ensure_model(spec)
+            .expect("the model should download and verify");
+        assert!(path.is_file());
+        assert_eq!(downloader.status_of(spec), DownloadStatus::Downloaded);
     }
 
     #[test]

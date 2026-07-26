@@ -47,7 +47,7 @@ pub struct TranscribeJob {
     /// 使用する内蔵モデルの識別子（設定 `whisper_model`）。カタログ外は既定へフォールバック。
     pub model_id: String,
     /// whisper モデルの上書きパス（設定 `whisper_model_path`）。`None` なら内蔵モデル
-    /// （`model_id`）を使う（未取得なら処理時に自動ダウンロードされる。`src/whisper_model.rs`）。
+    /// （`model_id`）を使う（未取得なら処理時に自動ダウンロードされる。`src/model_download.rs`）。
     pub model_override: Option<PathBuf>,
     /// 認識言語（whisper の言語コード。例: `en` / `ja`）。`auto` は自動判定。
     pub language: String,
