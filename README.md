@@ -184,3 +184,31 @@ macOS では `screencapturekit` と `objc2` 系を使います。
 
 - CI（GitHub Actions）で上記の build／fmt／clippy／test と `cargo audit`（依存の脆弱性検査）を
   実行しています。
+
+- **Mac App Store 可否の検証プローブ**: MAS 対応（[#77](https://github.com/pkshimizu/openshoki/issues/77)）の
+  技術検証に使う `examples/mas_probe.rs` を、App Sandbox の有無を切り替えて実行します。
+  出荷バイナリには含まれません（`cargo` の example）。
+
+  ```sh
+  ./scripts/mas-probe.sh --sandbox    -- --verbose --skip-screen   # サンドボックス有り
+  ./scripts/mas-probe.sh --no-sandbox -- --verbose --skip-screen   # 比較用
+  ./scripts/mas-probe.sh --sandbox --open                          # TCC を伴う検証
+  ```
+
+  `.app` に包んで ad-hoc 署名する理由と、`--open`（LaunchServices 経由の起動）が要る理由は
+  `scripts/mas-probe.sh` の冒頭コメントにあります。検証の結論は次のとおりで、後続作業は
+  [#107](https://github.com/pkshimizu/openshoki/issues/107) /
+  [#108](https://github.com/pkshimizu/openshoki/issues/108) /
+  [#109](https://github.com/pkshimizu/openshoki/issues/109) に切り出してあります
+  （測定値の全文はローカルのプラン `docs/plans/`。`docs/` は追跡対象外です）。
+
+  - App Sandbox 下でも、CoreAudio のプロセス照会・ScreenCaptureKit・security-scoped bookmark・
+    マイク取得はすべて動く。
+  - 自動録音が使っている private API（responsible pid）は、Chrome / Zen / Slack / Zoom については
+    公開 API で置き換えられる。
+  - **Safari（WebKit ベース）だけは置き換えられない**。マイクを掴むのが WebKit の GPU プロセスで、
+    そこから Safari へ辿れるのは private API だけのため。Safari は自動録音の対象外とする方針。
+
+  `--open` を付けた実行では、プロセス一覧を含むレポートが
+  `~/Library/Containers/net.noncore.openshoki.masprobe/Data/` に一時的に作られます
+  （表示後にスクリプトが削除します）。

@@ -34,6 +34,20 @@ i-slint-backend-testing = "1.17.0"
 [build-dependencies]
 slint-build = "1.17.0"
 
+# MAS 可否の技術検証プローブ（#77、`examples/mas_probe.rs`）専用。security-scoped bookmark を
+# 扱う NSURL 系 feature をここで足す。dev-dependencies なので `cargo build`（出荷バイナリ）の
+# feature は増えない（`cargo test` / `cargo clippy --all-targets` では feature 合成で乗る）。
+# プローブが使う feature は通常依存側の指定に頼らず全部書く（あちらから外れても壊れないように）。
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+objc2-foundation = { version = "0.3.2", features = [
+  "NSURL",
+  "NSData",
+  "NSError",
+  "NSArray",
+  "NSBundle",
+  "NSString",
+] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.4"
 objc2-app-kit = "0.3.2"
