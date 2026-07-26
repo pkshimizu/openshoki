@@ -1457,7 +1457,7 @@ mod tests {
     use super::{
         TranscriptStatus, breathing_level, playback_progress, seek_position_from_ratio,
         selected_model_status_text, transcript_display_status, transcript_placeholder_text,
-        transcript_status_text, trigger_app_row,
+        transcript_status_text,
     };
     use crate::transcribe::TranscribeStatus;
     use std::time::Duration;
@@ -1469,6 +1469,8 @@ mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn trigger_app_row_notes_undetectable_apps() {
+        // 非 macOS では item ごと落ちるので、import も関数の中に置く（外に出すと未使用になる）。
+        use super::trigger_app_row;
         use crate::config::AppTrigger;
 
         let row = trigger_app_row(&AppTrigger {
