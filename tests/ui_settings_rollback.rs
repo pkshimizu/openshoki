@@ -62,8 +62,10 @@ fn rust_can_roll_back_a_toggle_after_the_user_flipped_it() {
     );
 }
 
-/// SpinBox（自動停止の待ち時間）も同じ契約を持つ。ここは保存**成功**時にも書き戻す
-/// （Rust 側が範囲へ丸めた値を反映する）ため、片方向に戻ると丸めの反映も届かなくなる。
+/// SpinBox（自動停止の待ち時間）も同じ契約を持つ。ここは保存**成功**時にも Rust から書き戻す
+/// （範囲へ丸めた値を反映する経路がある）ので、片方向に戻ると失敗時だけでなく丸めも届かなくなる。
+/// 見るのは「操作のあとでも Rust の set が届くこと」までで、丸めの計算自体は
+/// `config::clamp_debounce_secs` のテストが持つ。
 #[test]
 #[cfg_attr(
     not(slint_debug_info),
@@ -83,7 +85,7 @@ fn rust_can_write_back_a_delay_after_the_user_edited_it() {
     spin.invoke_accessible_increment_action();
     assert_eq!(window.get_auto_stop_debounce_secs(), 5);
 
-    // Rust 側が保存済みの値（丸めた値）へ書き戻す。
+    // Rust 側が保存済みの値へ書き戻す。
     window.set_auto_stop_debounce_secs(4);
     assert_eq!(
         spin.accessible_value().as_deref(),

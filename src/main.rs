@@ -252,8 +252,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 「議事録要約を自動生成」トグル: 永続化に成功してから反映する（自動文字起こしトグルと対称）。
     // モデルは内蔵だが、ここでは取得を始めない（数 GB あり、ON にしただけで落とし始めると
-    // 帯域とディスクを黙って使う）。取得の契機は、要約 ON の状態でモデルを選び直した時点
-    // （`on_change_summary_model`）と、初回の要約時（`ensure_model`）。
+    // 帯域とディスクを黙って使う）。取得の契機は `summary_model_downloads_on_select` の
+    // doc コメントを参照。
     let config_for_summarize = Rc::clone(&config);
     let ui_for_summarize = ui.as_weak();
     ui.on_toggle_auto_summarize(move |enabled| {
@@ -1562,15 +1562,24 @@ fn model_choices(catalog: &[model_download::ModelSpec]) -> slint::ModelRc<slint:
     .into()
 }
 
-/// 設定画面で要約 LLM を選び直した時点で、そのモデルの取得を始めるか。
+/// 設定画面で要約 LLM を選び直した時点で、そのモデルの取得を始めるか。**取得の契機の正**で、
+/// 状態行の文言（`summary_model_status_text`）もこれに合わせる。
 ///
-/// 始めるのは「その選択で実際に要約が走る設定」のときだけにする（`docs/rules/security.md` の
-/// 「通信はユーザーが機能を有効化したときだけ」）。要約 OFF なら使わないモデルを数 GB 落とす
-/// ことになり、モデルパスを上書きしている場合はそのファイルが優先されるので落としても使われない。
-/// 始めない場合も選択は保存するので、要約 ON にした後の初回要約時に `ensure_model` が取得する。
+/// 使われないモデルを数 GB 落とさないための抑止（`docs/rules/security.md` の「通信はユーザーが
+/// 機能を有効化したときだけ」）。抑止する 2 ケースは、その後の取得の仕方も違う:
+///
+/// - 要約 OFF: 選択だけ保存し、ON にした後の初回要約時に `ensure_model` が取得する。
+/// - モデルパスを上書き中: そのファイルが優先されるので、カタログのモデルは以後も取得しない
+///   （`summarize::resolve_model`）。
+///
+/// なお `auto_transcribe` が OFF でも要約は走らないが、ここでは見ない（その状態では ComboBox
+/// 自体が無効なので選択が起きない）。
 ///
 /// whisper 側（`whisper_model_path` の上書き）は同じ抑止を持たない。上書き中も無条件に取得する
 /// 既存挙動のままで、対称にするには状態行の文言追加も要るため別 issue にしてある。
+///
+/// テストでピン留めしてあるのはこの述語まで。呼び出し側のガード（`on_change_summary_model` の
+/// `if downloads_now`）は、実際に取得を始める副作用を持つためテストから叩けない。
 fn summary_model_downloads_on_select(config: &Config) -> bool {
     config.auto_summarize && config.summary_model_path.is_none()
 }
