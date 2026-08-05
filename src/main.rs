@@ -132,12 +132,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into(),
     );
     // 議事録要約: トグルと、使う LLM の選択・取得状況。選択肢の組み立て・フォールバックは
-    // whisper と同じで、選んだモデルの所要時間とメモリの目安は説明行に出す（数 GB の
-    // ダウンロードと数十秒・数 GB の実行コストが選択で決まるため）。
+    // whisper と同じ（選択肢には所要時間とメモリの目安を含める。数 GB のダウンロードと
+    // 数十秒・数 GB の実行コストが選択で決まるため）。
     ui.set_auto_summarize(config.borrow().auto_summarize);
     ui.set_summary_models(model_choices(summary_model::CATALOG));
     ui.set_summary_model_index(summary_model::model_index(&config.borrow().summary_model) as i32);
-    ui.set_summary_model_detail(summary_model_detail_text(&config.borrow()).into());
     ui.set_summary_model_status(
         summary_model_status_text(&config.borrow(), &model_downloader).into(),
     );
@@ -251,8 +250,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // 「議事録要約を自動生成」トグル: 永続化に成功してから反映する（自動文字起こしトグルと対称）。
-    // モデルは内蔵（初回の要約時に自動ダウンロード）なので、ここでは取得を始めない
-    // （数 GB あり、ON にしただけで落とし始めると帯域とディスクを黙って使う）。
+    // モデルは内蔵だが、ここでは取得を始めない（数 GB あり、ON にしただけで落とし始めると
+    // 帯域とディスクを黙って使う）。取得の契機は、要約 ON の状態でモデルを選び直した時点
+    // （`on_change_summary_model`）と、初回の要約時（`ensure_model`）。
     let config_for_summarize = Rc::clone(&config);
     let ui_for_summarize = ui.as_weak();
     ui.on_toggle_auto_summarize(move |enabled| {
@@ -333,8 +333,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // 要約 LLM の変更: whisper モデルの変更と同じ流儀（インデックス→ID の変換、永続化成功後に
-    // 反映、保存失敗時は表示を保存済みの値へ戻す、未取得なら取得開始）。説明行も選択に合わせて
-    // 差し替える（所要時間・メモリの目安が選択中のものとずれないように）。
+    // 反映、保存失敗時は表示を保存済みの値へ戻す、未取得なら取得開始）。ただし取得を始めるのは
+    // 「その選択で実際に要約が走る設定」のときだけにする（下のコメント参照）。
     let config_for_summary_model = Rc::clone(&config);
     let ui_for_summary_model = ui.as_weak();
     let downloader_for_summary_model = model_downloader.clone();
@@ -356,18 +356,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ) as i32);
             return;
         }
+        // 取得を始めるのは、その選択で実際に要約が走る設定のときだけにする（`docs/rules/security.md`
+        // の「通信はユーザーが機能を有効化したときだけ」）。要約 OFF なら使わないモデルを数 GB
+        // 落とすことになり、モデルパスを上書きしている場合はそのファイルが優先されるので
+        // 落としても使われない（どちらも状態行に進捗が出ないまま帯域とディスクを使う）。
+        // 選択自体は保存するので、要約を ON にした後の初回要約時に `ensure_model` が取得する。
+        let should_download = candidate.auto_summarize && candidate.summary_model_path.is_none();
         *config_for_summary_model.borrow_mut() = candidate;
-        downloader_for_summary_model.request_download(spec);
-        // 表示に渡す文字列を作ってから借用を手放す（UI へ set する間は設定を借りたままにしない）。
-        let (detail, status) = {
-            let config_ref = config_for_summary_model.borrow();
-            (
-                summary_model_detail_text(&config_ref),
-                summary_model_status_text(&config_ref, &downloader_for_summary_model),
+        if should_download {
+            downloader_for_summary_model.request_download(spec);
+        }
+        ui.set_summary_model_status(
+            summary_model_status_text(
+                &config_for_summary_model.borrow(),
+                &downloader_for_summary_model,
             )
-        };
-        ui.set_summary_model_detail(detail.into());
-        ui.set_summary_model_status(status.into());
+            .into(),
+        );
     });
 
     // 登録アプリの削除: 一覧のインデックスで設定とモデルから取り除く（永続化成功後に反映）。
@@ -1539,9 +1544,10 @@ fn trigger_app_row(trigger: &config::AppTrigger) -> TriggerApp {
 
 /// 設定画面の ComboBox に並べる選択肢（`名前 — サイズ — 説明`）。whisper・要約 LLM で共用し、
 /// 並び順はカタログのまま（選択位置はカタログ内インデックスで表す）。
-fn model_choices(
-    catalog: &'static [model_download::ModelSpec],
-) -> slint::ModelRc<slint::SharedString> {
+///
+/// 要約 LLM の説明行はこの文字列を Slint 側で選択位置から引いて出す（ComboBox の行は箱幅で
+/// 省略されるため。`ui/app-window.slint` の `summary-models`）。
+fn model_choices(catalog: &[model_download::ModelSpec]) -> slint::ModelRc<slint::SharedString> {
     Rc::new(slint::VecModel::<slint::SharedString>::from(
         catalog
             .iter()
@@ -1556,21 +1562,6 @@ fn model_choices(
             .collect::<Vec<_>>(),
     ))
     .into()
-}
-
-/// 選択中の要約 LLM の説明（所要時間とメモリの目安）を、設定画面の説明行テキストにする。
-///
-/// 同じ文字列は ComboBox の選択肢にも入っているが、行はウィンドウ幅で省略される（選択肢を
-/// 開いても箱幅のまま）。選ぶ材料になる目安を確実に読めるよう、選択中のものだけ折り返して出す。
-/// モデルパスを手で上書きしている場合は選択が使われないので、説明も出さない（空文字列で
-/// Slint 側が行ごと省く）。
-fn summary_model_detail_text(config: &Config) -> String {
-    if config.summary_model_path.is_some() {
-        return String::new();
-    }
-    summary_model::spec_or_default(&config.summary_model)
-        .description
-        .to_owned()
 }
 
 /// 議事録要約に使う LLM の取得状況を、設定画面の状態行テキストにする。
@@ -1635,9 +1626,8 @@ fn hide_dock_icon() {
 mod tests {
     use super::{
         TranscriptStatus, app_version_text, breathing_level, model_choices, model_status_text,
-        playback_progress, seek_position_from_ratio, summary_model_detail_text,
-        summary_model_status_text, transcript_display_status, transcript_placeholder_text,
-        transcript_status_text,
+        playback_progress, seek_position_from_ratio, summary_model_status_text,
+        transcript_display_status, transcript_placeholder_text, transcript_status_text,
     };
     use crate::transcribe::TranscribeStatus;
     use std::time::Duration;
@@ -1881,7 +1871,6 @@ mod tests {
         let spec = crate::summary_model::default_spec();
         downloader.set_status_for_test(spec, crate::model_download::DownloadStatus::NotDownloaded);
 
-        // どのモデルかは ComboBox が示すので、状態行は whisper と同じ状態だけを出す。
         let config = crate::config::Config::default();
         assert_eq!(
             summary_model_status_text(&config, &downloader),
@@ -1908,44 +1897,8 @@ mod tests {
         );
     }
 
-    /// 説明行には選択中モデルの所要時間・メモリの目安が出る（ComboBox の行は幅で省略される
-    /// ため、ここが「読み取れる情報」の担保になる）。
-    #[test]
-    fn summary_model_detail_text_shows_the_selected_estimate() {
-        let config = crate::config::Config::default();
-        assert_eq!(
-            summary_model_detail_text(&config),
-            "55 s and 8.2 GB of memory for a 4-min meeting, more faithful"
-        );
-
-        let lighter = crate::config::Config {
-            summary_model: "qwen2.5-3b-instruct-q4-k-m".to_owned(),
-            ..crate::config::Config::default()
-        };
-        assert_eq!(
-            summary_model_detail_text(&lighter),
-            "25 s and 3.7 GB of memory for a 4-min meeting, but can invent details"
-        );
-
-        // カタログ外の手編集値は既定モデルの説明を出す（状態行・使用時と同じフォールバック）。
-        let unknown = crate::config::Config {
-            summary_model: "no-such-model".to_owned(),
-            ..crate::config::Config::default()
-        };
-        assert_eq!(
-            summary_model_detail_text(&unknown),
-            summary_model_detail_text(&config)
-        );
-
-        // モデルパスを上書きしているときは選択が使われないので説明も出さない。
-        let overridden = crate::config::Config {
-            summary_model_path: Some(std::path::PathBuf::from("/tmp/model.gguf")),
-            ..crate::config::Config::default()
-        };
-        assert!(summary_model_detail_text(&overridden).is_empty());
-    }
-
     /// ComboBox の選択肢は「名前 — サイズ — 説明」で、カタログの順・件数どおりに並ぶ。
+    /// 要約 LLM の説明行はこの文字列を Slint 側で引くので、目安が入っていることもここで固定する。
     #[test]
     fn model_choices_follow_the_catalog_order() {
         use slint::Model;
@@ -1957,6 +1910,10 @@ mod tests {
                 .row_data(0)
                 .expect("the catalog has at least one entry"),
             "Qwen2.5 3B Instruct — 2.0 GB — 25 s and 3.7 GB of memory for a 4-min meeting, but can invent details"
+        );
+        assert_eq!(
+            choices.row_data(1).expect("the catalog has a second entry"),
+            "Qwen2.5 7B Instruct — 4.4 GB — 54 s and 8.2 GB of memory for a 4-min meeting, more faithful"
         );
         // whisper でも同じ形（サイズは MB 表記になる）。
         let whisper = model_choices(crate::whisper_model::CATALOG);

@@ -16,9 +16,11 @@ const KIND: &str = "Summary LLM";
 /// 選べるモデルの一覧（小さい順）。設定画面の ComboBox はこの順で並ぶため、モデルを足すときは
 /// ここへ 1 エントリ追加するだけでよい（whisper 側と同じ）。
 ///
-/// `description` には **4 分の会議での所要時間とピーク RSS の目安**（#78 の計測値）を先に置く。
-/// 数 GB のダウンロードと数十秒・数 GB の実行コストが選択で決まるので、選ぶ前に読めるように
-/// する（元プランの「設定画面では所要時間とメモリの目安を添えること」）。
+/// `description` には **4 分の会議での所要時間とピーク RSS の目安**を先に置く。数 GB の
+/// ダウンロードと数十秒・数 GB の実行コストが選択で決まるので、選ぶ前に読めるようにする
+/// （元プランの「設定画面では所要時間とメモリの目安を添えること」）。
+/// 数値の正は #78 の計測（`docs/plans/done/20260722-meeting-minutes-summary.md` の表。
+/// 3B が 25.1s / 3.72GB、7B が 53.5s / 8.18GB）で、秒は繰り上げ・GB は小数第 1 位。
 ///
 /// URL・SHA-256 は HuggingFace の LFS メタデータより。モデルを追加・差し替えるときは
 /// URL と SHA-256 を必ずペアで更新する。
@@ -41,7 +43,7 @@ pub const CATALOG: &[ModelSpec] = &[
         kind: KIND,
         id: "qwen2.5-7b-instruct-q4-k-m",
         display_name: "Qwen2.5 7B Instruct",
-        description: "55 s and 8.2 GB of memory for a 4-min meeting, more faithful",
+        description: "54 s and 8.2 GB of memory for a 4-min meeting, more faithful",
         size_bytes: 4_683_074_240,
         filename: "Qwen2.5-7B-Instruct-Q4_K_M.gguf",
         url: "https://huggingface.co/bartowski/Qwen2.5-7B-Instruct-GGUF/resolve/main/Qwen2.5-7B-Instruct-Q4_K_M.gguf",
@@ -82,11 +84,10 @@ mod tests {
 
     #[test]
     fn catalog_is_consistent() {
-        // 種別を問わない検査（ID・ファイル名の重複、SHA-256 の形式、サイズ）は共有基盤の
-        // 正を呼ぶ。ここには要約 LLM 固有の条件だけ書く。
-        crate::model_download::catalog_checks::assert_valid(CATALOG);
+        // 種別を問わない検査（ID・ファイル名の重複、SHA-256 の形式、サイズ、既定 ID の存在）は
+        // 共有基盤の正を呼ぶ。ここには要約 LLM 固有の条件だけ書く。
+        crate::model_download::catalog_checks::assert_valid(CATALOG, DEFAULT_MODEL_ID);
 
-        assert!(spec_for(DEFAULT_MODEL_ID).is_some());
         for spec in CATALOG {
             // 配布元の URL は保存ファイル名で終わる（追加・差し替え時の取り違えを検知する）。
             assert!(

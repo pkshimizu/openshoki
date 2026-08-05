@@ -116,11 +116,10 @@ mod tests {
 
     #[test]
     fn catalog_is_consistent() {
-        // 種別を問わない検査（ID・ファイル名の重複、SHA-256 の形式、サイズ）は共有基盤の
-        // 正を呼ぶ。ここには whisper 固有の条件だけ書く。
-        crate::model_download::catalog_checks::assert_valid(CATALOG);
+        // 種別を問わない検査（ID・ファイル名の重複、SHA-256 の形式、サイズ、既定 ID の存在）は
+        // 共有基盤の正を呼ぶ。ここには whisper 固有の条件だけ書く。
+        crate::model_download::catalog_checks::assert_valid(CATALOG, DEFAULT_MODEL_ID);
 
-        assert!(spec_for(DEFAULT_MODEL_ID).is_some());
         for spec in CATALOG {
             // 配布元の URL は保存ファイル名で終わる（追加・差し替え時の取り違えを検知する）。
             assert!(

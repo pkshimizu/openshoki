@@ -131,15 +131,11 @@ export component AppWindow inherits Window {
     // 以後はトグル操作で Slint が状態を保持する（in-out。保存失敗時は Rust 側が書き戻す）。
     in-out property <bool> auto-summarize;
     // 要約に使う LLM の表示名一覧（Rust 側の summary_model::CATALOG を反映。whisper と同じく
-    // 名前・サイズ・説明を 1 行に整形済み）。
+    // 名前・サイズ・説明を 1 行に整形済み）。選択肢の下に出す説明行もここから導出する。
     in property <[string]> summary-models;
     // 選択中モデルのカタログ内インデックス。起動時に Rust 側が設定値で初期化し、以後は
     // ComboBox で編集する（in-out。保存失敗時は Rust 側が書き戻す）。
     in-out property <int> summary-model-index;
-    // 選択中モデルの説明（所要時間とメモリの目安）。ComboBox の行はウィンドウ幅で省略される
-    // ため、選ぶ材料になる説明はここで全文を出す（`summary_model_detail_text`）。
-    // config.toml でモデルパスを上書きしている場合は空で、行ごと出さない。
-    in property <string> summary-model-detail;
     // 選択中モデルの取得状況（Rust 側が定期的に更新する）。モデル名は ComboBox が出すので
     // 含めない（`summary_model_status_text`）。
     in property <string> summary-model-status;
@@ -215,9 +211,11 @@ export component AppWindow inherits Window {
             HorizontalLayout {
                 spacing: 8px;
                 CheckBox {
-                    checked: root.auto-record-app;
+                    // 双方向束縛にする。片方向（`checked: root.…`）だと、ユーザーが一度操作した
+                    // 時点でウィジェット側の代入がバインディングを外し、保存失敗時に Rust が
+                    // 書き戻しても表示が戻らない（`docs/rules/slint.md`）。
+                    checked <=> root.auto-record-app;
                     toggled => {
-                        root.auto-record-app = self.checked;
                         root.toggle-auto-record-app(self.checked);
                     }
                 }
@@ -257,11 +255,12 @@ export component AppWindow inherits Window {
                             // 範囲は src/config.rs の DEBOUNCE_MIN_SECS / DEBOUNCE_MAX_SECS と一致させること。
                             minimum: 1;
                             maximum: 60;
-                            value: root.auto-stop-debounce-secs;
+                            // 双方向束縛。Rust 側が丸めた値・保存済みの値を書き戻せるようにする
+                            // （理由は上のチェックボックスのコメント参照）。
+                            value <=> root.auto-stop-debounce-secs;
                             // 途絶が有効なのは自動録音 ON のときだけなので、OFF では無効化する。
                             enabled: deps.enabled-gate;
                             edited(secs) => {
-                                root.auto-stop-debounce-secs = secs;
                                 root.change-auto-stop-debounce(secs);
                             }
                         }
@@ -325,9 +324,8 @@ export component AppWindow inherits Window {
             HorizontalLayout {
                 spacing: 8px;
                 CheckBox {
-                    checked: root.auto-transcribe;
+                    checked <=> root.auto-transcribe;
                     toggled => {
-                        root.auto-transcribe = self.checked;
                         root.toggle-auto-transcribe(self.checked);
                     }
                 }
@@ -363,10 +361,9 @@ export component AppWindow inherits Window {
 
                         ComboBox {
                             model: root.transcribe-languages;
-                            current-index: root.transcribe-language-index;
+                            current-index <=> root.transcribe-language-index;
                             enabled: transcribe-deps.enabled-gate;
                             selected => {
-                                root.transcribe-language-index = self.current-index;
                                 root.change-transcribe-language(self.current-index);
                             }
                         }
@@ -384,10 +381,9 @@ export component AppWindow inherits Window {
 
                         ComboBox {
                             model: root.whisper-models;
-                            current-index: root.whisper-model-index;
+                            current-index <=> root.whisper-model-index;
                             enabled: transcribe-deps.enabled-gate;
                             selected => {
-                                root.whisper-model-index = self.current-index;
                                 root.change-whisper-model(self.current-index);
                             }
                         }
@@ -406,10 +402,9 @@ export component AppWindow inherits Window {
                     HorizontalLayout {
                         spacing: 8px;
                         CheckBox {
-                            checked: root.auto-summarize;
+                            checked <=> root.auto-summarize;
                             enabled: transcribe-deps.enabled-gate;
                             toggled => {
-                                root.auto-summarize = self.checked;
                                 root.toggle-auto-summarize(self.checked);
                             }
                         }
@@ -428,8 +423,9 @@ export component AppWindow inherits Window {
                         spacing: 8px;
                         Text {
                             // whisper の「Model」と同じセクションに並ぶので、どちらのモデルか
-                            // 分かるラベルにする。
-                            text: "Minutes model";
+                            // 分かるラベルにする（whisper 側は直上のチェックボックス文言
+                            // 「on-device Whisper」で分かるため素の「Model」のまま）。
+                            text: "Minutes Model";
                             font-size: Style.body-size;
                             vertical-alignment: center;
                             horizontal-stretch: 1;
@@ -438,20 +434,21 @@ export component AppWindow inherits Window {
 
                         ComboBox {
                             model: root.summary-models;
-                            current-index: root.summary-model-index;
+                            current-index <=> root.summary-model-index;
                             enabled: transcribe-deps.enabled-gate;
                             selected => {
-                                root.summary-model-index = self.current-index;
                                 root.change-summary-model(self.current-index);
                             }
                         }
                     }
 
-                    if root.summary-model-detail != "": Text {
-                        // 選択中モデルの説明（例: 55 s and 8.2 GB of memory for a 4-min meeting,
-                        // more faithful）。ComboBox の行は箱幅で省略されるので、選ぶ材料になる
-                        // 目安はここで全文を読めるようにする（折り返す）。
-                        text: root.summary-model-detail;
+                    Text {
+                        // 選択中の選択肢の全文（例: Qwen2.5 7B Instruct — 4.4 GB — 54 s and
+                        // 8.2 GB of memory for a 4-min meeting, more faithful）。ComboBox の行は
+                        // 箱幅で省略される（開いてもポップアップは箱幅のまま）ため、選ぶ材料になる
+                        // 目安をここで折り返して読めるようにする。選択位置から導出するので、
+                        // 「選択は 3B・説明は 7B」のような食い違いが起こらない。
+                        text: root.summary-models[root.summary-model-index];
                         wrap: word-wrap;
                         font-size: Style.caption-size;
                         color: Palette.foreground.transparentize(Style.muted-alpha);

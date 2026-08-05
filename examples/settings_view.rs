@@ -64,16 +64,14 @@ fn main() {
     ]))));
     win.set_whisper_model_status("Not downloaded — downloads automatically (465 MB)".into());
     win.set_auto_summarize(true);
-    // 要約 LLM は選択肢・説明行・状態行の 3 段。説明行は実カタログで最長の文言（3B）で見る
-    // （`src/summary_model.rs` の description の複製。あちらを変えたらここも合わせること）。
+    // 要約 LLM は選択肢・説明行（選択中の選択肢の全文）・状態行の 3 段。説明行の折り返しを
+    // 見たいので、実カタログで最長の文言（3B）を選択中にする（`src/summary_model.rs` の
+    // description の複製。あちらを変えたらここも合わせること）。
     win.set_summary_models(ModelRc::from(Rc::new(VecModel::from(vec![
         slint::SharedString::from(
-            "Qwen2.5 7B Instruct — 4.4 GB — 55 s and 8.2 GB of memory for a 4-min meeting, more faithful",
+            "Qwen2.5 3B Instruct — 2.0 GB — 25 s and 3.7 GB of memory for a 4-min meeting, but can invent details",
         ),
     ]))));
-    win.set_summary_model_detail(
-        "25 s and 3.7 GB of memory for a 4-min meeting, but can invent details".into(),
-    );
     win.set_summary_model_status("Not downloaded — downloads automatically (4.4 GB)".into());
 
     win.window()
