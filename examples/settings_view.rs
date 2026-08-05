@@ -64,14 +64,22 @@ fn main() {
     ]))));
     win.set_whisper_model_status("Not downloaded — downloads automatically (465 MB)".into());
     win.set_auto_summarize(true);
-    win.set_summary_model_status(
-        "Qwen2.5 7B Instruct — Not downloaded — downloads automatically (4.4 GB)".into(),
+    // 要約 LLM は選択肢・説明行・状態行の 3 段。説明行は実カタログで最長の文言（3B）で見る
+    // （`src/summary_model.rs` の description の複製。あちらを変えたらここも合わせること）。
+    win.set_summary_models(ModelRc::from(Rc::new(VecModel::from(vec![
+        slint::SharedString::from(
+            "Qwen2.5 7B Instruct — 4.4 GB — 55 s and 8.2 GB of memory for a 4-min meeting, more faithful",
+        ),
+    ]))));
+    win.set_summary_model_detail(
+        "25 s and 3.7 GB of memory for a 4-min meeting, but can invent details".into(),
     );
+    win.set_summary_model_status("Not downloaded — downloads automatically (4.4 GB)".into());
 
     win.window()
         .set_position(slint::LogicalPosition::new(60.0, 60.0));
     // 実アプリと同じ寸法で見る（`src/main.rs` の WINDOW_WIDTH/HEIGHT と一致させること）。
-    win.window().set_size(slint::LogicalSize::new(420.0, 840.0));
+    win.window().set_size(slint::LogicalSize::new(420.0, 900.0));
     win.show()
         .expect("showing the window should succeed in this verification binary");
 

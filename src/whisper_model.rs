@@ -104,17 +104,9 @@ pub fn spec_or_default(id: &str) -> &'static ModelSpec {
 }
 
 /// 識別子 → カタログ内インデックス。カタログ外（手編集値）は既定モデルの位置へ
-/// フォールバックする（値自体は書き換えず、表示だけ既定位置になる）。
+/// フォールバックする（解決は共有基盤の `catalog_index` が正。要約 LLM 側と同じ挙動になる）。
 pub fn model_index(id: &str) -> usize {
-    CATALOG
-        .iter()
-        .position(|spec| spec.id == id)
-        .unwrap_or_else(|| {
-            CATALOG
-                .iter()
-                .position(|spec| spec.id == DEFAULT_MODEL_ID)
-                .expect("the default model id is always in the catalog")
-        })
+    crate::model_download::catalog_index(CATALOG, id, DEFAULT_MODEL_ID)
 }
 
 #[cfg(test)]

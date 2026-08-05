@@ -93,12 +93,13 @@ export component AppWindow inherits Window {
     // preferred だけだと中身の最小高さ（≒0）に引っ張られて潰れるため、min も指定する。
     // 幅・高さは src/main.rs の WINDOW_WIDTH/HEIGHT と一致させること（片方だけ変えない）。
     // 幅は 420 固定。高さは 3 セクション＋Transcription の Language/Model 行・状態行・
-    // 議事録要約のトグルと状態行、＋末尾のバージョン行に合わせた値（中身を足すときは
-    // `examples/settings_view.rs -- snapshot` で見て、ここと `WINDOW_HEIGHT` を揃えて直す）。
+    // 議事録要約のトグルとモデル行・説明行・状態行、＋末尾のバージョン行に合わせた値
+    // （中身を足すときは `examples/settings_view.rs -- snapshot` で見て、ここと
+    // `WINDOW_HEIGHT` を揃えて直す）。
     min-width: 420px;
-    min-height: 840px;
+    min-height: 900px;
     preferred-width: 420px;
-    preferred-height: 840px;
+    preferred-height: 900px;
 
     // 現在の録音ファイル保存先（表示用）。Rust 側から設定する。
     in property <string> recording-dir;
@@ -129,8 +130,18 @@ export component AppWindow inherits Window {
     // 「文字起こしのあと議事録要約を自動生成」の ON/OFF。起動時に Rust 側が設定値で初期化し、
     // 以後はトグル操作で Slint が状態を保持する（in-out。保存失敗時は Rust 側が書き戻す）。
     in-out property <bool> auto-summarize;
-    // 要約に使う LLM の名前と取得状況（Rust 側が定期的に更新する）。モデルの選択 UI は無いので、
-    // 状態だけでなくモデル名も含める（`summary_model_status_text`）。
+    // 要約に使う LLM の表示名一覧（Rust 側の summary_model::CATALOG を反映。whisper と同じく
+    // 名前・サイズ・説明を 1 行に整形済み）。
+    in property <[string]> summary-models;
+    // 選択中モデルのカタログ内インデックス。起動時に Rust 側が設定値で初期化し、以後は
+    // ComboBox で編集する（in-out。保存失敗時は Rust 側が書き戻す）。
+    in-out property <int> summary-model-index;
+    // 選択中モデルの説明（所要時間とメモリの目安）。ComboBox の行はウィンドウ幅で省略される
+    // ため、選ぶ材料になる説明はここで全文を出す（`summary_model_detail_text`）。
+    // config.toml でモデルパスを上書きしている場合は空で、行ごと出さない。
+    in property <string> summary-model-detail;
+    // 選択中モデルの取得状況（Rust 側が定期的に更新する）。モデル名は ComboBox が出すので
+    // 含めない（`summary_model_status_text`）。
     in property <string> summary-model-status;
     // 設定画面の末尾に出すバージョン表記（例: `shoki v0.1.0`）。組み立てと理由は Rust 側の
     // `app_version_text` を参照。
@@ -154,6 +165,9 @@ export component AppWindow inherits Window {
     callback change-whisper-model(int);
     // 議事録要約トグルの切り替え。新しい ON/OFF を渡し、Rust 側で設定へ永続化する。
     callback toggle-auto-summarize(bool);
+    // 要約 LLM の変更。カタログ内インデックスを渡し、Rust 側で ID へ変換して永続化し、
+    // 未取得ならダウンロードを開始する（whisper モデルの変更と同じ）。
+    callback change-summary-model(int);
 
     VerticalLayout {
         alignment: start;
@@ -410,11 +424,43 @@ export component AppWindow inherits Window {
                         }
                     }
 
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text {
+                            // whisper の「Model」と同じセクションに並ぶので、どちらのモデルか
+                            // 分かるラベルにする。
+                            text: "Minutes model";
+                            font-size: Style.body-size;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                            color: Palette.foreground;
+                        }
+
+                        ComboBox {
+                            model: root.summary-models;
+                            current-index: root.summary-model-index;
+                            enabled: transcribe-deps.enabled-gate;
+                            selected => {
+                                root.summary-model-index = self.current-index;
+                                root.change-summary-model(self.current-index);
+                            }
+                        }
+                    }
+
+                    if root.summary-model-detail != "": Text {
+                        // 選択中モデルの説明（例: 55 s and 8.2 GB of memory for a 4-min meeting,
+                        // more faithful）。ComboBox の行は箱幅で省略されるので、選ぶ材料になる
+                        // 目安はここで全文を読めるようにする（折り返す）。
+                        text: root.summary-model-detail;
+                        wrap: word-wrap;
+                        font-size: Style.caption-size;
+                        color: Palette.foreground.transparentize(Style.muted-alpha);
+                    }
+
                     Text {
-                        // 要約 LLM の名前と取得状況（Rust 側が組み立てる。例:
-                        // Qwen2.5 7B Instruct — Not downloaded — downloads automatically (4.4 GB)）。
-                        // モデル名が付くぶん whisper の状態行より長く、1 行では収まらないので
-                        // 折り返す（ウィンドウ高はこの 2 行を見込んだ値にしてある）。
+                        // 選択中モデルの取得状況（Rust 側が組み立てる。whisper の状態行と同じ形。
+                        // 例: Not downloaded — downloads automatically (4.4 GB)）。モデルパスを
+                        // 上書きしている場合の文言は 1 行に収まらないので折り返す。
                         text: root.summary-model-status;
                         wrap: word-wrap;
                         font-size: Style.caption-size;

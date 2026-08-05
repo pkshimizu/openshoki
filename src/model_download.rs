@@ -78,6 +78,23 @@ pub fn format_size(bytes: u64) -> String {
     }
 }
 
+/// 識別子 → カタログ内インデックス。カタログ外（設定の手編集値）は `default_id` の位置へ
+/// フォールバックする（値自体は書き換えず、表示だけ既定位置になる）。
+///
+/// 種別ごとのカタログが同じ解決をするための正（`whisper_model::model_index` /
+/// `summary_model::model_index` から呼ぶ）。設定画面の ComboBox の選択位置に使う。
+pub fn catalog_index(catalog: &[ModelSpec], id: &str, default_id: &str) -> usize {
+    catalog
+        .iter()
+        .position(|spec| spec.id == id)
+        .unwrap_or_else(|| {
+            catalog
+                .iter()
+                .position(|spec| spec.id == default_id)
+                .expect("the default model id is always in the catalog")
+        })
+}
+
 /// モデルの取得状況。設定画面の表示と二重ダウンロード防止に使う。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DownloadStatus {

@@ -13,9 +13,12 @@ use crate::model_download::ModelSpec;
 /// ように使う（whisper 側の `Whisper speech` と見分けるための語）。
 const KIND: &str = "Summary LLM";
 
-/// 選べるモデルの一覧（小さい順）。設定画面の選択 UI はまだ無く（issue 未起票。#81 は
-/// Recordings ウィンドウでの表示・手動生成なので別件）、現状は設定 `summary_model` の
-/// 手編集で切り替える。
+/// 選べるモデルの一覧（小さい順）。設定画面の ComboBox はこの順で並ぶため、モデルを足すときは
+/// ここへ 1 エントリ追加するだけでよい（whisper 側と同じ）。
+///
+/// `description` には **4 分の会議での所要時間とピーク RSS の目安**（#78 の計測値）を先に置く。
+/// 数 GB のダウンロードと数十秒・数 GB の実行コストが選択で決まるので、選ぶ前に読めるように
+/// する（元プランの「設定画面では所要時間とメモリの目安を添えること」）。
 ///
 /// URL・SHA-256 は HuggingFace の LFS メタデータより。モデルを追加・差し替えるときは
 /// URL と SHA-256 を必ずペアで更新する。
@@ -28,7 +31,7 @@ pub const CATALOG: &[ModelSpec] = &[
         kind: KIND,
         id: "qwen2.5-3b-instruct-q4-k-m",
         display_name: "Qwen2.5 3B Instruct",
-        description: "faster and lighter, but can invent details",
+        description: "25 s and 3.7 GB of memory for a 4-min meeting, but can invent details",
         size_bytes: 2_104_932_768,
         filename: "qwen2.5-3b-instruct-q4_k_m.gguf",
         url: "https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/qwen2.5-3b-instruct-q4_k_m.gguf",
@@ -38,7 +41,7 @@ pub const CATALOG: &[ModelSpec] = &[
         kind: KIND,
         id: "qwen2.5-7b-instruct-q4-k-m",
         display_name: "Qwen2.5 7B Instruct",
-        description: "more faithful, about twice the time and memory",
+        description: "55 s and 8.2 GB of memory for a 4-min meeting, more faithful",
         size_bytes: 4_683_074_240,
         filename: "Qwen2.5-7B-Instruct-Q4_K_M.gguf",
         url: "https://huggingface.co/bartowski/Qwen2.5-7B-Instruct-GGUF/resolve/main/Qwen2.5-7B-Instruct-Q4_K_M.gguf",
@@ -67,6 +70,12 @@ pub fn spec_or_default(id: &str) -> &'static ModelSpec {
     spec_for(id).unwrap_or_else(default_spec)
 }
 
+/// 識別子 → カタログ内インデックス。カタログ外（手編集値）は既定モデルの位置へ
+/// フォールバックする（解決は共有基盤の `catalog_index` が正。whisper 側と同じ挙動になる）。
+pub fn model_index(id: &str) -> usize {
+    crate::model_download::catalog_index(CATALOG, id, DEFAULT_MODEL_ID)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,7 +102,23 @@ mod tests {
             );
             // 種別はログの見分けに使うので、カタログ内で揃っていること。
             assert_eq!(spec.kind, KIND, "unexpected kind for {}", spec.id);
+            // 設定画面は description をそのまま選択肢に出す。所要時間とメモリの目安を
+            // 書き忘れると、ユーザーが選ぶ材料（#119 の受け入れ条件）を失うので形で見る。
+            assert!(
+                spec.description.contains(" s and ")
+                    && spec.description.contains(" of memory for a "),
+                "description should carry the time and memory estimate: {}",
+                spec.id
+            );
         }
+    }
+
+    #[test]
+    fn model_index_resolves_known_and_falls_back() {
+        assert_eq!(model_index("qwen2.5-3b-instruct-q4-k-m"), 0);
+        assert_eq!(CATALOG[model_index(DEFAULT_MODEL_ID)].id, DEFAULT_MODEL_ID);
+        // カタログ外は既定モデルの位置へ（先頭ではなく既定の位置に落ちることを見る）。
+        assert_eq!(CATALOG[model_index("no-such-model")].id, DEFAULT_MODEL_ID);
     }
 
     #[test]
