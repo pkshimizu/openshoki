@@ -175,7 +175,8 @@ impl ModelDownloader {
     ///   （同一モデルの待ちにさえ上限つきタイムアウトが必要になっている。`ensure_model`）。
     ///
     /// 並走で本当に困るのはディスクなので、そちらは埋め尽くしを**上限ではなく事前確認**で防ぐ:
-    /// 受信サイズの上限（`max_download_bytes`）と、開始前の空き容量確認（`space_check_reason`）。
+    /// 受信サイズの上限（`max_download_bytes`）と、開始前の空き容量確認
+    /// （`insufficient_space_reason_for_dir`）。
     /// 確認に落ちた取得は**待たせずに失敗させる**（この doc の 2 点目のとおり、待たせる害を
     /// 避けるため）。文字起こし中なら当該セッションのジョブが失敗し、次のジョブ・設定画面での
     /// 再選択で再試行される（自動リトライは無い）。
@@ -250,8 +251,8 @@ impl ModelDownloader {
         }
 
         // 担当を引き受けた区間は番人で囲み、結果の記録もそれに任せる（理由と後始末の契約は
-        // `DownloadGuard` の doc）。この行を消すと、取得中のパニックで状態が `Downloading` の
-        // まま残る——テストでは捕まらないので消さないこと。
+        // `DownloadGuard` の doc）。この 2 行の組（囲む・`finish` に記録させる）を崩すと、
+        // 取得中のパニックで状態が `Downloading` のまま残る——テストでは捕まらないので崩さないこと。
         let guard = DownloadGuard::new(self, spec.id);
         guard.finish(download_model(spec, &path, self))?;
         Ok(path)
@@ -259,7 +260,7 @@ impl ModelDownloader {
 
     /// 走っている**他の**ダウンロードの残りバイト合計（`except_model_id` 自身は除く。
     /// `ensure_model` は取得開始時に自分を `Downloading` へ遷移させるので、除かないと自分の
-    /// サイズを二重に要求してしまう）。差し引く理由は `insufficient_space_reason` の doc。
+    /// サイズを二重に要求してしまう）。必要量へ加算する理由は `insufficient_space_reason` の doc。
     ///
     /// 既に書けたぶん（`received`）は空き容量に反映済みなので残りだけを数える。進捗の更新は
     /// `PROGRESS_STEP_BYTES` 刻みで遅れるが、その遅れは残りを多めに見る＝安全側に転ぶ。
@@ -321,7 +322,7 @@ impl<'a> DownloadGuard<'a> {
     ///
     /// 記録と解除をここにまとめてあるので、呼び出し側は順序を気にしなくてよい（`Drop` の中で
     /// 状態マップのロックを取るため、外でロックを保持したまま解除すると自己デッドロックする。
-    /// その順序制約をコメントで守らせない形にしてある）。
+    /// その順序制約はコメントではなく実装で守る形にしてある）。
     fn finish(
         mut self,
         result: Result<(), Box<dyn std::error::Error>>,
@@ -369,6 +370,9 @@ const RECV_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12
 /// 正常な待機を途中で打ち切らない。
 const WAIT_FOR_OTHER_DOWNLOAD_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(130 * 60);
+
+/// 不足ぶんを表示するときの単位。この単位へ切り上げて出す（`insufficient_space_reason`）。
+const REPORTED_SHORTFALL_UNIT_BYTES: u64 = 1024 * 1024;
 
 /// モデルの取得後に残しておく空き容量（`insufficient_space_reason`）。数 GB のモデルで
 /// ディスクを 0 まで埋めると、録音の書き出しも OS 自体も道連れにする。128 kbps・2 音源で
@@ -455,20 +459,28 @@ fn insufficient_space_reason(
     if available >= needed {
         return None;
     }
-    // 1MB 未満は `format_size` が「0 MB」と出してしまい、「0 MB 空けろ」という指示にならない
-    // 表示になる。少なくとも 1MB と言い切る（多めに見ても通れば同じこと）。
-    let shortfall = (needed - available).max(1024 * 1024);
-    Some(if in_flight >= needed - available {
+    let shortfall = needed - available;
+    // 表示は MB 単位へ**切り上げ**る。`format_size` は端数を丸めるので、そのまま出すと
+    // 「0 MB 空けろ」（1MB 未満）や、言われたぶんを空けても足りない値（切り下げ側）になり、
+    // 指示として成立しない。多めに言うぶんには実害が無い。
+    // 掛け戻しは飽和させる（見積もりが `u64::MAX` へ飽和した異常系で、切り上げの掛け算が
+    // オーバーフローしてパニックしないように）。
+    let reported = shortfall
+        .div_ceil(REPORTED_SHORTFALL_UNIT_BYTES)
+        .saturating_mul(REPORTED_SHORTFALL_UNIT_BYTES);
+    // 並走ぶんが終わるだけで不足が埋まるなら、待つのも手だと添える（埋まらないなら待っても
+    // 足りないので添えない）。
+    Some(if in_flight >= shortfall {
         format!(
             "not enough free disk space for {} — free up about {} or wait for the downloads in progress to finish",
             spec.display_name,
-            format_size(shortfall)
+            format_size(reported)
         )
     } else {
         format!(
             "not enough free disk space for {} — free up about {} and try again",
             spec.display_name,
-            format_size(shortfall)
+            format_size(reported)
         )
     })
 }
@@ -732,7 +744,7 @@ mod tests {
     }
 
     /// 空き容量の判定は「受信上限＋余白＋並走ぶんの残り」で見る（#120。上限を設けない代わりの
-    /// 歯止めなので、並走ぶんを差し引かないと 2 本で溢れる）。
+    /// 歯止めなので、並走ぶんを必要量へ加算しないと 2 本で溢れる）。
     #[test]
     fn insufficient_space_reason_counts_margin_and_other_downloads() {
         // 受信上限は 1,126 バイト。余白 100・並走なしなら 1,226 でちょうど足りる。
@@ -753,12 +765,13 @@ mod tests {
     fn insufficient_space_reason_tells_how_much_to_free() {
         const MB: u64 = 1024 * 1024;
 
-        // 受信上限 1,126 ＋ 余白 3MB に対して空き 1MB → 不足は約 2MB。並走なしなので待てない。
+        // 受信上限 1,126 ＋ 余白 3MB に対して空き 1MB → 不足は 2MB 強で、MB 単位へ切り上げて 3MB。
+        // 並走が無いので「空けて再試行」だけを案内する。
         let alone = insufficient_space_reason(&FAKE_LLM_MODEL, MB, 0, 3 * MB)
             .expect("less than the needed space should be refused");
         assert_eq!(
             alone,
-            "not enough free disk space for Test LLM — free up about 2 MB and try again"
+            "not enough free disk space for Test LLM — free up about 3 MB and try again"
         );
 
         // 必要は 3MB＋受信上限、空きは 1MB＋受信上限 → 不足 2MB。並走ぶん 3MB に収まるので待てる。
@@ -778,7 +791,16 @@ mod tests {
             "waiting does not help here: {not_waitable}"
         );
 
-        // 1MB 未満の不足は「0 MB 空けろ」にならないよう 1MB へ丸める。
+        // 並走ぶんと不足がちょうど同じなら、待つだけで足りる（`>=` の等号側。`>` に狭めると
+        // 「待てば解ける状況で空けろと言う」表示になる）。
+        let exactly_waitable = insufficient_space_reason(&FAKE_LLM_MODEL, 1_226, 1, 100)
+            .expect("one byte short should be refused");
+        assert!(
+            exactly_waitable.ends_with("to finish"),
+            "waiting alone is enough here: {exactly_waitable}"
+        );
+
+        // 1MB 未満の不足は「0 MB 空けろ」にならないよう、切り上げて 1MB と言い切る。
         let tiny = insufficient_space_reason(&FAKE_LLM_MODEL, 1_226 - 1, 0, 100)
             .expect("one byte short should be refused");
         assert_eq!(
