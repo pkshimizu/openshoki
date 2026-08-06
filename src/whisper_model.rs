@@ -104,17 +104,9 @@ pub fn spec_or_default(id: &str) -> &'static ModelSpec {
 }
 
 /// 識別子 → カタログ内インデックス。カタログ外（手編集値）は既定モデルの位置へ
-/// フォールバックする（値自体は書き換えず、表示だけ既定位置になる）。
+/// フォールバックする（解決は共有基盤の `catalog_index` が正。要約 LLM 側と同じ挙動になる）。
 pub fn model_index(id: &str) -> usize {
-    CATALOG
-        .iter()
-        .position(|spec| spec.id == id)
-        .unwrap_or_else(|| {
-            CATALOG
-                .iter()
-                .position(|spec| spec.id == DEFAULT_MODEL_ID)
-                .expect("the default model id is always in the catalog")
-        })
+    crate::model_download::catalog_index(CATALOG, id, DEFAULT_MODEL_ID)
 }
 
 #[cfg(test)]
@@ -124,11 +116,10 @@ mod tests {
 
     #[test]
     fn catalog_is_consistent() {
-        // 種別を問わない検査（ID・ファイル名の重複、SHA-256 の形式、サイズ）は共有基盤の
-        // 正を呼ぶ。ここには whisper 固有の条件だけ書く。
-        crate::model_download::catalog_checks::assert_valid(CATALOG);
+        // 種別を問わない検査（ID・ファイル名の重複、SHA-256 の形式、サイズ、既定 ID の存在）は
+        // 共有基盤の正を呼ぶ。ここには whisper 固有の条件だけ書く。
+        crate::model_download::catalog_checks::assert_valid(CATALOG, DEFAULT_MODEL_ID);
 
-        assert!(spec_for(DEFAULT_MODEL_ID).is_some());
         for spec in CATALOG {
             // 配布元の URL は保存ファイル名で終わる（追加・差し替え時の取り違えを検知する）。
             assert!(

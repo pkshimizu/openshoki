@@ -63,15 +63,24 @@ fn main() {
         slint::SharedString::from("Small — 465 MB — balanced speed and accuracy"),
     ]))));
     win.set_whisper_model_status("Not downloaded — downloads automatically (465 MB)".into());
-    win.set_auto_summarize(true);
+    // 要約 LLM は選択肢・説明行（選択中の選択肢の全文）・状態行の 3 段。いちばん背が高くなる
+    // 組み合わせで見る: 議事録要約は OFF（状態行が取得の契機を説明する長い文言になる）＋
+    // 説明が最長の 3B を選択中（`src/summary_model.rs` の description の複製。あちらを
+    // 変えたらここも合わせること）。
+    win.set_auto_summarize(false);
+    win.set_summary_models(ModelRc::from(Rc::new(VecModel::from(vec![
+        slint::SharedString::from(
+            "Qwen2.5 3B Instruct — 2.0 GB — 25 s and 3.7 GB of memory for a 4-min meeting, but can invent details",
+        ),
+    ]))));
     win.set_summary_model_status(
-        "Qwen2.5 7B Instruct — Not downloaded — downloads automatically (4.4 GB)".into(),
+        "Not downloaded — downloads when meeting minutes are on (2.0 GB)".into(),
     );
 
     win.window()
         .set_position(slint::LogicalPosition::new(60.0, 60.0));
     // 実アプリと同じ寸法で見る（`src/main.rs` の WINDOW_WIDTH/HEIGHT と一致させること）。
-    win.window().set_size(slint::LogicalSize::new(420.0, 840.0));
+    win.window().set_size(slint::LogicalSize::new(420.0, 900.0));
     win.show()
         .expect("showing the window should succeed in this verification binary");
 

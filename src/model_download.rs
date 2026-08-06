@@ -14,7 +14,8 @@
 //!
 //! モデル種別ごとのカタログ（`ModelSpec` の配列）は各モジュールが持つ
 //! （whisper なら `crate::whisper_model::CATALOG`）。このモジュールは「1 つの `ModelSpec` を
-//! 取ってきて置く」ことだけを担う。
+//! 取ってきて置く」ことと、**カタログに対する種別非依存の解決・検査**（`catalog_index` と
+//! `catalog_checks`）だけを担う。種別固有の中身（どのモデルを載せるか）には触らない。
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -78,6 +79,23 @@ pub fn format_size(bytes: u64) -> String {
     }
 }
 
+/// 識別子 → カタログ内インデックス。カタログ外（設定の手編集値）は `default_id` の位置へ
+/// フォールバックする（値自体は書き換えず、表示だけ既定位置になる）。
+///
+/// 種別ごとのカタログが同じ解決をするための正（`whisper_model::model_index` /
+/// `summary_model::model_index` から呼ぶ）。設定画面の ComboBox の選択位置に使う。
+pub fn catalog_index(catalog: &[ModelSpec], id: &str, default_id: &str) -> usize {
+    catalog
+        .iter()
+        .position(|spec| spec.id == id)
+        .unwrap_or_else(|| {
+            catalog
+                .iter()
+                .position(|spec| spec.id == default_id)
+                .expect("the default model id is always in the catalog")
+        })
+}
+
 /// モデルの取得状況。設定画面の表示と二重ダウンロード防止に使う。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DownloadStatus {
@@ -138,9 +156,10 @@ impl ModelDownloader {
     /// 呼ぶ利用側だけが行えばよい）。結果は状態マップとログに残る。
     ///
     /// 同時ダウンロード数の上限は持たない。whisper（最大 2.9GB）と要約 LLM（最大 4.4GB）の
-    /// 2 種別があり、UI 起点の whisper 取得とワーカー起点の要約 LLM 取得は**並走しうる**
-    /// （推論を直列化する `crate::inference_slot` は、待たせても意味が無いダウンロードを
-    /// 対象にしていない）。合計 7GB 超の同時受信になるが、上限を設けるかは未検討。
+    /// 2 種別があり、どちらも UI 起点（設定画面での選択）とワーカー起点（`ensure_model`）を
+    /// 持つため**並走しうる**（推論を直列化する `crate::inference_slot` は、待たせても意味が
+    /// 無いダウンロードを対象にしていない）。さらに同種別で別モデルを選び直しても先の取得は
+    /// 中断しないので、最悪では 3 本以上・10GB 級の同時受信になる。上限・中断を設けるかは未検討。
     pub fn request_download(&self, spec: &'static ModelSpec) {
         match self.status_of(spec) {
             DownloadStatus::Downloaded | DownloadStatus::Downloading { .. } => return,
@@ -401,8 +420,15 @@ fn write_verified(
 pub(crate) mod catalog_checks {
     use super::{ModelSpec, is_plain_filename};
 
-    /// 種別を問わず満たすべき条件。カタログ**内**の重複と、各エントリの形を見る。
-    pub(crate) fn assert_valid(catalog: &[ModelSpec]) {
+    /// 種別を問わず満たすべき条件。カタログ**内**の重複と、各エントリの形、そして
+    /// **既定 ID がカタログに在ること**を見る。最後のひとつは `catalog_index` と各カタログの
+    /// `default_spec` が持つ `expect`（「既定 ID は必ずカタログに在る」）の根拠で、種別が
+    /// 増えても検査し忘れないようここに置く。
+    pub(crate) fn assert_valid(catalog: &[ModelSpec], default_id: &str) {
+        assert!(
+            catalog.iter().any(|spec| spec.id == default_id),
+            "the default id {default_id} is not in the catalog"
+        );
         for (i, spec) in catalog.iter().enumerate() {
             assert!(
                 catalog.iter().skip(i + 1).all(|other| other.id != spec.id),
@@ -433,9 +459,18 @@ pub(crate) mod catalog_checks {
         }
     }
 
-    /// 全カタログの登録簿。**種別を足したらここに 1 行足す**。下のテストが横断で一意性を見る。
-    const ALL_CATALOGS: &[&[ModelSpec]] =
-        &[crate::whisper_model::CATALOG, crate::summary_model::CATALOG];
+    /// 全カタログの登録簿（カタログと、その既定 ID）。**種別を足したらここに 1 行足す**。
+    /// 下のテストが横断で一意性を見る。
+    const ALL_CATALOGS: &[(&[ModelSpec], &str)] = &[
+        (
+            crate::whisper_model::CATALOG,
+            crate::whisper_model::DEFAULT_MODEL_ID,
+        ),
+        (
+            crate::summary_model::CATALOG,
+            crate::summary_model::DEFAULT_MODEL_ID,
+        ),
+    ];
 
     /// 登録簿のカタログすべてが健全で、ID とファイル名は種別をまたいで一意
     /// （状態マップのキーと保存先が種別で混ざらないように）。
@@ -444,11 +479,14 @@ pub(crate) mod catalog_checks {
     /// （各カタログのテストからも呼べるが、呼び忘れてもここで捕まる）。
     #[test]
     fn registered_catalogs_are_valid_and_globally_unique() {
-        for catalog in ALL_CATALOGS {
-            assert_valid(catalog);
+        for (catalog, default_id) in ALL_CATALOGS {
+            assert_valid(catalog, default_id);
         }
 
-        let specs: Vec<&ModelSpec> = ALL_CATALOGS.iter().flat_map(|c| c.iter()).collect();
+        let specs: Vec<&ModelSpec> = ALL_CATALOGS
+            .iter()
+            .flat_map(|(catalog, _)| catalog.iter())
+            .collect();
         for (i, spec) in specs.iter().enumerate() {
             for other in specs.iter().skip(i + 1) {
                 assert_ne!(spec.id, other.id, "id {} is used by two catalogs", spec.id);

@@ -202,7 +202,8 @@ pub struct Config {
     #[serde(default, deserialize_with = "deserialize_bool_or_false")]
     pub auto_summarize: bool,
     /// 使用する内蔵要約 LLM の識別子（`summary_model::CATALOG` の `id`。既定は 7B）。
-    /// 設定画面の選択 UI はまだ無く、切り替えは config の手編集で行う（軽い 3B を選べる）。
+    /// 設定画面の ComboBox で選ぶ（軽い 3B も選べる）。選択した時点で未取得のモデルの取得を
+    /// 始めるかは設定次第（正は `main::summary_model_downloads_on_select` の doc コメント）。
     /// カタログ外の手編集値は使用時に既定へフォールバックする。
     #[serde(
         default = "default_summary_model",
