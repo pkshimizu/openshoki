@@ -155,11 +155,29 @@ impl ModelDownloader {
     /// 取得済み・ダウンロード中ならスレッドを立てずに戻る（DL 中の完了待ちは `ensure_model` を
     /// 呼ぶ利用側だけが行えばよい）。結果は状態マップとログに残る。
     ///
-    /// 同時ダウンロード数の上限は持たない。whisper（最大 2.9GB）と要約 LLM（最大 4.4GB）の
-    /// 2 種別があり、どちらも UI 起点（設定画面での選択）とワーカー起点（`ensure_model`）を
-    /// 持つため**並走しうる**（推論を直列化する `crate::inference_slot` は、待たせても意味が
-    /// 無いダウンロードを対象にしていない）。さらに同種別で別モデルを選び直しても先の取得は
-    /// 中断しないので、最悪では 3 本以上・10GB 級の同時受信になる。上限・中断を設けるかは未検討。
+    /// **同時ダウンロード数の上限は持たない**（#120 で判断。以下がその根拠）。whisper（最大
+    /// 2.9GB）と要約 LLM（最大 4.4GB）の 2 種別があり、どちらも UI 起点（設定画面での選択）と
+    /// ワーカー起点（`ensure_model`）を持つため**並走しうる**（推論を直列化する
+    /// `crate::inference_slot` は、待たせても意味が無いダウンロードを対象にしていない）。
+    /// さらに同種別で別モデルを選び直しても先の取得は中断しないので、最悪では 3 本以上・
+    /// 10GB 級の同時受信になる。それでも上限を入れないのは:
+    ///
+    /// - 直列化しても**受信の総バイトは変わらない**。帯域は共有されるだけなので「両方そろう
+    ///   時刻」はほぼ同じで、早まるのは先頭の 1 本だけ。しかも実際の順序（文字起こし →
+    ///   その結果を入力にする要約）では先に要る whisper が先に要求されるので、並走でも
+    ///   「後で要るほうが先に終わる」逆転は起きにくい。
+    /// - 種別をまたいで直列化すると、**逐次ワーカーが無関係な取得を待つ**ことになる。
+    ///   文字起こしのワーカーが要約 LLM の 4.4GB を待って数十分止まるのは、帯域を分け合う
+    ///   不利より体感の害が大きい（`crate::inference_slot` がダウンロードを対象外にしたのと
+    ///   同じ判断）。
+    /// - 待ちを増やすと「担当スレッドが死んで状態が `Downloading` のまま残る」ときの影響範囲が
+    ///   広がる。同一モデルの待ちにさえ上限つきタイムアウトが必要になっている（`ensure_model`）。
+    ///
+    /// 並走で本当に困るのはディスクなので、そちらは埋め尽くしを**上限ではなく事前確認**で防ぐ:
+    /// 受信サイズの上限（`max_download_bytes`）と、開始前の空き容量確認
+    /// （`insufficient_space_reason`。並走している他の取得の残りバイトも差し引く）。
+    ///
+    /// 同種別で別モデルを選び直したときに先の取得を打ち切る仕組みは別件（#124）。
     pub fn request_download(&self, spec: &'static ModelSpec) {
         match self.status_of(spec) {
             DownloadStatus::Downloaded | DownloadStatus::Downloading { .. } => return,
@@ -241,6 +259,26 @@ impl ModelDownloader {
         }
     }
 
+    /// 走っている**他の**ダウンロードの残りバイト合計（`except` のモデル自身は除く）。
+    /// 開始前の空き容量確認で差し引く: 並走を許す設計（`request_download` の doc）なので、
+    /// 各自が同じ空きを当てにすると合計では溢れる。
+    ///
+    /// 担当スレッドが結果を記録する前に異常終了すると `Downloading` が残るため、その間は
+    /// 使用量を多めに見積もる（空き容量不足として断る側に転ぶ。`ensure_model` の待ちが
+    /// 同じ状態をタイムアウトで畳むまでの一時的なもの）。
+    fn in_flight_remaining_bytes(&self, except: &str) -> u64 {
+        self.lock()
+            .iter()
+            .filter(|(id, _)| **id != except)
+            .filter_map(|(_, status)| match status {
+                DownloadStatus::Downloading { received, total } => {
+                    Some(total.saturating_sub(*received))
+                }
+                _ => None,
+            })
+            .sum()
+    }
+
     /// テスト用: 状態を直接注入する（表示ロジックをディスク・ネットワーク非依存で検証する）。
     #[cfg(test)]
     pub(crate) fn set_status_for_test(&self, spec: &'static ModelSpec, status: DownloadStatus) {
@@ -306,6 +344,35 @@ fn max_download_bytes(spec: &ModelSpec) -> u64 {
     spec.size_bytes + spec.size_bytes / 10
 }
 
+/// 取得後に残しておく空き容量。数 GB のモデルでディスクを 0 まで埋めると、録音の書き出しも
+/// OS 自体も道連れにするため、モデルの取り分とは別に確保する。
+const DISK_HEADROOM_BYTES: u64 = 512 * 1024 * 1024;
+
+/// 取得を始める前に空き容量が足りているかを判定し、足りなければ理由（ユーザーに出す文言）を返す。
+///
+/// 見積もりは「受信の上限（`max_download_bytes`）＋ 残す余白 ＋ 並走している他の取得の残り」。
+/// 一時ファイルは同じボリュームへ書いて rename するので、モデル 1 本ぶんのピークは 2 倍に
+/// ならない。`headroom` はテスト容易性のため引数で受ける（`write_verified` の `max_bytes` と同じ）。
+fn insufficient_space_reason(
+    spec: &ModelSpec,
+    available: u64,
+    in_flight: u64,
+    headroom: u64,
+) -> Option<String> {
+    let needed = max_download_bytes(spec)
+        .saturating_add(headroom)
+        .saturating_add(in_flight);
+    if available >= needed {
+        return None;
+    }
+    Some(format!(
+        "not enough free disk space for {} — needs about {}, {} available",
+        spec.display_name,
+        format_size(needed),
+        format_size(available)
+    ))
+}
+
 /// モデルをダウンロードして `dest` へ原子的に配置し、進捗を状態マップへ反映する。
 fn download_model(
     spec: &'static ModelSpec,
@@ -316,6 +383,22 @@ fn download_model(
         // モデルは公開配布物で機微データではないため、権限は OS 既定でよい
         // （録音データの 0700/0600 とは扱いが異なる）。
         std::fs::create_dir_all(parent)?;
+        // 受信を始める前に空き容量を見る。埋めてから ENOSPC で落ちると、帯域を数 GB 無駄にした
+        // うえにディスクが枯渇した状態で失敗する（録音の書き出しも巻き込む）。
+        match fs2::available_space(parent) {
+            Ok(available) => {
+                let in_flight = downloader.in_flight_remaining_bytes(spec.id);
+                if let Some(reason) =
+                    insufficient_space_reason(spec, available, in_flight, DISK_HEADROOM_BYTES)
+                {
+                    return Err(reason.into());
+                }
+            }
+            // 空きが読めないだけで取得を諦めるほどではない（受信上限と ENOSPC の失敗が残る）。
+            Err(err) => eprintln!(
+                "Continuing without the free-space check because reading the available space failed: {err}"
+            ),
+        }
     }
     println!(
         "Downloading the {} model {} (about {})",
@@ -553,6 +636,57 @@ mod tests {
     #[test]
     fn max_download_bytes_allows_ten_percent_over() {
         assert_eq!(max_download_bytes(&FAKE_LLM_MODEL), 1_024 + 102);
+    }
+
+    /// 空き容量の判定は「受信上限＋余白＋並走ぶんの残り」で見る（#120。上限を設けない代わりの
+    /// 歯止めなので、並走ぶんを差し引かないと 2 本で溢れる）。
+    #[test]
+    fn insufficient_space_reason_counts_margin_and_other_downloads() {
+        // 受信上限は 1,126 バイト。余白 100・並走なしなら 1,226 でちょうど足りる。
+        assert!(insufficient_space_reason(&FAKE_LLM_MODEL, 1_226, 0, 100).is_none());
+        assert!(insufficient_space_reason(&FAKE_LLM_MODEL, 1_225, 0, 100).is_some());
+        // 並走ぶん（他の取得の残り）を足した分だけ余分に要る。
+        assert!(insufficient_space_reason(&FAKE_LLM_MODEL, 1_226, 1, 100).is_some());
+        assert!(insufficient_space_reason(&FAKE_LLM_MODEL, 1_227, 1, 100).is_none());
+        // 文言はモデル名と必要量・空きが読み取れること（状態行に出る）。
+        let reason = insufficient_space_reason(&FAKE_LLM_MODEL, 0, 0, 512 * 1024 * 1024)
+            .expect("zero available space should be refused");
+        assert_eq!(
+            reason,
+            "not enough free disk space for Test LLM — needs about 512 MB, 0 MB available"
+        );
+    }
+
+    /// 並走ぶんの残りバイトは、自分以外の `Downloading` だけを数える。
+    #[test]
+    fn in_flight_remaining_bytes_skips_self_and_finished_downloads() {
+        let downloader = ModelDownloader::new();
+        downloader.set_status_for_test(
+            &FAKE_SPEECH_MODEL,
+            DownloadStatus::Downloading {
+                received: 500,
+                total: 2_048,
+            },
+        );
+        // 自分の分は数えない（`ensure_model` が取得開始時に Downloading へ遷移させるため、
+        // 数えると自分のサイズを二重に要求してしまう）。
+        downloader.set_status_for_test(
+            &FAKE_LLM_MODEL,
+            DownloadStatus::Downloading {
+                received: 0,
+                total: 1_024,
+            },
+        );
+        assert_eq!(
+            downloader.in_flight_remaining_bytes(FAKE_LLM_MODEL.id),
+            2_048 - 500
+        );
+
+        // 終わった取得・失敗した取得は残りバイトを持たない。
+        downloader.set_status_for_test(&FAKE_SPEECH_MODEL, DownloadStatus::Downloaded);
+        assert_eq!(downloader.in_flight_remaining_bytes(FAKE_LLM_MODEL.id), 0);
+        downloader.set_status_for_test(&FAKE_SPEECH_MODEL, DownloadStatus::Failed("boom".into()));
+        assert_eq!(downloader.in_flight_remaining_bytes(FAKE_LLM_MODEL.id), 0);
     }
 
     #[test]
