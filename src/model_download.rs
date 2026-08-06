@@ -171,8 +171,8 @@ impl ModelDownloader {
     ///   文字起こしのワーカーが要約 LLM の 4.4GB を待って数十分止まるのは、帯域を分け合う
     ///   不利より体感の害が大きい（`crate::inference_slot` がダウンロードを対象外にしたのと
     ///   同じ判断）。
-    /// - 待ちを増やすと「担当スレッドが死んで状態が `Downloading` のまま残る」ときの影響範囲が
-    ///   広がる。同一モデルの待ちにさえ上限つきタイムアウトが必要になっている（`ensure_model`）。
+    /// - 待ちを増やすと「担当が進まないまま状態が `Downloading` で残る」ときの影響範囲が広がる
+    ///   （同一モデルの待ちにさえ上限つきタイムアウトが必要になっている。`ensure_model`）。
     ///
     /// 並走で本当に困るのはディスクなので、そちらは埋め尽くしを**上限ではなく事前確認**で防ぐ:
     /// 受信サイズの上限（`max_download_bytes`）と、開始前の空き容量確認（`space_check_reason`）。
@@ -211,10 +211,11 @@ impl ModelDownloader {
         spec: &'static ModelSpec,
     ) -> Result<PathBuf, Box<dyn std::error::Error>> {
         let path = model_path(spec).ok_or("Cannot determine the data directory")?;
-        // 待機の上限。担当スレッドが結果を記録する前に異常終了すると状態が Downloading の
-        // まま残り、上限なしでは待機側（逐次のワーカー等）が永久に固まって以後のジョブが
-        // 黙って止まる。DL 全体のタイムアウトより長い上限で打ち切り、エラーとして返す
-        // （次のジョブ・次の選択で再試行される）。
+        // 待機の上限。担当スレッドが**進まない**（無応答接続、Drop が走らない `abort` 等）と
+        // 状態が Downloading のまま残り、上限なしでは待機側（逐次のワーカー等）が永久に固まって
+        // 以後のジョブが黙って止まる。DL 全体のタイムアウトより長い上限で打ち切り、エラーとして
+        // 返す（次のジョブ・次の選択で再試行される）。unwind するパニックで担当が消えた場合は
+        // `DownloadGuard` が `Failed` へ倒すので、待機側は次の周回で担当を引き継げる。
         let wait_deadline = std::time::Instant::now() + WAIT_FOR_OTHER_DOWNLOAD_TIMEOUT;
         loop {
             {
@@ -248,25 +249,12 @@ impl ModelDownloader {
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
 
-        // 担当を引き受けた区間は番人で囲む。結果を記録せずに抜けると（取得中のパニック等）
-        // `Downloading` が残り、そのモデルは二度と取得されず（`request_download` は
-        // `Downloading` を見て早期 return する）、空き容量の見積もりも恒久的に過大になる。
+        // 担当を引き受けた区間は番人で囲み、結果の記録もそれに任せる（理由と後始末の契約は
+        // `DownloadGuard` の doc）。この行を消すと、取得中のパニックで状態が `Downloading` の
+        // まま残る——テストでは捕まらないので消さないこと。
         let guard = DownloadGuard::new(self, spec.id);
-        let result = download_model(spec, &path, self);
-        // 正常に戻ったので番人を解除する。**状態マップのロックを取る前**に解除すること
-        // （`Drop` の中でロックを取るため、保持したまま drop すると自己デッドロックする）。
-        guard.disarm();
-        let mut status = self.lock();
-        match result {
-            Ok(()) => {
-                status.insert(spec.id, DownloadStatus::Downloaded);
-                Ok(path)
-            }
-            Err(err) => {
-                status.insert(spec.id, DownloadStatus::Failed(err.to_string()));
-                Err(err)
-            }
-        }
+        guard.finish(download_model(spec, &path, self))?;
+        Ok(path)
     }
 
     /// 走っている**他の**ダウンロードの残りバイト合計（`except_model_id` 自身は除く。
@@ -302,17 +290,22 @@ impl ModelDownloader {
     }
 }
 
-/// 取得を引き受けたスレッドが**結果を必ず状態マップへ残す**ための番人。`disarm` を呼ばずに
-/// drop されたら（取得中のパニック等）`Failed` へ倒す。
+/// 取得を引き受けたスレッドが**結果を必ず状態マップへ残す**ための番人。`finish` で結果を
+/// 記録して解除し、記録せずに drop されたら（取得中のパニック等）`Failed` へ倒す。
 ///
-/// これが無いと `Downloading` が残り、(1) `request_download` が早期 return してそのモデルを
-/// 二度と取得しない、(2) `insufficient_space_reason` の並走ぶんに恒久的に加算されて**他の
-/// モデルの取得まで空き容量不足として断られる**、という詰まりがプロセスの寿命いっぱい続く
-/// （`ensure_model` の待ちのタイムアウトは待ち側を打ち切るだけで、状態は畳まない）。
+/// **ここが `Downloading` の後始末の正**。これが無いと状態が `Downloading` のまま残り、
+/// (1) `request_download` が早期 return してそのモデルを二度と取得しない、
+/// (2) `insufficient_space_reason` の並走ぶんに恒久的に加算されて**他のモデルの取得まで
+/// 空き容量不足として断られる**、という詰まりがプロセスの寿命いっぱい続く（`ensure_model` の
+/// 待ちのタイムアウトは待ち側を打ち切るだけで、状態は畳まない）。
+///
+/// 畳めないのは Drop が走らない終わり方（`abort`・プロセスの強制終了）だけで、そのときは
+/// 状態マップ自体も消えるので詰まりは残らない。
+#[must_use = "the guard must be bound (and finished) or the status stays Downloading on panic"]
 struct DownloadGuard<'a> {
     downloader: &'a ModelDownloader,
     id: &'static str,
-    disarmed: bool,
+    recorded: bool,
 }
 
 impl<'a> DownloadGuard<'a> {
@@ -320,19 +313,33 @@ impl<'a> DownloadGuard<'a> {
         Self {
             downloader,
             id,
-            disarmed: false,
+            recorded: false,
         }
     }
 
-    /// 呼び出し側が結果を記録するので、番人の出番は無い。
-    fn disarm(mut self) {
-        self.disarmed = true;
+    /// 取得の結果を状態マップへ記録し、番人を解除して結果をそのまま返す。
+    ///
+    /// 記録と解除をここにまとめてあるので、呼び出し側は順序を気にしなくてよい（`Drop` の中で
+    /// 状態マップのロックを取るため、外でロックを保持したまま解除すると自己デッドロックする。
+    /// その順序制約をコメントで守らせない形にしてある）。
+    fn finish(
+        mut self,
+        result: Result<(), Box<dyn std::error::Error>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // 記録する値はロックを取る前に作る（`to_string` がパニックしても番人が畳める）。
+        let status = match &result {
+            Ok(()) => DownloadStatus::Downloaded,
+            Err(err) => DownloadStatus::Failed(err.to_string()),
+        };
+        self.downloader.lock().insert(self.id, status);
+        self.recorded = true;
+        result
     }
 }
 
 impl Drop for DownloadGuard<'_> {
     fn drop(&mut self) {
-        if self.disarmed {
+        if self.recorded {
             return;
         }
         // 失敗として記録し、次の要求（次のジョブ・設定画面での再選択）で再試行できる状態に戻す。
@@ -398,13 +405,14 @@ fn max_download_bytes(spec: &ModelSpec) -> u64 {
     spec.size_bytes + spec.size_bytes / 10
 }
 
-/// 保存先の空きを読んで、足りなければ理由（ユーザーに出す文言）を返す。**空きが読めない場合は
-/// 続行**する（`None`）: 読めないだけで機能を落とすのは過剰で、受信サイズの上限と ENOSPC での
-/// 失敗が最後の砦として残る（`docs/rules/error-handling.md` の縮退）。
+/// 保存先の空きを読んで足りなければ拒否の理由（ユーザーに出す文言）を返す
+/// （判定そのものは `insufficient_space_reason`）。**空きが読めない場合は続行**する（`None`）:
+/// 読めないだけで機能を落とすのは過剰で、受信サイズの上限と ENOSPC での失敗が最後の砦として
+/// 残る（`docs/rules/error-handling.md` の縮退）。
 ///
 /// `dir` はモデルの保存先ディレクトリ、`headroom` は残す余白（どちらもテスト容易性のため
 /// 引数で受ける。`write_verified` の `max_bytes` と同じ）。
-fn space_check_reason(
+fn insufficient_space_reason_for_dir(
     dir: &Path,
     spec: &ModelSpec,
     in_flight: u64,
@@ -412,6 +420,8 @@ fn space_check_reason(
 ) -> Option<String> {
     match fs2::available_space(dir) {
         Ok(available) => insufficient_space_reason(spec, available, in_flight, headroom),
+        // `fs2` のエラーは `statvfs` の OS エラー（か NUL 混入）だけでパスを含まないため、
+        // そのままログへ出せる（`docs/rules/security.md`）。
         Err(err) => {
             eprintln!(
                 "Continuing without the free-disk-space check because the available space could not be read: {err}"
@@ -423,14 +433,16 @@ fn space_check_reason(
 
 /// 空き容量が足りているかを判定し、足りなければ「どれだけ空ければよいか」を返す。
 ///
-/// **必要量は「受信の上限（`max_download_bytes`）＋ 残す余白 ＋ 並走している他の取得の残り」**。
-/// 並走ぶんを差し引くのは、同時ダウンロードに上限を持たない設計（`request_download` の doc）で
-/// 各自が同じ空きを当てにすると、合計でディスクが溢れるため。並走ぶんは相手の受信上限
-/// （＋1 割）ではなく残りバイトだけを見る（過剰に断らないための割り切り）。一時ファイルは同じ
-/// ボリュームへ書いて rename するので、モデル 1 本ぶんのピークは 2 倍にならない。
+/// **必要量は「受信の上限（`max_download_bytes`）＋ 残す余白 ＋ 並走している他の取得の残り」**
+/// （空きから差し引くのではなく、必要量へ加算する形で表している）。並走ぶんを見込むのは、同時
+/// ダウンロードに上限を持たない設計（`request_download` の doc）で各自が同じ空きを当てにすると、
+/// 合計でディスクが溢れるため。並走ぶんは相手の受信上限（＋1 割）ではなく残りバイトだけを見る
+/// （過剰に断らないための割り切り）。一時ファイルは同じボリュームへ書いて rename するので、
+/// モデル 1 本ぶんのピークは 2 倍にならない。
 ///
 /// 文言は合算値ではなく**不足ぶん**を出す。合算値だと「4.4GB のモデルに 8GB 要る」と読めて、
-/// 何をすればよいか分からない（並走が原因のときは待てば解ける、も添える）。
+/// 何をすればよいか分からない。並走ぶんだけで不足が埋まるなら「待てば解ける」ことも添える
+/// （埋まらないなら待っても足りないので添えない）。
 fn insufficient_space_reason(
     spec: &ModelSpec,
     available: u64,
@@ -443,10 +455,12 @@ fn insufficient_space_reason(
     if available >= needed {
         return None;
     }
-    let shortfall = needed - available;
-    Some(if in_flight > 0 {
+    // 1MB 未満は `format_size` が「0 MB」と出してしまい、「0 MB 空けろ」という指示にならない
+    // 表示になる。少なくとも 1MB と言い切る（多めに見ても通れば同じこと）。
+    let shortfall = (needed - available).max(1024 * 1024);
+    Some(if in_flight >= needed - available {
         format!(
-            "not enough free disk space for {} — free up about {} or wait for the download in progress to finish",
+            "not enough free disk space for {} — free up about {} or wait for the downloads in progress to finish",
             spec.display_name,
             format_size(shortfall)
         )
@@ -469,10 +483,13 @@ fn download_model(
         // モデルは公開配布物で機微データではないため、権限は OS 既定でよい
         // （録音データの 0700/0600 とは扱いが異なる）。
         std::fs::create_dir_all(parent)?;
-        // 受信を始める前に空きを見る（判定は `space_check_reason`）。埋めてから ENOSPC で落ちると、
-        // 帯域を数 GB 無駄にしたうえにディスクが枯渇した状態で失敗する（録音の書き出しも巻き込む）。
+        // 受信を始める前に空きを見る（判定は `insufficient_space_reason`）。埋めてから ENOSPC で
+        // 落ちると、帯域を数 GB 無駄にしたうえにディスクが枯渇した状態で失敗する（録音の
+        // 書き出しも巻き込む）。
         let in_flight = downloader.in_flight_remaining_bytes(spec.id);
-        if let Some(reason) = space_check_reason(parent, spec, in_flight, DISK_HEADROOM_BYTES) {
+        if let Some(reason) =
+            insufficient_space_reason_for_dir(parent, spec, in_flight, DISK_HEADROOM_BYTES)
+        {
             return Err(reason.into());
         }
     }
@@ -729,33 +746,57 @@ mod tests {
         assert!(insufficient_space_reason(&FAKE_LLM_MODEL, 1_000_000, u64::MAX, 100).is_some());
     }
 
-    /// 文言は合算値ではなく**不足ぶん**を出し、並走が原因なら待てば解けることも示す
-    /// （状態行に `Download failed: {reason}` として出る唯一の説明なので固定する）。
+    /// 文言は合算値ではなく**不足ぶん**を出す。並走ぶんだけで不足が埋まるなら「待てば解ける」も
+    /// 添え、埋まらないなら添えない（待っても足りないため）。状態行に `Download failed: {reason}`
+    /// として出る唯一の説明なので固定する。
     #[test]
     fn insufficient_space_reason_tells_how_much_to_free() {
-        // 必要 1,226 に対して空き 226 → 1,000 バイト（`format_size` は MB 未満を 0 MB と出す）。
-        let alone = insufficient_space_reason(&FAKE_LLM_MODEL, 226, 0, 100)
+        const MB: u64 = 1024 * 1024;
+
+        // 受信上限 1,126 ＋ 余白 3MB に対して空き 1MB → 不足は約 2MB。並走なしなので待てない。
+        let alone = insufficient_space_reason(&FAKE_LLM_MODEL, MB, 0, 3 * MB)
             .expect("less than the needed space should be refused");
         assert_eq!(
             alone,
-            "not enough free disk space for Test LLM — free up about 0 MB and try again"
+            "not enough free disk space for Test LLM — free up about 2 MB and try again"
         );
 
-        let with_other = insufficient_space_reason(&FAKE_LLM_MODEL, 226, 1, 100)
+        // 必要は 3MB＋受信上限、空きは 1MB＋受信上限 → 不足 2MB。並走ぶん 3MB に収まるので待てる。
+        let waitable = insufficient_space_reason(&FAKE_LLM_MODEL, MB + 1_126, 3 * MB, 0)
             .expect("less than the needed space should be refused");
         assert_eq!(
-            with_other,
-            "not enough free disk space for Test LLM — free up about 0 MB or wait for the download in progress to finish"
+            waitable,
+            "not enough free disk space for Test LLM — free up about 2 MB or wait for the downloads in progress to finish"
+        );
+
+        // 並走ぶんがあっても、それだけでは埋まらない不足は「空けて再試行」を案内する
+        // （待っても足りないのに待たせない）。
+        let not_waitable = insufficient_space_reason(&FAKE_LLM_MODEL, MB, MB, 5 * MB)
+            .expect("less than the needed space should be refused");
+        assert!(
+            not_waitable.ends_with("and try again"),
+            "waiting does not help here: {not_waitable}"
+        );
+
+        // 1MB 未満の不足は「0 MB 空けろ」にならないよう 1MB へ丸める。
+        let tiny = insufficient_space_reason(&FAKE_LLM_MODEL, 1_226 - 1, 0, 100)
+            .expect("one byte short should be refused");
+        assert_eq!(
+            tiny,
+            "not enough free disk space for Test LLM — free up about 1 MB and try again"
         );
     }
 
     /// 空きが読めないときは確認を飛ばして続行する（縮退。受信上限と ENOSPC が最後の砦）。
     #[test]
-    fn space_check_reason_continues_when_the_space_cannot_be_read() {
+    fn insufficient_space_reason_for_dir_continues_when_the_space_cannot_be_read() {
         let missing = temp_path("no-such-dir-for-space-check");
         assert!(!missing.exists(), "the fixture path should not exist");
-        // 空きが 0 でも通る（＝判定に入っていない）ことを、必要量を極端に大きくして確かめる。
-        assert!(space_check_reason(&missing, &FAKE_LLM_MODEL, u64::MAX, u64::MAX).is_none());
+        // 判定に入れば必ず断る値（必要量を極端に大きく）を渡しても None ＝ 判定へ入っていない。
+        assert!(
+            insufficient_space_reason_for_dir(&missing, &FAKE_LLM_MODEL, u64::MAX, u64::MAX)
+                .is_none()
+        );
     }
 
     /// 並走ぶんの残りバイトは、自分以外の `Downloading` だけを数える。
@@ -801,31 +842,43 @@ mod tests {
         assert_eq!(downloader.in_flight_remaining_bytes(FAKE_LLM_MODEL.id), 0);
     }
 
-    /// 取得の担当が結果を記録せずに抜けても、状態は `Downloading` のまま残らない
-    /// （残ると そのモデルは二度と取得されず、空き容量の見積もりも恒久的に過大になる）。
+    /// 番人の契約（`DownloadGuard` の doc）: 結果を記録せずに抜けたら `Failed` へ倒し、
+    /// `finish` なら結果をそのまま記録する。
     #[test]
-    fn download_guard_marks_failed_when_it_is_not_disarmed() {
+    fn download_guard_records_the_outcome_or_marks_failed() {
         let downloader = ModelDownloader::new();
-        downloader.set_status_for_test(
-            &FAKE_LLM_MODEL,
-            DownloadStatus::Downloading {
-                received: 0,
-                total: 1_024,
-            },
-        );
+        let downloading = DownloadStatus::Downloading {
+            received: 0,
+            total: 1_024,
+        };
 
+        // 記録せずに抜けた（パニック相当）。
+        downloader.set_status_for_test(&FAKE_LLM_MODEL, downloading.clone());
         drop(DownloadGuard::new(&downloader, FAKE_LLM_MODEL.id));
         assert_eq!(
             downloader.status_of(&FAKE_LLM_MODEL),
             DownloadStatus::Failed("the download stopped unexpectedly".to_owned())
         );
 
-        // 解除すれば触らない（結果は呼び出し側が記録する）。
-        downloader.set_status_for_test(&FAKE_LLM_MODEL, DownloadStatus::Downloaded);
-        DownloadGuard::new(&downloader, FAKE_LLM_MODEL.id).disarm();
+        // 成功を記録した。
+        downloader.set_status_for_test(&FAKE_LLM_MODEL, downloading.clone());
+        DownloadGuard::new(&downloader, FAKE_LLM_MODEL.id)
+            .finish(Ok(()))
+            .expect("finishing with Ok should return Ok");
         assert_eq!(
             downloader.status_of(&FAKE_LLM_MODEL),
             DownloadStatus::Downloaded
+        );
+
+        // 失敗を記録した（理由はそのまま状態行に出る）。
+        downloader.set_status_for_test(&FAKE_LLM_MODEL, downloading);
+        let err = DownloadGuard::new(&downloader, FAKE_LLM_MODEL.id)
+            .finish(Err("boom".into()))
+            .expect_err("finishing with Err should return Err");
+        assert_eq!(err.to_string(), "boom");
+        assert_eq!(
+            downloader.status_of(&FAKE_LLM_MODEL),
+            DownloadStatus::Failed("boom".to_owned())
         );
     }
 
