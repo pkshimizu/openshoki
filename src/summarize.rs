@@ -27,8 +27,14 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use crate::transcript::TranscriptSegment;
 
 /// 生成した議事録の保存ファイル名。セッションディレクトリに固定名で置く
-/// （`mic.json` / `mix.mp3` と同系統）。表示側（後続 issue）と一致させること。
+/// （`mic.json` / `mix.mp3` と同系統）。生成（`run_job`）・表示（`load_summary`）・
+/// 一覧の有無判定（`crate::recordings`）がこの 1 つの名前を共有する。
 pub const SUMMARY_FILENAME: &str = "summary.md";
+
+/// 読み込む `summary.md` のサイズ上限。保存先の生成物は手で置換されうる信頼境界外の入力なので、
+/// 想定外の巨大ファイルでメモリを大量確保しない保険（`docs/rules/security.md`。
+/// `transcript.rs` の `MAX_TRANSCRIPT_BYTES` と同じ趣旨）。実際の議事録は長い会議でも数十 KB。
+const MAX_SUMMARY_BYTES: u64 = 4 * 1024 * 1024;
 
 /// 1 チャンクに入れるトランスクリプト本文のトークン概算の上限。
 ///
@@ -72,8 +78,8 @@ pub struct SummarizeJob {
     pub language: String,
 }
 
-/// セッション単位の要約の進行状況。表示は後続 issue だが、ワーカーの契約
-/// （`TranscribeWorker` と同型）として先に持つ。
+/// セッション単位の要約の進行状況（`TranscribeWorker` と同型）。Recordings ウィンドウの
+/// 詳細ペインが `main::summary_display_status` で表示状態へ合成して出す。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SummarizeStatus {
     /// 投入済み（キュー待ちを含む）または生成中。
@@ -163,12 +169,8 @@ impl SummarizeWorker {
     }
 
     /// セッションの進行状況。マップに載っていなければ `None`
-    /// （表示側が `summary.md` の有無で「未生成/生成済み」を解決する）。
-    ///
-    /// ワーカーの契約として先に用意してあるが、**読む側（Recordings ウィンドウの状態表示・
-    /// 手動再生成）は #81 のスコープ**なので、本体からの呼び出しはまだ無い（テストからは使う）。
-    /// #81 で消費されるまでの一時的な `allow`。
-    #[allow(dead_code)]
+    /// （表示側が `summary.md` の有無で「未生成/生成済み」を解決する。
+    /// `main::summary_display_status`）。
     pub fn status_of(&self, session_dir: &Path) -> Option<SummarizeStatus> {
         lock_status(&self.status).get(session_dir).copied()
     }
@@ -177,6 +179,52 @@ impl SummarizeWorker {
     pub fn forget(&self, session_dir: &Path) {
         lock_status(&self.status).remove(session_dir);
     }
+}
+
+/// セッションの `summary.md` を読む（表示用）。未生成・欠落は `None`、読み取り失敗・過大・
+/// 非通常ファイルもログして `None` にする（縮退。アプリは落とさない）。
+///
+/// ガードの理由は `transcript.rs` の `load_one` と同じ（保存先の生成物は手で置換されうる
+/// 信頼境界外の入力）。ログにはファイル名だけを含める: フルパス（保存先）も本文（発話由来の
+/// 議事録）も機微情報なので出さない（`docs/rules/security.md`）。
+pub fn load_summary(session_dir: &Path) -> Option<String> {
+    use std::io::Read;
+
+    let path = session_dir.join(SUMMARY_FILENAME);
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        // 未生成（ファイルが無い）は正常な縮退。ログもしない。
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(err) => {
+            eprintln!("Skipping {SUMMARY_FILENAME} because it could not be opened: {err}");
+            return None;
+        }
+    };
+    // 開いたハンドルの fstat で通常ファイルを確認し（FIFO 等は読み終わらないことがある）、
+    // サイズ上限は読み込みそのものに掛ける（事前の metadata 判定では差し替えに追従できない）。
+    if let Ok(meta) = file.metadata()
+        && !meta.is_file()
+    {
+        eprintln!("Skipping {SUMMARY_FILENAME} because it is not a regular file");
+        return None;
+    }
+    let mut limited = file.take(MAX_SUMMARY_BYTES + 1);
+    let mut text = String::new();
+    if let Err(err) = limited.read_to_string(&mut text) {
+        // UTF-8 でない（破損・別物への置換）場合もここに来る。
+        eprintln!("Skipping {SUMMARY_FILENAME} because it could not be read: {err}");
+        return None;
+    }
+    // 上限＋1 バイトまで読み切った（limit が尽きた）なら上限超過。
+    if limited.limit() == 0 {
+        eprintln!("Skipping {SUMMARY_FILENAME} because it is too large");
+        return None;
+    }
+    // 空ファイル（生成が中途で終わった等）は「無い」と同じ扱いにする（縮退表示へ落とす）。
+    if text.trim().is_empty() {
+        return None;
+    }
+    Some(text)
 }
 
 /// 状態マップのガードを取る。poison（ロック保持中のパニック）でも状態表示を止めないため、
@@ -877,6 +925,46 @@ mod tests {
 
     /// 状態マップのライフサイクルを、モデル無しで検証する。存在しないモデル上書きパスを渡すと、
     /// ネットワークにもモデルにも触れず即 Failed になる。
+    /// 表示用の読み込み: 生成物はそのまま読め、未生成・空・非通常ファイル・過大は `None`
+    /// （縮退。呼び出し側は状態依存のラベルへ落とす）。
+    #[test]
+    fn load_summary_reads_the_file_and_degrades_on_bad_input() {
+        let dir = std::env::temp_dir().join(format!("shoki-summary-load-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("the temp session dir should be creatable");
+
+        // 未生成（ファイルが無い）。
+        assert!(load_summary(&dir).is_none());
+
+        let path = dir.join(SUMMARY_FILENAME);
+        std::fs::write(&path, "# 議事概要\n\n本文\n").expect("the summary should be writable");
+        assert_eq!(
+            load_summary(&dir).as_deref(),
+            Some("# 議事概要\n\n本文\n"),
+            "the file content is returned as-is (rendering is the UI's job)"
+        );
+
+        // 空・空白だけは「無い」と同じ扱い（生成が中途で終わった場合）。
+        std::fs::write(&path, "   \n\n").expect("the summary should be writable");
+        assert!(load_summary(&dir).is_none());
+
+        // UTF-8 でない（別物へ置換された）ファイルは読めないものとして縮退する。
+        std::fs::write(&path, [0xff, 0xfe, 0x00]).expect("the summary should be writable");
+        assert!(load_summary(&dir).is_none());
+
+        // 上限を超えるファイルは読まない（`MAX_SUMMARY_BYTES` + 1 バイト）。
+        let too_large = "a".repeat(MAX_SUMMARY_BYTES as usize + 1);
+        std::fs::write(&path, &too_large).expect("the summary should be writable");
+        assert!(load_summary(&dir).is_none());
+
+        // ディレクトリ（非通常ファイル）に置き換えられていても落ちない。
+        std::fs::remove_file(&path).expect("the summary should be removable");
+        std::fs::create_dir(&path).expect("the fixture directory should be creatable");
+        assert!(load_summary(&dir).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn submit_tracks_status_until_failure() {
         let worker = SummarizeWorker::start(

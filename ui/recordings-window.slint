@@ -10,12 +10,29 @@ export enum TranscriptStatus {
     failed,
 }
 
+// 議事録要約の表示状態。Rust 側（main.rs の summary_display_status）がワーカーの進行状況と
+// `summary.md` の有無から合成して詰める。TranscriptStatus と同じ流儀（先頭が未生成＝既定値）。
+export enum SummaryStatus {
+    not-summarized,
+    summarizing,
+    done,
+    failed,
+}
+
 // 一覧の 1 行分。Rust の recordings::RecordingSession から詰める。
 export struct SessionRow {
     datetime: string,
     has-mic: bool,
     has-system: bool,
     transcript-status: TranscriptStatus,
+}
+
+// 議事録要約の表示 1 行分（`summary.md` を行単位に分けたもの。Rust の summary_rows が作る）。
+// Markdown の本格レンダリングはしない（#81 のスコープ外）。見出し（`#` 始まり）だけ heading を
+// 立てて強調し、記号は Rust 側で落としてある。
+export struct SummaryRow {
+    text: string,
+    heading: bool,
 }
 
 // トランスクリプトの表示 1 行分。Rust の transcript::TranscriptSegment から詰める
@@ -108,6 +125,42 @@ component DangerButton inherits Rectangle {
 
     touch := TouchArea {
         enabled: root.enabled;
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+// 右ペイン下段の表示切替タブ（Transcript / Summary）。選択中は前景色＋下線、非選択は muted。
+// std-widgets の TabWidget は枠と余白の見た目がこの画面（角丸 1px 枠のセクション）と合わないため、
+// 見出し行に並べられる軽いタブを自作する（`SourceBadge` / `DangerButton` と同じ流儀）。
+component ViewTab inherits Rectangle {
+    in property <string> text;
+    in property <bool> selected;
+
+    callback clicked();
+
+    background: transparent;
+
+    VerticalLayout {
+        spacing: 3px;
+        Text {
+            text: root.text;
+            font-size: Style.heading-size;
+            font-weight: root.selected ? Style.semibold : 400;
+            color: root.selected
+                ? Palette.foreground
+                : Palette.foreground.transparentize(Style.muted-alpha);
+        }
+
+        // 選択中だけ下線を出す（高さは常に確保して、切替でタブの高さが動かないようにする）。
+        Rectangle {
+            height: 2px;
+            background: root.selected ? Palette.accent-background : transparent;
+        }
+    }
+
+    touch := TouchArea {
         clicked => {
             root.clicked();
         }
@@ -235,9 +288,30 @@ export component RecordingsWindow inherits Window {
     // Transcript セクションの縮退表示（セグメントが無いとき）のラベル。状態→文言の対応表は
     // Rust 側（transcript_placeholder_text）に集約し、ここでは表示するだけ。
     in property <string> detail-transcript-placeholder;
-    // 選択中セッションが文字起こし中か（Transcribe / Delete の無効化に使う）。状態 enum から
-    // 導出し、Rust から個別に set しない（bool と enum の食い違いを作らない）。
+    // 選択中セッションが文字起こし中か。状態 enum から導出し、Rust から個別に set しない
+    // （bool と enum の食い違いを作らない）。
     property <bool> detail-transcribing: root.detail-transcript-status == TranscriptStatus.transcribing;
+    // 選択中セッションの議事録要約の状態テキスト（Rust 側が組み立てる。例: Summarized /
+    // Summarizing… / Summarization failed / Not summarized）。
+    in property <string> detail-summary-status-text;
+    // 議事録要約の状態。状態テキストの失敗色の分岐と、生成中判定の導出に使う
+    // （Rust 側が detail-summary-status-text と同時に更新する）。
+    in property <SummaryStatus> detail-summary-status;
+    // Summary タブの縮退表示（行が無いとき）のラベル。状態→文言の対応表は Rust 側
+    // （summary_placeholder_text）に集約し、ここでは表示するだけ。
+    in property <string> detail-summary-placeholder;
+    // 選択中セッションの議事録要約（`summary.md` を行単位に分けたもの）。空なら状態依存の
+    // ラベルに縮退表示する。
+    in property <[SummaryRow]> summary-rows;
+    // 選択中セッションが要約生成中か（上の enum から導出。Rust から個別に set しない）。
+    property <bool> detail-summarizing: root.detail-summary-status == SummaryStatus.summarizing;
+    // 文字起こし・要約のいずれかが走っているか。**従属コントロールの無効化はこの 1 つに
+    // 一本化する**（Transcribe / Summarize / Delete。条件を各所へ複写しない。
+    // `docs/rules/slint.md`）。走っている間はワーカーがセッションのファイルを読み書きするため、
+    // 多重投入も削除もさせない。
+    property <bool> detail-busy: root.detail-transcribing || root.detail-summarizing;
+    // 選択中セッションに文字起こしがあるか（要約の入力になるので、無ければ Summarize は無効）。
+    in property <bool> has-transcript;
     // 選択セッションのトランスクリプト（mic.json / system.json をマージしたもの。新→旧でなく時刻順）。
     // 空なら Transcript セクションは状態依存のラベルに縮退表示する。
     in property <[TranscriptRow]> segments;
@@ -260,6 +334,11 @@ export component RecordingsWindow inherits Window {
     out property <bool> scrubbing;
     // 削除の確認モーダルの表示状態。Delete 押下で開き、Cancel / 確定で閉じる（Slint 内で完結）。
     in-out property <bool> show-delete-confirm: false;
+    // 右ペイン下段が Summary タブを表示しているか。タブの選択は UI が所有し、セッションを
+    // 選び直しても保つ（アプリ側の Rust は Transcript / Summary の中身を常に最新へ更新するので、
+    // どちらを見せているかを知る必要が無い＝set しない）。`in-out` なのは、確認用バイナリ
+    // （`examples/transcript_view.rs`）が Summary タブの見た目を出すために選ぶため。
+    in-out property <bool> showing-summary: false;
 
     // 行クリックでの選択通知。Rust 側で詳細更新・再生対象のロードを行う。
     callback select-session(int);
@@ -274,6 +353,9 @@ export component RecordingsWindow inherits Window {
     callback seek-to-ratio(float);
     // 「Transcribe」押下。選択中セッションの文字起こしを（再）実行する。インデックスを渡す。
     callback transcribe-session(int);
+    // 「Summarize」押下。選択中セッションの議事録要約を（再）生成する。インデックスを渡す
+    // （設定 `auto_summarize` とは独立に、押されたら生成する）。
+    callback summarize-session(int);
     // 確認モーダルの Delete 押下。選択中セッションをゴミ箱へ移動する（インデックスを渡す）。
     callback delete-session(int);
 
@@ -431,6 +513,15 @@ export component RecordingsWindow inherits Window {
                                 ? Style.danger
                                 : Palette.foreground.transparentize(Style.muted-alpha);
                         }
+
+                        Text {
+                            text: root.detail-summary-status-text;
+                            font-size: Style.caption-size;
+                            // 失敗の扱いは文字起こしの状態行と揃える。
+                            color: root.detail-summary-status == SummaryStatus.failed
+                                ? Style.danger
+                                : Palette.foreground.transparentize(Style.muted-alpha);
+                        }
                     }
 
                     VerticalLayout {
@@ -441,17 +532,27 @@ export component RecordingsWindow inherits Window {
                             text: "Transcribe";
                             // 実行中（キュー待ち含む）は多重投入を防ぐ。完了済み・失敗・未実施の
                             // いずれからも（再）実行できる（言語・モデル変更後のやり直し用途）。
-                            enabled: !root.detail-transcribing;
+                            enabled: !root.detail-busy;
                             clicked => {
                                 root.transcribe-session(root.selected-index);
                             }
                         }
 
+                        Button {
+                            text: "Summarize";
+                            // 要約は文字起こしを入力にするので、無いセッションでは押させない。
+                            // 生成済み・失敗からは押し直せる（モデル変更後のやり直し用途）。
+                            enabled: root.has-transcript && !root.detail-busy;
+                            clicked => {
+                                root.summarize-session(root.selected-index);
+                            }
+                        }
+
                         DangerButton {
                             text: "Delete";
-                            // 文字起こし中はワーカーが対象ファイルを読んでいるため削除させない
-                            // （Transcribe と同じ縮退表現）。
-                            enabled: !root.detail-transcribing;
+                            // 実行中はワーカーが対象ファイルを読み書きしているため削除させない
+                            // （Transcribe / Summarize と同じ縮退表現）。
+                            enabled: !root.detail-busy;
                             clicked => {
                                 root.show-delete-confirm = true;
                             }
@@ -523,8 +624,10 @@ export component RecordingsWindow inherits Window {
                     }
                 }
 
-                // Transcript セクション。セグメントを時刻順に表示し、現在再生位置をハイライト、
-                // クリックでその開始秒へシークする。セグメントが無いときは状態依存のラベルに縮退。
+                // Transcript / Summary セクション。タブで表示を切り替える。Transcript は
+                // セグメントを時刻順に表示し、現在再生位置をハイライト、クリックでその開始秒へ
+                // シークする。Summary は `summary.md` を行単位に表示する（クリック連動は無い。
+                // #81 のスコープ外）。どちらも中身が無いときは状態依存のラベルに縮退。
                 Rectangle {
                     vertical-stretch: 1;
                     border-width: 1px;
@@ -536,16 +639,32 @@ export component RecordingsWindow inherits Window {
                         padding-top: 12px;
                         padding-bottom: 12px;
                         spacing: 10px;
-                        Text {
-                            text: "Transcript";
-                            font-size: Style.heading-size;
-                            font-weight: Style.semibold;
-                            color: Palette.foreground;
+                        HorizontalLayout {
+                            vertical-stretch: 0;
+                            alignment: start;
+                            spacing: 18px;
+                            ViewTab {
+                                text: "Transcript";
+                                selected: !root.showing-summary;
+                                clicked => {
+                                    root.showing-summary = false;
+                                }
+                            }
+
+                            ViewTab {
+                                text: "Summary";
+                                selected: root.showing-summary;
+                                clicked => {
+                                    root.showing-summary = true;
+                                }
+                            }
                         }
 
                         Rectangle {
                             vertical-stretch: 1;
                             clip: true;
+
+                            if !root.showing-summary: Rectangle {
 
                             // 文字起こしがあればセグメント一覧、無ければ縮退表示。長時間録音では
                             // セグメントが数千件になり得るため、可視範囲だけ生成する ListView を使う
@@ -613,6 +732,46 @@ export component RecordingsWindow inherits Window {
                                 horizontal-alignment: center;
                                 vertical-alignment: center;
                                 color: Palette.foreground.transparentize(Style.muted-alpha);
+                            }
+                            }
+
+                            if root.showing-summary: Rectangle {
+                                // 議事録があれば行一覧、無ければ縮退表示。長い議事録でも可視範囲
+                                // だけ生成する（Transcript 側と同じ理由で ListView）。
+                                if root.summary-rows.length > 0: ListView {
+                                    for row in root.summary-rows: Rectangle {
+                                        // ListView の行は自身の高さを明示する（word-wrap する
+                                        // 本文の実高さに追従させる）。
+                                        height: summary-row-content.preferred-height;
+                                        summary-row-content := VerticalLayout {
+                                            padding-left: 2px;
+                                            padding-right: 6px;
+                                            // 見出しは上に余白を置いて段落の切れ目を作る
+                                            // （記号を落としているぶん、間隔で構造を見せる）。
+                                            padding-top: row.heading ? 8px : 2px;
+                                            padding-bottom: 2px;
+                                            Text {
+                                                text: row.text;
+                                                wrap: word-wrap;
+                                                font-size: row.heading
+                                                    ? Style.heading-size
+                                                    : Style.body-size;
+                                                font-weight: row.heading ? Style.semibold : 400;
+                                                color: Palette.foreground;
+                                            }
+                                        }
+                                    }
+                                }
+                                if root.summary-rows.length == 0: Text {
+                                    // ラベルの対応は Rust 側の summary_placeholder_text 参照
+                                    // （`summary.md` の欠落・破損・空はいずれも未生成と同じ表示に
+                                    // 落ちる）。再生成中は旧議事録が残るため一覧表示が維持される。
+                                    text: root.detail-summary-placeholder;
+                                    font-size: Style.body-size;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                    color: Palette.foreground.transparentize(Style.muted-alpha);
+                                }
                             }
                         }
                     }
