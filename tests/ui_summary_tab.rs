@@ -76,8 +76,8 @@ fn clicking_the_tabs_switches_the_pane() {
     );
 }
 
-/// Summarize は選択中インデックスを渡して発火し、文字起こしが無い／実行中は押せない
-/// （無効化は Slint 側の `detail-busy` と `has-transcript` が決める）。
+/// Summarize は有効なときだけ、選択中インデックスを渡して発火する
+/// （どの状態で押せるかは `the_summary_state_decides_which_actions_are_offered` が表で見る）。
 #[test]
 #[cfg_attr(
     not(slint_debug_info),
@@ -102,13 +102,6 @@ fn summarize_reports_the_index_only_while_it_is_enabled() {
     assert_eq!(summarize.accessible_enabled(), Some(false));
     summarize.mock_single_click(PointerEventButton::Left);
     assert_eq!(calls.borrow().len(), 1, "a disabled button must not fire");
-
-    // 生成中も無効（多重投入を防ぐ）。
-    window.set_has_transcript(true);
-    window.set_detail_summary_status(SummaryStatus::Summarizing);
-    assert_eq!(summarize.accessible_enabled(), Some(false));
-    summarize.mock_single_click(PointerEventButton::Left);
-    assert_eq!(calls.borrow().len(), 1);
 }
 
 /// 要約の状態ごとに、ボタン列の活性と取り消しの導線が意図どおりであること。
@@ -135,8 +128,7 @@ fn the_summary_state_decides_which_actions_are_offered() {
     window.set_has_transcript(true);
     for (status, summarize_enabled, cancel_shown, delete_enabled) in expected {
         window.set_detail_summary_status(status);
-        // 確認モーダルを閉じてから数える（モーダルにも Cancel があるので、開いたままだと
-        // ヘッダの取り消しと二重に数える）。
+        // 前の周回で開いた確認モーダルを閉じる（開いたままだと Delete の判定が常に真になる）。
         window.set_show_delete_confirm(false);
 
         assert_eq!(
@@ -145,7 +137,7 @@ fn the_summary_state_decides_which_actions_are_offered() {
             "Summarize for {status:?}"
         );
         assert_eq!(
-            ElementHandle::find_by_accessible_label(&window, "Cancel").count(),
+            ElementHandle::find_by_accessible_label(&window, "Cancel Summary").count(),
             usize::from(cancel_shown),
             "the Cancel button should only exist while queued ({status:?})"
         );
@@ -164,8 +156,8 @@ fn the_summary_state_decides_which_actions_are_offered() {
     }
 }
 
-/// キュー待ちの取り消しは、状態行の隣に出る専用のボタンから行う（Summarize の位置は動かさない。
-/// 同じ位置で「積む」と「やめる」が入れ替わると、投入直後の 2 度押しが取り消しになる）。
+/// キュー待ちの取り消しは、状態行の隣に出る専用のボタンから行う
+/// （Summarize と差し替えない理由は `ui/recordings-window.slint` の状態行のコメント）。
 #[test]
 #[cfg_attr(
     not(slint_debug_info),
@@ -183,7 +175,7 @@ fn cancelling_a_queued_summary_reports_the_index() {
     window.on_summarize_session(|_| panic!("a queued summary must not be re-submitted"));
 
     window.set_detail_summary_status(SummaryStatus::Queued);
-    button(&window, "Cancel").mock_single_click(PointerEventButton::Left);
+    button(&window, "Cancel Summary").mock_single_click(PointerEventButton::Left);
     assert_eq!(*calls.borrow(), vec![1], "the selected index is passed");
 }
 

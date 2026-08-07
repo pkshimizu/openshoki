@@ -794,16 +794,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             else {
                 return;
             };
-            // **ゴミ箱へ移す前にワーカーの状態を確かめる**。UI のゲート（`detail-running`）は
+            // **ゴミ箱へ移す前にワーカーの状態を確かめる**。UI のゲート（`detail-files-in-use`）は
             // 100ms の tick 遅れがあるので、「表示はキュー待ちだが、もう走り出している」瞬間に
             // Delete を押せてしまう。走行中のセッションを消すと、ワーカーは消えたディレクトリへ
             // 書きに行って失敗し、`forget` の後から状態を入れ直す（消えたセッションの記録が
-            // 残る）。キュー待ちなら**先に取り消してから**消す。
-            if summarizer.status_of(&dir) == Some(summarize::SummarizeStatus::Summarizing) {
-                eprintln!("Skipping the deletion because the summary is still running");
-                return;
+            // 残る）。キュー待ちなら**先に取り消してから**消す（判定と取り消しは
+            // `cancel_for_delete` が 1 回のロックでまとめて行う）。
+            // 要約だけを見るのは、要約が**ワーカー経由でも投入される**（文字起こしの完了から
+            // 自動生成）ため。文字起こしは投入が UI スレッドで、直後に
+            // `refresh_detail_transcript_status` がゲートを閉じるので、この窓が開かない。
+            match summarizer.cancel_for_delete(&dir) {
+                summarize::CancelForDelete::Running => {
+                    eprintln!("Skipping the deletion because the summary is still running");
+                    return;
+                }
+                // 取り消したジョブは戻せない（`SummarizeJob` は破棄済み）。下でゴミ箱への
+                // 移動に失敗しても、積んでいた生成は失われたままになる（選択し直して
+                // Summarize を押せば積み直せる）。
+                summarize::CancelForDelete::Cancelled | summarize::CancelForDelete::NotQueued => {}
             }
-            summarizer.cancel(&dir);
             // ゴミ箱への移動前に再生対象を手放す。削除済みファイルを play_pause / seek の
             // 開き直し経路が参照しないようにし、開いたままのハンドルが移動を妨げる OS でも
             // 失敗しないようにする。
@@ -1253,7 +1262,8 @@ fn clear_recordings_selection(
     rec.set_current_segment(-1);
     transcript_segments.borrow_mut().clear();
     rec.set_summary_rows(Rc::new(slint::VecModel::<SummaryRow>::default()).into());
-    // 状態も未実施へ畳む（次の選択で必ず上書きされるが、`detail-busy` の入力なので前の
+    // 状態も未実施へ畳む（次の選択で必ず上書きされるが、`detail-files-in-use` /
+    // `detail-jobs-pending` の入力なので前の
     // セッションの「実行中」を持ち越さない）。文字起こし・要約で対称にする。
     apply_detail_transcript_status(rec, TranscriptStatus::NotTranscribed);
     apply_detail_summary_status(rec, SummaryStatus::NotSummarized);

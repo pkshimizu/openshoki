@@ -18,7 +18,7 @@
 
 mod on_device;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -112,12 +112,12 @@ pub enum SummarizeStatus {
 pub struct SummarizeWorker {
     /// ワーカースレッドへの送信口。スレッド起動に失敗していたら `None`（要約のみ縮退）。
     tx: Option<Sender<QueuedJob>>,
-    /// セッションディレクトリ → 最後に投入したジョブの通番と進行状況。
+    /// セッションディレクトリ → そのセッションで**最後に投入したジョブ**の通番と進行状況。
+    /// これがジョブを走らせてよいかの唯一の判断材料（`cancel` の doc）。
     status: Arc<Mutex<StatusMap>>,
-    /// 取り消したジョブの通番（`cancel` が積む墓標。仕組みは `cancel` の doc）。
-    cancelled: Arc<Mutex<HashSet<u64>>>,
     /// 投入通番の採番。**セッションではなくジョブを識別する**ので、同じセッションを積み直しても
-    /// 別の値になり、取り消しが他のジョブを巻き添えにしない。
+    /// 別の値になり、取り消しが他のジョブを巻き添えにしない。採番は `status` のロックの中で
+    /// 行う（マップに載る通番の順序と採番の順序をずらさない）。
     next_seq: Arc<AtomicU64>,
 }
 
@@ -128,13 +128,25 @@ struct QueuedJob {
     job: SummarizeJob,
 }
 
-/// セッションディレクトリ → 最後に投入したジョブの通番と進行状況（UI スレッドとワーカー
-/// スレッドで共有）。通番を持つのは、**古いジョブの完了で新しいジョブの表示を上書きしない**
-/// ため（同じセッションを積み直したときに、先行の完了が後続の「キュー待ち」を消さない）。
+/// セッションディレクトリ → そのセッションで最後に投入したジョブの通番と進行状況
+/// （UI スレッドとワーカースレッドで共有）。
 ///
-/// **ロック順序は `status` → `cancelled`**（入れ子で取るときは必ずこの順。逆順で取ると
-/// デッドロックする）。
+/// 通番はジョブの識別子で、**このマップが「いま有効なジョブはどれか」の単一のソース**になる:
+/// ワーカーは取り出したジョブの通番がここに載っているときだけ走らせ、完了の書き戻しも
+/// 同じ照合で守る。これにより (1) 取り消したジョブ、(2) 同じセッションで後から積み直されて
+/// 追い越されたジョブ、(3) 先行ジョブの完了による後続の表示の上書き、がまとめて落ちる。
 type StatusMap = HashMap<PathBuf, (u64, SummarizeStatus)>;
+
+/// `cancel_for_delete` の結果（削除してよいかの判断つき）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelForDelete {
+    /// キュー待ちだったジョブを取り消した。削除してよい。
+    Cancelled,
+    /// 投入されていない（または既に終わっている）。削除してよい。
+    NotQueued,
+    /// 生成中。ワーカーがこのセッションのファイルを読み書きしているので削除させない。
+    Running,
+}
 
 impl SummarizeWorker {
     /// ワーカースレッドを起動する。スレッド生成に失敗しても常駐アプリは落とさず、
@@ -150,33 +162,30 @@ impl SummarizeWorker {
     ) -> Self {
         let status: Arc<Mutex<StatusMap>> = Arc::new(Mutex::new(HashMap::new()));
         let status_for_worker = Arc::clone(&status);
-        let cancelled: Arc<Mutex<HashSet<u64>>> = Arc::new(Mutex::new(HashSet::new()));
-        let cancelled_for_worker = Arc::clone(&cancelled);
         let (tx, rx) = mpsc::channel::<QueuedJob>();
         let spawned = std::thread::Builder::new()
             .name("summarize-worker".into())
             .spawn(move || {
                 // 送信側（アプリ本体）が落ちてチャネルが閉じたら自然に終了する。
                 while let Ok(QueuedJob { seq, job }) = rx.recv() {
-                    // **取り消しの確認と「生成中」への遷移は 1 つのクリティカルセクションで行う**
-                    // （別々にすると、その隙間に入った `cancel` が「取り消せた」と答えたあとで
-                    // ジョブが走り出す）。ロック順序は `status` → `cancelled`（`StatusMap` の doc）。
+                    // **走らせてよいかの判定と「生成中」への遷移は 1 つのクリティカル
+                    // セクションで行う**（別々にすると、その隙間に入った `cancel` が
+                    // 「取り消せた」と答えたあとでジョブが走り出す）。マップに自分の通番が
+                    // 載っていなければ、取り消されたか後続に追い越されたジョブ（`StatusMap`）。
                     let claimed = {
                         let mut status = lock_status(&status_for_worker);
-                        if lock_cancelled(&cancelled_for_worker).remove(&seq) {
-                            false
-                        } else {
-                            // 先行ジョブの完了が後続の表示を上書きしたままにならないよう、
-                            // 取り出した時点で入れ直す（`TranscribeWorker` と同じ）。
+                        if status.get(&job.session_dir).map(|(latest, _)| *latest) == Some(seq) {
                             status.insert(
                                 job.session_dir.clone(),
                                 (seq, SummarizeStatus::Summarizing),
                             );
                             true
+                        } else {
+                            false
                         }
                     };
                     if !claimed {
-                        println!("Skipping summarization because it was cancelled");
+                        println!("Skipping summarization because the job is no longer current");
                         continue;
                     }
                     // 生成中のパニックでワーカースレッドを殺さない。死ぬと状態が
@@ -201,7 +210,7 @@ impl SummarizeWorker {
                     let mut map = lock_status(&status_for_worker);
                     // 自分より後に積まれたジョブが載っているなら、その表示（キュー待ち）を
                     // 古い結果で上書きしない。
-                    if map.get(&job.session_dir).map(|(seq, _)| *seq) != Some(seq) {
+                    if map.get(&job.session_dir).map(|(latest, _)| *latest) != Some(seq) {
                         continue;
                     }
                     match outcome {
@@ -216,43 +225,63 @@ impl SummarizeWorker {
                     };
                 }
             });
-        match spawned {
-            Ok(_handle) => Self {
-                tx: Some(tx),
-                status,
-                cancelled,
-                next_seq: Arc::new(AtomicU64::new(0)),
-            },
+        // 差分はワーカーが立ったか（= 送信口を持つか）だけ。`Self { .. }` を 2 回書くと、
+        // フィールドを足したときに片方だけ直す事故になる。
+        let tx = match spawned {
+            Ok(_handle) => Some(tx),
             Err(err) => {
                 eprintln!(
                     "Disabling summarization because the worker thread failed to start: {err}"
                 );
-                Self {
-                    tx: None,
-                    status,
-                    cancelled,
-                    next_seq: Arc::new(AtomicU64::new(0)),
-                }
+                None
             }
+        };
+        Self {
+            tx,
+            status,
+            next_seq: Arc::new(AtomicU64::new(0)),
         }
     }
 
     /// ジョブを投入する。投入した時点でセッションを「キュー待ち」として記録する
     /// （ワーカーが取り出すと「生成中」へ進む）。ワーカーが動いていない場合はログのみ
     /// （文字起こしまでは保存済み）。
+    ///
+    /// 同じセッションを積み直すと**新しいジョブが古いジョブを追い越す**（古い方はワーカーが
+    /// 取り出したときに落ちる。`StatusMap`）。既に生成中のセッションへ積んだ場合は表示を
+    /// 「キュー待ち」へ下げない: ワーカーはまだそのセッションのファイルを読み書きしており、
+    /// 下げると Delete と Cancel を開けてしまう。
     pub fn submit(&self, job: SummarizeJob) {
         let Some(tx) = &self.tx else {
             eprintln!("Skipping summarization because the summary worker is not running");
             return;
         };
-        // 通番はジョブごとに新しくなるので、前のジョブへの墓標が新しいジョブに効くことはない。
-        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
-        lock_status(&self.status).insert(job.session_dir.clone(), (seq, SummarizeStatus::Queued));
+        // 採番とマップへの登録を 1 つのクリティカルセクションで行う（別々にすると、2 つの
+        // スレッドから同時に積んだときに古い通番が後から載り、新しいジョブが落ちる）。
+        let seq = {
+            let mut status = lock_status(&self.status);
+            let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+            let running = matches!(
+                status.get(&job.session_dir),
+                Some((_, SummarizeStatus::Summarizing))
+            );
+            let shown = if running {
+                SummarizeStatus::Summarizing
+            } else {
+                SummarizeStatus::Queued
+            };
+            status.insert(job.session_dir.clone(), (seq, shown));
+            seq
+        };
         // 送信失敗 = ワーカースレッドが（panic 等で）終了しレシーバが閉じた状態。記録した
-        // 「キュー待ち」を取り消す（永遠に進行中表示のままにしない）。
+        // 「キュー待ち」を取り消す（永遠に進行中表示のままにしない）。自分の通番が載っている
+        // ときだけ消す（後から積まれたジョブの記録を消さない）。
         if let Err(mpsc::SendError(QueuedJob { job, .. })) = tx.send(QueuedJob { seq, job }) {
             eprintln!("Skipping summarization because the summary worker is not running");
-            lock_status(&self.status).remove(&job.session_dir);
+            let mut status = lock_status(&self.status);
+            if status.get(&job.session_dir).map(|(latest, _)| *latest) == Some(seq) {
+                status.remove(&job.session_dir);
+            }
         }
     }
 
@@ -272,21 +301,37 @@ impl SummarizeWorker {
     /// `decode` 呼び出し）で、そこから抜ける口が無い。中断できるようにするなら生成ループへ
     /// 中断フラグを見る箇所を作る必要があり、#133 ではキュー待ちの取り消しに絞った。
     ///
-    /// **仕組み**: `mpsc` は積んだジョブを取り出せないため、キューからは消さず**墓標**
-    /// （取り消したジョブの通番）を置き、ワーカーが取り出したときに捨てさせる。墓標が
-    /// セッションではなく**ジョブの通番**なのは、取り消し → 積み直し → 取り消しのように
-    /// 同じセッションのジョブが複数キューに載る場合に、1 つの印では足りないため
-    /// （どれを捨てるのか identify できないと、取り消したはずのジョブが走る）。
-    /// 状態はここで消して、表示を `summary.md` の有無ベース（未生成／生成済み）へ戻す。
+    /// **仕組み**: `mpsc` は積んだジョブを取り出せないので、キューからは消さず**状態マップの
+    /// エントリを消す**。ワーカーは取り出したジョブの通番がマップに載っているときだけ走らせる
+    /// ので、載っていないジョブ（＝取り消した／追い越された）はそこで捨てられる（`StatusMap`）。
+    /// 「取り消したジョブの印」を別に持たないため、取り消し → 積み直し → 取り消しでも、
+    /// 同じセッションのジョブが同時に何本キューに載っていても、走るのは常に最後の 1 本だけ。
+    /// 状態を消すことで、表示は `summary.md` の有無ベース（未生成／生成済み）へ戻る。
+    #[must_use]
     pub fn cancel(&self, session_dir: &Path) -> bool {
-        // ロック順序は `status` → `cancelled`（`StatusMap` の doc）。
+        matches!(self.cancel_locked(session_dir), CancelForDelete::Cancelled)
+    }
+
+    /// 削除の前段。**キュー待ちなら取り消し、生成中なら削除させない**（`Running`）。
+    ///
+    /// 判定と取り消しを分けて呼ぶと、その隙間でワーカーがジョブを取り出し、生成中の
+    /// セッションを削除してしまう（呼び出し側は 2 回ロックを取るので、UI の tick 遅れより
+    /// ずっと短いが必ず開く窓）。1 回のロックで両方やる。
+    #[must_use]
+    pub fn cancel_for_delete(&self, session_dir: &Path) -> CancelForDelete {
+        self.cancel_locked(session_dir)
+    }
+
+    fn cancel_locked(&self, session_dir: &Path) -> CancelForDelete {
         let mut status = lock_status(&self.status);
-        let Some((seq, SummarizeStatus::Queued)) = status.get(session_dir).copied() else {
-            return false;
-        };
-        status.remove(session_dir);
-        lock_cancelled(&self.cancelled).insert(seq);
-        true
+        match status.get(session_dir) {
+            Some((_, SummarizeStatus::Summarizing)) => CancelForDelete::Running,
+            Some((_, SummarizeStatus::Queued)) => {
+                status.remove(session_dir);
+                CancelForDelete::Cancelled
+            }
+            _ => CancelForDelete::NotQueued,
+        }
     }
 
     /// セッションの進行状況の記録を破棄する（セッション削除時の掃除）。未登録なら何もしない。
@@ -367,14 +412,6 @@ fn load_summary_limited(session_dir: &Path, max_bytes: u64) -> Option<String> {
 /// ガードを取り出して続行する（`docs/rules/error-handling.md`）。
 fn lock_status(status: &Mutex<StatusMap>) -> MutexGuard<'_, StatusMap> {
     status
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-/// 取り消し印のガードを取る（poison の扱いは `lock_status` と同じ）。
-/// `status` と入れ子で取るときの順序は `StatusMap` の doc を参照。
-fn lock_cancelled(cancelled: &Mutex<HashSet<u64>>) -> MutexGuard<'_, HashSet<u64>> {
-    cancelled
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -1140,7 +1177,7 @@ mod tests {
     /// 先行ジョブにスロットを取らせて止めておくと、後続は**確実にキュー待ちのまま**になる
     /// （生成の速さに依存しない）。この間だけ `cancel` が効くこと、取り消したジョブは取り出されても
     /// 走らないこと、**取り消し → 積み直し → 取り消し**でも 2 本とも捨てられることを見る
-    /// （墓標がセッション単位だと 2 本目が走ってしまう）。
+    /// （取り消しがセッション単位の印だと 2 本目が走ってしまう）。
     ///
     /// 「捨てられた」ことは**番兵ジョブ**で確かめる: 取り消したジョブより後に積んだ番兵が
     /// 終端状態へ達していれば、取り消したジョブは既に取り出されている（＝まだ取り出されて
@@ -1167,11 +1204,18 @@ mod tests {
                 .expect("the fake model should be writable");
             dir
         };
-        let job = |dir: &std::path::Path| SummarizeJob {
+        // スロットまで到達させたいジョブだけ実在の偽 GGUF を渡す（ロードで失敗する）。
+        // それ以外は存在しないパスにして、`resolve_model` の時点で即 Failed にする
+        // （llama.cpp に触れないぶん速く、環境差にも強い）。
+        let job = |dir: &std::path::Path, reach_slot: bool| SummarizeJob {
             session_dir: dir.to_path_buf(),
             engine: SummaryEngine::OnDevice,
             model_id: crate::summary_model::DEFAULT_MODEL_ID.to_owned(),
-            model_override: Some(dir.join("not-a-model.gguf")),
+            model_override: Some(dir.join(if reach_slot {
+                "not-a-model.gguf"
+            } else {
+                "missing.gguf"
+            })),
             language: "en".to_owned(),
             existing_is_stale: false,
         };
@@ -1193,7 +1237,7 @@ mod tests {
 
         // 重い区間の実行権を握って、先行ジョブをスロット待ちで止める。
         let held = slot.acquire();
-        worker.submit(job(&running));
+        worker.submit(job(&running, true));
         let mut started = false;
         for _ in 0..600 {
             if worker.status_of(&running) == Some(SummarizeStatus::Summarizing) {
@@ -1208,7 +1252,7 @@ mod tests {
         );
 
         // 後続はワーカーが塞がっているのでキュー待ちのまま。
-        worker.submit(job(&cancelled));
+        worker.submit(job(&cancelled, false));
         assert_eq!(worker.status_of(&cancelled), Some(SummarizeStatus::Queued));
 
         // 走っているジョブは取り消せない（止める口が無い）。
@@ -1223,13 +1267,13 @@ mod tests {
         assert_eq!(worker.status_of(&cancelled), None);
 
         // 取り消し → 積み直し → 取り消し。2 本ともキューに残るが、どちらも捨てられること。
-        worker.submit(job(&cancelled));
+        worker.submit(job(&cancelled, false));
         assert_eq!(worker.status_of(&cancelled), Some(SummarizeStatus::Queued));
         assert!(worker.cancel(&cancelled));
         assert_eq!(worker.status_of(&cancelled), None);
 
         // 番兵はこれらより後に積む（終端に達したら、前のジョブは取り出し済み）。
-        worker.submit(job(&sentinel));
+        worker.submit(job(&sentinel, false));
 
         drop(held);
         assert!(
@@ -1251,6 +1295,82 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 生成中のセッションへ積み直したときの契約を、推論スロットで止めて決定的に見る。
+    ///
+    /// (1) 表示を「キュー待ち」へ下げないこと（下げると走行中のセッションで Delete と Cancel が
+    /// 開いてしまう）、(2) 先行ジョブの完了で後続の記録を上書きしないこと（`StatusMap` の
+    /// 通番照合）、(3) それでも後続はちゃんと走ること、を見る。
+    #[test]
+    fn resubmitting_while_running_keeps_the_session_marked_as_running() {
+        let slot = crate::inference_slot::InferenceSlot::new();
+        let worker =
+            SummarizeWorker::start(crate::model_download::ModelDownloader::new(), slot.clone());
+        let dir =
+            std::env::temp_dir().join(format!("shoki-summary-resubmit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("the temp session dir should be creatable");
+        std::fs::write(
+            dir.join("mic.json"),
+            r#"{"segments":[{"start":0.0,"end":1.0,"text":"hello"}]}"#,
+        )
+        .expect("the transcript should be writable");
+        // 1 本目はスロットまで到達させたいので実在の偽 GGUF、2 本目は即 Failed にする。
+        std::fs::write(dir.join("not-a-model.gguf"), b"not a gguf")
+            .expect("the fake model should be writable");
+        let job = |name: &str| SummarizeJob {
+            session_dir: dir.clone(),
+            engine: SummaryEngine::OnDevice,
+            model_id: crate::summary_model::DEFAULT_MODEL_ID.to_owned(),
+            model_override: Some(dir.join(name)),
+            language: "en".to_owned(),
+            existing_is_stale: false,
+        };
+
+        let held = slot.acquire();
+        worker.submit(job("not-a-model.gguf"));
+        let mut started = false;
+        for _ in 0..600 {
+            if worker.status_of(&dir) == Some(SummarizeStatus::Summarizing) {
+                started = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            started,
+            "the first job should reach the slot within 6s (it blocks there)"
+        );
+
+        // 走っている最中の積み直しでは表示を下げない（Delete / Cancel を開けない）。
+        worker.submit(job("missing.gguf"));
+        assert_eq!(
+            worker.status_of(&dir),
+            Some(SummarizeStatus::Summarizing),
+            "resubmitting must not downgrade a running session to Queued"
+        );
+        assert!(
+            !worker.cancel(&dir),
+            "a running session must not be cancellable"
+        );
+
+        drop(held);
+        // 2 本目が走り切るまで待つ（1 本目の完了は通番が古いので書き戻されない）。
+        let mut finished = false;
+        for _ in 0..600 {
+            if worker.status_of(&dir) == Some(SummarizeStatus::Failed) {
+                finished = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            finished,
+            "the resubmitted job should run and reach a terminal state within 6s"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 状態マップのライフサイクルを、モデル無しで検証する。存在しないモデル上書きパスを渡すと、

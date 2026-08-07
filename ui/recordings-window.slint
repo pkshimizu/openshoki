@@ -524,8 +524,10 @@ export component RecordingsWindow inherits Window {
                                 : Palette.foreground.transparentize(Style.muted-alpha);
                         }
 
-                        // 要約の状態行。キュー待ちの間だけ、その場に取り消しを出す
-                        // （ボタン列を動かさないので、Summarize / Delete の位置が変わらない）。
+                        // 要約の状態行。キュー待ちの間だけ、その場に取り消しを出す。
+                        // **Summarize ボタンと差し替えない**: 同じ位置で「積む」と「やめる」が
+                        // 入れ替わると、投入直後の 2 度押しが取り消しになってしまう。ここに置けば
+                        // ボタン列も動かないので、Summarize / Delete の位置が変わらない。
                         HorizontalLayout {
                             alignment: start;
                             spacing: 10px;
@@ -541,6 +543,9 @@ export component RecordingsWindow inherits Window {
 
                             if root.detail-summary-queued: Button {
                                 text: "Cancel";
+                                // 削除確認モーダルの「Cancel」と読み上げが衝突するので、
+                                // 支援技術向けには何を取り消すのかを明示する。
+                                accessible-label: "Cancel Summary";
                                 clicked => {
                                     root.cancel-summary(root.selected-index);
                                 }
@@ -567,9 +572,8 @@ export component RecordingsWindow inherits Window {
                             text: "Summarize";
                             // 要約は文字起こしを入力にするので、無いセッションでは押させない
                             // （生成済み・失敗からは押し直せる。モデル変更後のやり直し用途）。
-                            // 取り消しはこのボタンを差し替えず、状態行の隣に出す（同じ位置で
-                            // 「積む」と「やめる」が入れ替わると、投入直後の 2 度押しが取り消しに
-                            // なってしまう）。
+                            // 取り消しはこのボタンを差し替えず、状態行の隣に出す（理由は
+                            // 状態行のコメント）。
                             enabled: root.has-transcript && !root.detail-jobs-pending;
                             clicked => {
                                 root.summarize-session(root.selected-index);
