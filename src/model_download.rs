@@ -373,11 +373,11 @@ const WAIT_FOR_OTHER_DOWNLOAD_TIMEOUT: std::time::Duration =
 
 /// 取り残された一時ファイルと見なす、最終更新からの経過時間（`sweep_orphaned_part_files`）。
 ///
-/// **受信全体のタイムアウト（`RECV_BODY_TIMEOUT` の 2 時間）より十分に長く**取る。走っている
-/// 取得の一時ファイルは書き込みのたびに mtime が更新されるので、これだけ放置されたものは
-/// 生きた取得ではありえない（2 時間無反応なら受信側がタイムアウトして自分で片付ける）。
-/// 多重起動した別プロセスの取得を壊さないための余裕でもある。
-const STALE_PART_AGE: std::time::Duration = std::time::Duration::from_secs(12 * 60 * 60);
+/// **受信全体のタイムアウト（`RECV_BODY_TIMEOUT` の 2 時間）より長く**取る。走っている取得の
+/// 一時ファイルは書き込みのたびに mtime が更新されるので、これだけ放置されたものは生きた取得では
+/// ありえない（2 時間受信が進まなければ、受信側がタイムアウトして自分で片付ける）。多重起動した
+/// 別プロセスの取得を壊さないための余裕でもある。
+const STALE_PART_AGE: std::time::Duration = std::time::Duration::from_secs(3 * 60 * 60);
 
 /// 不足ぶんを表示するときの単位。この単位へ切り上げて出す（`insufficient_space_reason`）。
 const REPORTED_SHORTFALL_UNIT_BYTES: u64 = 1024 * 1024;
@@ -409,20 +409,26 @@ fn models_dir() -> Option<PathBuf> {
     crate::config::data_dir().map(|dir| dir.join("models"))
 }
 
-/// 強制終了などで残った一時ファイルを回収する（起動時に 1 回呼ぶ）。
+/// 強制終了などで残ったモデルの一時ファイルを回収する（起動時に 1 回呼ぶ）。判定と限界は
+/// `atomic_replace::sweep_orphaned_parts` の doc。モデルは数 GB あり、保存先はユーザーが辿らない
+/// データディレクトリ配下なので、残ると気づかれないまま容量を食う。
 ///
-/// 失敗・パニックの後始末は `atomic_replace::PartFile` が済ませるので、ここが対象にするのは
-/// **Drop が走らない終わり方**（`abort`・強制終了・電源喪失）で残ったもの。モデルは数 GB あり、
-/// 保存先はユーザーが辿らないデータディレクトリ配下なので、残ると気づかれないまま容量を食う。
-///
-/// 録音側の一時ファイル（`src/mixdown.rs` の `mix.mp3.part.*`）は掃除しない: そちらは
-/// **ユーザーが選んだ保存先**にあり、Finder から見えて自分で消せる。起動時にユーザーのフォルダを
-/// 走査して消す方がリスクが大きいという判断（残っても 1 セッションぶんで、上限も小さい）。
+/// 録音側の一時ファイル（`mixdown::normalize_if_quiet` が `mic.mp3` / `system.mp3` を書き直す
+/// ときの `*.part.*`）は掃除しない: そちらは**ユーザーが選んだ保存先**にあり、Finder から見えて
+/// 自分で消せる。1 セッションぶん（128 kbps で 1 時間あたり数十 MB）と小さいので、起動時に
+/// ユーザーのフォルダを走査して消すリスクを取るほどではないという判断。
 pub fn sweep_orphaned_part_files() {
     let Some(dir) = models_dir() else {
         return;
     };
-    crate::atomic_replace::sweep_orphaned_parts(&dir, std::time::SystemTime::now(), STALE_PART_AGE);
+    let removed = crate::atomic_replace::sweep_orphaned_parts(
+        &dir,
+        std::time::SystemTime::now(),
+        STALE_PART_AGE,
+    );
+    if removed > 0 {
+        println!("Reclaimed {removed} leftover model download(s)");
+    }
 }
 
 /// パス要素を持たない素のファイル名か（`/` や `..`、絶対パスを弾く）。
@@ -559,7 +565,8 @@ fn download_model(
     // 一時ファイルへ書き、検証に通ってから本来の名前へ rename する（原子的）。途中で失敗しても
     // 壊れた/部分的なファイルがモデルとして残らない。一時ファイルの命名・後始末（失敗・パニック）は
     // `crate::atomic_replace::PartFile` が持つ（プロセス固有名にする理由もそちらの doc）。
-    let part = crate::atomic_replace::PartFile::for_dest(dest);
+    let part = crate::atomic_replace::PartFile::for_dest(dest)
+        .ok_or("the model path does not end in a file name")?;
     let on_progress = |received: u64| {
         downloader
             .lock()
@@ -572,7 +579,7 @@ fn download_model(
         max_download_bytes(spec),
         on_progress,
     )?;
-    part.commit(dest)?;
+    part.commit()?;
     println!("Downloaded the {} model {}", spec.kind, spec.display_name);
     Ok(())
 }

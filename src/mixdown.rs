@@ -186,9 +186,10 @@ fn normalize_if_quiet(path: &Path) -> Result<NormalizeOutcome, Box<dyn std::erro
 
     // 一時ファイルへ書いてから rename で置き換える（途中で失敗しても元ファイルが壊れない）。
     // 一時ファイルの命名・後始末（失敗・パニック）は `crate::atomic_replace::PartFile` が持つ。
-    let part = crate::atomic_replace::PartFile::for_dest(path);
+    let part = crate::atomic_replace::PartFile::for_dest(path)
+        .ok_or_else(|| std::io::Error::other("the audio path does not end in a file name"))?;
     crate::private_file::write(part.path(), &mp3)?;
-    part.commit(path)?;
+    part.commit()?;
     Ok(NormalizeOutcome::Normalized { peak_db, gain_db })
 }
 
