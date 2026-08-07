@@ -373,10 +373,10 @@ const WAIT_FOR_OTHER_DOWNLOAD_TIMEOUT: std::time::Duration =
 
 /// 取り残された一時ファイルと見なす、最終更新からの経過時間（`sweep_orphaned_part_files`）。
 ///
-/// **受信全体のタイムアウト（`RECV_BODY_TIMEOUT` の 2 時間）より長く**取る。走っている取得の
-/// 一時ファイルは書き込みのたびに mtime が更新されるので、これだけ放置されたものは生きた取得では
-/// ありえない（2 時間受信が進まなければ、受信側がタイムアウトして自分で片付ける）。多重起動した
-/// 別プロセスの取得を壊さないための余裕でもある。
+/// **受信全体のタイムアウト（`RECV_BODY_TIMEOUT`）より長く**取る。あれは無通信の上限ではなく
+/// **ボディ受信全体の期限**（2 時間）なので、生きた取得の一時ファイルはそもそも 2 時間＋接続の
+/// 30 秒しか存在しえない（超えたら失敗して自分で片付ける）。3 時間はその上限に 1 時間の余裕を
+/// 足した値で、多重起動した別プロセスの取得を壊さないための余裕でもある。
 const STALE_PART_AGE: std::time::Duration = std::time::Duration::from_secs(3 * 60 * 60);
 
 /// 不足ぶんを表示するときの単位。この単位へ切り上げて出す（`insufficient_space_reason`）。
@@ -415,20 +415,19 @@ fn models_dir() -> Option<PathBuf> {
 ///
 /// 録音側の一時ファイル（`mixdown::normalize_if_quiet` が `mic.mp3` / `system.mp3` を書き直す
 /// ときの `*.part.*`）は掃除しない: そちらは**ユーザーが選んだ保存先**にあり、Finder から見えて
-/// 自分で消せる。1 セッションぶん（128 kbps で 1 時間あたり数十 MB）と小さいので、起動時に
-/// ユーザーのフォルダを走査して消すリスクを取るほどではないという判断。
+/// 自分で消せる。1 ファイルは数十 MB（128 kbps・1 時間）で、後処理中に落ちたセッションの
+/// フォルダに 1〜2 個ずつ残りうる（総量に上限は無いが 1 個は小さい）。起動時にユーザーの
+/// フォルダを走査して消すリスクを取るほどではないという判断。
 pub fn sweep_orphaned_part_files() {
     let Some(dir) = models_dir() else {
         return;
     };
-    let removed = crate::atomic_replace::sweep_orphaned_parts(
+    // 消したファイルは掃除側が 1 件ずつログに出すので、件数は使わない。
+    let _removed = crate::atomic_replace::sweep_orphaned_parts(
         &dir,
         std::time::SystemTime::now(),
         STALE_PART_AGE,
     );
-    if removed > 0 {
-        println!("Reclaimed {removed} leftover model download(s)");
-    }
 }
 
 /// パス要素を持たない素のファイル名か（`/` や `..`、絶対パスを弾く）。

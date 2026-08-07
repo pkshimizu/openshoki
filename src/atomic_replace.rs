@@ -21,7 +21,9 @@ use std::time::{Duration, SystemTime};
 
 /// 置き換え用の一時ファイル。`path()` へ書き、`commit()` で本来の名前へ rename する。
 /// `commit()` せずに drop されたら（失敗・パニック）一時ファイルを消す。
-#[derive(Debug)]
+///
+/// `Debug` は付けない: 保持しているのはフルパスで、`{:?}` でログへ出すとユーザー名が漏れる
+/// （`docs/rules/security.md`。ログに出すのはファイル名だけ）。
 #[must_use = "the temporary file is removed when the guard is dropped; bind it"]
 pub struct PartFile {
     part: PathBuf,
@@ -35,6 +37,7 @@ impl PartFile {
     ///
     /// `dest` がファイル名で終わらない（`/`・`..` 等）場合は `None`。ディスクへ書く関数なので、
     /// 既定値で埋めて**別の場所**に一時ファイルを作るより、呼び出し側に失敗させる。
+    #[must_use = "the temporary file is removed when the guard is dropped; bind it"]
     pub fn for_dest(dest: &Path) -> Option<Self> {
         let mut name = dest.file_name()?.to_os_string();
         name.push(format!(".part.{}", std::process::id()));
@@ -74,7 +77,8 @@ impl Drop for PartFile {
     }
 }
 
-/// `dir` の直下に取り残された一時ファイルを消す（消した数を返す）。
+/// `dir` の直下に取り残された一時ファイルを消す（消した数を返す。消したファイルは 1 件ずつ
+/// ログに出るので、戻り値はテストで数を固定するためのもので、呼び出し側は無視してよい）。
 ///
 /// `PartFile` の Drop が走らない終わり方（`abort`・強制終了・電源喪失）で残ったものが対象。
 /// **走っている取得の一時ファイルは消さない**: 判定は「最終更新から `max_age` 以上経っている」
@@ -106,20 +110,30 @@ pub fn sweep_orphaned_parts(dir: &Path, now: SystemTime, max_age: Duration) -> u
         let entry = match entry {
             Ok(entry) => entry,
             Err(err) => {
-                eprintln!("Skipping an entry while cleaning up leftover temporary files: {err}");
+                eprintln!(
+                    "Skipping an entry while cleaning up leftover temporary files because it could not be read: {err}"
+                );
                 continue;
             }
         };
+        // 名前で先にふるう（安い。無関係なエントリに stat を打たない）。
+        let name = entry.file_name();
+        if !is_part_file(Path::new(&name)) {
+            continue;
+        }
         // 通常ファイルだけを対象にする。シンボリックリンクを辿って別の場所の mtime で
         // 判断したり、同名のディレクトリを毎起動 remove_file で失敗させたりしない
         // （`entry.metadata()` はリンクを辿らない）。
-        let Ok(metadata) = entry.metadata() else {
-            continue;
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                eprintln!(
+                    "Skipping a temporary file while cleaning up because its metadata could not be read: {err}"
+                );
+                continue;
+            }
         };
-        if !metadata.is_file() || !is_part_file(&entry.path()) {
-            continue;
-        }
-        if !is_older_than(&metadata, now, max_age) {
+        if !metadata.is_file() || !is_older_than(&metadata, now, max_age) {
             continue;
         }
         let path = entry.path();
@@ -129,7 +143,7 @@ pub fn sweep_orphaned_parts(dir: &Path, now: SystemTime, max_age: Duration) -> u
                 // （フルパスはユーザー名を含むため。`docs/rules/security.md`）。
                 println!(
                     "Removed a leftover temporary file: {}",
-                    path.file_name().unwrap_or_default().to_string_lossy()
+                    name.to_string_lossy()
                 );
                 removed += 1;
             }
@@ -318,14 +332,47 @@ mod tests {
             "a part file that is still being written must be kept"
         );
         assert!(fresh_part.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
-        // 境界: 経過がちょうど上限なら消す（`>=`。`>` に狭めると 1 巡遅れる）。
-        let just_at_limit = std::fs::metadata(&fresh_part)
+    /// 境界: 経過がちょうど上限なら消す（`>=`。`>` に狭めると回収が 1 巡遅れる）。
+    #[test]
+    fn sweep_removes_a_part_file_exactly_at_the_limit() {
+        const LIMIT: Duration = Duration::from_secs(24 * 60 * 60);
+
+        let dir = temp_dir("sweep-boundary");
+        let part = dir.join("model.bin.part.123");
+        std::fs::write(&part, b"x").expect("writing the fixture should succeed");
+
+        let just_at_limit = std::fs::metadata(&part)
             .and_then(|meta| meta.modified())
             .expect("the fixture should have an mtime")
             + LIMIT;
         assert_eq!(sweep_orphaned_parts(&dir, just_at_limit, LIMIT), 1);
-        assert!(!fresh_part.exists());
+        assert!(!part.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// シンボリックリンクは消さない（`is_file()` が除く。`entry.metadata()` はリンクを辿らない
+    /// のでリンク自身の属性で判断する）。`is_file()` の条件を外すとリンクが消えて落ちる。
+    #[test]
+    #[cfg(unix)]
+    fn sweep_keeps_symlinks() {
+        let dir = temp_dir("sweep-symlink");
+        let target = dir.join("important.bin");
+        std::fs::write(&target, b"keep me").expect("writing the fixture should succeed");
+        let link = dir.join("victim.bin.part.111");
+        std::os::unix::fs::symlink(&target, &link).expect("creating the symlink should succeed");
+
+        // 古さの条件は満たす時刻を渡す（残る理由が「新しいから」ではないことを固定する）。
+        let elapsed = SystemTime::now() + Duration::from_secs(48 * 60 * 60);
+        assert_eq!(
+            sweep_orphaned_parts(&dir, elapsed, Duration::from_secs(60)),
+            0,
+            "a symlink must not be swept"
+        );
+        assert!(link.is_symlink(), "the symlink itself should remain");
+        assert!(target.exists(), "the target must not be touched");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
