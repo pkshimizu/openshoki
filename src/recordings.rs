@@ -2,6 +2,10 @@
 //! セッションディレクトリを列挙し、含まれる音源（mic / system）・文字起こし・議事録要約の
 //! 有無を調べて新しい順に並べる。Recordings ウィンドウの一覧表示に使う。
 //!
+//! 読むだけのモジュールではない: 一覧に出たセッションに取り残された一時ファイルの回収
+//! （`spawn_session_part_sweep`）も持つ。**消す**のはこの 1 箇所だけなので、範囲と時期の判断は
+//! そこの doc に集約する。
+//!
 //! `recording_dir` は設定（手編集されうる信頼境界外）由来で、無関係なファイル・ディレクトリが
 //! 混じりうる。名前が日時形式でないもの・音源ファイルが 1 つも無いものは安全にスキップし、
 //! 走査失敗（ディレクトリ不在など）でも空一覧を返してアプリを落とさない。
@@ -22,16 +26,24 @@ const SYSTEM_JSON: &str = "system.json";
 /// `mixdown::MIX_FILENAME` と一致させること。
 const MIX_MP3: &str = "mix.mp3";
 
-/// 取り残された一時ファイルと見なす、最終更新からの経過時間（`sweep_session_parts`）。
+/// 取り残された一時ファイルと見なす、最終更新からの経過時間（`spawn_session_part_sweep`）。
 ///
 /// セッション側の一時ファイルは**寿命が短い**: 書き手（`mixdown::normalize_if_quiet` と
 /// `summarize::write_summary`）はどちらも中身を先にメモリで作り、一時ファイルへは 1 回書いて
-/// すぐ rename する。数十 MB の書き出しでも 1 秒に満たないので、生きた一時ファイルが 1 時間も
-/// 残ることはない（モデル取得の 3 時間は、受信そのものが数十分かかることに由来する別の値）。
+/// すぐ rename するので、通常は 1 秒に満たない（モデル取得の `STALE_MODEL_PART_AGE` が 3 時間
+/// なのは、受信そのものが数十分かかることに由来する別の理由）。時計のずれ・mtime の粒度ぶんの
+/// 余裕もこの 1 時間に含む。
+///
 /// 走っている書き込みを消さない保証そのものは mtime が更新され続けることで足りる
-/// （`atomic_replace::sweep_orphaned_parts` の doc）。時計のずれ・mtime の粒度ぶんの余裕も
-/// この 1 時間に含む。
-const STALE_PART_AGE: Duration = Duration::from_secs(60 * 60);
+/// （`atomic_replace::sweep_orphaned_parts` の doc）。ただし**書き出し中のスリープ**を挟むと
+/// 経過は伸びうる（mtime は止まり「今」が進む）。その場合に失われるのは走っていた書き出し
+/// 1 回ぶんで、rename が失敗してログに出るだけ（成果物は元のまま壊れない）。
+const STALE_SESSION_PART_AGE: Duration = Duration::from_secs(60 * 60);
+
+/// 掃除する一時ファイルの宛先名（`spawn_session_part_sweep`）。セッションディレクトリは**ユーザーが
+/// 中身を置ける場所**なので、アプリが `PartFile` 経由で書く宛先だけに絞る（`mix.mp3` は
+/// `PartFile` を通さず直接書くので入れない）。名前の由来は `atomic_replace::PartScope`。
+const SWEPT_PART_DESTS: &[&str] = &[MIC_MP3, SYSTEM_MP3, crate::summarize::SUMMARY_FILENAME];
 
 /// セッションディレクトリ名の日時フォーマット（`main.rs` の録音開始時の命名と一致させること）。
 const DIR_DATETIME_FORMAT: &str = "%Y%m%d-%H%M%S";
@@ -166,20 +178,68 @@ pub fn list_sessions(recording_dir: &Path) -> Vec<RecordingSession> {
 ///
 /// `PartFile` の Drop が走らない終わり方（`abort`・強制終了・電源喪失）で残ったものが対象。
 /// 発話由来の派生物（正規化中の音声・議事録）なので、ユーザーが気づかないまま録音フォルダに
-/// 残り続けないようにする（`docs/review-perspectives/security.md`）。判定と限界は
-/// `atomic_replace::sweep_orphaned_parts` の doc。
+/// 残り続けないようにする（`docs/review-perspectives/security.md`）。古さの判定と、そこから
+/// 来る限界（強制終了の直後は回収されない）は `atomic_replace::sweep_orphaned_parts` の doc。
 ///
-/// **走査するのは `list_sessions` が返したセッションだけ**にする。#130 で「起動時にユーザーの
-/// フォルダを走査して消すのはリスクが大きい」と見送った判断を保つための線引きで、
-/// (1) 掃除が走るのはユーザーが Recordings ウィンドウを開いたときだけ、(2) 対象は日時形式の
-/// 名前で音源を持つディレクトリの直下だけ、になる。保存先に置かれた無関係なフォルダ
-/// （`recording_dir` は手編集されうる設定由来）には触れない。
+/// **これがユーザーの保存先でファイルを消す唯一の経路**なので、範囲を 3 重に絞る:
 ///
-/// 音源が 1 つも無いディレクトリは一覧に出ないので掃除されないが、一時ファイルを作る経路は
-/// どれも音源が在る状態でしか走らない（録音そのものは `PartFile` を通さず直接書く）。
-pub fn sweep_session_parts(sessions: &[RecordingSession], now: SystemTime) {
-    for session in sessions {
-        crate::atomic_replace::sweep_orphaned_parts(&session.dir, now, STALE_PART_AGE);
+/// 1. **時期**: ユーザーが Recordings ウィンドウを開いたときだけ（常駐の起動時には走らない。
+///    #130 で「起動時にユーザーの選んだ保存先を走査するリスクは取らない」と見送った判断を、
+///    「保存先を**丸ごと**走査しない」に狭めて保つ）。
+/// 2. **場所**: `list_sessions` が返したセッション（日時形式の名前で音源を持つディレクトリ）の
+///    直下だけ。保存先に置かれた無関係なフォルダには触れない（`recording_dir` は手編集されうる
+///    設定由来）。セッションディレクトリ自体が**シンボリックリンク**なら掃除しない:
+///    `list_sessions` の `is_dir()` はリンクを辿るので、日時形式の名前のリンクを置かれると
+///    掃除が録音ツリーの外へ出る。一覧に出す（読むだけ）のは許し、消す側は辿らない。
+/// 3. **名前**: `SWEPT_PART_DESTS`（アプリが `PartFile` で書く宛先）の一時ファイルだけ。
+///    これで、たまたま `*.part.<数字>` という名前のユーザーのファイル（分割書庫など）には
+///    原理的に触れない。
+///
+/// 消したファイルは**ゴミ箱へは送らない**（セッション削除との差）。成果物ではなく書き損じの
+/// 断片で、復元する価値が無いため。
+///
+/// 走査は**バックグラウンドスレッドで行い、呼び出し側は待たない**（表示には使わない副作用な
+/// ので待つ理由が無く、セッション数に比例する I/O を UI スレッドへ載せない。
+/// `docs/rules/performance.md`）。戻り値のハンドルはそのための同期点で、本番は捨てて構わない
+/// （掃除が終わる前にアプリが終了しても、次に開いたときにまた走る）。
+///
+/// 音源が 1 つも無いディレクトリは一覧に出ないので掃除されない。一時ファイルを作る経路は
+/// どれも音源が在る状態でしか走る（録音そのものは `PartFile` を通さず直接書く）ので、作られた
+/// 時点では必ず一覧に出る。あとで音源だけ消されたセッションの残骸は回収されないが、残るのは
+/// 1〜2 ファイルなので許容する。
+pub fn spawn_session_part_sweep(
+    sessions: &[RecordingSession],
+    now: SystemTime,
+) -> Option<std::thread::JoinHandle<()>> {
+    let dirs: Vec<PathBuf> = sessions.iter().map(|session| session.dir.clone()).collect();
+    match std::thread::Builder::new()
+        .name("session-part-sweep".into())
+        .spawn(move || sweep_session_dirs(&dirs, now))
+    {
+        Ok(handle) => Some(handle),
+        Err(err) => {
+            // 掃除は「次に開いたときにまた走る」ので、失敗しても機能に影響しない。
+            eprintln!(
+                "Skipping the cleanup of leftover temporary files because a thread could not be started: {err}"
+            );
+            None
+        }
+    }
+}
+
+/// 掃除の本体（`spawn_session_part_sweep` が別スレッドで呼ぶ）。範囲の判断はそちらの doc。
+fn sweep_session_dirs(dirs: &[PathBuf], now: SystemTime) {
+    for dir in dirs {
+        // リンクを辿らずにディレクトリであることを確かめる（上の 2.）。
+        if !dir.symlink_metadata().is_ok_and(|meta| meta.is_dir()) {
+            continue;
+        }
+        crate::atomic_replace::sweep_orphaned_parts(
+            dir,
+            now,
+            STALE_SESSION_PART_AGE,
+            crate::atomic_replace::PartScope::Dests(SWEPT_PART_DESTS),
+        );
     }
 }
 
@@ -191,12 +251,21 @@ fn parse_session_datetime(name: &str) -> Option<NaiveDateTime> {
 #[cfg(test)]
 mod tests {
     use super::{
-        RecordingSession, STALE_PART_AGE, list_sessions, parse_session_datetime,
-        sweep_session_parts,
+        RecordingSession, STALE_SESSION_PART_AGE, list_sessions, parse_session_datetime,
+        spawn_session_part_sweep,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::time::SystemTime;
+    use std::time::{Duration, SystemTime};
+
+    /// 掃除を走らせて終わるまで待つ（本番は待たないが、テストは決定的にしたいのでハンドルを
+    /// join する）。
+    fn sweep_and_wait(sessions: &[RecordingSession], now: SystemTime) {
+        spawn_session_part_sweep(sessions, now)
+            .expect("the sweep thread should start in test")
+            .join()
+            .expect("the sweep thread should not panic");
+    }
 
     /// テスト用に、指定ディレクトリ配下へセッションディレクトリと空の音源/文字起こしファイルを作る。
     fn make_session(root: &Path, name: &str, files: &[&str]) {
@@ -228,16 +297,21 @@ mod tests {
         make_session(&root, "20260628-160000", &["mic.json"]);
 
         let listed_old = root.join("20260628-143025").join("mic.mp3.part.123");
-        let listed_fresh = root.join("20260628-150000").join("system.mp3.part.456");
+        let listed_second = root.join("20260628-150000").join("system.mp3.part.456");
+        let listed_other_name = root.join("20260628-143025").join("archive.zip.part.1");
         let listed_user_file = root.join("20260628-143025").join("notes.part.txt");
         let unlisted_by_name = root.join("notes").join("mic.mp3.part.789");
         let unlisted_by_content = root.join("20260628-160000").join("summary.md.part.789");
+        // 保存先のルート自体（セッションではない）に置かれたもの。
+        let in_the_root = root.join("mic.mp3.part.999");
         for path in [
             &listed_old,
-            &listed_fresh,
+            &listed_second,
+            &listed_other_name,
             &listed_user_file,
             &unlisted_by_name,
             &unlisted_by_content,
+            &in_the_root,
         ] {
             fs::write(path, b"x").expect("writing the fixture succeeds in test");
         }
@@ -245,8 +319,16 @@ mod tests {
         // 実ファイルの mtime は「今」なので、判定の現在時刻を未来へずらして経過を作る
         // （`atomic_replace` のテストと同じ流儀）。
         let sessions = list_sessions(&root);
-        sweep_session_parts(&sessions, SystemTime::now() + STALE_PART_AGE);
+        sweep_and_wait(&sessions, SystemTime::now() + STALE_SESSION_PART_AGE);
         assert!(!listed_old.exists(), "a leftover part file must be removed");
+        assert!(
+            !listed_second.exists(),
+            "every listed session must be swept, not just the first"
+        );
+        assert!(
+            listed_other_name.exists(),
+            "a part file whose destination we never write must be kept"
+        );
         assert!(
             listed_user_file.exists(),
             "a user file that merely contains .part must be kept"
@@ -259,16 +341,60 @@ mod tests {
             unlisted_by_content.exists(),
             "a folder without audio is not listed, so it must not be swept"
         );
+        assert!(
+            in_the_root.exists(),
+            "the recording folder itself must not be swept"
+        );
 
         // 書き込み中（mtime が新しい）の一時ファイルは、古さの条件を満たさないので残る。
-        fs::write(&listed_fresh, b"x").expect("writing the fixture succeeds in test");
-        sweep_session_parts(&sessions, SystemTime::now());
+        // 閾値の桁も固定する: 1 時間より短い経過では消えない。
+        fs::write(&listed_old, b"x").expect("writing the fixture succeeds in test");
+        sweep_and_wait(&sessions, SystemTime::now());
+        sweep_and_wait(
+            &sessions,
+            SystemTime::now() + STALE_SESSION_PART_AGE - Duration::from_secs(60),
+        );
         assert!(
-            listed_fresh.exists(),
+            listed_old.exists(),
             "a part file that is still being written must be kept"
         );
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// セッションディレクトリ自体がシンボリックリンクなら掃除しない（掃除が録音ツリーの外へ
+    /// 出ないための線引き。`list_sessions` の `is_dir()` はリンクを辿るので一覧には出る）。
+    #[test]
+    #[cfg(unix)]
+    fn sweep_does_not_follow_a_symlinked_session() {
+        let root = unique_root("sweep-symlink");
+        let _ = fs::remove_dir_all(&root);
+        // 録音ツリーの外にあるセッションらしいディレクトリ（リンク先）。
+        let outside = unique_root("sweep-symlink-outside");
+        let _ = fs::remove_dir_all(&outside);
+        fs::create_dir_all(&outside).expect("creating the outside dir succeeds in test");
+        fs::write(outside.join("mic.mp3"), b"").expect("writing the fixture succeeds in test");
+        let victim = outside.join("mic.mp3.part.123");
+        fs::write(&victim, b"x").expect("writing the fixture succeeds in test");
+
+        fs::create_dir_all(&root).expect("creating the root succeeds in test");
+        let link = root.join("20260628-143025");
+        std::os::unix::fs::symlink(&outside, &link).expect("creating the symlink succeeds in test");
+
+        let sessions = list_sessions(&root);
+        assert_eq!(
+            sessions.len(),
+            1,
+            "the symlink is listed (is_dir follows it)"
+        );
+        sweep_and_wait(&sessions, SystemTime::now() + STALE_SESSION_PART_AGE);
+        assert!(
+            victim.exists(),
+            "a part file behind a symlinked session must not be swept"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outside);
     }
 
     #[test]

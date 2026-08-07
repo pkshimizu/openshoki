@@ -78,6 +78,31 @@ impl Drop for PartFile {
     }
 }
 
+/// 掃除の対象にする一時ファイルの絞り込み（`sweep_orphaned_parts`）。
+///
+/// 掃除の安全性は「対象ディレクトリを限定していること」に依るので、**ユーザーが中身を置ける
+/// 場所を掃除するときは宛先名まで絞る**（アプリが書いた一時ファイルしか触らないことが名前で
+/// 決まる）。アプリ専有の場所（モデルの保存先）は宛先名がカタログ次第で増えるため絞らない。
+pub enum PartScope<'a> {
+    /// `*.part.<数字>` の形ならすべて。アプリ専有のディレクトリ用。
+    AnyDest,
+    /// この宛先名（`mic.mp3` など）の一時ファイルだけ。ユーザーの領域にあるディレクトリ用。
+    Dests(&'a [&'a str]),
+}
+
+impl PartScope<'_> {
+    /// この名前を掃除の対象にするか。
+    fn covers(&self, name: &Path) -> bool {
+        let Some(dest) = part_dest(name) else {
+            return false;
+        };
+        match self {
+            Self::AnyDest => true,
+            Self::Dests(dests) => dests.contains(&dest),
+        }
+    }
+}
+
 /// `dir` の直下に取り残された一時ファイルを消す（消したファイルは 1 件ずつログに出る）。
 ///
 /// `PartFile` の Drop が走らない終わり方（`abort`・強制終了・電源喪失）で残ったものが対象。
@@ -90,7 +115,7 @@ impl Drop for PartFile {
 /// 過ぎてからの起動で回収される）。即時に回収するには一時ファイルのロック等で「書いていた
 /// プロセスが生きているか」を直接見る必要があり、そこまではやらない（掃除が走らない間も、
 /// 残骸は空き容量に反映されるので取得の可否判断は正しく働く）。
-pub fn sweep_orphaned_parts(dir: &Path, now: SystemTime, max_age: Duration) {
+pub fn sweep_orphaned_parts(dir: &Path, now: SystemTime, max_age: Duration, scope: PartScope) {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         // ディレクトリが無い（初回起動）・読めないのは掃除しないだけで機能に影響しない。
@@ -117,7 +142,7 @@ pub fn sweep_orphaned_parts(dir: &Path, now: SystemTime, max_age: Duration) {
         };
         // 名前で先にふるう（安い。無関係なエントリに stat を打たない）。
         let name = entry.file_name();
-        if !is_part_file(Path::new(&name)) {
+        if !scope.covers(Path::new(&name)) {
             continue;
         }
         // 通常ファイルだけを対象にする。シンボリックリンクを辿って別の場所の mtime で
@@ -138,8 +163,9 @@ pub fn sweep_orphaned_parts(dir: &Path, now: SystemTime, max_age: Duration) {
         let path = entry.path();
         match std::fs::remove_file(&path) {
             Ok(()) => {
-                // 数 GB を回収する操作なので、黙って消さずログに残す。ファイル名だけを出す
-                // （フルパスはユーザー名を含むため。`docs/rules/security.md`）。
+                // 取り残しを黙って消さずログに残す（モデルなら 1 件で数 GB になりうる）。
+                // ファイル名だけを出す（フルパスはユーザー名を含むため。
+                // `docs/rules/security.md`）。
                 println!(
                     "Removed a leftover temporary file: {}",
                     name.to_string_lossy()
@@ -151,22 +177,23 @@ pub fn sweep_orphaned_parts(dir: &Path, now: SystemTime, max_age: Duration) {
     }
 }
 
-/// `*.part.<数字>` という名前か（`PartFile::for_dest` が作る形）。
+/// `<宛先名>.part.<数字>`（`PartFile::for_dest` が作る形）なら、その宛先名を返す。
+/// 形が違えば `None`。
 ///
-/// 数字まで見るのは、拡張子付きのユーザーファイル（`notes.part.txt` 等）を誤って掴まない
-/// ための最低限のふるい。分割書庫の慣習名（`archive.zip.part.1`）までは見分けられないので、
-/// **安全性の主体は対象ディレクトリを限定していること**にある。掃除を掛けているのは
-/// モデルの保存先（`model_download::sweep_orphaned_part_files`）と、Recordings ウィンドウに
-/// 出たセッションの直下（`recordings::sweep_session_parts`）だけ。ユーザーが選んだ保存先を
-/// 丸ごと走査することはしない（範囲と時期の理由はそれぞれの doc）。
-fn is_part_file(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-    let Some((rest, pid)) = name.rsplit_once('.') else {
-        return false;
-    };
-    rest.ends_with(".part") && !pid.is_empty() && pid.chars().all(|c| c.is_ascii_digit())
+/// pid が数字であることまで見るのは、拡張子付きのユーザーファイル（`notes.part.txt` 等）を
+/// 誤って掴まないための最低限のふるい。これだけでは分割書庫の慣習名（`archive.zip.part.1`）を
+/// 見分けられないので、**安全性の主体は対象を限定していること**にある（`PartScope`）。掃除の
+/// 掛け先は 2 つ: モデルの保存先（`model_download::sweep_orphaned_part_files`）と、Recordings
+/// ウィンドウに出たセッションの直下（`recordings::spawn_session_part_sweep`）。範囲と時期の
+/// 理由はそれぞれの doc。
+fn part_dest(path: &Path) -> Option<&str> {
+    let name = path.file_name().and_then(|name| name.to_str())?;
+    let (rest, pid) = name.rsplit_once('.')?;
+    let dest = rest.strip_suffix(".part")?;
+    if dest.is_empty() || pid.is_empty() || !pid.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(dest)
 }
 
 /// 最終更新から `max_age` 以上経っているか。時刻が読めない・未来の時刻が入っている場合は
@@ -309,7 +336,7 @@ mod tests {
         // 実ファイルの mtime は「今」なので、判定の現在時刻を未来へずらして経過を作る
         // （mtime を書き換える依存を足さずに決定的に検証する）。
         let elapsed = SystemTime::now() + LIMIT;
-        sweep_orphaned_parts(&dir, elapsed, LIMIT);
+        sweep_orphaned_parts(&dir, elapsed, LIMIT, PartScope::AnyDest);
         // どちらの一時ファイルも上限を超えているので消える。
         assert!(!old_part.exists());
         assert!(!fresh_part.exists());
@@ -323,7 +350,7 @@ mod tests {
 
         // 書き込み中（mtime が新しい）の一時ファイルは消さない。
         std::fs::write(&fresh_part, b"x").expect("writing the fixture should succeed");
-        sweep_orphaned_parts(&dir, SystemTime::now(), LIMIT);
+        sweep_orphaned_parts(&dir, SystemTime::now(), LIMIT, PartScope::AnyDest);
         assert!(
             fresh_part.exists(),
             "a part file that is still being written must be kept"
@@ -344,7 +371,7 @@ mod tests {
             .and_then(|meta| meta.modified())
             .expect("the fixture should have an mtime")
             + LIMIT;
-        sweep_orphaned_parts(&dir, just_at_limit, LIMIT);
+        sweep_orphaned_parts(&dir, just_at_limit, LIMIT, PartScope::AnyDest);
         assert!(!part.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -362,7 +389,7 @@ mod tests {
 
         // 古さの条件は満たす時刻を渡す（残る理由が「新しいから」ではないことを固定する）。
         let elapsed = SystemTime::now() + Duration::from_secs(48 * 60 * 60);
-        sweep_orphaned_parts(&dir, elapsed, Duration::from_secs(60));
+        sweep_orphaned_parts(&dir, elapsed, Duration::from_secs(60), PartScope::AnyDest);
         assert!(link.is_symlink(), "a symlink must not be swept");
         assert!(target.exists(), "the target must not be touched");
         let _ = std::fs::remove_dir_all(&dir);
@@ -377,7 +404,7 @@ mod tests {
         std::fs::write(&part, b"x").expect("writing the fixture should succeed");
 
         let past = SystemTime::now() - Duration::from_secs(60 * 60);
-        sweep_orphaned_parts(&dir, past, Duration::from_secs(1));
+        sweep_orphaned_parts(&dir, past, Duration::from_secs(1), PartScope::AnyDest);
         assert!(
             part.exists(),
             "a file modified after `now` must be treated as fresh"
@@ -390,20 +417,61 @@ mod tests {
     fn sweep_handles_a_missing_directory() {
         let missing = std::env::temp_dir().join(format!("shoki-part-none-{}", std::process::id()));
         assert!(!missing.exists());
-        sweep_orphaned_parts(&missing, SystemTime::now(), Duration::from_secs(1));
+        sweep_orphaned_parts(
+            &missing,
+            SystemTime::now(),
+            Duration::from_secs(1),
+            PartScope::AnyDest,
+        );
         assert!(!missing.exists(), "the directory must not be created");
     }
 
     #[test]
-    fn is_part_file_wants_a_numeric_pid() {
-        assert!(is_part_file(Path::new("/tmp/model.bin.part.1")));
-        assert!(is_part_file(Path::new("/tmp/mic.mp3.part.99999")));
+    fn part_dest_wants_a_numeric_pid_and_returns_the_destination() {
+        assert_eq!(
+            part_dest(Path::new("/tmp/model.bin.part.1")),
+            Some("model.bin")
+        );
+        assert_eq!(
+            part_dest(Path::new("/tmp/mic.mp3.part.99999")),
+            Some("mic.mp3")
+        );
         // 旧形式（拡張子を落としていた頃の名前）も対象にする。
-        assert!(is_part_file(Path::new("/tmp/ggml-small.part.42")));
-        // pid が数字でない・無いものはユーザーのファイルとして扱う。
-        assert!(!is_part_file(Path::new("/tmp/notes.part.txt")));
-        assert!(!is_part_file(Path::new("/tmp/model.bin.part.")));
-        assert!(!is_part_file(Path::new("/tmp/model.bin")));
-        assert!(!is_part_file(Path::new("/tmp/part.123")));
+        assert_eq!(
+            part_dest(Path::new("/tmp/ggml-small.part.42")),
+            Some("ggml-small")
+        );
+        // pid が数字でない・無いもの、宛先名が無いものはユーザーのファイルとして扱う。
+        assert_eq!(part_dest(Path::new("/tmp/notes.part.txt")), None);
+        assert_eq!(part_dest(Path::new("/tmp/model.bin.part.")), None);
+        assert_eq!(part_dest(Path::new("/tmp/model.bin")), None);
+        assert_eq!(part_dest(Path::new("/tmp/part.123")), None);
+        assert_eq!(part_dest(Path::new("/tmp/.part.123")), None);
+    }
+
+    /// 宛先名で絞ると、アプリが書いた名前以外の一時ファイルには触れない
+    /// （ユーザーが中身を置ける場所を掃除するときの主柱）。
+    #[test]
+    fn sweep_with_named_dests_keeps_other_part_files() {
+        let dir = temp_dir("sweep-dests");
+        let ours = dir.join("mic.mp3.part.123");
+        let theirs = dir.join("archive.zip.part.1");
+        for path in [&ours, &theirs] {
+            std::fs::write(path, b"x").expect("writing the fixture should succeed");
+        }
+
+        let elapsed = SystemTime::now() + Duration::from_secs(60 * 60);
+        sweep_orphaned_parts(
+            &dir,
+            elapsed,
+            Duration::from_secs(60),
+            PartScope::Dests(&["mic.mp3"]),
+        );
+        assert!(!ours.exists(), "our own part file must be removed");
+        assert!(
+            theirs.exists(),
+            "a part file we never write must be kept even when it looks like one"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

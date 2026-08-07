@@ -371,7 +371,8 @@ const RECV_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12
 const WAIT_FOR_OTHER_DOWNLOAD_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(130 * 60);
 
-/// 取り残された一時ファイルと見なす、最終更新からの経過時間（`sweep_orphaned_part_files`）。
+/// 取り残されたモデルの一時ファイルと見なす、最終更新からの経過時間
+/// （`sweep_orphaned_part_files`。録音側は `recordings::STALE_SESSION_PART_AGE` で別に決める）。
 ///
 /// **受信全体のタイムアウト（`RECV_BODY_TIMEOUT`）より長く**取る。あれは無通信の上限ではなく
 /// **ボディ受信全体の期限**（2 時間）で、一時ファイルはヘッダ受信後に作られるので、生きた取得の
@@ -379,7 +380,7 @@ const WAIT_FOR_OTHER_DOWNLOAD_TIMEOUT: std::time::Duration =
 /// 1 時間の余裕を足した値（時計のずれ・mtime の粒度・受信後の検証と rename にかかる時間ぶん）。
 /// 走っている取得を消さない保証そのものは mtime が更新され続けることで足りる
 /// （`atomic_replace::sweep_orphaned_parts` の doc）。
-const STALE_PART_AGE: std::time::Duration = std::time::Duration::from_secs(3 * 60 * 60);
+const STALE_MODEL_PART_AGE: std::time::Duration = std::time::Duration::from_secs(3 * 60 * 60);
 
 /// 不足ぶんを表示するときの単位。この単位へ切り上げて出す（`insufficient_space_reason`）。
 const REPORTED_SHORTFALL_UNIT_BYTES: u64 = 1024 * 1024;
@@ -415,15 +416,19 @@ fn models_dir() -> Option<PathBuf> {
 /// `atomic_replace::sweep_orphaned_parts` の doc。モデルは数 GB あり、保存先はユーザーが辿らない
 /// データディレクトリ配下なので、残ると気づかれないまま容量を食う。
 ///
-/// 録音側の一時ファイル（`mixdown::normalize_if_quiet` と `summarize::write_summary` のもの）は
-/// **ここでは**掃除しない。そちらは Recordings ウィンドウを開いたときに、一覧へ出たセッション
-/// だけを対象に回収する（#134。`recordings::sweep_session_parts`）。起動時にユーザーの選んだ
-/// 保存先を走査しない、という #130 の判断はそのまま保つ。
+/// 録音側の一時ファイルは**ここでは**掃除しない（#134。範囲と時期は
+/// `recordings::spawn_session_part_sweep` の doc）。
 pub fn sweep_orphaned_part_files() {
     let Some(dir) = models_dir() else {
         return;
     };
-    crate::atomic_replace::sweep_orphaned_parts(&dir, std::time::SystemTime::now(), STALE_PART_AGE);
+    // 宛先名は絞らない（`models/` はアプリ専有で、カタログが増えると宛先名も増える）。
+    crate::atomic_replace::sweep_orphaned_parts(
+        &dir,
+        std::time::SystemTime::now(),
+        STALE_MODEL_PART_AGE,
+        crate::atomic_replace::PartScope::AnyDest,
+    );
 }
 
 /// パス要素を持たない素のファイル名か（`/` や `..`、絶対パスを弾く）。

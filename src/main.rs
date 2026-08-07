@@ -28,7 +28,7 @@ mod whisper_model;
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 // VecModel の row_data / set_row_data（tick の行単位更新）に必要。
 use slint::Model;
@@ -1284,8 +1284,9 @@ fn open_recordings_window(
 ) {
     let list = recordings::list_sessions(&config.borrow().recording_dir);
     // 一覧に出たセッションに取り残された一時ファイルを回収する（強制終了などで残ったもの。
-    // 走査の範囲と時期をここに限る理由は `recordings::sweep_session_parts` の doc）。
-    recordings::sweep_session_parts(&list, std::time::SystemTime::now());
+    // 範囲と時期の判断は `recordings::spawn_session_part_sweep` の doc）。表示には使わない
+    // 副作用なので、ハンドルは捨てて完了を待たない。
+    let _ = recordings::spawn_session_part_sweep(&list, SystemTime::now());
     let rows: Vec<SessionRow> = list
         .iter()
         .map(|session| SessionRow {

@@ -576,8 +576,8 @@ fn write_summary(path: &Path, markdown: &str) -> Result<(), Box<dyn std::error::
     // 上書きすると `truncate` で**開いた時点で**既存の議事録が消え、書き込み中に失敗した場合に
     // (1) 前の議事録が失われ、(2) 途中まで書けたファイルが「生成済み」として表示される
     // （`load_summary` は非空なら返す）。失敗しても一時ファイルは番人が消す。
-    // 強制終了で残った `summary.md.part.<pid>` は掃除の対象外（`sweep_orphaned_parts` は
-    // モデルの保存先だけに掛ける）。セッションを削除すれば一緒に消える。
+    // Drop が走らない終わり方で残った `summary.md.part.<pid>` は、Recordings ウィンドウを
+    // 開いたときに回収する（`recordings::spawn_session_part_sweep`）。
     let part = crate::atomic_replace::PartFile::for_dest(path)
         .ok_or("the summary path does not end in a file name")?;
     // 0600 で作る（議事録は発話由来の機微データ。`crate::private_file`）。rename はモードを
