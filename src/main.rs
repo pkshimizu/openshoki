@@ -5,6 +5,7 @@
 
 #[cfg(target_os = "macos")]
 mod app_audio_monitor;
+mod atomic_replace;
 mod config;
 mod inference_slot;
 mod mixdown;
@@ -94,6 +95,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
     }
+
+    // 強制終了などで残った取得中ファイル（数 GB になりうる）を回収する。走っている取得は
+    // 対象にならない（判定は `atomic_replace::sweep_orphaned_parts` の doc）。
+    model_download::sweep_orphaned_part_files();
 
     // 内蔵 whisper モデルのダウンロード・状態管理。設定画面（モデル選択・DL 状況表示）と
     // 文字起こしワーカーで同じ状態を共有し、同一モデルの二重ダウンロードを防ぐ。

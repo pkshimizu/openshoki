@@ -185,18 +185,11 @@ fn normalize_if_quiet(path: &Path) -> Result<NormalizeOutcome, Box<dyn std::erro
     let mp3 = encode_mp3(&to_i16(pcm), decoded.channels, decoded.sample_rate)?;
 
     // 一時ファイルへ書いてから rename で置き換える（途中で失敗しても元ファイルが壊れない）。
-    let part = path.with_extension(format!("mp3.part.{}", std::process::id()));
-    let result =
-        crate::private_file::write(&part, &mp3).and_then(|()| std::fs::rename(&part, path));
-    if let Err(err) = result {
-        // 後始末の失敗も黙って捨てない（docs/rules/error-handling.md）。
-        if let Err(remove_err) = std::fs::remove_file(&part)
-            && remove_err.kind() != std::io::ErrorKind::NotFound
-        {
-            eprintln!("Failed to remove the partially written audio: {remove_err}");
-        }
-        return Err(err.into());
-    }
+    // 一時ファイルの命名・後始末（失敗・パニック）は `crate::atomic_replace::PartFile` が持つ。
+    let part = crate::atomic_replace::PartFile::for_dest(path)
+        .ok_or_else(|| std::io::Error::other("the audio path does not end in a file name"))?;
+    crate::private_file::write(part.path(), &mp3)?;
+    part.commit()?;
     Ok(NormalizeOutcome::Normalized { peak_db, gain_db })
 }
 
