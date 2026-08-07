@@ -37,7 +37,7 @@ impl PartFile {
     ///
     /// `dest` がファイル名で終わらない（`/`・`..` 等）場合は `None`。ディスクへ書く関数なので、
     /// 既定値で埋めて**別の場所**に一時ファイルを作るより、呼び出し側に失敗させる。
-    #[must_use = "the temporary file is removed when the guard is dropped; bind it"]
+    #[must_use = "the returned guard owns the temporary file; bind it and commit() it"]
     pub fn for_dest(dest: &Path) -> Option<Self> {
         let mut name = dest.file_name()?.to_os_string();
         name.push(format!(".part.{}", std::process::id()));
@@ -77,8 +77,7 @@ impl Drop for PartFile {
     }
 }
 
-/// `dir` の直下に取り残された一時ファイルを消す（消した数を返す。消したファイルは 1 件ずつ
-/// ログに出るので、戻り値はテストで数を固定するためのもので、呼び出し側は無視してよい）。
+/// `dir` の直下に取り残された一時ファイルを消す（消したファイルは 1 件ずつログに出る）。
 ///
 /// `PartFile` の Drop が走らない終わり方（`abort`・強制終了・電源喪失）で残ったものが対象。
 /// **走っている取得の一時ファイルは消さない**: 判定は「最終更新から `max_age` 以上経っている」
@@ -90,21 +89,20 @@ impl Drop for PartFile {
 /// 過ぎてからの起動で回収される）。即時に回収するには一時ファイルのロック等で「書いていた
 /// プロセスが生きているか」を直接見る必要があり、そこまではやらない（掃除が走らない間も、
 /// 残骸は空き容量に反映されるので取得の可否判断は正しく働く）。
-pub fn sweep_orphaned_parts(dir: &Path, now: SystemTime, max_age: Duration) -> usize {
+pub fn sweep_orphaned_parts(dir: &Path, now: SystemTime, max_age: Duration) {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         // ディレクトリが無い（初回起動）・読めないのは掃除しないだけで機能に影響しない。
         // 保存先のフルパスはログに出さない（`docs/rules/security.md`）。
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return 0,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
         Err(err) => {
             eprintln!(
                 "Skipping the cleanup of leftover temporary files because the folder could not be read: {err}"
             );
-            return 0;
+            return;
         }
     };
 
-    let mut removed = 0;
     for entry in entries {
         // 1 件読めなくても残りは掃除する（握りつぶさずログに残す。`docs/rules/error-handling.md`）。
         let entry = match entry {
@@ -128,7 +126,7 @@ pub fn sweep_orphaned_parts(dir: &Path, now: SystemTime, max_age: Duration) -> u
             Ok(metadata) => metadata,
             Err(err) => {
                 eprintln!(
-                    "Skipping a temporary file while cleaning up because its metadata could not be read: {err}"
+                    "Skipping an entry that looks like a leftover temporary file because its metadata could not be read: {err}"
                 );
                 continue;
             }
@@ -145,13 +143,11 @@ pub fn sweep_orphaned_parts(dir: &Path, now: SystemTime, max_age: Duration) -> u
                     "Removed a leftover temporary file: {}",
                     name.to_string_lossy()
                 );
-                removed += 1;
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => eprintln!("Failed to remove the leftover temporary file: {err}"),
         }
     }
-    removed
 }
 
 /// `*.part.<数字>` という名前か（`PartFile::for_dest` が作る形）。
@@ -309,11 +305,8 @@ mod tests {
         // 実ファイルの mtime は「今」なので、判定の現在時刻を未来へずらして経過を作る
         // （mtime を書き換える依存を足さずに決定的に検証する）。
         let elapsed = SystemTime::now() + LIMIT;
-        assert_eq!(
-            sweep_orphaned_parts(&dir, elapsed, LIMIT),
-            2,
-            "both part files are older than the limit at that point in time"
-        );
+        sweep_orphaned_parts(&dir, elapsed, LIMIT);
+        // どちらの一時ファイルも上限を超えているので消える。
         assert!(!old_part.exists());
         assert!(!fresh_part.exists());
         // 一時ファイル以外は残る。
@@ -326,12 +319,11 @@ mod tests {
 
         // 書き込み中（mtime が新しい）の一時ファイルは消さない。
         std::fs::write(&fresh_part, b"x").expect("writing the fixture should succeed");
-        assert_eq!(
-            sweep_orphaned_parts(&dir, SystemTime::now(), LIMIT),
-            0,
+        sweep_orphaned_parts(&dir, SystemTime::now(), LIMIT);
+        assert!(
+            fresh_part.exists(),
             "a part file that is still being written must be kept"
         );
-        assert!(fresh_part.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -348,7 +340,7 @@ mod tests {
             .and_then(|meta| meta.modified())
             .expect("the fixture should have an mtime")
             + LIMIT;
-        assert_eq!(sweep_orphaned_parts(&dir, just_at_limit, LIMIT), 1);
+        sweep_orphaned_parts(&dir, just_at_limit, LIMIT);
         assert!(!part.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -366,12 +358,8 @@ mod tests {
 
         // 古さの条件は満たす時刻を渡す（残る理由が「新しいから」ではないことを固定する）。
         let elapsed = SystemTime::now() + Duration::from_secs(48 * 60 * 60);
-        assert_eq!(
-            sweep_orphaned_parts(&dir, elapsed, Duration::from_secs(60)),
-            0,
-            "a symlink must not be swept"
-        );
-        assert!(link.is_symlink(), "the symlink itself should remain");
+        sweep_orphaned_parts(&dir, elapsed, Duration::from_secs(60));
+        assert!(link.is_symlink(), "a symlink must not be swept");
         assert!(target.exists(), "the target must not be touched");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -385,24 +373,21 @@ mod tests {
         std::fs::write(&part, b"x").expect("writing the fixture should succeed");
 
         let past = SystemTime::now() - Duration::from_secs(60 * 60);
-        assert_eq!(
-            sweep_orphaned_parts(&dir, past, Duration::from_secs(1)),
-            0,
+        sweep_orphaned_parts(&dir, past, Duration::from_secs(1));
+        assert!(
+            part.exists(),
             "a file modified after `now` must be treated as fresh"
         );
-        assert!(part.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// ディレクトリが無くても（初回起動）静かに何もしない。
+    /// ディレクトリが無くても（初回起動）静かに何もしない（パニックせずに戻る）。
     #[test]
     fn sweep_handles_a_missing_directory() {
         let missing = std::env::temp_dir().join(format!("shoki-part-none-{}", std::process::id()));
         assert!(!missing.exists());
-        assert_eq!(
-            sweep_orphaned_parts(&missing, SystemTime::now(), Duration::from_secs(1)),
-            0
-        );
+        sweep_orphaned_parts(&missing, SystemTime::now(), Duration::from_secs(1));
+        assert!(!missing.exists(), "the directory must not be created");
     }
 
     #[test]

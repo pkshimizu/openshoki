@@ -374,9 +374,11 @@ const WAIT_FOR_OTHER_DOWNLOAD_TIMEOUT: std::time::Duration =
 /// 取り残された一時ファイルと見なす、最終更新からの経過時間（`sweep_orphaned_part_files`）。
 ///
 /// **受信全体のタイムアウト（`RECV_BODY_TIMEOUT`）より長く**取る。あれは無通信の上限ではなく
-/// **ボディ受信全体の期限**（2 時間）なので、生きた取得の一時ファイルはそもそも 2 時間＋接続の
-/// 30 秒しか存在しえない（超えたら失敗して自分で片付ける）。3 時間はその上限に 1 時間の余裕を
-/// 足した値で、多重起動した別プロセスの取得を壊さないための余裕でもある。
+/// **ボディ受信全体の期限**（2 時間）で、一時ファイルはヘッダ受信後に作られるので、生きた取得の
+/// 一時ファイルの寿命はその 2 時間が上限（超えたら失敗して自分で片付ける）。3 時間はそこに
+/// 1 時間の余裕を足した値（時計のずれ・mtime の粒度・受信後の検証と rename にかかる時間ぶん）。
+/// 走っている取得を消さない保証そのものは mtime が更新され続けることで足りる
+/// （`atomic_replace::sweep_orphaned_parts` の doc）。
 const STALE_PART_AGE: std::time::Duration = std::time::Duration::from_secs(3 * 60 * 60);
 
 /// 不足ぶんを表示するときの単位。この単位へ切り上げて出す（`insufficient_space_reason`）。
@@ -422,12 +424,7 @@ pub fn sweep_orphaned_part_files() {
     let Some(dir) = models_dir() else {
         return;
     };
-    // 消したファイルは掃除側が 1 件ずつログに出すので、件数は使わない。
-    let _removed = crate::atomic_replace::sweep_orphaned_parts(
-        &dir,
-        std::time::SystemTime::now(),
-        STALE_PART_AGE,
-    );
+    crate::atomic_replace::sweep_orphaned_parts(&dir, std::time::SystemTime::now(), STALE_PART_AGE);
 }
 
 /// パス要素を持たない素のファイル名か（`/` や `..`、絶対パスを弾く）。
