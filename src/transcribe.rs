@@ -123,7 +123,22 @@ impl TranscribeWorker {
                     // デキューの隙間はごく短い）。
                     lock_status(&status_for_worker)
                         .insert(job.session_dir.clone(), TranscribeStatus::Transcribing);
-                    let outcome = run_job(&job, &downloader, &slot);
+                    // 文字起こし中のパニックでワーカースレッドを殺さない。死ぬと状態が
+                    // `Transcribing` のまま残り、そのセッションは再起動まで Transcribe /
+                    // Summarize / Delete がすべて無効になる（Recordings ウィンドウの
+                    // `detail-busy`）。失敗として記録し、次のジョブは受け続ける
+                    // （`SummarizeWorker` と同じ扱い）。
+                    let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                        || run_job(&job, &downloader, &slot),
+                    )) {
+                        Ok(outcome) => outcome,
+                        Err(_) => {
+                            eprintln!(
+                                "Skipping transcription because transcribing the session panicked"
+                            );
+                            JobOutcome::Failed
+                        }
+                    };
                     // 要約は「全音源の文字起こしに成功した」ときだけ続ける。部分的に失敗した
                     // 文字起こしから議事録を作ると、欠けたまま完成品に見えてしまう。
                     let summarize = match outcome {

@@ -17,14 +17,18 @@ use slint::platform::PointerEventButton;
 
 slint::include_modules!();
 
-/// 詳細ペイン（`if root.has-selection` の中）を出した状態のウィンドウ。要素の座標を出すために
-/// 実アプリと同じ寸法を与える（`src/main.rs` の RECORDINGS_WIDTH/HEIGHT）。
+/// ウィンドウ寸法（実アプリと同じ。`src/main.rs` の RECORDINGS_WIDTH/HEIGHT）。要素の座標を
+/// 出すために必要で、この値自体はアサートに使わない。
+const WINDOW_WIDTH: f32 = 720.0;
+const WINDOW_HEIGHT: f32 = 540.0;
+
+/// 詳細ペイン（`if root.has-selection` の中）を出した状態のウィンドウ。
 fn open_window() -> RecordingsWindow {
     ui_support::init_backend();
     let window = RecordingsWindow::new().expect("create the recordings window");
     window
         .window()
-        .set_size(slint::LogicalSize::new(720.0, 540.0));
+        .set_size(slint::LogicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT));
     window.set_has_selection(true);
     window
 }
@@ -34,6 +38,8 @@ fn tabs(window: &RecordingsWindow) -> Vec<ElementHandle> {
     ElementHandle::find_by_element_type_name(window, "ViewTab").collect()
 }
 
+/// ラベルで詳細ペインのボタンを引く。対象は std-widgets の `Button` のみ（自作の
+/// `DangerButton` は accessible-role/enabled を持たないので `accessible_enabled` が取れない）。
 fn button(window: &RecordingsWindow, label: &str) -> ElementHandle {
     ElementHandle::find_by_accessible_label(window, label)
         .next()
@@ -105,8 +111,9 @@ fn summarize_reports_the_index_only_while_it_is_enabled() {
     assert_eq!(calls.borrow().len(), 1);
 }
 
-/// 要約の生成中は Transcribe / Delete も無効になる（`detail-busy` に一本化した挙動。
-/// ワーカーが対象ファイルを読み書きしている最中に多重投入・削除をさせない）。
+/// 要約の生成中は Transcribe も無効になる（`detail-busy` に一本化した挙動。ワーカーが対象
+/// ファイルを読み書きしている最中に多重投入をさせない）。Delete も同じゲートだが、自作の
+/// `DangerButton` は accessible-enabled を出さないのでここでは見ない。
 #[test]
 #[cfg_attr(
     not(slint_debug_info),

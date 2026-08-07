@@ -731,7 +731,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // 文字起こしが無ければ入力が無い（ボタンは無効なので通常は来ない。黙って戻ると
             // 「押しても何も起きない」になるのでログを残す）。
             if !session.has_transcript {
-                eprintln!("Skipping the summary because the session has no transcript");
+                eprintln!("Skipping summarization because the session has no transcript");
                 return;
             }
             summarizer.submit(manual_summarize_job(&config.borrow(), &session.dir));
@@ -1060,7 +1060,8 @@ fn build_menu_event_handler(
             // 生成物の有無の正で、ボタンの活性・状態の解決がここを読む。ウィンドウを開いたまま
             // 実行したときに UI とメモリがずれないように、UI だけを直す形にはしない）。
             let mut transcribed: Vec<usize> = Vec::new();
-            let mut summarized: Vec<usize> = Vec::new();
+            // 要約の追従は選択中セッションだけを見るので、書き戻す対象も高々 1 件。
+            let mut summarized: Option<usize> = None;
             {
                 let sessions_ref = recordings.sessions.borrow();
                 for (i, session) in sessions_ref.iter().enumerate() {
@@ -1099,7 +1100,12 @@ fn build_menu_event_handler(
 
                 // 選択中セッションの要約状態も追従させる。一覧行には要約のインジケータが無い
                 // （#81 のスコープ外）ので、行の差分更新ではなく詳細ペインの現在値と比べる。
-                if let Some((i, session)) = selected.and_then(|i| Some((i, sessions_ref.get(i)?))) {
+                // **見ているのは選択中セッションだけ**: 他セッションの `has_summary` は次に
+                // 一覧を開くまで古いままだが、状態の解決はワーカーの状態マップを優先するので
+                // 表示は正しい（`summary_display_status`）。
+                if let Some(i) = selected
+                    && let Some(session) = sessions_ref.get(i)
+                {
                     let status = summary_display_status(
                         recordings.summarizer.status_of(&session.dir),
                         session.has_summary,
@@ -1110,23 +1116,21 @@ fn build_menu_event_handler(
                         // 生成が終わった瞬間に表示を差し替える（失敗時は前の議事録を残す）。
                         if previous == SummaryStatus::Summarizing && status == SummaryStatus::Done {
                             refresh_detail_summary_rows(&rec, &session.dir);
-                            summarized.push(i);
+                            summarized = Some(i);
                         }
                     }
                 }
             }
 
-            if !transcribed.is_empty() || !summarized.is_empty() {
+            if !transcribed.is_empty() || summarized.is_some() {
                 let mut sessions_mut = recordings.sessions.borrow_mut();
                 for i in transcribed {
                     if let Some(session) = sessions_mut.get_mut(i) {
                         session.has_transcript = true;
                     }
                 }
-                for i in summarized {
-                    if let Some(session) = sessions_mut.get_mut(i) {
-                        session.has_summary = true;
-                    }
+                if let Some(session) = summarized.and_then(|i| sessions_mut.get_mut(i)) {
+                    session.has_summary = true;
                 }
                 // 選択中セッションのボタン活性（Summarize は文字起こしの有無で決まる）を、
                 // 書き戻した値から更新する。
@@ -1210,6 +1214,9 @@ fn clear_recordings_selection(
     rec.set_current_segment(-1);
     transcript_segments.borrow_mut().clear();
     rec.set_summary_rows(Rc::new(slint::VecModel::<SummaryRow>::default()).into());
+    // 状態も未実施へ畳む（次の選択で必ず上書きされるが、`detail-busy` の入力なので前の
+    // セッションの「実行中」を持ち越さない）。文字起こし・要約で対称にする。
+    apply_detail_transcript_status(rec, TranscriptStatus::NotTranscribed);
     apply_detail_summary_status(rec, SummaryStatus::NotSummarized);
     apply_playback_position(rec, Duration::ZERO, None);
 }
@@ -1706,8 +1713,11 @@ fn summary_rows(text: &str) -> Vec<SummaryRow> {
             }
         })
         .collect();
-    // 末尾の空行を落とす。見出し記号だけの行（`#` 単独）も本文が空なので同じ扱いにする
-    // （`is_heading` で残すと、空行 1 つのために縮退表示へ落ちなくなる）。
+    // 見出し記号だけの行（`#` 単独）は本文が空なので落とす（強調だけの空行を描かない。
+    // 行の途中でも末尾でも同じ扱い）。本文側の空行は段落の切れ目として残す。
+    rows.retain(|row| !(row.is_heading && row.text.is_empty()));
+    // 末尾の空行は落とす（生成物は末尾に改行を持つ）。中身が全部空なら行なしになり、
+    // 呼び出し側で状態依存の縮退表示へ落ちる。
     while rows.last().is_some_and(|row| row.text.is_empty()) {
         rows.pop();
     }
@@ -1735,7 +1745,8 @@ fn apply_detail_summary_status(rec: &RecordingsWindow, status: SummaryStatus) {
     rec.set_detail_summary_status(status);
 }
 
-/// セッションの現在の要約状態を合成して詳細ペインへ反映する（選択時・手動投入直後・tick 用）。
+/// セッションの現在の要約状態を合成して詳細ペインへ反映する（選択時・手動投入直後用。
+/// tick は状態を計算済みなので `apply_detail_summary_status` を直接使う）。
 fn refresh_detail_summary_status(
     rec: &RecordingsWindow,
     summarizer: &summarize::SummarizeWorker,
@@ -1813,7 +1824,8 @@ fn model_choices(catalog: &[model_download::ModelSpec]) -> slint::ModelRc<slint:
 /// 使われないモデルを数 GB 落とさないための抑止（`docs/rules/security.md` の「通信はユーザーが
 /// 機能を有効化したときだけ」）。抑止する 2 ケースは、その後の取得の仕方も違う:
 ///
-/// - 要約 OFF: 選択だけ保存し、ON にした後の初回要約時に `ensure_model` が取得する。
+/// - 要約 OFF: 選択だけ保存する。取得は次に要約が走るとき（設定を ON にした後の初回要約、または
+///   Recordings ウィンドウの「Summarize」による手動生成）に `ensure_model` が行う。
 /// - モデルパスを上書き中: そのファイルが優先されるので、カタログのモデルは以後も取得しない
 ///   （`summarize::resolve_model`）。
 ///
@@ -1836,7 +1848,8 @@ fn summary_model_downloads_on_select(config: &Config) -> bool {
 /// 「downloads automatically」では表示と挙動が食い違う場合がある。その場合は契機を明示する:
 ///
 /// - モデルパスを上書きしている: そのファイルが使われ、カタログのモデルは取得しない。
-/// - 要約 OFF: 選んでも取得は始まらない（ON にした後の初回要約時に取得する）。
+/// - 要約 OFF: 選んでも取得は始まらない（次に要約が走るときに取得する。設定を ON にした後の
+///   初回要約か、Recordings ウィンドウからの手動生成）。
 fn summary_model_status_text(
     config: &Config,
     downloader: &model_download::ModelDownloader,
@@ -1849,7 +1862,7 @@ fn summary_model_status_text(
         && downloader.status_of(spec) == model_download::DownloadStatus::NotDownloaded
     {
         return format!(
-            "Not downloaded — downloads when meeting minutes are on ({})",
+            "Not downloaded — downloads when minutes are generated ({})",
             model_download::format_size(spec.size_bytes)
         );
     }
@@ -2304,7 +2317,7 @@ mod tests {
         let idle = crate::config::Config::default();
         assert_eq!(
             summary_model_status_text(&idle, &downloader),
-            "Not downloaded — downloads when meeting minutes are on (4.4 GB)"
+            "Not downloaded — downloads when minutes are generated (4.4 GB)"
         );
         // 取得済みなら契機の説明は不要（状態そのものを出す）。
         downloader.set_status_for_test(spec, crate::model_download::DownloadStatus::Downloaded);

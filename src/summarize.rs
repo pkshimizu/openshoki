@@ -211,8 +211,9 @@ impl SummarizeWorker {
 /// 非通常ファイルもログして `None` にする（縮退。アプリは落とさない）。
 ///
 /// ガードの理由は `transcript.rs` の `load_one` と同じ（保存先の生成物は手で置換されうる
-/// 信頼境界外の入力）。ログにはファイル名だけを含める: フルパス（保存先）も本文（発話由来の
-/// 議事録）も機微情報なので出さない（`docs/rules/security.md`）。
+/// 信頼境界外の入力）。ログに出すのは**セッション名（日時のディレクトリ名）とファイル名だけ**:
+/// フルパス（保存先）も本文（発話由来の議事録）も機微情報なので出さない
+/// （`docs/rules/security.md`）。
 pub fn load_summary(session_dir: &Path) -> Option<String> {
     load_summary_limited(session_dir, MAX_SUMMARY_BYTES)
 }
@@ -224,10 +225,13 @@ fn load_summary_limited(session_dir: &Path, max_bytes: u64) -> Option<String> {
 
     let path = session_dir.join(SUMMARY_FILENAME);
     // ログ用のセッション識別子（日時のディレクトリ名だけ。フルパスは出さない）。
+    // フルパス（保存先）は出さない（`docs/rules/security.md`）。名前が取れない異常時は
+    // 固定文字列へ落とす（退避先にパスを混ぜない）。
     let session = session_dir
         .file_name()
-        .unwrap_or(session_dir.as_os_str())
-        .to_string_lossy();
+        .map_or(std::borrow::Cow::Borrowed("unknown"), |name| {
+            name.to_string_lossy()
+        });
     let file = match std::fs::File::open(&path) {
         Ok(file) => file,
         // 未生成（ファイルが無い）は正常な縮退。ログもしない。
@@ -313,17 +317,6 @@ fn run_job(
             let Some(model_path) = resolve_model(job, downloader) else {
                 return JobOutcome::Failed;
             };
-            // 文字起こし直後のジョブ（`existing_is_stale`）だけ、既にある `summary.md` を先に
-            // 消す。それは**古い文字起こしの議事録**なので、残したまま生成に失敗すると
-            // （失敗の記録はメモリのみで再起動すると消える）表示側が古い議事録を「新しい
-            // 文字起こしの議事録」として読んでしまう。消せなかった場合は上書きに賭けて進む。
-            //
-            // 消すのは**生成に入ることが確定してから**（モデルを用意できずに即失敗する経路で
-            // 過去の議事録を巻き添えにしない）。手動の再生成では既存の議事録は現在の文字起こしと
-            // 整合した有効なデータなので消さない（失敗しても失わせない。成功時は上書きされる）。
-            if job.existing_is_stale {
-                remove_stale_summary(&path);
-            }
             // ここから先が重い区間。文字起こしと同時に走らせない（`crate::inference_slot`）。
             // モデルの準備（ダウンロード）はスロットの外で済ませてある。
             let _slot = slot.acquire();
@@ -334,7 +327,7 @@ fn run_job(
         Ok(text) => text,
         Err(err) => {
             eprintln!("Skipping summarization because generating the summary failed: {err}");
-            return JobOutcome::Failed;
+            return failed(job, &path);
         }
     };
     // 空（または空白だけ）の生成結果は失敗として扱う。空ファイルを置くと、表示側が
@@ -342,7 +335,7 @@ fn run_job(
     let generated = generated.trim();
     if generated.is_empty() {
         eprintln!("Skipping summarization because the model produced no text");
-        return JobOutcome::Failed;
+        return failed(job, &path);
     }
 
     match write_summary(&path, generated) {
@@ -354,12 +347,24 @@ fn run_job(
         }
         Err(err) => {
             eprintln!("Skipping summarization because writing the summary failed: {err}");
-            JobOutcome::Failed
+            failed(job, &path)
         }
     }
 }
 
-/// 再生成の前に、古い（＝ひとつ前の文字起こしから作った）議事録を消す。無ければ何もしない。
+/// 生成に失敗したときの後始末（結果は常に `Failed`）。
+///
+/// `write_summary` が原子的に置き換えるので、失敗した時点で既にある `summary.md` は手つかず。
+/// **それが古いと分かっているジョブ（`existing_is_stale`）だけ消す**（判断の理由はその
+/// フィールドの doc）。
+fn failed(job: &SummarizeJob, path: &Path) -> JobOutcome {
+    if job.existing_is_stale {
+        remove_stale_summary(path);
+    }
+    JobOutcome::Failed
+}
+
+/// 古い（＝ひとつ前の文字起こしから作った）議事録を消す。無ければ何もしない。
 fn remove_stale_summary(path: &Path) {
     if let Err(err) = std::fs::remove_file(path)
         && err.kind() != std::io::ErrorKind::NotFound
@@ -403,10 +408,22 @@ fn resolve_model(
 /// 議事録を保存する。録音・文字起こしと同じ機微データなので所有者のみ読み書き可で作る
 /// （`crate::private_file`）。
 fn write_summary(path: &Path, markdown: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let mut file = crate::private_file::create(path)?;
+    // 一時ファイルへ書き切ってから rename で置き換える（`crate::atomic_replace`）。直接
+    // 上書きすると `truncate` で**開いた時点で**既存の議事録が消え、書き込み中に失敗した場合に
+    // (1) 前の議事録が失われ、(2) 途中まで書けたファイルが「生成済み」として表示される
+    // （`load_summary` は非空なら返す）。失敗しても一時ファイルは番人が消す。
+    let part = crate::atomic_replace::PartFile::for_dest(path)
+        .ok_or("the summary path does not end in a file name")?;
+    // 0600 で作る（議事録は発話由来の機微データ。`crate::private_file`）。rename はモードを
+    // 保つので、置き換え後も 0600 のまま。
+    let mut file = crate::private_file::create(part.path())?;
     file.write_all(markdown.as_bytes())?;
     // Markdown ファイルとして扱いやすいよう末尾を改行で終える。
     file.write_all(b"\n")?;
+    // rename の前にハンドルを閉じる（書き込みの失敗を rename より先に見つける）。
+    file.sync_all()?;
+    drop(file);
+    part.commit()?;
     Ok(())
 }
 
@@ -1003,6 +1020,11 @@ mod tests {
         assert_eq!(load_summary_limited(&dir, 4).as_deref(), Some("abcd"));
         assert!(load_summary_limited(&dir, 3).is_none());
 
+        // 公開入口が `MAX_SUMMARY_BYTES` を渡していること（結線）も見る。
+        let too_large = "a".repeat(MAX_SUMMARY_BYTES as usize + 1);
+        std::fs::write(&path, &too_large).expect("the summary should be writable");
+        assert!(load_summary(&dir).is_none());
+
         // ディレクトリ（非通常ファイル）に置き換えられていても落ちない（macOS では読み取り
         // 自体も失敗するので、`is_file()` ガードが無くても同じ結果になる。ここで見るのは
         // 「落ちない」ことまで）。
@@ -1205,7 +1227,7 @@ mod tests {
     /// 再生成のとき、古い議事録が残ったままにならないこと。失敗の記録はメモリのみ（再起動で
     /// 消える）なので、古いファイルが残ると表示側が「新しい文字起こしの議事録」として読む。
     #[test]
-    fn regenerating_removes_the_previous_summary_even_when_it_fails() {
+    fn a_failed_run_removes_the_previous_summary_only_when_it_is_stale() {
         let worker = SummarizeWorker::start(
             crate::model_download::ModelDownloader::new(),
             crate::inference_slot::InferenceSlot::new(),
@@ -1250,6 +1272,37 @@ mod tests {
         assert!(
             !dir.join(SUMMARY_FILENAME).exists(),
             "the stale summary must not survive a failed regeneration"
+        );
+
+        // 手動の再生成（`existing_is_stale: false`）では、失敗しても既存の議事録を失わせない
+        // （現在の文字起こしと整合した有効なデータなので）。同じフィクスチャで対を見る。
+        std::fs::write(dir.join(SUMMARY_FILENAME), "# valid minutes\n")
+            .expect("the existing summary should be writable");
+        worker.submit(SummarizeJob {
+            session_dir: dir.clone(),
+            engine: SummaryEngine::OnDevice,
+            model_id: crate::summary_model::DEFAULT_MODEL_ID.to_owned(),
+            model_override: Some(dir.join("not-a-model.gguf")),
+            language: "en".to_owned(),
+            existing_is_stale: false,
+        });
+        let mut settled = false;
+        for _ in 0..600 {
+            // 直前のジョブも Failed なので、状態ではなくファイルの生存で待たない: いったん
+            // Summarizing へ戻る（`submit` が記録する）ことを見てから Failed を待つ。
+            if worker.status_of(&dir) == Some(SummarizeStatus::Failed)
+                && std::fs::read_to_string(dir.join(SUMMARY_FILENAME)).is_ok()
+            {
+                settled = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(settled, "the manual job should fail within 6s");
+        assert_eq!(
+            std::fs::read_to_string(dir.join(SUMMARY_FILENAME)).expect("the summary should remain"),
+            "# valid minutes\n",
+            "a failed manual regeneration must keep the existing summary"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

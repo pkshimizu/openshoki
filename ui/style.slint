@@ -5,7 +5,10 @@ import { Palette } from "std-widgets.slint";
 // 設定ウィンドウ（app-window.slint）と Recordings ウィンドウ（recordings-window.slint）で共有する。
 export global Style {
     out property <length> detail-title-size: 16px; // 詳細見出し（Recordings の日時）
-    out property <length> heading-size: 12px; // セクション見出し
+    // セクション見出し・タブのラベル用。**本文（body-size）より小さい**ので、本文と並ぶ
+    // 見出し（議事録の `#` 行など）にはサイズを上げず `semibold` で差を付ける
+    // （サイズの逆転を作らない）。
+    out property <length> heading-size: 12px;
     out property <length> body-size: 13px; // 本文ラベル
     out property <length> caption-size: 12px; // 補助テキスト（パス・注記）
     out property <length> badge-size: 10px; // 音源バッジ（Mic / System）

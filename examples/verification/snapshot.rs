@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 const FIRST_FRAME_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// 引数から `snapshot <path>` を読む。指定が無ければ `None`（通常の表示のみ）。
-pub fn requested_path() -> Option<PathBuf> {
+fn requested_path() -> Option<PathBuf> {
     std::env::args()
         .skip_while(|arg| arg != "snapshot")
         .nth(1)

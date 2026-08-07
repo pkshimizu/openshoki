@@ -9,7 +9,8 @@
 //! - `summary`: Summary タブを開いた状態（議事録の見出し強調・折り返しの確認）
 //! - `summarizing` / `summary-failed`: Summary タブを開き、生成中／失敗の状態にした状態
 //!   （状態行の色・縮退ラベルの確認）
-//! - `no-transcript`: 文字起こしも議事録も無いセッション（両タブの縮退表示・Summarize の無効化）
+//! - `no-transcript`: 文字起こしも議事録も無いセッション（両タブの縮退表示・Summarize の無効化）。
+//!   要約は入力が無いので、上の要約状態の指定より優先される
 //! - `snapshot <path>`: PNG に書き出す（画面収録の許可が無い環境用）
 
 slint::include_modules!();
@@ -28,6 +29,10 @@ fn flag(name: &str) -> bool {
 
 /// 引数で件数を指定しなかったときのセグメント件数。
 const DEFAULT_SEGMENT_COUNT: usize = 30;
+
+/// 生成中のラベル。状態テキストと縮退ラベルで同じ文言を使うため 1 箇所に置く
+/// （`src/main.rs` の `SUMMARIZING_LABEL` の複製。あちらを変えたらここも合わせること）。
+const SUMMARIZING_LABEL: &str = "Summarizing…";
 
 /// Summary タブの確認用のダミー議事録。見出しの強調・本文の折り返し・段落の間隔を見たいので、
 /// 実際の生成物（`src/summarize.rs` のプロンプトが作る 4 見出し構成）と同じ形にする。
@@ -117,7 +122,7 @@ fn main() {
     win.set_detail_summary_status_text(
         match summary_status {
             SummaryStatus::NotSummarized => "Not summarized",
-            SummaryStatus::Summarizing => "Summarizing…",
+            SummaryStatus::Summarizing => SUMMARIZING_LABEL,
             SummaryStatus::Done => "Summarized",
             SummaryStatus::Failed => "Summarization failed",
         }
@@ -125,7 +130,7 @@ fn main() {
     );
     win.set_detail_summary_placeholder(
         match summary_status {
-            SummaryStatus::Summarizing => "Summarizing…",
+            SummaryStatus::Summarizing => SUMMARIZING_LABEL,
             SummaryStatus::Failed => "Summarization Failed",
             SummaryStatus::NotSummarized | SummaryStatus::Done => "Not Summarized Yet",
         }
