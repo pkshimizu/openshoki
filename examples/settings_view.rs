@@ -13,6 +13,9 @@
 
 slint::include_modules!();
 
+#[path = "verification/snapshot.rs"]
+mod snapshot;
+
 use std::rc::Rc;
 
 use slint::{ComponentHandle, ModelRc, VecModel};
@@ -84,55 +87,8 @@ fn main() {
     win.show()
         .expect("showing the window should succeed in this verification binary");
 
-    // `snapshot <path>`: 最初のフレームが描かれてから書き出す。ループ開始前だと中身が空になる。
-    let snapshot_path = std::env::args()
-        .skip_while(|arg| arg != "snapshot")
-        .nth(1)
-        .map(std::path::PathBuf::from);
-    let timer = slint::Timer::default();
-    if let Some(path) = snapshot_path {
-        let handle = win.as_weak();
-        timer.start(
-            slint::TimerMode::SingleShot,
-            std::time::Duration::from_millis(500),
-            move || {
-                if let Some(win) = handle.upgrade() {
-                    write_snapshot(&win, &path);
-                }
-                slint::quit_event_loop().expect("quitting the event loop should succeed");
-            },
-        );
-    }
+    // `snapshot <path>` が指定されていれば 1 フレーム後に PNG を書く（`snapshot` モジュール）。
+    let _snapshot_timer = snapshot::arm(win.as_weak());
 
     slint::run_event_loop().expect("the event loop should run in this verification binary");
-}
-
-fn write_snapshot(win: &AppWindow, path: &std::path::Path) {
-    let buffer = match win.window().take_snapshot() {
-        Ok(buffer) => buffer,
-        Err(err) => {
-            eprintln!("Could not take a snapshot: {err}");
-            return;
-        }
-    };
-    let file = match std::fs::File::create(path) {
-        Ok(file) => file,
-        Err(err) => {
-            eprintln!("Could not create {}: {err}", path.display());
-            return;
-        }
-    };
-    let mut encoder = png::Encoder::new(
-        std::io::BufWriter::new(file),
-        buffer.width(),
-        buffer.height(),
-    );
-    encoder.set_color(png::ColorType::Rgba);
-    let write = encoder
-        .write_header()
-        .and_then(|mut writer| writer.write_image_data(buffer.as_bytes()));
-    match write {
-        Ok(()) => println!("Wrote {}", path.display()),
-        Err(err) => eprintln!("Could not write {}: {err}", path.display()),
-    }
 }

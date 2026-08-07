@@ -27,8 +27,18 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use crate::transcript::TranscriptSegment;
 
 /// 生成した議事録の保存ファイル名。セッションディレクトリに固定名で置く
-/// （`mic.json` / `mix.mp3` と同系統）。表示側（後続 issue）と一致させること。
+/// （`mic.json` / `mix.mp3` と同系統）。生成（`run_job`）・表示（`load_summary`）・
+/// 一覧の有無判定（`crate::recordings`）がこの 1 つの名前を共有する。
 pub const SUMMARY_FILENAME: &str = "summary.md";
+
+/// 読み込む `summary.md` のサイズ上限。保存先の生成物は手で置換されうる信頼境界外の入力なので、
+/// 想定外の巨大ファイルでメモリを大量確保しない保険（`docs/rules/security.md`。
+/// `transcript.rs` の `MAX_TRANSCRIPT_BYTES` と同じ趣旨）。
+///
+/// 実際の議事録は長い会議でも数十 KB なので、桁の余裕は 1 つに留める。**バイト数の上限は
+/// そこから作る表示行の数・長さの上限も兼ねる**（`main::summary_rows` は 1 行ごとに文字列を
+/// 確保するので、改行だけの巨大ファイルを許すと行モデルの構築で UI が固まる）。
+const MAX_SUMMARY_BYTES: u64 = 256 * 1024;
 
 /// 1 チャンクに入れるトランスクリプト本文のトークン概算の上限。
 ///
@@ -70,10 +80,17 @@ pub struct SummarizeJob {
     pub model_override: Option<PathBuf>,
     /// 出力言語の決定に使う認識言語コード（設定 `transcribe_language`。`auto` を含む）。
     pub language: String,
+    /// 既にある `summary.md` を「古い」と見なすか（生成に失敗したときに消すかの判断。`failed`）。
+    ///
+    /// 文字起こし直後の自動生成は `true`: 既存の議事録は**前の文字起こし**のものなので、生成に
+    /// 失敗したときに残しておくと新しい文字起こしの議事録として読まれてしまう。
+    /// Recordings ウィンドウからの手動生成は `false`: 既存の議事録は現在の文字起こしと整合した
+    /// 有効なデータなので、失敗しても失わせない（成功時は上書きされる）。
+    pub existing_is_stale: bool,
 }
 
-/// セッション単位の要約の進行状況。表示は後続 issue だが、ワーカーの契約
-/// （`TranscribeWorker` と同型）として先に持つ。
+/// セッション単位の要約の進行状況（`TranscribeWorker` と同型）。Recordings ウィンドウの
+/// 詳細ペインが `main::summary_display_status` で表示状態へ合成して出す。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SummarizeStatus {
     /// 投入済み（キュー待ちを含む）または生成中。
@@ -122,7 +139,24 @@ impl SummarizeWorker {
                     // 上書きしたままにならないように。`TranscribeWorker` と同じ）。
                     lock_status(&status_for_worker)
                         .insert(job.session_dir.clone(), SummarizeStatus::Summarizing);
-                    let outcome = run_job(&job, &downloader, &slot);
+                    // 生成中のパニックでワーカースレッドを殺さない。死ぬと状態が
+                    // `Summarizing` のまま残り、そのセッションは再起動まで Transcribe /
+                    // Summarize / Delete がすべて無効になる（UI の `detail-busy`）。
+                    // 失敗として記録し、次のジョブは受け続ける。
+                    let outcome =
+                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            run_job(&job, &downloader, &slot)
+                        })) {
+                            Ok(outcome) => outcome,
+                            Err(_) => {
+                                eprintln!(
+                                    "Skipping summarization because generating the summary panicked"
+                                );
+                                // 古い議事録の後始末は `run_job` の失敗経路と同じにする
+                                // （パニックでも「古い議事録を残さない」を守る）。
+                                failed(&job, &job.session_dir.join(SUMMARY_FILENAME))
+                            }
+                        };
                     let mut map = lock_status(&status_for_worker);
                     match outcome {
                         // 対象なしで何もしなかった場合は「投入済み」の痕跡を消す。
@@ -163,12 +197,8 @@ impl SummarizeWorker {
     }
 
     /// セッションの進行状況。マップに載っていなければ `None`
-    /// （表示側が `summary.md` の有無で「未生成/生成済み」を解決する）。
-    ///
-    /// ワーカーの契約として先に用意してあるが、**読む側（Recordings ウィンドウの状態表示・
-    /// 手動再生成）は #81 のスコープ**なので、本体からの呼び出しはまだ無い（テストからは使う）。
-    /// #81 で消費されるまでの一時的な `allow`。
-    #[allow(dead_code)]
+    /// （表示側が `summary.md` の有無で「未生成/生成済み」を解決する。
+    /// `main::summary_display_status`）。
     pub fn status_of(&self, session_dir: &Path) -> Option<SummarizeStatus> {
         lock_status(&self.status).get(session_dir).copied()
     }
@@ -177,6 +207,73 @@ impl SummarizeWorker {
     pub fn forget(&self, session_dir: &Path) {
         lock_status(&self.status).remove(session_dir);
     }
+}
+
+/// セッションの `summary.md` を読む（表示用）。未生成・欠落は `None`、読み取り失敗・過大・
+/// 非通常ファイルもログして `None` にする（縮退。アプリは落とさない）。
+///
+/// ガードの理由は `transcript.rs` の `load_one` と同じ（保存先の生成物は手で置換されうる
+/// 信頼境界外の入力）。ログに出すのは**セッション名（日時のディレクトリ名）とファイル名だけ**:
+/// フルパス（保存先）も本文（発話由来の議事録）も機微情報なので出さない
+/// （`docs/rules/security.md`）。
+pub fn load_summary(session_dir: &Path) -> Option<String> {
+    load_summary_limited(session_dir, MAX_SUMMARY_BYTES)
+}
+
+/// `load_summary` の本体。上限はテスト容易性のため引数で受ける（`write_verified` の
+/// `max_bytes` と同じ理由。境界のオフバイワンを小さな上限で検証できるようにする）。
+fn load_summary_limited(session_dir: &Path, max_bytes: u64) -> Option<String> {
+    use std::io::Read;
+
+    let path = session_dir.join(SUMMARY_FILENAME);
+    // ログ用のセッション識別子（日時のディレクトリ名だけ）。フルパス（保存先）は出さない
+    // （`docs/rules/security.md`）。名前が取れない異常時も固定文字列へ落とし、退避先に
+    // パスを混ぜない。
+    let session = session_dir
+        .file_name()
+        .map_or(std::borrow::Cow::Borrowed("unknown"), |name| {
+            name.to_string_lossy()
+        });
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        // 未生成（ファイルが無い）は正常な縮退。ログもしない。
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(err) => {
+            eprintln!(
+                "Skipping the summary of {session} because {SUMMARY_FILENAME} could not be opened: {err}"
+            );
+            return None;
+        }
+    };
+    // 開いたハンドルの fstat で通常ファイルを確認し（FIFO 等は読み終わらないことがある）、
+    // サイズ上限は読み込みそのものに掛ける（事前の metadata 判定では差し替えに追従できない）。
+    if let Ok(meta) = file.metadata()
+        && !meta.is_file()
+    {
+        eprintln!(
+            "Skipping the summary of {session} because {SUMMARY_FILENAME} is not a regular file"
+        );
+        return None;
+    }
+    let mut limited = file.take(max_bytes + 1);
+    let mut text = String::new();
+    if let Err(err) = limited.read_to_string(&mut text) {
+        // UTF-8 でない（破損・別物への置換）場合もここに来る。
+        eprintln!(
+            "Skipping the summary of {session} because {SUMMARY_FILENAME} could not be read: {err}"
+        );
+        return None;
+    }
+    // 上限＋1 バイトまで読み切った（limit が尽きた）なら上限超過。
+    if limited.limit() == 0 {
+        eprintln!("Skipping the summary of {session} because {SUMMARY_FILENAME} is too large");
+        return None;
+    }
+    // 空ファイル（生成が中途で終わった等）は「無い」と同じ扱いにする（縮退表示へ落とす）。
+    if text.trim().is_empty() {
+        return None;
+    }
+    Some(text)
 }
 
 /// 状態マップのガードを取る。poison（ロック保持中のパニック）でも状態表示を止めないため、
@@ -220,16 +317,8 @@ fn run_job(
     let generated = match job.engine {
         SummaryEngine::OnDevice => {
             let Some(model_path) = resolve_model(job, downloader) else {
-                return JobOutcome::Failed;
+                return failed(job, &path);
             };
-            // 既にある `summary.md` は、ここへ来た時点で**古い文字起こしの議事録**（このジョブは
-            // 文字起こしが成功した直後にしか走らない）。残したまま生成に失敗すると、失敗の記録は
-            // メモリのみで再起動すると消えるため、表示側は古い議事録を「新しい文字起こしの
-            // 議事録」として読んでしまう。消せなかった場合は上書きに賭けて先へ進む。
-            //
-            // 消すのは**生成に入ることが確定してから**（モデルを用意できずに即失敗する経路で
-            // 過去の議事録を巻き添えにしない）。
-            remove_stale_summary(&path);
             // ここから先が重い区間。文字起こしと同時に走らせない（`crate::inference_slot`）。
             // モデルの準備（ダウンロード）はスロットの外で済ませてある。
             let _slot = slot.acquire();
@@ -240,7 +329,7 @@ fn run_job(
         Ok(text) => text,
         Err(err) => {
             eprintln!("Skipping summarization because generating the summary failed: {err}");
-            return JobOutcome::Failed;
+            return failed(job, &path);
         }
     };
     // 空（または空白だけ）の生成結果は失敗として扱う。空ファイルを置くと、表示側が
@@ -248,7 +337,7 @@ fn run_job(
     let generated = generated.trim();
     if generated.is_empty() {
         eprintln!("Skipping summarization because the model produced no text");
-        return JobOutcome::Failed;
+        return failed(job, &path);
     }
 
     match write_summary(&path, generated) {
@@ -260,17 +349,30 @@ fn run_job(
         }
         Err(err) => {
             eprintln!("Skipping summarization because writing the summary failed: {err}");
-            JobOutcome::Failed
+            failed(job, &path)
         }
     }
 }
 
-/// 再生成の前に、古い（＝ひとつ前の文字起こしから作った）議事録を消す。無ければ何もしない。
+/// 生成に失敗したときの後始末（結果は常に `Failed`）。
+///
+/// `write_summary` が原子的に置き換えるので、失敗した時点で既にある `summary.md` は手つかず。
+/// **それが古いと分かっているジョブ（`existing_is_stale`）だけ消す**（判断の理由はその
+/// フィールドの doc）。
+fn failed(job: &SummarizeJob, path: &Path) -> JobOutcome {
+    if job.existing_is_stale {
+        remove_stale_summary(path);
+    }
+    JobOutcome::Failed
+}
+
+/// 古い（＝ひとつ前の文字起こしから作った）議事録を消す。無ければ何もしない。
+/// 呼ばれるのは生成に失敗したときだけ（成功時は `write_summary` が原子的に置き換える）。
 fn remove_stale_summary(path: &Path) {
     if let Err(err) = std::fs::remove_file(path)
         && err.kind() != std::io::ErrorKind::NotFound
     {
-        eprintln!("Could not remove the previous meeting summary before regenerating it: {err}");
+        eprintln!("Could not remove the stale meeting summary after a failed run: {err}");
     }
 }
 
@@ -309,10 +411,24 @@ fn resolve_model(
 /// 議事録を保存する。録音・文字起こしと同じ機微データなので所有者のみ読み書き可で作る
 /// （`crate::private_file`）。
 fn write_summary(path: &Path, markdown: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let mut file = crate::private_file::create(path)?;
+    // 一時ファイルへ書き切ってから rename で置き換える（`crate::atomic_replace`）。直接
+    // 上書きすると `truncate` で**開いた時点で**既存の議事録が消え、書き込み中に失敗した場合に
+    // (1) 前の議事録が失われ、(2) 途中まで書けたファイルが「生成済み」として表示される
+    // （`load_summary` は非空なら返す）。失敗しても一時ファイルは番人が消す。
+    // 強制終了で残った `summary.md.part.<pid>` は掃除の対象外（`sweep_orphaned_parts` は
+    // モデルの保存先だけに掛ける）。セッションを削除すれば一緒に消える。
+    let part = crate::atomic_replace::PartFile::for_dest(path)
+        .ok_or("the summary path does not end in a file name")?;
+    // 0600 で作る（議事録は発話由来の機微データ。`crate::private_file`）。rename はモードを
+    // 保つので、置き換え後も 0600 のまま。
+    let mut file = crate::private_file::create(part.path())?;
     file.write_all(markdown.as_bytes())?;
     // Markdown ファイルとして扱いやすいよう末尾を改行で終える。
     file.write_all(b"\n")?;
+    // rename の前にハンドルを閉じる（書き込みの失敗を rename より先に見つける）。
+    file.sync_all()?;
+    drop(file);
+    part.commit()?;
     Ok(())
 }
 
@@ -875,6 +991,55 @@ mod tests {
         assert!(!notes_system_prompt("ko").contains("{0}"));
     }
 
+    /// 表示用の読み込み: 生成物はそのまま読め、未生成・空・非通常ファイル・過大は `None`
+    /// （縮退。呼び出し側は状態依存のラベルへ落とす）。上限は引数で受ける版
+    /// （`load_summary_limited`）で境界の両側を見る。
+    #[test]
+    fn load_summary_reads_the_file_and_degrades_on_bad_input() {
+        let dir = std::env::temp_dir().join(format!("shoki-summary-load-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("the temp session dir should be creatable");
+
+        // 未生成（ファイルが無い）。
+        assert!(load_summary(&dir).is_none());
+
+        let path = dir.join(SUMMARY_FILENAME);
+        std::fs::write(&path, "# 議事概要\n\n本文\n").expect("the summary should be writable");
+        assert_eq!(
+            load_summary(&dir).as_deref(),
+            Some("# 議事概要\n\n本文\n"),
+            "the file content is returned as-is (rendering is the UI's job)"
+        );
+
+        // 空・空白だけは「無い」と同じ扱い（生成が中途で終わった場合）。
+        std::fs::write(&path, "   \n\n").expect("the summary should be writable");
+        assert!(load_summary(&dir).is_none());
+
+        // UTF-8 でない（別物へ置換された）ファイルは読めないものとして縮退する。
+        std::fs::write(&path, [0xff, 0xfe, 0x00]).expect("the summary should be writable");
+        assert!(load_summary(&dir).is_none());
+
+        // 上限の境界（オフバイワン）は小さな上限で両側を見る。ちょうど上限は読め、
+        // 1 バイト超えると読まない。
+        std::fs::write(&path, "abcd").expect("the summary should be writable");
+        assert_eq!(load_summary_limited(&dir, 4).as_deref(), Some("abcd"));
+        assert!(load_summary_limited(&dir, 3).is_none());
+
+        // 公開入口が `MAX_SUMMARY_BYTES` を渡していること（結線）も見る。
+        let too_large = "a".repeat(MAX_SUMMARY_BYTES as usize + 1);
+        std::fs::write(&path, &too_large).expect("the summary should be writable");
+        assert!(load_summary(&dir).is_none());
+
+        // ディレクトリ（非通常ファイル）に置き換えられていても落ちない（macOS では読み取り
+        // 自体も失敗するので、`is_file()` ガードが無くても同じ結果になる。ここで見るのは
+        // 「落ちない」ことまで）。
+        std::fs::remove_file(&path).expect("the summary should be removable");
+        std::fs::create_dir(&path).expect("the fixture directory should be creatable");
+        assert!(load_summary(&dir).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 状態マップのライフサイクルを、モデル無しで検証する。存在しないモデル上書きパスを渡すと、
     /// ネットワークにもモデルにも触れず即 Failed になる。
     #[test]
@@ -899,6 +1064,7 @@ mod tests {
             model_id: crate::summary_model::DEFAULT_MODEL_ID.to_owned(),
             model_override: Some(dir.join("missing-model.gguf")),
             language: "en".to_owned(),
+            existing_is_stale: true,
         });
         assert!(matches!(
             worker.status_of(&dir),
@@ -947,6 +1113,7 @@ mod tests {
             // 効くので、ここでダウンロードが始まらないことがこのテストの要点。
             model_override: None,
             language: "en".to_owned(),
+            existing_is_stale: true,
         });
         let mut settled = false;
         for _ in 0..200 {
@@ -1007,6 +1174,7 @@ mod tests {
             model_id: crate::summary_model::DEFAULT_MODEL_ID.to_owned(),
             model_override: Some(PathBuf::from(model)),
             language: "ja".to_owned(),
+            existing_is_stale: true,
         });
         // 7B・4 分の会議で 1 分弱（コールドのロードを含めても数分）。上限つきで待つ。
         let mut status = None;
@@ -1064,7 +1232,7 @@ mod tests {
     /// 再生成のとき、古い議事録が残ったままにならないこと。失敗の記録はメモリのみ（再起動で
     /// 消える）なので、古いファイルが残ると表示側が「新しい文字起こしの議事録」として読む。
     #[test]
-    fn regenerating_removes_the_previous_summary_even_when_it_fails() {
+    fn a_failed_run_removes_the_previous_summary_only_when_it_is_stale() {
         let worker = SummarizeWorker::start(
             crate::model_download::ModelDownloader::new(),
             crate::inference_slot::InferenceSlot::new(),
@@ -1092,6 +1260,7 @@ mod tests {
             model_id: crate::summary_model::DEFAULT_MODEL_ID.to_owned(),
             model_override: Some(fake_model),
             language: "en".to_owned(),
+            existing_is_stale: true,
         });
         let mut settled = false;
         for _ in 0..600 {
@@ -1108,6 +1277,38 @@ mod tests {
         assert!(
             !dir.join(SUMMARY_FILENAME).exists(),
             "the stale summary must not survive a failed regeneration"
+        );
+
+        // 手動の再生成（`existing_is_stale: false`）では、失敗しても既存の議事録を失わせない
+        // （現在の文字起こしと整合した有効なデータなので）。同じフィクスチャで対を見る。
+        std::fs::write(dir.join(SUMMARY_FILENAME), "# valid minutes\n")
+            .expect("the existing summary should be writable");
+        worker.submit(SummarizeJob {
+            session_dir: dir.clone(),
+            engine: SummaryEngine::OnDevice,
+            model_id: crate::summary_model::DEFAULT_MODEL_ID.to_owned(),
+            model_override: Some(dir.join("not-a-model.gguf")),
+            language: "en".to_owned(),
+            existing_is_stale: false,
+        });
+        // `submit` が同じスレッドで同期的に `Summarizing` を記録するので、直前のジョブの
+        // `Failed` を拾ってしまう競合は無い（状態だけを待てる）。
+        let mut settled = false;
+        for _ in 0..600 {
+            if worker.status_of(&dir) == Some(SummarizeStatus::Failed) {
+                settled = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            settled,
+            "the manual job should fail within 6s (the model file is not a gguf)"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join(SUMMARY_FILENAME)).expect("the summary should remain"),
+            "# valid minutes\n",
+            "a failed manual regeneration must keep the existing summary"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1135,8 +1336,9 @@ mod tests {
             };
             assert_eq!(mode(&path), 0o600, "the summary must be owner-only");
 
-            // 緩いモードの `summary.md` が在る状態で上書きしても 0600 へ揃うこと
-            // （`OpenOptions::mode` は新規作成時にしか効かない。`crate::private_file`）。
+            // 緩いモードの `summary.md` が在る状態で置き換えても 0600 になること。書き込み先は
+            // 常に新規の一時ファイルで、rename が inode ごと差し替えるので宛先の旧モードは
+            // 残らない（既存ファイルのモードを締め直す経路は `crate::private_file` 側のテスト）。
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
                 .expect("the fixture mode should be settable");
             write_summary(&path, "## Summary\nStill good.").expect("overwriting should succeed");

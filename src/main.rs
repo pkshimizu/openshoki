@@ -1,7 +1,9 @@
-//! shoki — メニューバー／タスクバーに常駐する録音アプリ（基盤）。
+//! shoki — メニューバー／タスクバーに常駐する録音アプリのエントリポイント。
 //!
-//! 起動時はウィンドウを表示せずトレイに常駐し、トレイメニューから Slint ウィンドウの
-//! 表示/非表示とアプリ終了を行う。録音機能は後続の issue で実装する。
+//! 起動時はウィンドウを表示せずトレイに常駐し、トレイメニューから設定ウィンドウ・Recordings
+//! ウィンドウの表示/非表示とアプリ終了を行う。録音・文字起こし・議事録要約は各モジュール
+//! （`recorder` / `transcribe` / `summarize`）が持ち、ここは UI との配線とタイマー駆動の
+//! 状態追従（メニューバー表示・再生位置・進行状況）を担う。
 
 #[cfg(target_os = "macos")]
 mod app_audio_monitor;
@@ -508,6 +510,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let sessions = Rc::clone(&sessions);
         let transcript_segments = Rc::clone(&transcript_segments);
         let transcriber = transcriber.clone();
+        let summarizer = summarizer.clone();
         let rec_weak = recordings_ui.as_weak();
         recordings_ui.on_select_session(move |index| {
             let Some(rec) = rec_weak.upgrade() else {
@@ -519,10 +522,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             rec.set_has_selection(true);
             rec.set_detail_datetime(session.display_datetime.clone().into());
-            rec.set_detail_summary(session.source_summary().into());
+            rec.set_detail_sources(session.source_summary().into());
+            rec.set_has_transcript(session.has_transcript);
             // 文字起こしの状態テキストと Transcribe ボタンの活性を、ワーカーの進行状況＋
             // JSON の有無から設定する（以後の変化は tick が追従させる）。
             refresh_detail_transcript_status(&rec, &transcriber, session);
+            // 議事録要約も同じ流儀で状態を設定し、`summary.md` を読み直して表示へ反映する。
+            refresh_detail_summary_status(&rec, &summarizer, session);
+            refresh_detail_summary_rows(&rec, &session.dir);
             // 文字起こしを読み込み、話者ラベル＋開始時刻付きのセグメント一覧を更新する
             // （空＝欠落・破損・未生成なら Slint 側が縮退表示する）。
             let segments = transcript::load_transcript(&session.dir);
@@ -698,12 +705,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 language: config_ref.transcribe_language.clone(),
                 // 手動の再実行でも、設定 ON なら要約を作り直す（作り直さないと `summary.md` が
                 // 古い文字起こしのまま残り、内容が食い違う）。
-                summarize: summarize_job_for(&config_ref, &session.dir),
+                summarize: auto_summarize_job(&config_ref, &session.dir),
             });
             // 投入結果（通常は「文字起こし中」）を詳細ペインへ即反映し、次の tick を待つ間の
             // 2 連クリックによる多重投入を防ぐ。一覧行のドットは tick の差分更新に任せる。
             if let Some(rec) = rec_weak.upgrade() {
                 refresh_detail_transcript_status(&rec, &transcriber, session);
+            }
+        });
+    }
+
+    // 「Summarize」: 選択中セッションの議事録要約を手動で（再）生成する。設定 `auto_summarize`
+    // とは独立で、押されたら生成する（文字起こしが無いセッションは Slint 側でボタンが無効）。
+    // ジョブの組み立て・設定のスナップショットは `manual_summarize_job`（その doc が正）。
+    {
+        let sessions = Rc::clone(&sessions);
+        let config = Rc::clone(&config);
+        let summarizer = summarizer.clone();
+        let rec_weak = recordings_ui.as_weak();
+        recordings_ui.on_summarize_session(move |index| {
+            let sessions = sessions.borrow();
+            let Some(session) = usize::try_from(index).ok().and_then(|i| sessions.get(i)) else {
+                return;
+            };
+            // 文字起こしが無ければ入力が無い（ボタンは無効なので通常は来ない。黙って戻ると
+            // 「押しても何も起きない」になるのでログを残す）。
+            if !session.has_transcript {
+                eprintln!(
+                    "Skipping the requested summarization because the session has no transcript"
+                );
+                return;
+            }
+            summarizer.submit(manual_summarize_job(&config.borrow(), &session.dir));
+            // 投入結果（通常は「生成中」）を即反映し、2 連クリックの多重投入を防ぐ。
+            if let Some(rec) = rec_weak.upgrade() {
+                refresh_detail_summary_status(&rec, &summarizer, session);
             }
         });
     }
@@ -715,6 +751,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let sessions = Rc::clone(&sessions);
         let sessions_model = Rc::clone(&sessions_model);
         let player = Rc::clone(&player);
+        let transcript_segments = Rc::clone(&transcript_segments);
         let transcriber = transcriber.clone();
         let summarizer = summarizer.clone();
         let rec_weak = recordings_ui.as_weak();
@@ -777,7 +814,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // 進行状況マップに残ったエントリを掃除する（削除済みセッションの記録を残さない）。
             transcriber.forget(&dir);
             summarizer.forget(&dir);
-            clear_recordings_selection(&rec);
+            clear_recordings_selection(&rec, &transcript_segments);
         });
     }
 
@@ -796,6 +833,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 sessions_model: Rc::clone(&sessions_model),
                 transcript_segments: Rc::clone(&transcript_segments),
                 transcriber: transcriber.clone(),
+                summarizer: summarizer.clone(),
             },
             &tray,
             Rc::clone(&config),
@@ -834,6 +872,8 @@ struct RecordingsHandles {
     sessions_model: Rc<slint::VecModel<SessionRow>>,
     transcript_segments: Rc<RefCell<Vec<transcript::TranscriptSegment>>>,
     transcriber: transcribe::TranscribeWorker,
+    /// 詳細ペインの要約状態を tick で追従させるために読む（#81）。
+    summarizer: summarize::SummarizeWorker,
 }
 
 /// メニューイベントの処理と、録音中のメニューバー表示更新を毎ティック行うクロージャを作る。
@@ -1016,34 +1056,88 @@ fn build_menu_event_handler(
         if let Some(rec) = recordings.ui.upgrade()
             && rec.window().is_visible()
         {
-            let sessions_ref = recordings.sessions.borrow();
             let selected = usize::try_from(rec.get_selected_index()).ok();
-            for (i, session) in sessions_ref.iter().enumerate() {
-                let Some(mut row) = recordings.sessions_model.row_data(i) else {
-                    continue;
-                };
-                let status = transcript_display_status(
-                    recordings.transcriber.status_of(&session.dir),
-                    session.has_transcript,
-                );
-                if row.transcript_status == status {
-                    continue;
-                }
-                let previous = row.transcript_status;
-                row.transcript_status = status;
-                recordings.sessions_model.set_row_data(i, row);
-                if selected == Some(i) {
-                    apply_detail_transcript_status(&rec, status);
+            // 完了を観測して**生成物の有無を書き戻す**セッション。一覧の走査は不変借用で回すので、
+            // 借用を手放してから反映する（`sessions` の `has_transcript` / `has_summary` が
+            // 生成物の有無の正で、ボタンの活性・状態の解決がここを読む。ウィンドウを開いたまま
+            // 実行したときに UI とメモリがずれないように、UI だけを直す形にはしない）。
+            let mut transcribed: Vec<usize> = Vec::new();
+            // 要約の追従は選択中セッションだけを見るので、書き戻す対象も高々 1 件。
+            let mut summarized: Option<usize> = None;
+            {
+                let sessions_ref = recordings.sessions.borrow();
+                for (i, session) in sessions_ref.iter().enumerate() {
+                    let Some(mut row) = recordings.sessions_model.row_data(i) else {
+                        continue;
+                    };
+                    let status = transcript_display_status(
+                        recordings.transcriber.status_of(&session.dir),
+                        session.has_transcript,
+                    );
+                    if row.transcript_status == status {
+                        continue;
+                    }
+                    let previous = row.transcript_status;
+                    row.transcript_status = status;
+                    recordings.sessions_model.set_row_data(i, row);
                     if previous == TranscriptStatus::Transcribing
                         && status == TranscriptStatus::Done
                     {
-                        let segments = transcript::load_transcript(&session.dir);
-                        rec.set_segments(
-                            Rc::new(slint::VecModel::from(transcript_rows(&segments))).into(),
-                        );
-                        rec.set_current_segment(-1);
-                        *recordings.transcript_segments.borrow_mut() = segments;
+                        transcribed.push(i);
                     }
+                    if selected == Some(i) {
+                        apply_detail_transcript_status(&rec, status);
+                        if previous == TranscriptStatus::Transcribing
+                            && status == TranscriptStatus::Done
+                        {
+                            let segments = transcript::load_transcript(&session.dir);
+                            rec.set_segments(
+                                Rc::new(slint::VecModel::from(transcript_rows(&segments))).into(),
+                            );
+                            rec.set_current_segment(-1);
+                            *recordings.transcript_segments.borrow_mut() = segments;
+                        }
+                    }
+                }
+
+                // 選択中セッションの要約状態も追従させる。一覧行には要約のインジケータが無い
+                // （#81 のスコープ外）ので、行の差分更新ではなく詳細ペインの現在値と比べる。
+                // **見ているのは選択中セッションだけ**: 他セッションの `has_summary` は次に
+                // 一覧を開くまで古いままだが、状態の解決はワーカーの状態マップを優先するので
+                // 表示は正しい（`summary_display_status`）。
+                if let Some(i) = selected
+                    && let Some(session) = sessions_ref.get(i)
+                {
+                    let status = summary_display_status(
+                        recordings.summarizer.status_of(&session.dir),
+                        session.has_summary,
+                    );
+                    let previous = rec.get_detail_summary_status();
+                    if previous != status {
+                        apply_detail_summary_status(&rec, status);
+                        // 生成が終わった瞬間に表示を差し替える（失敗時は前の議事録を残す）。
+                        if previous == SummaryStatus::Summarizing && status == SummaryStatus::Done {
+                            refresh_detail_summary_rows(&rec, &session.dir);
+                            summarized = Some(i);
+                        }
+                    }
+                }
+            }
+
+            if !transcribed.is_empty() || summarized.is_some() {
+                let mut sessions_mut = recordings.sessions.borrow_mut();
+                for i in transcribed {
+                    if let Some(session) = sessions_mut.get_mut(i) {
+                        session.has_transcript = true;
+                    }
+                }
+                if let Some(session) = summarized.and_then(|i| sessions_mut.get_mut(i)) {
+                    session.has_summary = true;
+                }
+                // 選択中セッションのボタン活性（Summarize は文字起こしの有無で決まる）を、
+                // 書き戻した値から更新する。
+                if let Some(session) = selected.and_then(|i| sessions_mut.get(i)) {
+                    rec.set_has_transcript(session.has_transcript);
                 }
             }
         }
@@ -1105,11 +1199,27 @@ fn trash_error_kind(err: &trash::Error) -> String {
 
 /// Recordings ウィンドウの選択・再生表示を未選択状態へ初期化する
 /// （ウィンドウを開いたとき・セッション削除後に共用する）。
-fn clear_recordings_selection(rec: &RecordingsWindow) {
+///
+/// 表示中だった文字起こし・議事録も手放す: どちらも発話由来の機微データで、詳細ペインが
+/// 隠れている間もモデルとして持ち続ける理由が無い（削除したセッションの内容が残らないように。
+/// `docs/rules/security.md`）。
+fn clear_recordings_selection(
+    rec: &RecordingsWindow,
+    transcript_segments: &RefCell<Vec<transcript::TranscriptSegment>>,
+) {
     rec.set_selected_index(-1);
     rec.set_has_selection(false);
     rec.set_playing(false);
     rec.set_seekable(false);
+    rec.set_has_transcript(false);
+    rec.set_segments(Rc::new(slint::VecModel::<TranscriptRow>::default()).into());
+    rec.set_current_segment(-1);
+    transcript_segments.borrow_mut().clear();
+    rec.set_summary_rows(Rc::new(slint::VecModel::<SummaryRow>::default()).into());
+    // 状態も未実施へ畳む（次の選択で必ず上書きされるが、`detail-busy` の入力なので前の
+    // セッションの「実行中」を持ち越さない）。文字起こし・要約で対称にする。
+    apply_detail_transcript_status(rec, TranscriptStatus::NotTranscribed);
+    apply_detail_summary_status(rec, SummaryStatus::NotSummarized);
     apply_playback_position(rec, Duration::ZERO, None);
 }
 
@@ -1137,7 +1247,7 @@ fn open_recordings_window(
         .collect();
     handles.sessions_model.set_vec(rows);
     // 開くたびに未選択・停止表示へ初期化する。
-    clear_recordings_selection(rec);
+    clear_recordings_selection(rec, &handles.transcript_segments);
     *handles.sessions.borrow_mut() = list;
     *last_play_secs = None;
     // 再生ハンドルがあれば前回の再生対象を手放す（未選択表示に合わせて「何もロードされて
@@ -1278,7 +1388,7 @@ fn submit_post_processing(
             model_id: config_ref.whisper_model.clone(),
             model_override: config_ref.whisper_model_path.clone(),
             language: config_ref.transcribe_language.clone(),
-            summarize: summarize_job_for(&config_ref, session_dir),
+            summarize: auto_summarize_job(&config_ref, session_dir),
         });
     postprocessor.submit(mixdown::PostProcessJob {
         session_dir: session_dir.to_path_buf(),
@@ -1287,21 +1397,39 @@ fn submit_post_processing(
     });
 }
 
-/// 文字起こしに添える議事録要約の依頼を組み立てる。設定 OFF なら `None`（要約は走らない）。
-/// 設定値はここでスナップショットし、処理中の設定変更の影響を受けない。
+/// 手動（Recordings ウィンドウの Summarize）の議事録要約の依頼を組み立てる。設定値
+/// （モデル・言語）は**ここでスナップショット**し、処理中の設定変更の影響を受けない。
+/// エンジンはいまオンデバイスのみ。
 ///
-/// 要約は文字起こし結果を入力にするため、必ず文字起こしジョブへぶら下げる（成功時のみ
-/// `TranscribeWorker` が要約ワーカーへ投入する）。エンジンはいまオンデバイスのみ。
-fn summarize_job_for(
-    config: &Config,
-    session_dir: &std::path::Path,
-) -> Option<summarize::SummarizeJob> {
-    config.auto_summarize.then(|| summarize::SummarizeJob {
+/// 既存の `summary.md` は現在の文字起こしと整合した有効なデータなので、`existing_is_stale` は
+/// `false`（生成に失敗しても失わせない。理由はそのフィールドの doc）。
+///
+/// 投入は 1 セッション 1 本（実行中は Slint 側でボタンが無効）だが、**セッションをまたいだ
+/// 投入は制限しない**（順に選んで押せばキューに積める）。取り消し手段を持たせるかは
+/// 後続の検討事項で、#81 のスコープ外。
+fn manual_summarize_job(config: &Config, session_dir: &std::path::Path) -> summarize::SummarizeJob {
+    summarize::SummarizeJob {
         session_dir: session_dir.to_path_buf(),
         engine: summarize::SummaryEngine::OnDevice,
         model_id: config.summary_model.clone(),
         model_override: config.summary_model_path.clone(),
         language: config.transcribe_language.clone(),
+        existing_is_stale: false,
+    }
+}
+
+/// 文字起こしに添える議事録要約の依頼を組み立てる。設定 OFF なら `None`（要約は走らない）。
+///
+/// 要約は文字起こし結果を入力にするため、必ず文字起こしジョブへぶら下げる（成功時のみ
+/// `TranscribeWorker` が要約ワーカーへ投入する）。この経路では既存の `summary.md` は**前の
+/// 文字起こし**の議事録なので `existing_is_stale` を `true` にする。
+fn auto_summarize_job(
+    config: &Config,
+    session_dir: &std::path::Path,
+) -> Option<summarize::SummarizeJob> {
+    config.auto_summarize.then(|| summarize::SummarizeJob {
+        existing_is_stale: true,
+        ..manual_summarize_job(config, session_dir)
     })
 }
 
@@ -1495,8 +1623,10 @@ fn transcript_placeholder_text(display_status: TranscriptStatus) -> &'static str
 
 /// 詳細ペインの文字起こし表示（状態テキスト・状態依存の配色・縮退ラベル）を反映する。
 /// 選択時・手動投入直後・tick 追従の全経路でここを通し、表示ロジックを 1 箇所にする。
-/// Transcribe / Delete ボタンの活性は Slint 側が `detail-transcript-status` から導出する
-/// （bool を別途 set して enum と食い違う余地を作らない）。
+///
+/// **ボタンの活性は Rust から set しない**: Transcribe / Summarize / Delete は Slint 側の
+/// `detail-busy`（文字起こし・要約の 2 つの状態 enum から導出）が一本で決める。bool を別途
+/// 渡して enum と食い違う余地を作らないため（`docs/rules/slint.md`）。
 fn apply_detail_transcript_status(rec: &RecordingsWindow, status: TranscriptStatus) {
     rec.set_detail_transcript_text(transcript_status_text(status).into());
     rec.set_detail_transcript_placeholder(transcript_placeholder_text(status).into());
@@ -1514,6 +1644,130 @@ fn refresh_detail_transcript_status(
         rec,
         transcript_display_status(transcriber.status_of(&session.dir), session.has_transcript),
     );
+}
+
+/// 議事録要約の表示状態（`ui/recordings-window.slint` の `SummaryStatus`）を合成する。
+/// ワーカーの進行状況（メモリ）があればそれを優先し、無ければ `summary.md` の有無で解決する
+/// （`transcript_display_status` と同じ流儀）。
+fn summary_display_status(
+    worker_status: Option<summarize::SummarizeStatus>,
+    has_summary: bool,
+) -> SummaryStatus {
+    match worker_status {
+        Some(summarize::SummarizeStatus::Summarizing) => SummaryStatus::Summarizing,
+        Some(summarize::SummarizeStatus::Done) => SummaryStatus::Done,
+        Some(summarize::SummarizeStatus::Failed) => SummaryStatus::Failed,
+        None if has_summary => SummaryStatus::Done,
+        None => SummaryStatus::NotSummarized,
+    }
+}
+
+/// 「要約生成中」の表示ラベル。状態テキストと Summary の縮退表示で同じ文言を使うため 1 箇所で
+/// 管理する（`TRANSCRIBING_LABEL` と同じ理由）。
+const SUMMARIZING_LABEL: &str = "Summarizing…";
+
+/// 議事録要約の表示状態 → 詳細ペインの状態テキスト。
+fn summary_status_text(display_status: SummaryStatus) -> &'static str {
+    match display_status {
+        SummaryStatus::NotSummarized => "Not summarized",
+        SummaryStatus::Summarizing => SUMMARIZING_LABEL,
+        SummaryStatus::Done => "Summarized",
+        SummaryStatus::Failed => "Summarization failed",
+    }
+}
+
+/// 議事録要約の表示状態 → Summary タブの縮退表示（行が無いとき）のラベル。状態テキストが
+/// 文形式なのに対し、こちらは他の空状態ラベルと同じ Title Case にする
+/// （`transcript_placeholder_text` と対称）。`Done` で行が空になるのは `summary.md` の欠落・
+/// 破損・空のときで、未生成と同じ表示に落とす。
+fn summary_placeholder_text(display_status: SummaryStatus) -> &'static str {
+    match display_status {
+        SummaryStatus::Summarizing => SUMMARIZING_LABEL,
+        SummaryStatus::Failed => "Summarization Failed",
+        SummaryStatus::NotSummarized | SummaryStatus::Done => "Not Summarized Yet",
+    }
+}
+
+/// `summary.md` を Summary タブの表示行へ分ける（**Markdown をどこまで解釈するかの正はここ**。
+/// `ui/recordings-window.slint` の `SummaryRow` はこの doc を参照する）。
+///
+/// 本格的なレンダリングはしない（#81 のスコープ外）。行単位に切って、**見出し（`#` の連なりの
+/// 後ろに空白か行末が続く行）だけ**記号を落として `is_heading` を立てる。`##` 以降も同じ強調で、
+/// 階層は付けない（この幅のペインで 3 段の見出しを描き分けても読み取れない）。ほかの記法
+/// （`- ` の箇条書き等）は記号ごとそのまま出す（消すと構造が読めなくなる）。
+///
+/// 空行は段落の切れ目として残すが、末尾の空行は落とす（生成物は末尾に改行を持つ）。**見出し記号
+/// だけの行（`#` 単独）は行の途中でも落とす**（強調だけの空行を描かない）。中身が空になる行だけの
+/// 入力は**行なし**になり、呼び出し側で状態依存の縮退表示へ落ちる。
+fn summary_rows(text: &str) -> Vec<SummaryRow> {
+    let mut rows: Vec<SummaryRow> = text
+        .lines()
+        .map(|line| {
+            let trimmed = line.trim_end();
+            match heading_text(trimmed.trim_start()) {
+                Some(heading) => SummaryRow {
+                    text: heading.into(),
+                    is_heading: true,
+                },
+                None => SummaryRow {
+                    text: trimmed.into(),
+                    is_heading: false,
+                },
+            }
+        })
+        .collect();
+    // 見出し記号だけの行（`#` 単独）は本文が空なので落とす（強調だけの空行を描かない。
+    // 行の途中でも末尾でも同じ扱い）。本文側の空行は段落の切れ目として残す。
+    rows.retain(|row| !(row.is_heading && row.text.is_empty()));
+    // 末尾の空行は落とす（生成物は末尾に改行を持つ）。中身が全部空なら行なしになり、
+    // 呼び出し側で状態依存の縮退表示へ落ちる。
+    while rows.last().is_some_and(|row| row.text.is_empty()) {
+        rows.pop();
+    }
+    rows
+}
+
+/// 行が Markdown の見出しなら、記号と後続の空白を落とした本文を返す。
+///
+/// `#` の連なりの直後が**空白か行末**であることを条件にする（`#81 の件` のような行頭ハッシュを
+/// 見出しと誤認して `81 の件` と表示しないため）。
+fn heading_text(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix('#')?.trim_start_matches('#');
+    if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+        Some(rest.trim_start())
+    } else {
+        None
+    }
+}
+
+/// 詳細ペインの議事録要約の表示（状態テキスト・状態依存の配色・縮退ラベル）を反映する
+/// （`apply_detail_transcript_status` と対称。ボタンの活性の扱いもそちらの doc 参照）。
+fn apply_detail_summary_status(rec: &RecordingsWindow, status: SummaryStatus) {
+    rec.set_detail_summary_status_text(summary_status_text(status).into());
+    rec.set_detail_summary_placeholder(summary_placeholder_text(status).into());
+    rec.set_detail_summary_status(status);
+}
+
+/// セッションの現在の要約状態を合成して詳細ペインへ反映する（選択時・手動投入直後用。
+/// tick は状態を計算済みなので `apply_detail_summary_status` を直接使う）。
+fn refresh_detail_summary_status(
+    rec: &RecordingsWindow,
+    summarizer: &summarize::SummarizeWorker,
+    session: &recordings::RecordingSession,
+) {
+    apply_detail_summary_status(
+        rec,
+        summary_display_status(summarizer.status_of(&session.dir), session.has_summary),
+    );
+}
+
+/// 選択中セッションの `summary.md` を読み直して Summary タブへ反映する（選択時・生成完了時）。
+/// 欠落・破損・空はいずれも行なしになり、Slint 側が状態依存のラベルへ縮退させる。
+fn refresh_detail_summary_rows(rec: &RecordingsWindow, session_dir: &std::path::Path) {
+    let rows = summarize::load_summary(session_dir)
+        .map(|text| summary_rows(&text))
+        .unwrap_or_default();
+    rec.set_summary_rows(Rc::new(slint::VecModel::from(rows)).into());
 }
 
 /// 保存先パスを画面表示用の文字列に変換する。
@@ -1573,7 +1827,8 @@ fn model_choices(catalog: &[model_download::ModelSpec]) -> slint::ModelRc<slint:
 /// 使われないモデルを数 GB 落とさないための抑止（`docs/rules/security.md` の「通信はユーザーが
 /// 機能を有効化したときだけ」）。抑止する 2 ケースは、その後の取得の仕方も違う:
 ///
-/// - 要約 OFF: 選択だけ保存し、ON にした後の初回要約時に `ensure_model` が取得する。
+/// - 要約 OFF: 選択だけ保存する。取得は次に要約が走るとき（設定を ON にした後の初回要約、または
+///   Recordings ウィンドウの「Summarize」による手動生成）に `ensure_model` が行う。
 /// - モデルパスを上書き中: そのファイルが優先されるので、カタログのモデルは以後も取得しない
 ///   （`summarize::resolve_model`）。
 ///
@@ -1596,7 +1851,8 @@ fn summary_model_downloads_on_select(config: &Config) -> bool {
 /// 「downloads automatically」では表示と挙動が食い違う場合がある。その場合は契機を明示する:
 ///
 /// - モデルパスを上書きしている: そのファイルが使われ、カタログのモデルは取得しない。
-/// - 要約 OFF: 選んでも取得は始まらない（ON にした後の初回要約時に取得する）。
+/// - 要約 OFF: 選んでも取得は始まらない（次に要約が走るときに取得する。設定を ON にした後の
+///   初回要約か、Recordings ウィンドウからの手動生成）。
 fn summary_model_status_text(
     config: &Config,
     downloader: &model_download::ModelDownloader,
@@ -1609,7 +1865,7 @@ fn summary_model_status_text(
         && downloader.status_of(spec) == model_download::DownloadStatus::NotDownloaded
     {
         return format!(
-            "Not downloaded — downloads when meeting minutes are on ({})",
+            "Not downloaded — downloads when minutes are generated ({})",
             model_download::format_size(spec.size_bytes)
         );
     }
@@ -1660,9 +1916,10 @@ fn hide_dock_icon() {
 #[cfg(test)]
 mod tests {
     use super::{
-        TranscriptStatus, app_version_text, breathing_level, model_choices, model_status_text,
-        playback_progress, seek_position_from_ratio, summary_model_downloads_on_select,
-        summary_model_status_text, transcript_display_status, transcript_placeholder_text,
+        SummaryStatus, TranscriptStatus, app_version_text, breathing_level, model_choices,
+        model_status_text, playback_progress, seek_position_from_ratio, summary_display_status,
+        summary_model_downloads_on_select, summary_model_status_text, summary_placeholder_text,
+        summary_rows, summary_status_text, transcript_display_status, transcript_placeholder_text,
         transcript_status_text,
     };
     use crate::transcribe::TranscribeStatus;
@@ -1786,6 +2043,129 @@ mod tests {
             transcript_placeholder_text(TranscriptStatus::Failed),
             "Transcription Failed"
         );
+    }
+
+    /// 要約もワーカーの進行状況を優先し、無ければ `summary.md` の有無で解決する
+    /// （文字起こし側と同じ契約）。
+    #[test]
+    fn summary_display_status_prefers_worker_status_over_the_file() {
+        use crate::summarize::SummarizeStatus;
+
+        // 再生成中は `summary.md` が残っていても「生成中」。
+        assert_eq!(
+            summary_display_status(Some(SummarizeStatus::Summarizing), true),
+            SummaryStatus::Summarizing
+        );
+        assert_eq!(
+            summary_display_status(Some(SummarizeStatus::Done), false),
+            SummaryStatus::Done
+        );
+        // 失敗の記録は古い `summary.md` があっても優先する（失敗を隠さない）。
+        assert_eq!(
+            summary_display_status(Some(SummarizeStatus::Failed), true),
+            SummaryStatus::Failed
+        );
+        // ワーカーの記録が無ければファイルの有無で解決する（起動前に生成した分など）。
+        assert_eq!(summary_display_status(None, true), SummaryStatus::Done);
+        assert_eq!(
+            summary_display_status(None, false),
+            SummaryStatus::NotSummarized
+        );
+    }
+
+    #[test]
+    fn summary_status_text_covers_all_states() {
+        assert_eq!(
+            summary_status_text(SummaryStatus::NotSummarized),
+            "Not summarized"
+        );
+        assert_eq!(
+            summary_status_text(SummaryStatus::Summarizing),
+            "Summarizing…"
+        );
+        assert_eq!(summary_status_text(SummaryStatus::Done), "Summarized");
+        assert_eq!(
+            summary_status_text(SummaryStatus::Failed),
+            "Summarization failed"
+        );
+    }
+
+    /// 縮退表示ラベル。Done で行が空になるのは `summary.md` の欠落・破損・空の経路で、
+    /// 未生成と同じラベルに落とす。
+    #[test]
+    fn summary_placeholder_text_covers_all_states() {
+        assert_eq!(
+            summary_placeholder_text(SummaryStatus::NotSummarized),
+            "Not Summarized Yet"
+        );
+        assert_eq!(
+            summary_placeholder_text(SummaryStatus::Summarizing),
+            "Summarizing…"
+        );
+        assert_eq!(
+            summary_placeholder_text(SummaryStatus::Done),
+            "Not Summarized Yet"
+        );
+        assert_eq!(
+            summary_placeholder_text(SummaryStatus::Failed),
+            "Summarization Failed"
+        );
+    }
+
+    /// `summary.md` の行分け: 見出しは記号を落として heading を立て、他はそのまま。
+    /// 途中の空行は段落の切れ目として残し、末尾の空行だけ落とす。
+    ///
+    /// 実際の議事録は日本語にもなるが、この関数は行頭の `#` だけを見て言語に依存しないので、
+    /// 期待値の読みやすさを優先して英語で書く（日本語の見え方は確認用バイナリで見る）。
+    #[test]
+    fn summary_rows_marks_headings_and_keeps_body_lines() {
+        let rows =
+            summary_rows("# Overview\n\n- Decision: ship next week\n## Follow-ups\nbody\n\n\n");
+
+        let texts: Vec<&str> = rows.iter().map(|row| row.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "Overview",
+                "",
+                "- Decision: ship next week",
+                "Follow-ups",
+                "body",
+            ],
+            "trailing blank lines are dropped, inner ones are kept"
+        );
+        let headings: Vec<bool> = rows.iter().map(|row| row.is_heading).collect();
+        assert_eq!(headings, vec![true, false, false, true, false]);
+    }
+
+    /// 見出しは「`#` の連なり＋空白（または行末）」だけ。本文中の `#`・行頭の `#123` は
+    /// 見出しにしない（記号を落として意味を変えてしまわないため）。
+    #[test]
+    fn summary_rows_only_treats_real_headings_as_headings() {
+        let rows = summary_rows("issue #81 follow-up\n#81 follow-up\n#\tTabbed\n");
+        let texts: Vec<&str> = rows.iter().map(|row| row.text.as_str()).collect();
+        let headings: Vec<bool> = rows.iter().map(|row| row.is_heading).collect();
+        assert_eq!(
+            texts,
+            vec!["issue #81 follow-up", "#81 follow-up", "Tabbed"]
+        );
+        assert_eq!(headings, vec![false, false, true]);
+
+        // 行末の空白は落とす（LLM の出力に混じる）。
+        let rows = summary_rows("body   \n");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].text, "body");
+
+        // 記号だけの見出し行は本文が空なので、**行の途中でも**残さない（強調だけの空行を
+        // 描かない）。前後の空行は段落の切れ目として残る。
+        let rows = summary_rows("# A\nbody\n\n#\n\nmore\n");
+        let texts: Vec<&str> = rows.iter().map(|row| row.text.as_str()).collect();
+        assert_eq!(texts, vec!["A", "body", "", "", "more"]);
+
+        // 中身が無い入力は行なし（呼び出し側が状態依存の縮退表示へ落とす）。
+        assert!(summary_rows("").is_empty());
+        assert!(summary_rows("\n\n").is_empty());
+        assert!(summary_rows("###\n").is_empty());
     }
 
     /// シークバーの比率→再生位置。全体長に対する按分で、両端は境界そのものになる。
@@ -1945,7 +2325,7 @@ mod tests {
         let idle = crate::config::Config::default();
         assert_eq!(
             summary_model_status_text(&idle, &downloader),
-            "Not downloaded — downloads when meeting minutes are on (4.4 GB)"
+            "Not downloaded — downloads when minutes are generated (4.4 GB)"
         );
         // 取得済みなら契機の説明は不要（状態そのものを出す）。
         downloader.set_status_for_test(spec, crate::model_download::DownloadStatus::Downloaded);

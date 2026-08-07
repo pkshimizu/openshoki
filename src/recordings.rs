@@ -1,6 +1,6 @@
 //! 録音セッションの探索。設定の保存先（`recording_dir`）配下にある `<%Y%m%d-%H%M%S>` 形式の
-//! セッションディレクトリを列挙し、含まれる音源（mic / system）・文字起こしの有無を調べて
-//! 新しい順に並べる。Recordings ウィンドウの一覧表示に使う。
+//! セッションディレクトリを列挙し、含まれる音源（mic / system）・文字起こし・議事録要約の
+//! 有無を調べて新しい順に並べる。Recordings ウィンドウの一覧表示に使う。
 //!
 //! `recording_dir` は設定（手編集されうる信頼境界外）由来で、無関係なファイル・ディレクトリが
 //! 混じりうる。名前が日時形式でないもの・音源ファイルが 1 つも無いものは安全にスキップし、
@@ -26,7 +26,7 @@ const DIR_DATETIME_FORMAT: &str = "%Y%m%d-%H%M%S";
 /// 一覧に表示する日時フォーマット（カンプに合わせて分まで）。
 const DISPLAY_DATETIME_FORMAT: &str = "%Y-%m-%d %H:%M";
 
-/// 1 つの録音セッション。ディレクトリと、含まれる音源・文字起こしの有無を持つ。
+/// 1 つの録音セッション。ディレクトリと、含まれる音源・文字起こし・議事録要約の有無を持つ。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordingSession {
     /// ソート用の日時（ディレクトリ名からパース）。表示には `display_datetime` を使う。
@@ -43,6 +43,9 @@ pub struct RecordingSession {
     pub has_mix: bool,
     /// 文字起こし（`mic.json` / `system.json` のいずれか）があるか。
     pub has_transcript: bool,
+    /// 議事録要約（`summary.md`）があるか。中身の妥当性は見ない（表示側の `load_summary` が
+    /// 破損・空を縮退させる）。
+    pub has_summary: bool,
 }
 
 impl RecordingSession {
@@ -126,6 +129,7 @@ pub fn list_sessions(recording_dir: &Path) -> Vec<RecordingSession> {
         }
         let has_mix = dir.join(MIX_MP3).is_file();
         let has_transcript = dir.join(MIC_JSON).is_file() || dir.join(SYSTEM_JSON).is_file();
+        let has_summary = dir.join(crate::summarize::SUMMARY_FILENAME).is_file();
 
         sessions.push(RecordingSession {
             datetime,
@@ -135,6 +139,7 @@ pub fn list_sessions(recording_dir: &Path) -> Vec<RecordingSession> {
             has_system,
             has_mix,
             has_transcript,
+            has_summary,
         });
     }
 
@@ -185,7 +190,7 @@ mod tests {
         make_session(
             &root,
             "20260628-143025",
-            &["mic.mp3", "system.mp3", "mic.json"],
+            &["mic.mp3", "system.mp3", "mic.json", "summary.md"],
         );
         make_session(&root, "20260628-110500", &["mic.mp3"]);
         make_session(&root, "20260627-164200", &["system.mp3"]);
@@ -196,11 +201,14 @@ mod tests {
         assert_eq!(sessions[0].display_datetime, "2026-06-28 14:30");
         assert_eq!(sessions[1].display_datetime, "2026-06-28 11:05");
         assert_eq!(sessions[2].display_datetime, "2026-06-27 16:42");
-        // 音源・文字起こしの判定とサマリー。
+        // 音源・文字起こし・議事録要約の判定とサマリー。
         assert!(sessions[0].has_mic && sessions[0].has_system && sessions[0].has_transcript);
+        assert!(sessions[0].has_summary);
         assert_eq!(sessions[0].source_summary(), "Mic + System");
         assert_eq!(sessions[1].source_summary(), "Mic only");
         assert!(!sessions[1].has_transcript);
+        // 文字起こしも要約も無いセッション（要約の有無は独立に判定される）。
+        assert!(!sessions[1].has_summary);
         assert_eq!(sessions[2].source_summary(), "System only");
 
         let _ = fs::remove_dir_all(&root);

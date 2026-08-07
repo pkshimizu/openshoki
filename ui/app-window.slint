@@ -459,7 +459,7 @@ export component AppWindow inherits Window {
 
                     Text {
                         // 選択中モデルの取得状況（Rust 側が組み立てる。例: Not downloaded —
-                        // downloads when meeting minutes are on (4.4 GB)）。取得の契機が設定で
+                        // downloads when minutes are generated (4.4 GB)）。取得の契機が設定で
                         // 変わるぶん whisper の状態行より長い文言があるので折り返す。
                         text: root.summary-model-status;
                         wrap: word-wrap;

@@ -1,6 +1,7 @@
 //! 一時ファイルへ書いてから rename で原子的に置き換える定型。モデルの取得
-//! （`crate::model_download`）と、録音の音量正規化（`crate::mixdown::normalize_if_quiet` が
-//! `mic.mp3` / `system.mp3` を書き直す経路）で共用する。
+//! （`crate::model_download`）、録音の音量正規化（`crate::mixdown::normalize_if_quiet` が
+//! `mic.mp3` / `system.mp3` を書き直す経路）、議事録の保存（`crate::summarize::write_summary`）で
+//! 共用する。
 //!
 //! 途中で失敗しても、壊れた／部分的なファイルを成果物として残さない。**パニックで抜けても
 //! 一時ファイルを残さない**（#130）: `commit` せずに drop されたら消す。これが無いと、
@@ -154,7 +155,9 @@ pub fn sweep_orphaned_parts(dir: &Path, now: SystemTime, max_age: Duration) {
 ///
 /// 数字まで見るのは、拡張子付きのユーザーファイル（`notes.part.txt` 等）を誤って掴まない
 /// ための最低限のふるい。分割書庫の慣習名（`archive.zip.part.1`）までは見分けられないので、
-/// **安全性の主体は対象ディレクトリを限定していること**（呼び出し側は `models/` 直下だけ）。
+/// **安全性の主体は対象ディレクトリを限定していること**にある。掃除を掛けているのは
+/// モデルの保存先だけで（`model_download::sweep_orphaned_part_files`）、録音の保存先は
+/// 対象外（ユーザーのフォルダを走査しない判断。そちらの doc 参照）。
 fn is_part_file(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
