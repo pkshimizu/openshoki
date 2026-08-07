@@ -27,6 +27,8 @@ use rodio::{ChannelCount, Decoder, SampleRate, Source};
 /// ミックス出力のファイル名。セッションディレクトリに固定名で置く（`mic.mp3` / `system.mp3` と同系統。
 /// `recordings.rs` の再生対象判定と一致させること）。
 pub const MIX_FILENAME: &str = "mix.mp3";
+/// ミックスの門番と入力に使う音源のファイル名（`recorder.rs` / `system_audio.rs` の出力名と
+/// 一致させること。`system_audio` は macOS 限定なので直接は参照できない）。
 const MIC_FILENAME: &str = "mic.mp3";
 const SYSTEM_FILENAME: &str = "system.mp3";
 

@@ -20,7 +20,7 @@ use screencapturekit::stream::configuration::audio::{AudioChannelCount, AudioSam
 use crate::recorder::{RecordError, create_recording_file, discard_partial_recording, run_writer};
 
 /// システム音源の出力ファイル名（セッションディレクトリ内に固定名で置く）。
-const SYSTEM_FILENAME: &str = "system.mp3";
+pub(crate) const SYSTEM_FILENAME: &str = "system.mp3";
 /// 取得フォーマット。ScreenCaptureKit が対応する 48kHz / ステレオ。LAME もこの値で初期化する。
 const SAMPLE_RATE: u32 = 48_000;
 const CHANNELS: u16 = 2;
