@@ -111,6 +111,67 @@ fn summarize_reports_the_index_only_while_it_is_enabled() {
     assert_eq!(calls.borrow().len(), 1);
 }
 
+/// キュー待ちの間はボタンが Cancel になり、押すと `cancel-summary` が発火する。走り出したら
+/// （取り消せないので）Summarize へ戻って無効になる。
+#[test]
+#[cfg_attr(
+    not(slint_debug_info),
+    ignore = "needs Slint debug info (SLINT_EMIT_DEBUG_INFO=1)"
+)]
+fn a_queued_summary_can_be_cancelled_from_the_same_button() {
+    let window = open_window();
+    window.set_selected_index(1);
+    window.set_has_transcript(true);
+
+    let calls: Rc<RefCell<Vec<i32>>> = Rc::new(RefCell::new(Vec::new()));
+    let recorded = Rc::clone(&calls);
+    window.on_cancel_summary(move |index| recorded.borrow_mut().push(index));
+    // 取り消しのつもりで生成を投入してしまわないこと（同じボタンなので取り違えが致命的）。
+    window.on_summarize_session(|_| panic!("a queued summary must not be re-submitted"));
+
+    window.set_detail_summary_status(SummaryStatus::Queued);
+    let cancel = button(&window, "Cancel");
+    assert_eq!(cancel.accessible_enabled(), Some(true));
+    cancel.mock_single_click(PointerEventButton::Left);
+    assert_eq!(*calls.borrow(), vec![1], "the selected index is passed");
+
+    // 走り出したら取り消せない: ラベルは Summarize に戻り、無効になる。
+    window.set_detail_summary_status(SummaryStatus::Summarizing);
+    let summarize = button(&window, "Summarize");
+    assert_eq!(summarize.accessible_enabled(), Some(false));
+}
+
+/// キュー待ちの間も Delete は押せる（まだファイルを触っていないので、Rust 側が取り消してから
+/// 削除する）。走り出したら押せない。押せたかどうかは確認モーダルが開くかで見る
+/// （自作の `DangerButton` は accessible-enabled を出さないため）。
+#[test]
+#[cfg_attr(
+    not(slint_debug_info),
+    ignore = "needs Slint debug info (SLINT_EMIT_DEBUG_INFO=1)"
+)]
+fn delete_stays_available_while_a_summary_is_queued() {
+    let window = open_window();
+    let delete = ElementHandle::find_by_element_type_name(&window, "DangerButton")
+        .next()
+        .expect("the detail pane should have a Delete button");
+
+    window.set_detail_summary_status(SummaryStatus::Queued);
+    delete.mock_single_click(PointerEventButton::Left);
+    assert!(
+        window.get_show_delete_confirm(),
+        "a queued summary is not touching the session yet, so Delete stays available"
+    );
+
+    // 走り出したら押せない（ワーカーが読み書きしている最中に消させない）。
+    window.set_show_delete_confirm(false);
+    window.set_detail_summary_status(SummaryStatus::Summarizing);
+    delete.mock_single_click(PointerEventButton::Left);
+    assert!(
+        !window.get_show_delete_confirm(),
+        "Delete must be disabled while the summary is running"
+    );
+}
+
 /// 要約の生成中は Transcribe も無効になる（`detail-busy` に一本化した挙動。ワーカーが対象
 /// ファイルを読み書きしている最中に多重投入をさせない）。Delete も同じゲートだが、自作の
 /// `DangerButton` は accessible-enabled を出さないのでここでは見ない。

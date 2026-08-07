@@ -14,6 +14,9 @@ export enum TranscriptStatus {
 // `summary.md` の有無から合成して詰める。TranscriptStatus と同じ流儀（先頭が未生成＝既定値）。
 export enum SummaryStatus {
     not-summarized,
+    // 投入済みで、ワーカーが取り出すのを待っている（まだ CPU を使っていない）。この間だけ
+    // 取り消せるので、Summarize ボタンが Cancel に変わる。
+    queued,
     summarizing,
     done,
     failed,
@@ -304,11 +307,16 @@ export component RecordingsWindow inherits Window {
     in property <[SummaryRow]> summary-rows;
     // 選択中セッションが要約生成中か（上の enum から導出。Rust から個別に set しない）。
     property <bool> detail-summarizing: root.detail-summary-status == SummaryStatus.summarizing;
-    // 文字起こし・要約のいずれかが走っているか。**従属コントロールの無効化はこの 1 つに
-    // 一本化する**（Transcribe / Summarize / Delete。条件を各所へ複写しない。
-    // `docs/rules/slint.md`）。走っている間はワーカーがセッションのファイルを読み書きするため、
-    // 多重投入も削除もさせない。
-    property <bool> detail-busy: root.detail-transcribing || root.detail-summarizing;
+    // 要約がキュー待ちか（まだ走っていないので取り消せる）。
+    property <bool> detail-summary-queued: root.detail-summary-status == SummaryStatus.queued;
+    // **ワーカーがこのセッションのファイルを読み書きしているか**。削除の可否はこれ 1 つで
+    // 決める（条件を各所へ複写しない。`docs/rules/slint.md`）。キュー待ちはまだ触っていない
+    // ので含めない（Delete は取り消してから消す）。
+    property <bool> detail-running: root.detail-transcribing || root.detail-summarizing;
+    // **待たされている状態か**（走っている＋キュー待ち）。新しい仕事を積ませない判断に使う
+    // （Transcribe / Summarize）。キュー待ちの要約は、いま文字起こしをやり直すと途中の
+    // JSON を読みかねないので、走っていなくても積ませない。
+    property <bool> detail-busy: root.detail-running || root.detail-summary-queued;
     // 選択中セッションに文字起こしがあるか（要約の入力になるので、無ければ Summarize は無効）。
     in property <bool> has-transcript;
     // 選択セッションのトランスクリプト（mic.json / system.json をマージしたもの。新→旧でなく時刻順）。
@@ -355,6 +363,8 @@ export component RecordingsWindow inherits Window {
     // 「Summarize」押下。選択中セッションの議事録要約を（再）生成する。インデックスを渡す
     // （設定 `auto_summarize` とは独立に、押されたら生成する）。
     callback summarize-session(int);
+    // 「Cancel」押下（キュー待ちの間だけ出る）。積んだ要約ジョブを取り消す。
+    callback cancel-summary(int);
     // 確認モーダルの Delete 押下。選択中セッションをゴミ箱へ移動する（インデックスを渡す）。
     callback delete-session(int);
 
@@ -539,18 +549,27 @@ export component RecordingsWindow inherits Window {
                         }
 
                         Button {
-                            text: "Summarize";
+                            // キュー待ちの間は取り消しボタンになる（同じ場所で「積む／やめる」を
+                            // 切り替える。ボタンを増やすとヘッダが混み、押せない Cancel が
+                            // 常時並ぶことになる）。走り出したら取り消せないので無効に戻る。
+                            text: root.detail-summary-queued ? "Cancel" : "Summarize";
                             // 要約は文字起こしを入力にするので、無いセッションでは押させない
                             // （生成済み・失敗からは押し直せる。モデル変更後のやり直し用途）。
-                            enabled: root.has-transcript && !root.detail-busy;
+                            enabled: root.detail-summary-queued
+                                || (root.has-transcript && !root.detail-busy);
                             clicked => {
-                                root.summarize-session(root.selected-index);
+                                if (root.detail-summary-queued) {
+                                    root.cancel-summary(root.selected-index);
+                                } else {
+                                    root.summarize-session(root.selected-index);
+                                }
                             }
                         }
 
                         DangerButton {
                             text: "Delete";
-                            enabled: !root.detail-busy;
+                            // キュー待ちなら消せる（Rust 側が取り消してから削除する）。
+                            enabled: !root.detail-running;
                             clicked => {
                                 root.show-delete-confirm = true;
                             }

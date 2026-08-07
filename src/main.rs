@@ -744,6 +744,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // 「Cancel」: キュー待ちの要約ジョブを取り消す（走り出したものは取り消せない。理由は
+    // `SummarizeWorker::cancel` の doc）。ボタンはキュー待ちの間だけ Cancel になる。
+    {
+        let sessions = Rc::clone(&sessions);
+        let summarizer = summarizer.clone();
+        let rec_weak = recordings_ui.as_weak();
+        recordings_ui.on_cancel_summary(move |index| {
+            let sessions = sessions.borrow();
+            let Some(session) = usize::try_from(index).ok().and_then(|i| sessions.get(i)) else {
+                return;
+            };
+            if !summarizer.cancel(&session.dir) {
+                // 走り出した後にボタンが Cancel のまま押された（tick が状態を更新する前の
+                // 数十 ms）。取り消せないことをログに残し、表示は次の tick が直す。
+                eprintln!("Skipping the cancellation because the summary already started");
+            }
+            // 取り消し結果（通常は未生成／生成済みへ戻る）を即反映する。
+            if let Some(rec) = rec_weak.upgrade() {
+                refresh_detail_summary_status(&rec, &summarizer, session);
+            }
+        });
+    }
+
     // 確認モーダルの Delete: 選択中セッションをディレクトリごと OS のゴミ箱へ移動し、
     // 一覧・メモリの両方から除去する（完全削除への自動フォールバックはしない）。
     // 失敗はログのみでアプリ・一覧を壊さない（`docs/rules/error-handling.md`）。
@@ -811,6 +834,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             sessions.borrow_mut().remove(i);
             sessions_model.remove(i);
+            // キュー待ちの要約が積まれていたら取り消す（消したセッションを後から要約しない。
+            // 取り出し時に対象が無く Skipped になるだけだが、無駄な起動を避ける）。
+            summarizer.cancel(&dir);
             // 進行状況マップに残ったエントリを掃除する（削除済みセッションの記録を残さない）。
             transcriber.forget(&dir);
             summarizer.forget(&dir);
@@ -1116,7 +1142,11 @@ fn build_menu_event_handler(
                     if previous != status {
                         apply_detail_summary_status(&rec, status);
                         // 生成が終わった瞬間に表示を差し替える（失敗時は前の議事録を残す）。
-                        if previous == SummaryStatus::Summarizing && status == SummaryStatus::Done {
+                        // 通常は生成中を経るが、tick の間隔より短い経路もありうるので
+                        // キュー待ちからの完了も拾う。
+                        if matches!(previous, SummaryStatus::Queued | SummaryStatus::Summarizing)
+                            && status == SummaryStatus::Done
+                        {
                             refresh_detail_summary_rows(&rec, &session.dir);
                             summarized = Some(i);
                         }
@@ -1654,6 +1684,7 @@ fn summary_display_status(
     has_summary: bool,
 ) -> SummaryStatus {
     match worker_status {
+        Some(summarize::SummarizeStatus::Queued) => SummaryStatus::Queued,
         Some(summarize::SummarizeStatus::Summarizing) => SummaryStatus::Summarizing,
         Some(summarize::SummarizeStatus::Done) => SummaryStatus::Done,
         Some(summarize::SummarizeStatus::Failed) => SummaryStatus::Failed,
@@ -1666,10 +1697,15 @@ fn summary_display_status(
 /// 管理する（`TRANSCRIBING_LABEL` と同じ理由）。
 const SUMMARIZING_LABEL: &str = "Summarizing…";
 
+/// 「キュー待ち」の表示ラベル（上と同じ理由で 1 箇所に置く）。生成中と区別できる語にする:
+/// この間はまだ CPU を使っておらず、取り消せる（`SummarizeWorker::cancel`）。
+const SUMMARY_QUEUED_LABEL: &str = "Waiting to summarize…";
+
 /// 議事録要約の表示状態 → 詳細ペインの状態テキスト。
 fn summary_status_text(display_status: SummaryStatus) -> &'static str {
     match display_status {
         SummaryStatus::NotSummarized => "Not summarized",
+        SummaryStatus::Queued => SUMMARY_QUEUED_LABEL,
         SummaryStatus::Summarizing => SUMMARIZING_LABEL,
         SummaryStatus::Done => "Summarized",
         SummaryStatus::Failed => "Summarization failed",
@@ -1682,6 +1718,7 @@ fn summary_status_text(display_status: SummaryStatus) -> &'static str {
 /// 破損・空のときで、未生成と同じ表示に落とす。
 fn summary_placeholder_text(display_status: SummaryStatus) -> &'static str {
     match display_status {
+        SummaryStatus::Queued => SUMMARY_QUEUED_LABEL,
         SummaryStatus::Summarizing => SUMMARIZING_LABEL,
         SummaryStatus::Failed => "Summarization Failed",
         SummaryStatus::NotSummarized | SummaryStatus::Done => "Not Summarized Yet",
@@ -2051,6 +2088,11 @@ mod tests {
     fn summary_display_status_prefers_worker_status_over_the_file() {
         use crate::summarize::SummarizeStatus;
 
+        // 投入直後（キュー待ち）は生成中と区別する。取り消せるのはこの間だけ。
+        assert_eq!(
+            summary_display_status(Some(SummarizeStatus::Queued), false),
+            SummaryStatus::Queued
+        );
         // 再生成中は `summary.md` が残っていても「生成中」。
         assert_eq!(
             summary_display_status(Some(SummarizeStatus::Summarizing), true),
@@ -2080,6 +2122,10 @@ mod tests {
             "Not summarized"
         );
         assert_eq!(
+            summary_status_text(SummaryStatus::Queued),
+            "Waiting to summarize…"
+        );
+        assert_eq!(
             summary_status_text(SummaryStatus::Summarizing),
             "Summarizing…"
         );
@@ -2097,6 +2143,10 @@ mod tests {
         assert_eq!(
             summary_placeholder_text(SummaryStatus::NotSummarized),
             "Not Summarized Yet"
+        );
+        assert_eq!(
+            summary_placeholder_text(SummaryStatus::Queued),
+            "Waiting to summarize…"
         );
         assert_eq!(
             summary_placeholder_text(SummaryStatus::Summarizing),
