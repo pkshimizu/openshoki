@@ -799,19 +799,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Delete を押せてしまう。走行中のセッションを消すと、ワーカーは消えたディレクトリへ
             // 書きに行って失敗し、`forget` の後から状態を入れ直す（消えたセッションの記録が
             // 残る）。キュー待ちなら**先に取り消してから**消す（判定と取り消しは
-            // `cancel_for_delete` が 1 回のロックでまとめて行う）。
+            // `cancel_queued` が 1 回のロックでまとめて行う）。
             // 要約だけを見るのは、要約が**ワーカー経由でも投入される**（文字起こしの完了から
             // 自動生成）ため。文字起こしは投入が UI スレッドで、直後に
             // `refresh_detail_transcript_status` がゲートを閉じるので、この窓が開かない。
-            match summarizer.cancel_for_delete(&dir) {
-                summarize::CancelForDelete::Running => {
+            // なお、このチェックの**後**に自動投入が届く窓は残る。その場合はワーカーが
+            // 取り出したときに文字起こしが無く `Skipped` で消える（`summary.md` を書く前に
+            // 返るので、消えたディレクトリへは書きに行かない）。
+            match summarizer.cancel_queued(&dir) {
+                summarize::CancelOutcome::Running => {
                     eprintln!("Skipping the deletion because the summary is still running");
                     return;
                 }
                 // 取り消したジョブは戻せない（`SummarizeJob` は破棄済み）。下でゴミ箱への
                 // 移動に失敗しても、積んでいた生成は失われたままになる（選択し直して
                 // Summarize を押せば積み直せる）。
-                summarize::CancelForDelete::Cancelled | summarize::CancelForDelete::NotQueued => {}
+                summarize::CancelOutcome::Cancelled | summarize::CancelOutcome::NotQueued => {}
             }
             // ゴミ箱への移動前に再生対象を手放す。削除済みファイルを play_pause / seek の
             // 開き直し経路が参照しないようにし、開いたままのハンドルが移動を妨げる OS でも

@@ -15,7 +15,7 @@ export enum TranscriptStatus {
 export enum SummaryStatus {
     not-summarized,
     // 投入済みで、ワーカーが取り出すのを待っている（まだ CPU を使っていない）。この間だけ
-    // 取り消せるので、Summarize ボタンが Cancel に変わる。
+    // 取り消せる（取り消しは状態行の隣に出す。理由は状態行のコメント）。
     queued,
     summarizing,
     done,

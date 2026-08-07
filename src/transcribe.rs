@@ -642,7 +642,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert_eq!(worker.status_of(&dir), None);
-        // 要約ワーカーは触られていない（投入されていれば submit が同期的に Summarizing を
+        // 要約ワーカーは触られていない（投入されていれば submit が同期的に Queued を
         // 記録し、その後 Failed になる。どちらも消えない）。状態が「付かないこと」の確認なので、
         // 文字起こし側の完了から少しだけ猶予を置いて見る。
         for _ in 0..20 {
