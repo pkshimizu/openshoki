@@ -76,8 +76,8 @@ fn clicking_the_tabs_switches_the_pane() {
     );
 }
 
-/// Summarize は選択中インデックスを渡して発火し、文字起こしが無い／実行中は押せない
-/// （無効化は Slint 側の `detail-busy` と `has-transcript` が決める）。
+/// Summarize は有効なときだけ、選択中インデックスを渡して発火する
+/// （どの状態で押せるかは `the_summary_state_decides_which_actions_are_offered` が表で見る）。
 #[test]
 #[cfg_attr(
     not(slint_debug_info),
@@ -102,18 +102,86 @@ fn summarize_reports_the_index_only_while_it_is_enabled() {
     assert_eq!(summarize.accessible_enabled(), Some(false));
     summarize.mock_single_click(PointerEventButton::Left);
     assert_eq!(calls.borrow().len(), 1, "a disabled button must not fire");
-
-    // 生成中も無効（多重投入を防ぐ）。
-    window.set_has_transcript(true);
-    window.set_detail_summary_status(SummaryStatus::Summarizing);
-    assert_eq!(summarize.accessible_enabled(), Some(false));
-    summarize.mock_single_click(PointerEventButton::Left);
-    assert_eq!(calls.borrow().len(), 1);
 }
 
-/// 要約の生成中は Transcribe も無効になる（`detail-busy` に一本化した挙動。ワーカーが対象
-/// ファイルを読み書きしている最中に多重投入をさせない）。Delete も同じゲートだが、自作の
-/// `DangerButton` は accessible-enabled を出さないのでここでは見ない。
+/// 要約の状態ごとに、ボタン列の活性と取り消しの導線が意図どおりであること。
+///
+/// 状態が増えたときに**静かに「Summarize が押せる」へ落ちる**のを防ぐため、全バリアントを
+/// 表で固定する（対応表は Slint 側の導出プロパティにあり、Rust の網羅 match で守れないため。
+/// `docs/rules/slint.md` の「三項連鎖にしない」の代替）。
+#[test]
+#[cfg_attr(
+    not(slint_debug_info),
+    ignore = "needs Slint debug info (SLINT_EMIT_DEBUG_INFO=1)"
+)]
+fn the_summary_state_decides_which_actions_are_offered() {
+    // (状態, Summarize が押せるか, Cancel が出ているか, Delete が押せるか)
+    let expected = [
+        (SummaryStatus::NotSummarized, true, false, true),
+        (SummaryStatus::Queued, false, true, true),
+        (SummaryStatus::Summarizing, false, false, false),
+        (SummaryStatus::Done, true, false, true),
+        (SummaryStatus::Failed, true, false, true),
+    ];
+
+    let window = open_window();
+    window.set_has_transcript(true);
+    for (status, summarize_enabled, cancel_shown, delete_enabled) in expected {
+        window.set_detail_summary_status(status);
+        // 前の周回で開いた確認モーダルを閉じる（開いたままだと Delete の判定が常に真になる）。
+        window.set_show_delete_confirm(false);
+
+        assert_eq!(
+            button(&window, "Summarize").accessible_enabled(),
+            Some(summarize_enabled),
+            "Summarize for {status:?}"
+        );
+        assert_eq!(
+            ElementHandle::find_by_accessible_label(&window, "Cancel Summary").count(),
+            usize::from(cancel_shown),
+            "the Cancel button should only exist while queued ({status:?})"
+        );
+
+        // Delete は自作の `DangerButton` で accessible-enabled を出さないので、確認モーダルが
+        // 開くかで見る。
+        ElementHandle::find_by_element_type_name(&window, "DangerButton")
+            .next()
+            .expect("the detail pane should have a Delete button")
+            .mock_single_click(PointerEventButton::Left);
+        assert_eq!(
+            window.get_show_delete_confirm(),
+            delete_enabled,
+            "Delete for {status:?}"
+        );
+    }
+}
+
+/// キュー待ちの取り消しは、状態行の隣に出る専用のボタンから行う
+/// （Summarize と差し替えない理由は `ui/recordings-window.slint` の状態行のコメント）。
+#[test]
+#[cfg_attr(
+    not(slint_debug_info),
+    ignore = "needs Slint debug info (SLINT_EMIT_DEBUG_INFO=1)"
+)]
+fn cancelling_a_queued_summary_reports_the_index() {
+    let window = open_window();
+    window.set_selected_index(1);
+    window.set_has_transcript(true);
+
+    let calls: Rc<RefCell<Vec<i32>>> = Rc::new(RefCell::new(Vec::new()));
+    let recorded = Rc::clone(&calls);
+    window.on_cancel_summary(move |index| recorded.borrow_mut().push(index));
+    // 取り消しのつもりで生成を投入してしまわないこと（取り違えが致命的な組み合わせ）。
+    window.on_summarize_session(|_| panic!("a queued summary must not be re-submitted"));
+
+    window.set_detail_summary_status(SummaryStatus::Queued);
+    button(&window, "Cancel Summary").mock_single_click(PointerEventButton::Left);
+    assert_eq!(*calls.borrow(), vec![1], "the selected index is passed");
+}
+
+/// 要約の生成中は Transcribe も無効になる（`detail-jobs-pending`。ワーカーが対象ファイルを
+/// 読み書きしている最中に多重投入をさせない）。Delete は別ゲート（`detail-files-in-use`）で、
+/// 状態ごとの違いは `the_summary_state_decides_which_actions_are_offered` が見る。
 #[test]
 #[cfg_attr(
     not(slint_debug_info),

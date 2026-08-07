@@ -7,8 +7,8 @@
 //! - `modal`: 削除確認モーダルを重ねた状態
 //! - `no-seek`: シークバーを表示専用へ縮退させた状態（再生不可・全体長不明のセッション相当）
 //! - `summary`: Summary タブを開いた状態（議事録の見出し強調・折り返しの確認）
-//! - `summarizing` / `summary-failed`: Summary タブを開き、生成中／失敗の状態にした状態
-//!   （状態行の色・縮退ラベルの確認）
+//! - `queued` / `summarizing` / `summary-failed`: Summary タブを開き、キュー待ち／生成中／
+//!   失敗の状態にした状態（状態行の色・縮退ラベル・状態行の隣に出る取り消しの確認）
 //! - `no-transcript`: 文字起こしも議事録も無いセッション（両タブの縮退表示・Summarize の無効化）。
 //!   要約は入力が無いので、上の要約状態の指定より優先される
 //! - `snapshot <path>`: PNG に書き出す（画面収録の許可が無い環境用）
@@ -33,6 +33,10 @@ const DEFAULT_SEGMENT_COUNT: usize = 30;
 /// 生成中のラベル。状態テキストと縮退ラベルで同じ文言を使うため 1 箇所に置く
 /// （`src/main.rs` の `SUMMARIZING_LABEL` の複製。あちらを変えたらここも合わせること）。
 const SUMMARIZING_LABEL: &str = "Summarizing…";
+
+/// キュー待ちのラベル（同上。`src/main.rs` の複製。状態行と縮退表示で大小が違う）。
+const SUMMARY_QUEUED_LABEL: &str = "Waiting to summarize…";
+const SUMMARY_QUEUED_PLACEHOLDER: &str = "Waiting to Summarize…";
 
 /// Summary タブの確認用のダミー議事録。見出しの強調・本文の折り返し・段落の間隔を見たいので、
 /// 実際の生成物（`src/summarize.rs` のプロンプトが作る 4 見出し構成）と同じ形にする。
@@ -108,9 +112,11 @@ fn main() {
         win.set_current_segment(2);
     }
 
-    // 議事録の 4 状態を引数で選べるようにする（状態行の色・縮退ラベルの確認用）。
+    // 議事録の状態を引数で選べるようにする（状態行の色・縮退ラベル・取り消しの確認用）。
     let summary_status = if !has_transcript {
         SummaryStatus::NotSummarized
+    } else if flag("queued") {
+        SummaryStatus::Queued
     } else if flag("summarizing") {
         SummaryStatus::Summarizing
     } else if flag("summary-failed") {
@@ -122,6 +128,7 @@ fn main() {
     win.set_detail_summary_status_text(
         match summary_status {
             SummaryStatus::NotSummarized => "Not summarized",
+            SummaryStatus::Queued => SUMMARY_QUEUED_LABEL,
             SummaryStatus::Summarizing => SUMMARIZING_LABEL,
             SummaryStatus::Done => "Summarized",
             SummaryStatus::Failed => "Summarization failed",
@@ -130,6 +137,7 @@ fn main() {
     );
     win.set_detail_summary_placeholder(
         match summary_status {
+            SummaryStatus::Queued => SUMMARY_QUEUED_PLACEHOLDER,
             SummaryStatus::Summarizing => SUMMARIZING_LABEL,
             SummaryStatus::Failed => "Summarization Failed",
             SummaryStatus::NotSummarized | SummaryStatus::Done => "Not Summarized Yet",
@@ -144,7 +152,11 @@ fn main() {
     }
     // タブは通常 UI が所有するが、Summary 側の見た目を確認できるよう引数で選べるようにする。
     win.set_showing_summary(
-        flag("summary") || flag("summarizing") || flag("summary-failed") || flag("no-transcript"),
+        flag("summary")
+            || flag("queued")
+            || flag("summarizing")
+            || flag("summary-failed")
+            || flag("no-transcript"),
     );
     // Playback セクション（シークバー）の確認用のダミー再生状態。
     win.set_playable(true);
