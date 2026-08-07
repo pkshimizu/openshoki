@@ -1285,8 +1285,8 @@ fn open_recordings_window(
     let list = recordings::list_sessions(&config.borrow().recording_dir);
     // 一覧に出たセッションに取り残された一時ファイルを回収する（強制終了などで残ったもの。
     // 範囲と時期の判断は `recordings::spawn_session_part_sweep` の doc）。表示には使わない
-    // 副作用なので、ハンドルは捨てて完了を待たない。
-    let _ = recordings::spawn_session_part_sweep(&list, SystemTime::now());
+    // 副作用なので、完了は待たない。
+    recordings::spawn_session_part_sweep(&list, SystemTime::now());
     let rows: Vec<SessionRow> = list
         .iter()
         .map(|session| SessionRow {
