@@ -549,6 +549,7 @@ mod tests {
             model_id: crate::summary_model::DEFAULT_MODEL_ID.to_owned(),
             model_override: Some(session_dir.join("missing-model.gguf")),
             language: "en".to_owned(),
+            existing_is_stale: true,
         }
     }
 

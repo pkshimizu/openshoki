@@ -27,12 +27,11 @@ export struct SessionRow {
     transcript-status: TranscriptStatus,
 }
 
-// 議事録要約の表示 1 行分（`summary.md` を行単位に分けたもの。Rust の summary_rows が作る）。
-// Markdown の本格レンダリングはしない（#81 のスコープ外）。見出し（`#` 始まり）だけ heading を
-// 立てて強調し、記号は Rust 側で落としてある。
+// 議事録要約の表示 1 行分。行分けと見出し判定（`#` を落として `is-heading` を立てる）は Rust の
+// `summary_rows` が行う（**その doc が正**。Markdown をどこまで解釈するかもそちら）。
 export struct SummaryRow {
     text: string,
-    heading: bool,
+    is-heading: bool,
 }
 
 // トランスクリプトの表示 1 行分。Rust の transcript::TranscriptSegment から詰める
@@ -116,7 +115,7 @@ component DangerButton inherits Rectangle {
         Text {
             text: root.text;
             font-size: Style.body-size;
-            font-weight: root.filled ? Style.semibold : 400;
+            font-weight: root.filled ? Style.semibold : Style.regular;
             color: root.filled ? Style.on-accent-foreground : Style.danger;
             horizontal-alignment: center;
             vertical-alignment: center;
@@ -147,7 +146,7 @@ component ViewTab inherits Rectangle {
         Text {
             text: root.text;
             font-size: Style.heading-size;
-            font-weight: root.selected ? Style.semibold : 400;
+            font-weight: root.selected ? Style.semibold : Style.regular;
             color: root.selected
                 ? Palette.foreground
                 : Palette.foreground.transparentize(Style.muted-alpha);
@@ -160,7 +159,7 @@ component ViewTab inherits Rectangle {
         }
     }
 
-    touch := TouchArea {
+    TouchArea {
         clicked => {
             root.clicked();
         }
@@ -278,7 +277,7 @@ export component RecordingsWindow inherits Window {
     // 選択セッションの詳細（Rust 側が選択時に更新する）。
     in property <bool> has-selection;
     in property <string> detail-datetime;
-    in property <string> detail-summary;
+    in property <string> detail-sources;
     // 選択中セッションの文字起こし状態テキスト（Rust 側が組み立てる。例: Transcribed /
     // Transcribing… / Transcription failed / Not transcribed）。
     in property <string> detail-transcript-text;
@@ -485,7 +484,8 @@ export component RecordingsWindow inherits Window {
             if root.has-selection: VerticalLayout {
                 spacing: 12px;
 
-                // ヘッダ: 日時・音源要約と、文字起こしの状態＋再実行ボタン。
+                // ヘッダ: 日時・音源の内訳と、文字起こし／議事録要約の状態＋
+                // Transcribe / Summarize / Delete。
                 HorizontalLayout {
                     vertical-stretch: 0;
                     spacing: 12px;
@@ -500,7 +500,7 @@ export component RecordingsWindow inherits Window {
                         }
 
                         Text {
-                            text: root.detail-summary;
+                            text: root.detail-sources;
                             font-size: Style.caption-size;
                             color: Palette.foreground.transparentize(Style.muted-alpha);
                         }
@@ -530,8 +530,8 @@ export component RecordingsWindow inherits Window {
                         spacing: 8px;
                         Button {
                             text: "Transcribe";
-                            // 実行中（キュー待ち含む）は多重投入を防ぐ。完了済み・失敗・未実施の
-                            // いずれからも（再）実行できる（言語・モデル変更後のやり直し用途）。
+                            // 完了済み・失敗・未実施のいずれからも（再）実行できる
+                            // （言語・モデル変更後のやり直し用途）。無効化の理由は detail-busy。
                             enabled: !root.detail-busy;
                             clicked => {
                                 root.transcribe-session(root.selected-index);
@@ -540,8 +540,8 @@ export component RecordingsWindow inherits Window {
 
                         Button {
                             text: "Summarize";
-                            // 要約は文字起こしを入力にするので、無いセッションでは押させない。
-                            // 生成済み・失敗からは押し直せる（モデル変更後のやり直し用途）。
+                            // 要約は文字起こしを入力にするので、無いセッションでは押させない
+                            // （生成済み・失敗からは押し直せる。モデル変更後のやり直し用途）。
                             enabled: root.has-transcript && !root.detail-busy;
                             clicked => {
                                 root.summarize-session(root.selected-index);
@@ -550,8 +550,6 @@ export component RecordingsWindow inherits Window {
 
                         DangerButton {
                             text: "Delete";
-                            // 実行中はワーカーが対象ファイルを読み書きしているため削除させない
-                            // （Transcribe / Summarize と同じ縮退表現）。
                             enabled: !root.detail-busy;
                             clicked => {
                                 root.show-delete-confirm = true;
@@ -665,74 +663,73 @@ export component RecordingsWindow inherits Window {
                             clip: true;
 
                             if !root.showing-summary: Rectangle {
-
-                            // 文字起こしがあればセグメント一覧、無ければ縮退表示。長時間録音では
-                            // セグメントが数千件になり得るため、可視範囲だけ生成する ListView を使う
-                            // （ScrollView + for は全行を即時生成し、選択時のヒッチにつながる）。
-                            if root.segments.length > 0: ListView {
-                                for seg[i] in root.segments: Rectangle {
-                                    // 現在再生位置のセグメントをハイライト（淡色背景＋左 3px 罫線）。
-                                    property <bool> active: i == root.current-segment;
-                                    background: active ? Style.segment-highlight : transparent;
-                                    // ListView の行は自身の高さを明示する（word-wrap する本文の
-                                    // 実高さに追従させる）。
-                                    height: row-content.preferred-height;
-                                    TouchArea {
-                                        clicked => {
-                                            root.seek-to-segment(i);
-                                        }
-                                    }
-
-                                    row-content := HorizontalLayout {
-                                        // 左端のアクセント罫線（active のときだけ幅を持つ）。
-                                        Rectangle {
-                                            width: active ? 3px : 0px;
-                                            background: Palette.accent-background;
+                                // 文字起こしがあればセグメント一覧、無ければ縮退表示。長時間録音では
+                                // セグメントが数千件になり得るため、可視範囲だけ生成する ListView を使う
+                                // （ScrollView + for は全行を即時生成し、選択時のヒッチにつながる）。
+                                if root.segments.length > 0: ListView {
+                                    for seg[i] in root.segments: Rectangle {
+                                        // 現在再生位置のセグメントをハイライト（淡色背景＋左 3px 罫線）。
+                                        property <bool> active: i == root.current-segment;
+                                        background: active ? Style.segment-highlight : transparent;
+                                        // ListView の行は自身の高さを明示する（word-wrap する本文の
+                                        // 実高さに追従させる）。
+                                        height: row-content.preferred-height;
+                                        TouchArea {
+                                            clicked => {
+                                                root.seek-to-segment(i);
+                                            }
                                         }
 
-                                        VerticalLayout {
-                                            padding-left: 8px;
-                                            padding-right: 6px;
-                                            padding-top: 6px;
-                                            padding-bottom: 6px;
-                                            spacing: 3px;
-                                            HorizontalLayout {
-                                                alignment: start;
-                                                spacing: 7px;
-                                                SpeakerBadge {
-                                                    label: seg.speaker;
-                                                    accent: seg.is-mic;
+                                        row-content := HorizontalLayout {
+                                            // 左端のアクセント罫線（active のときだけ幅を持つ）。
+                                            Rectangle {
+                                                width: active ? 3px : 0px;
+                                                background: Palette.accent-background;
+                                            }
+
+                                            VerticalLayout {
+                                                padding-left: 8px;
+                                                padding-right: 6px;
+                                                padding-top: 6px;
+                                                padding-bottom: 6px;
+                                                spacing: 3px;
+                                                HorizontalLayout {
+                                                    alignment: start;
+                                                    spacing: 7px;
+                                                    SpeakerBadge {
+                                                        label: seg.speaker;
+                                                        accent: seg.is-mic;
+                                                    }
+
+                                                    Text {
+                                                        text: seg.time;
+                                                        font-size: Style.caption-size;
+                                                        vertical-alignment: center;
+                                                        color: Palette.foreground.transparentize(Style.muted-alpha);
+                                                    }
                                                 }
 
                                                 Text {
-                                                    text: seg.time;
-                                                    font-size: Style.caption-size;
-                                                    vertical-alignment: center;
-                                                    color: Palette.foreground.transparentize(Style.muted-alpha);
+                                                    text: seg.text;
+                                                    wrap: word-wrap;
+                                                    font-size: Style.body-size;
+                                                    color: Palette.foreground;
                                                 }
-                                            }
-
-                                            Text {
-                                                text: seg.text;
-                                                wrap: word-wrap;
-                                                font-size: Style.body-size;
-                                                color: Palette.foreground;
                                             }
                                         }
                                     }
                                 }
-                            }
-                            if root.segments.length == 0: Text {
-                                // 縮退表示は実際の状態を語る（ラベルの対応は Rust 側の
-                                // transcript_placeholder_text 参照。JSON の欠落・破損は状態 Done の
-                                // ままセグメントが空になり、未実施と同じ表示に落ちる）。完了済みの
-                                // 再実行中は旧トランスクリプトが残るため上の一覧表示が維持される。
-                                text: root.detail-transcript-placeholder;
-                                font-size: Style.body-size;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                                color: Palette.foreground.transparentize(Style.muted-alpha);
-                            }
+                                if root.segments.length == 0: Text {
+                                    // 縮退表示は実際の状態を語る（ラベルの対応は Rust 側の
+                                    // transcript_placeholder_text 参照。JSON の欠落・破損は状態 Done の
+                                    // ままセグメントが空になり、未実施と同じ表示に落ちる）。完了済みの
+                                    // 再実行中は旧トランスクリプトが残るため上の一覧表示が維持される。
+                                    text: root.detail-transcript-placeholder;
+                                    font-size: Style.body-size;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                    color: Palette.foreground.transparentize(Style.muted-alpha);
+                                }
                             }
 
                             if root.showing-summary: Rectangle {
@@ -748,15 +745,18 @@ export component RecordingsWindow inherits Window {
                                             padding-right: 6px;
                                             // 見出しは上に余白を置いて段落の切れ目を作る
                                             // （記号を落としているぶん、間隔で構造を見せる）。
-                                            padding-top: row.heading ? 8px : 2px;
+                                            padding-top: row.is-heading ? 8px : 2px;
                                             padding-bottom: 2px;
                                             Text {
                                                 text: row.text;
                                                 wrap: word-wrap;
-                                                font-size: row.heading
-                                                    ? Style.heading-size
-                                                    : Style.body-size;
-                                                font-weight: row.heading ? Style.semibold : 400;
+                                                // 見出しはサイズを上げず太さだけで差を付ける
+                                                // （`heading-size` は本文より小さいので、
+                                                // 使うと見出しと本文のサイズが逆転する）。
+                                                font-size: Style.body-size;
+                                                font-weight: row.is-heading
+                                                    ? Style.semibold
+                                                    : Style.regular;
                                                 color: Palette.foreground;
                                             }
                                         }
