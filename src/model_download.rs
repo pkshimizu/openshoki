@@ -371,6 +371,14 @@ const RECV_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12
 const WAIT_FOR_OTHER_DOWNLOAD_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(130 * 60);
 
+/// 取り残された一時ファイルと見なす、最終更新からの経過時間（`sweep_orphaned_part_files`）。
+///
+/// **受信全体のタイムアウト（`RECV_BODY_TIMEOUT` の 2 時間）より十分に長く**取る。走っている
+/// 取得の一時ファイルは書き込みのたびに mtime が更新されるので、これだけ放置されたものは
+/// 生きた取得ではありえない（2 時間無反応なら受信側がタイムアウトして自分で片付ける）。
+/// 多重起動した別プロセスの取得を壊さないための余裕でもある。
+const STALE_PART_AGE: std::time::Duration = std::time::Duration::from_secs(12 * 60 * 60);
+
 /// 不足ぶんを表示するときの単位。この単位へ切り上げて出す（`insufficient_space_reason`）。
 const REPORTED_SHORTFALL_UNIT_BYTES: u64 = 1024 * 1024;
 
@@ -393,7 +401,28 @@ fn model_path(spec: &ModelSpec) -> Option<PathBuf> {
         );
         return None;
     }
-    crate::config::data_dir().map(|dir| dir.join("models").join(spec.filename))
+    models_dir().map(|dir| dir.join(spec.filename))
+}
+
+/// モデルの保存ディレクトリ（`<データディレクトリ>/models`）。
+fn models_dir() -> Option<PathBuf> {
+    crate::config::data_dir().map(|dir| dir.join("models"))
+}
+
+/// 強制終了などで残った一時ファイルを回収する（起動時に 1 回呼ぶ）。
+///
+/// 失敗・パニックの後始末は `atomic_replace::PartFile` が済ませるので、ここが対象にするのは
+/// **Drop が走らない終わり方**（`abort`・強制終了・電源喪失）で残ったもの。モデルは数 GB あり、
+/// 保存先はユーザーが辿らないデータディレクトリ配下なので、残ると気づかれないまま容量を食う。
+///
+/// 録音側の一時ファイル（`src/mixdown.rs` の `mix.mp3.part.*`）は掃除しない: そちらは
+/// **ユーザーが選んだ保存先**にあり、Finder から見えて自分で消せる。起動時にユーザーのフォルダを
+/// 走査して消す方がリスクが大きいという判断（残っても 1 セッションぶんで、上限も小さい）。
+pub fn sweep_orphaned_part_files() {
+    let Some(dir) = models_dir() else {
+        return;
+    };
+    crate::atomic_replace::sweep_orphaned_parts(&dir, std::time::SystemTime::now(), STALE_PART_AGE);
 }
 
 /// パス要素を持たない素のファイル名か（`/` や `..`、絶対パスを弾く）。
@@ -528,40 +557,28 @@ fn download_model(
     let reader = response.body_mut().as_reader();
 
     // 一時ファイルへ書き、検証に通ってから本来の名前へ rename する（原子的）。途中で失敗しても
-    // 壊れた/部分的なファイルがモデルとして残らない。一時ファイル名はプロセス固有にする:
-    // アプリの多重起動（別プロセス）が同名の一時ファイルへ同時に書くと、ハッシュは各自の受信
-    // ストリームで計算されるためファイルの破損を検知できず、壊れた内容が検証済みモデルとして
-    // 配置されうる。名前を分ければ各自が自分の書いた内容だけを検証し、rename（原子的・後勝ち）は
-    // どちらも検証済みなので安全になる（同一プロセス内は状態マップで二重取得を防いでいる）。
-    let part = dest.with_extension(format!("part.{}", std::process::id()));
+    // 壊れた/部分的なファイルがモデルとして残らない。一時ファイルの命名・後始末（失敗・パニック）は
+    // `crate::atomic_replace::PartFile` が持つ（プロセス固有名にする理由もそちらの doc）。
+    let part = crate::atomic_replace::PartFile::for_dest(dest);
     let on_progress = |received: u64| {
         downloader
             .lock()
             .insert(spec.id, DownloadStatus::Downloading { received, total });
     };
-    let result = write_verified(
+    write_verified(
         reader,
-        &part,
+        part.path(),
         spec.sha256,
         max_download_bytes(spec),
         on_progress,
-    )
-    .and_then(|()| std::fs::rename(&part, dest).map_err(Into::into));
-    if let Err(err) = result {
-        // 後始末の失敗も黙って捨てない（docs/rules/error-handling.md）。
-        if let Err(remove_err) = std::fs::remove_file(&part)
-            && remove_err.kind() != std::io::ErrorKind::NotFound
-        {
-            eprintln!("Failed to remove the partially downloaded model: {remove_err}");
-        }
-        return Err(err);
-    }
+    )?;
+    part.commit(dest)?;
     println!("Downloaded the {} model {}", spec.kind, spec.display_name);
     Ok(())
 }
 
 /// `reader` の内容を `dest` へ書き出しつつ SHA-256 を計算し、`expected_sha256` と一致しなければ
-/// エラーを返す（ファイルは書かれたまま残るため、後始末は呼び出し側で行う）。
+/// エラーを返す（ファイルは書かれたまま残る。後始末は呼び出し側の `PartFile` が持つ）。
 /// `max_bytes` を超える受信は打ち切る（想定外の応答でディスクを埋めない保険。テスト容易性の
 /// ため引数で受ける）。`on_progress` には累積受信バイトを `PROGRESS_STEP_BYTES` ごとに渡す。
 fn write_verified(
