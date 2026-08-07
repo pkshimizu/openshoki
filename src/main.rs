@@ -731,7 +731,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // 文字起こしが無ければ入力が無い（ボタンは無効なので通常は来ない。黙って戻ると
             // 「押しても何も起きない」になるのでログを残す）。
             if !session.has_transcript {
-                eprintln!("Skipping summarization because the session has no transcript");
+                eprintln!(
+                    "Skipping the requested summarization because the session has no transcript"
+                );
                 return;
             }
             summarizer.submit(manual_summarize_job(&config.borrow(), &session.dir));
@@ -1694,8 +1696,9 @@ fn summary_placeholder_text(display_status: SummaryStatus) -> &'static str {
 /// 階層は付けない（この幅のペインで 3 段の見出しを描き分けても読み取れない）。ほかの記法
 /// （`- ` の箇条書き等）は記号ごとそのまま出す（消すと構造が読めなくなる）。
 ///
-/// 空行は段落の切れ目として残すが、末尾の空行は落とす（生成物は末尾に改行を持つ）。中身が
-/// 空になる行だけの入力は**行なし**になり、呼び出し側で状態依存の縮退表示へ落ちる。
+/// 空行は段落の切れ目として残すが、末尾の空行は落とす（生成物は末尾に改行を持つ）。**見出し記号
+/// だけの行（`#` 単独）は行の途中でも落とす**（強調だけの空行を描かない）。中身が空になる行だけの
+/// 入力は**行なし**になり、呼び出し側で状態依存の縮退表示へ落ちる。
 fn summary_rows(text: &str) -> Vec<SummaryRow> {
     let mut rows: Vec<SummaryRow> = text
         .lines()
@@ -2153,8 +2156,13 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].text, "body");
 
-        // 中身が無い入力は行なし（呼び出し側が状態依存の縮退表示へ落とす）。記号だけの
-        // 見出し行も本文が空なので残さない。
+        // 記号だけの見出し行は本文が空なので、**行の途中でも**残さない（強調だけの空行を
+        // 描かない）。前後の空行は段落の切れ目として残る。
+        let rows = summary_rows("# A\nbody\n\n#\n\nmore\n");
+        let texts: Vec<&str> = rows.iter().map(|row| row.text.as_str()).collect();
+        assert_eq!(texts, vec!["A", "body", "", "", "more"]);
+
+        // 中身が無い入力は行なし（呼び出し側が状態依存の縮退表示へ落とす）。
         assert!(summary_rows("").is_empty());
         assert!(summary_rows("\n\n").is_empty());
         assert!(summary_rows("###\n").is_empty());
