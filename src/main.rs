@@ -756,9 +756,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return;
             };
             if !summarizer.cancel(&session.dir) {
-                // 走り出した後にボタンが Cancel のまま押された（tick が状態を更新する前の
-                // 数十 ms）。取り消せないことをログに残し、表示は次の tick が直す。
-                eprintln!("Skipping the cancellation because the summary already started");
+                // キュー待ちでなくなっていた（走り出した・既に終わった）。tick が状態を
+                // 更新する前の数十 ms に押されると起こる。表示は次の tick が直す。
+                eprintln!("Skipping the cancellation because the summary is no longer queued");
             }
             // 取り消し結果（通常は未生成／生成済みへ戻る）を即反映する。
             if let Some(rec) = rec_weak.upgrade() {
@@ -794,6 +794,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             else {
                 return;
             };
+            // **ゴミ箱へ移す前にワーカーの状態を確かめる**。UI のゲート（`detail-running`）は
+            // 100ms の tick 遅れがあるので、「表示はキュー待ちだが、もう走り出している」瞬間に
+            // Delete を押せてしまう。走行中のセッションを消すと、ワーカーは消えたディレクトリへ
+            // 書きに行って失敗し、`forget` の後から状態を入れ直す（消えたセッションの記録が
+            // 残る）。キュー待ちなら**先に取り消してから**消す。
+            if summarizer.status_of(&dir) == Some(summarize::SummarizeStatus::Summarizing) {
+                eprintln!("Skipping the deletion because the summary is still running");
+                return;
+            }
+            summarizer.cancel(&dir);
             // ゴミ箱への移動前に再生対象を手放す。削除済みファイルを play_pause / seek の
             // 開き直し経路が参照しないようにし、開いたままのハンドルが移動を妨げる OS でも
             // 失敗しないようにする。
@@ -834,9 +844,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             sessions.borrow_mut().remove(i);
             sessions_model.remove(i);
-            // キュー待ちの要約が積まれていたら取り消す（消したセッションを後から要約しない。
-            // 取り出し時に対象が無く Skipped になるだけだが、無駄な起動を避ける）。
-            summarizer.cancel(&dir);
             // 進行状況マップに残ったエントリを掃除する（削除済みセッションの記録を残さない）。
             transcriber.forget(&dir);
             summarizer.forget(&dir);
@@ -1654,9 +1661,10 @@ fn transcript_placeholder_text(display_status: TranscriptStatus) -> &'static str
 /// 詳細ペインの文字起こし表示（状態テキスト・状態依存の配色・縮退ラベル）を反映する。
 /// 選択時・手動投入直後・tick 追従の全経路でここを通し、表示ロジックを 1 箇所にする。
 ///
-/// **ボタンの活性は Rust から set しない**: Transcribe / Summarize / Delete は Slint 側の
-/// `detail-busy`（文字起こし・要約の 2 つの状態 enum から導出）が一本で決める。bool を別途
-/// 渡して enum と食い違う余地を作らないため（`docs/rules/slint.md`）。
+/// **ボタンの活性は Rust から set しない**。Slint 側が状態 enum から導出する 2 つのゲートで
+/// 決める（bool を別途渡して enum と食い違う余地を作らないため。`docs/rules/slint.md`）:
+/// `detail-files-in-use`（文字起こし中・要約生成中＝ワーカーがファイルを読み書き中）が Delete を、
+/// `detail-jobs-pending`（それ＋要約のキュー待ち）が Transcribe / Summarize を止める。
 fn apply_detail_transcript_status(rec: &RecordingsWindow, status: TranscriptStatus) {
     rec.set_detail_transcript_text(transcript_status_text(status).into());
     rec.set_detail_transcript_placeholder(transcript_placeholder_text(status).into());
@@ -1697,9 +1705,13 @@ fn summary_display_status(
 /// 管理する（`TRANSCRIBING_LABEL` と同じ理由）。
 const SUMMARIZING_LABEL: &str = "Summarizing…";
 
-/// 「キュー待ち」の表示ラベル（上と同じ理由で 1 箇所に置く）。生成中と区別できる語にする:
-/// この間はまだ CPU を使っておらず、取り消せる（`SummarizeWorker::cancel`）。
+/// 「キュー待ち」の表示ラベル。生成中と区別できる語にする: この間はまだ CPU を使っておらず、
+/// 取り消せる（`SummarizeWorker::cancel`）。
+///
+/// 状態行（文形式）と縮退表示（Title Case）で大小が違うので、`SUMMARIZING_LABEL` のように
+/// 1 つを共有できない（1 語のラベルは偶然どちらの流儀にも合っていた）。2 つに分ける。
 const SUMMARY_QUEUED_LABEL: &str = "Waiting to summarize…";
+const SUMMARY_QUEUED_PLACEHOLDER: &str = "Waiting to Summarize…";
 
 /// 議事録要約の表示状態 → 詳細ペインの状態テキスト。
 fn summary_status_text(display_status: SummaryStatus) -> &'static str {
@@ -1718,7 +1730,7 @@ fn summary_status_text(display_status: SummaryStatus) -> &'static str {
 /// 破損・空のときで、未生成と同じ表示に落とす。
 fn summary_placeholder_text(display_status: SummaryStatus) -> &'static str {
     match display_status {
-        SummaryStatus::Queued => SUMMARY_QUEUED_LABEL,
+        SummaryStatus::Queued => SUMMARY_QUEUED_PLACEHOLDER,
         SummaryStatus::Summarizing => SUMMARIZING_LABEL,
         SummaryStatus::Failed => "Summarization Failed",
         SummaryStatus::NotSummarized | SummaryStatus::Done => "Not Summarized Yet",
@@ -2146,7 +2158,7 @@ mod tests {
         );
         assert_eq!(
             summary_placeholder_text(SummaryStatus::Queued),
-            "Waiting to summarize…"
+            "Waiting to Summarize…"
         );
         assert_eq!(
             summary_placeholder_text(SummaryStatus::Summarizing),

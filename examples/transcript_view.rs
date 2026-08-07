@@ -34,8 +34,9 @@ const DEFAULT_SEGMENT_COUNT: usize = 30;
 /// （`src/main.rs` の `SUMMARIZING_LABEL` の複製。あちらを変えたらここも合わせること）。
 const SUMMARIZING_LABEL: &str = "Summarizing…";
 
-/// キュー待ちのラベル（同上。`src/main.rs` の `SUMMARY_QUEUED_LABEL` の複製）。
+/// キュー待ちのラベル（同上。`src/main.rs` の複製。状態行と縮退表示で大小が違う）。
 const SUMMARY_QUEUED_LABEL: &str = "Waiting to summarize…";
+const SUMMARY_QUEUED_PLACEHOLDER: &str = "Waiting to Summarize…";
 
 /// Summary タブの確認用のダミー議事録。見出しの強調・本文の折り返し・段落の間隔を見たいので、
 /// 実際の生成物（`src/summarize.rs` のプロンプトが作る 4 見出し構成）と同じ形にする。
@@ -111,7 +112,7 @@ fn main() {
         win.set_current_segment(2);
     }
 
-    // 議事録の 4 状態を引数で選べるようにする（状態行の色・縮退ラベルの確認用）。
+    // 議事録の状態を引数で選べるようにする（状態行の色・縮退ラベル・取り消しの確認用）。
     let summary_status = if !has_transcript {
         SummaryStatus::NotSummarized
     } else if flag("queued") {
@@ -136,7 +137,7 @@ fn main() {
     );
     win.set_detail_summary_placeholder(
         match summary_status {
-            SummaryStatus::Queued => SUMMARY_QUEUED_LABEL,
+            SummaryStatus::Queued => SUMMARY_QUEUED_PLACEHOLDER,
             SummaryStatus::Summarizing => SUMMARIZING_LABEL,
             SummaryStatus::Failed => "Summarization Failed",
             SummaryStatus::NotSummarized | SummaryStatus::Done => "Not Summarized Yet",

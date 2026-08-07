@@ -293,8 +293,8 @@ export component RecordingsWindow inherits Window {
     // 選択中セッションが文字起こし中か。状態 enum から導出し、Rust から個別に set しない
     // （bool と enum の食い違いを作らない）。
     property <bool> detail-transcribing: root.detail-transcript-status == TranscriptStatus.transcribing;
-    // 選択中セッションの議事録要約の状態テキスト（Rust 側が組み立てる。例: Summarized /
-    // Summarizing… / Summarization failed / Not summarized）。
+    // 選択中セッションの議事録要約の状態テキスト（文言の対応表は Rust 側の
+    // `summary_status_text` が正）。
     in property <string> detail-summary-status-text;
     // 議事録要約の状態。状態テキストの失敗色の分岐と、生成中判定の導出に使う
     // （Rust 側が detail-summary-status-text と同時に更新する）。
@@ -309,14 +309,14 @@ export component RecordingsWindow inherits Window {
     property <bool> detail-summarizing: root.detail-summary-status == SummaryStatus.summarizing;
     // 要約がキュー待ちか（まだ走っていないので取り消せる）。
     property <bool> detail-summary-queued: root.detail-summary-status == SummaryStatus.queued;
-    // **ワーカーがこのセッションのファイルを読み書きしているか**。削除の可否はこれ 1 つで
+    // **ワーカーがこのセッションのファイルを読み書きしているか**。Delete の可否はこれ 1 つで
     // 決める（条件を各所へ複写しない。`docs/rules/slint.md`）。キュー待ちはまだ触っていない
-    // ので含めない（Delete は取り消してから消す）。
-    property <bool> detail-running: root.detail-transcribing || root.detail-summarizing;
-    // **待たされている状態か**（走っている＋キュー待ち）。新しい仕事を積ませない判断に使う
-    // （Transcribe / Summarize）。キュー待ちの要約は、いま文字起こしをやり直すと途中の
-    // JSON を読みかねないので、走っていなくても積ませない。
-    property <bool> detail-busy: root.detail-running || root.detail-summary-queued;
+    // ので含めない（Rust 側が取り消してから消す）。
+    property <bool> detail-files-in-use: root.detail-transcribing || root.detail-summarizing;
+    // **このセッションに仕事が積まれているか**（走行中＋キュー待ち）。新しい仕事を積ませない
+    // 判断に使う（Transcribe / Summarize）。キュー待ちの要約は、いま文字起こしをやり直すと
+    // 書き換え途中の JSON を読みかねないので、走っていなくても積ませない。
+    property <bool> detail-jobs-pending: root.detail-files-in-use || root.detail-summary-queued;
     // 選択中セッションに文字起こしがあるか（要約の入力になるので、無ければ Summarize は無効）。
     in property <bool> has-transcript;
     // 選択セッションのトランスクリプト（mic.json / system.json をマージしたもの。新→旧でなく時刻順）。
@@ -524,13 +524,27 @@ export component RecordingsWindow inherits Window {
                                 : Palette.foreground.transparentize(Style.muted-alpha);
                         }
 
-                        Text {
-                            text: root.detail-summary-status-text;
-                            font-size: Style.caption-size;
-                            // 失敗の扱いは文字起こしの状態行と揃える。
-                            color: root.detail-summary-status == SummaryStatus.failed
-                                ? Style.danger
-                                : Palette.foreground.transparentize(Style.muted-alpha);
+                        // 要約の状態行。キュー待ちの間だけ、その場に取り消しを出す
+                        // （ボタン列を動かさないので、Summarize / Delete の位置が変わらない）。
+                        HorizontalLayout {
+                            alignment: start;
+                            spacing: 10px;
+                            Text {
+                                text: root.detail-summary-status-text;
+                                font-size: Style.caption-size;
+                                vertical-alignment: center;
+                                // 失敗の扱いは文字起こしの状態行と揃える。
+                                color: root.detail-summary-status == SummaryStatus.failed
+                                    ? Style.danger
+                                    : Palette.foreground.transparentize(Style.muted-alpha);
+                            }
+
+                            if root.detail-summary-queued: Button {
+                                text: "Cancel";
+                                clicked => {
+                                    root.cancel-summary(root.selected-index);
+                                }
+                            }
                         }
                     }
 
@@ -541,35 +555,31 @@ export component RecordingsWindow inherits Window {
                         Button {
                             text: "Transcribe";
                             // 完了済み・失敗・未実施のいずれからも（再）実行できる
-                            // （言語・モデル変更後のやり直し用途）。無効化の理由は detail-busy。
-                            enabled: !root.detail-busy;
+                            // （言語・モデル変更後のやり直し用途）。無効化の理由は
+                            // detail-jobs-pending。
+                            enabled: !root.detail-jobs-pending;
                             clicked => {
                                 root.transcribe-session(root.selected-index);
                             }
                         }
 
                         Button {
-                            // キュー待ちの間は取り消しボタンになる（同じ場所で「積む／やめる」を
-                            // 切り替える。ボタンを増やすとヘッダが混み、押せない Cancel が
-                            // 常時並ぶことになる）。走り出したら取り消せないので無効に戻る。
-                            text: root.detail-summary-queued ? "Cancel" : "Summarize";
+                            text: "Summarize";
                             // 要約は文字起こしを入力にするので、無いセッションでは押させない
                             // （生成済み・失敗からは押し直せる。モデル変更後のやり直し用途）。
-                            enabled: root.detail-summary-queued
-                                || (root.has-transcript && !root.detail-busy);
+                            // 取り消しはこのボタンを差し替えず、状態行の隣に出す（同じ位置で
+                            // 「積む」と「やめる」が入れ替わると、投入直後の 2 度押しが取り消しに
+                            // なってしまう）。
+                            enabled: root.has-transcript && !root.detail-jobs-pending;
                             clicked => {
-                                if (root.detail-summary-queued) {
-                                    root.cancel-summary(root.selected-index);
-                                } else {
-                                    root.summarize-session(root.selected-index);
-                                }
+                                root.summarize-session(root.selected-index);
                             }
                         }
 
                         DangerButton {
                             text: "Delete";
                             // キュー待ちなら消せる（Rust 側が取り消してから削除する）。
-                            enabled: !root.detail-running;
+                            enabled: !root.detail-files-in-use;
                             clicked => {
                                 root.show-delete-confirm = true;
                             }

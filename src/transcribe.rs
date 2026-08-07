@@ -126,7 +126,7 @@ impl TranscribeWorker {
                     // 文字起こし中のパニックでワーカースレッドを殺さない。死ぬと状態が
                     // `Transcribing` のまま残り、そのセッションは再起動まで Transcribe /
                     // Summarize / Delete がすべて無効になる（Recordings ウィンドウの
-                    // `detail-busy`）。失敗として記録し、次のジョブは受け続ける
+                    // `detail-files-in-use` / `detail-jobs-pending`）。失敗として記録し、次のジョブは受け続ける
                     // （`SummarizeWorker` と同じ扱い）。
                     let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(
                         || run_job(&job, &downloader, &slot),
