@@ -7,6 +7,7 @@
 //! 走査失敗（ディレクトリ不在など）でも空一覧を返してアプリを落とさない。
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use chrono::NaiveDateTime;
 
@@ -20,6 +21,17 @@ const SYSTEM_JSON: &str = "system.json";
 /// 録音後に生成されるミックス音声（`src/mixdown.rs`。両音源セッションの再生対象）。名前は
 /// `mixdown::MIX_FILENAME` と一致させること。
 const MIX_MP3: &str = "mix.mp3";
+
+/// 取り残された一時ファイルと見なす、最終更新からの経過時間（`sweep_session_parts`）。
+///
+/// セッション側の一時ファイルは**寿命が短い**: 書き手（`mixdown::normalize_if_quiet` と
+/// `summarize::write_summary`）はどちらも中身を先にメモリで作り、一時ファイルへは 1 回書いて
+/// すぐ rename する。数十 MB の書き出しでも 1 秒に満たないので、生きた一時ファイルが 1 時間も
+/// 残ることはない（モデル取得の 3 時間は、受信そのものが数十分かかることに由来する別の値）。
+/// 走っている書き込みを消さない保証そのものは mtime が更新され続けることで足りる
+/// （`atomic_replace::sweep_orphaned_parts` の doc）。時計のずれ・mtime の粒度ぶんの余裕も
+/// この 1 時間に含む。
+const STALE_PART_AGE: Duration = Duration::from_secs(60 * 60);
 
 /// セッションディレクトリ名の日時フォーマット（`main.rs` の録音開始時の命名と一致させること）。
 const DIR_DATETIME_FORMAT: &str = "%Y%m%d-%H%M%S";
@@ -149,6 +161,28 @@ pub fn list_sessions(recording_dir: &Path) -> Vec<RecordingSession> {
     sessions
 }
 
+/// 一覧に出たセッションの直下に取り残された一時ファイル（`*.part.<pid>`）を回収する
+/// （Recordings ウィンドウを開くたびに、`list_sessions` の結果を渡して呼ぶ）。
+///
+/// `PartFile` の Drop が走らない終わり方（`abort`・強制終了・電源喪失）で残ったものが対象。
+/// 発話由来の派生物（正規化中の音声・議事録）なので、ユーザーが気づかないまま録音フォルダに
+/// 残り続けないようにする（`docs/review-perspectives/security.md`）。判定と限界は
+/// `atomic_replace::sweep_orphaned_parts` の doc。
+///
+/// **走査するのは `list_sessions` が返したセッションだけ**にする。#130 で「起動時にユーザーの
+/// フォルダを走査して消すのはリスクが大きい」と見送った判断を保つための線引きで、
+/// (1) 掃除が走るのはユーザーが Recordings ウィンドウを開いたときだけ、(2) 対象は日時形式の
+/// 名前で音源を持つディレクトリの直下だけ、になる。保存先に置かれた無関係なフォルダ
+/// （`recording_dir` は手編集されうる設定由来）には触れない。
+///
+/// 音源が 1 つも無いディレクトリは一覧に出ないので掃除されないが、一時ファイルを作る経路は
+/// どれも音源が在る状態でしか走らない（録音そのものは `PartFile` を通さず直接書く）。
+pub fn sweep_session_parts(sessions: &[RecordingSession], now: SystemTime) {
+    for session in sessions {
+        crate::atomic_replace::sweep_orphaned_parts(&session.dir, now, STALE_PART_AGE);
+    }
+}
+
 /// セッションディレクトリ名（`%Y%m%d-%H%M%S`）を日時としてパースする。形式外なら `None`。
 fn parse_session_datetime(name: &str) -> Option<NaiveDateTime> {
     NaiveDateTime::parse_from_str(name, DIR_DATETIME_FORMAT).ok()
@@ -156,9 +190,13 @@ fn parse_session_datetime(name: &str) -> Option<NaiveDateTime> {
 
 #[cfg(test)]
 mod tests {
-    use super::{RecordingSession, list_sessions, parse_session_datetime};
+    use super::{
+        RecordingSession, STALE_PART_AGE, list_sessions, parse_session_datetime,
+        sweep_session_parts,
+    };
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::time::SystemTime;
 
     /// テスト用に、指定ディレクトリ配下へセッションディレクトリと空の音源/文字起こしファイルを作る。
     fn make_session(root: &Path, name: &str, files: &[&str]) {
@@ -171,6 +209,66 @@ mod tests {
 
     fn unique_root(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("shoki-recordings-{tag}-{}", std::process::id()))
+    }
+
+    /// 取り残された一時ファイルを、一覧に出たセッションの直下からだけ回収する。
+    ///
+    /// 対象は `*.part.<数字>` かつ十分に古いものだけで、ユーザーのファイル・書き込み中の
+    /// 一時ファイル・**一覧に出ないディレクトリ**（日時形式でない名前、音源が無いもの）は
+    /// 触らない。#130 の「ユーザーのフォルダを丸ごと走査しない」を保つ線引きなので、
+    /// 範囲もここで固定する。
+    #[test]
+    fn sweep_session_parts_only_touches_listed_sessions() {
+        let root = unique_root("sweep");
+        let _ = fs::remove_dir_all(&root);
+        make_session(&root, "20260628-143025", &["mic.mp3"]);
+        make_session(&root, "20260628-150000", &["system.mp3"]);
+        // 一覧に出ないディレクトリ: 日時形式でない名前と、音源が 1 つも無いもの。
+        make_session(&root, "notes", &["mic.mp3"]);
+        make_session(&root, "20260628-160000", &["mic.json"]);
+
+        let listed_old = root.join("20260628-143025").join("mic.mp3.part.123");
+        let listed_fresh = root.join("20260628-150000").join("system.mp3.part.456");
+        let listed_user_file = root.join("20260628-143025").join("notes.part.txt");
+        let unlisted_by_name = root.join("notes").join("mic.mp3.part.789");
+        let unlisted_by_content = root.join("20260628-160000").join("summary.md.part.789");
+        for path in [
+            &listed_old,
+            &listed_fresh,
+            &listed_user_file,
+            &unlisted_by_name,
+            &unlisted_by_content,
+        ] {
+            fs::write(path, b"x").expect("writing the fixture succeeds in test");
+        }
+
+        // 実ファイルの mtime は「今」なので、判定の現在時刻を未来へずらして経過を作る
+        // （`atomic_replace` のテストと同じ流儀）。
+        let sessions = list_sessions(&root);
+        sweep_session_parts(&sessions, SystemTime::now() + STALE_PART_AGE);
+        assert!(!listed_old.exists(), "a leftover part file must be removed");
+        assert!(
+            listed_user_file.exists(),
+            "a user file that merely contains .part must be kept"
+        );
+        assert!(
+            unlisted_by_name.exists(),
+            "a folder that is not a session must not be swept"
+        );
+        assert!(
+            unlisted_by_content.exists(),
+            "a folder without audio is not listed, so it must not be swept"
+        );
+
+        // 書き込み中（mtime が新しい）の一時ファイルは、古さの条件を満たさないので残る。
+        fs::write(&listed_fresh, b"x").expect("writing the fixture succeeds in test");
+        sweep_session_parts(&sessions, SystemTime::now());
+        assert!(
+            listed_fresh.exists(),
+            "a part file that is still being written must be kept"
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

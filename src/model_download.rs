@@ -415,11 +415,10 @@ fn models_dir() -> Option<PathBuf> {
 /// `atomic_replace::sweep_orphaned_parts` の doc。モデルは数 GB あり、保存先はユーザーが辿らない
 /// データディレクトリ配下なので、残ると気づかれないまま容量を食う。
 ///
-/// 録音側の一時ファイル（`mixdown::normalize_if_quiet` が `mic.mp3` / `system.mp3` を書き直す
-/// ときの `*.part.*`）は掃除しない: そちらは**ユーザーが選んだ保存先**にあり、Finder から見えて
-/// 自分で消せる。1 ファイルは数十 MB（128 kbps・1 時間）で、後処理中に落ちたセッションの
-/// フォルダに 1〜2 個ずつ残りうる（総量に上限は無いが 1 個は小さい）。起動時にユーザーの
-/// フォルダを走査して消すリスクを取るほどではないという判断。
+/// 録音側の一時ファイル（`mixdown::normalize_if_quiet` と `summarize::write_summary` のもの）は
+/// **ここでは**掃除しない。そちらは Recordings ウィンドウを開いたときに、一覧へ出たセッション
+/// だけを対象に回収する（#134。`recordings::sweep_session_parts`）。起動時にユーザーの選んだ
+/// 保存先を走査しない、という #130 の判断はそのまま保つ。
 pub fn sweep_orphaned_part_files() {
     let Some(dir) = models_dir() else {
         return;

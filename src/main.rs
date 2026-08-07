@@ -1283,6 +1283,9 @@ fn open_recordings_window(
     last_play_secs: &mut Option<u64>,
 ) {
     let list = recordings::list_sessions(&config.borrow().recording_dir);
+    // 一覧に出たセッションに取り残された一時ファイルを回収する（強制終了などで残ったもの。
+    // 走査の範囲と時期をここに限る理由は `recordings::sweep_session_parts` の doc）。
+    recordings::sweep_session_parts(&list, std::time::SystemTime::now());
     let rows: Vec<SessionRow> = list
         .iter()
         .map(|session| SessionRow {

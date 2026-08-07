@@ -156,8 +156,9 @@ pub fn sweep_orphaned_parts(dir: &Path, now: SystemTime, max_age: Duration) {
 /// 数字まで見るのは、拡張子付きのユーザーファイル（`notes.part.txt` 等）を誤って掴まない
 /// ための最低限のふるい。分割書庫の慣習名（`archive.zip.part.1`）までは見分けられないので、
 /// **安全性の主体は対象ディレクトリを限定していること**にある。掃除を掛けているのは
-/// モデルの保存先だけで（`model_download::sweep_orphaned_part_files`）、録音の保存先は
-/// 対象外（ユーザーのフォルダを走査しない判断。そちらの doc 参照）。
+/// モデルの保存先（`model_download::sweep_orphaned_part_files`）と、Recordings ウィンドウに
+/// 出たセッションの直下（`recordings::sweep_session_parts`）だけ。ユーザーが選んだ保存先を
+/// 丸ごと走査することはしない（範囲と時期の理由はそれぞれの doc）。
 fn is_part_file(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
