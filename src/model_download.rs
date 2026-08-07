@@ -151,6 +151,15 @@ impl ModelDownloader {
         }
     }
 
+    /// 記録済みの取得状況を ID で引く（記録が無ければ `None`）。
+    ///
+    /// `status_of` と違い**ディスクを見ない**。モデル一覧（#117）はディスク走査の結果を持って
+    /// いるので存在確認は不要で、知りたいのは「いま取得中か」だけ。`&'static ModelSpec` を
+    /// 用意せずに引けるようにしてある（一覧の行はカタログ外もありうる）。
+    pub fn status_of_id(&self, id: &str) -> Option<DownloadStatus> {
+        self.lock().get(id).cloned()
+    }
+
     /// UI 起点: 未取得（または直近失敗）ならバックグラウンドスレッドでダウンロードを開始する。
     /// 取得済み・ダウンロード中ならスレッドを立てずに戻る（DL 中の完了待ちは `ensure_model` を
     /// 呼ぶ利用側だけが行えばよい）。結果は状態マップとログに残る。
@@ -284,6 +293,53 @@ impl ModelDownloader {
 
     /// 状態マップのガードを取る。poison（ロック保持中のパニック）でも状態表示・DL 管理を
     /// 止めないため、ガードを取り出して続行する（`docs/rules/error-handling.md`）。
+    /// 取得済みのモデルファイルを**完全削除**する（ゴミ箱へは入れない。#117）。
+    ///
+    /// ゴミ箱へ送らないのは、カタログに URL と SHA-256 があって再取得できるため。ディスクを
+    /// 空けるのが目的なのに、ゴミ箱に数 GB 残っては本末転倒になる（録音の削除とは扱いを変える。
+    /// `docs/rules/security.md`）。
+    ///
+    /// **状態マップのエントリも一緒に消す**。`status_of` はメモリの状態を優先するので、消さないと
+    /// 設定画面の 100ms ポーリングが「削除したのに Downloaded」と表示し続ける。
+    ///
+    /// 取得中（`Downloading`）のモデルは削除せずエラーにする: 完了時の rename でファイルが復活し、
+    /// 「削除したのに残っている」ことになる。UI でも無効化するが、UI の状態は開いた時点のもの
+    /// （一覧は tick で作り直さない）なので、**ここが最後の砦**。判定・削除・エントリ掃除を
+    /// 1 回のロックの中で行う: ダウンロードの開始も同じロックを取る（`ensure_model` の
+    /// check-and-set）ため、この間に取得が始まることはない
+    /// （`docs/rules/coding-conventions.md` の「見てから決めるは 1 回のロックに畳む」）。
+    pub fn delete(&self, model: &InstalledModel) -> Result<(), Box<dyn std::error::Error>> {
+        let dir = models_dir().ok_or("Cannot determine the data directory")?;
+        self.delete_in(&dir, model)
+    }
+
+    /// `delete` の本体（基点ディレクトリを引数で受け、テストから呼べるようにする）。
+    fn delete_in(
+        &self,
+        dir: &Path,
+        model: &InstalledModel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !is_plain_filename(&model.filename) {
+            // UI 経由で来る値なので、`models/` の外へ出る形を弾く（`../` や絶対パス）。
+            return Err("the model file name is not a plain file name".into());
+        }
+        let path = dir.join(&model.filename);
+        let mut status = self.lock();
+        if let Some(id) = model.catalog_id
+            && let Some(DownloadStatus::Downloading { .. }) = status.get(id)
+        {
+            return Err("the model is being downloaded".into());
+        }
+        // フルパスはエラーへ載せない（ユーザー名を含む。`docs/rules/security.md`）。呼び出し側が
+        // 表示・ログに使うので、種別だけを返す。
+        std::fs::remove_file(&path)
+            .map_err(|err| format!("{} ({})", err.kind(), model.filename))?;
+        if let Some(id) = model.catalog_id {
+            status.remove(id);
+        }
+        Ok(())
+    }
+
     fn lock(&self) -> MutexGuard<'_, HashMap<&'static str, DownloadStatus>> {
         self.status
             .lock()
@@ -429,6 +485,93 @@ pub fn sweep_orphaned_part_files() {
         STALE_MODEL_PART_AGE,
         crate::atomic_replace::PartScope::AnyDest,
     );
+}
+
+/// `models/` に置かれているモデルファイル 1 件（モデル一覧ウィンドウの 1 行。#117）。
+///
+/// **一覧の正はディスク**で、カタログは表示名・種別の解決にだけ使う（カタログ全件を並べると
+/// 未取得の行がノイズになる。一覧の目的は「何が容量を食っているか」を見て消すこと）。
+/// カタログを差し替えた後の旧ファイルのように、**カタログに無いファイルも一覧に出す**
+/// （消せないと掃除できない）。その場合は種別・表示名・ID が `None` になる。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledModel {
+    /// `models/` 直下のファイル名。削除の対象を指すキー（`ModelDownloader::delete`）。
+    pub filename: String,
+    /// **実ファイルの長さ**。カタログの `size_bytes` ではない（途中で壊れたファイルの実サイズを
+    /// 見せたいため）。
+    pub size_bytes: u64,
+    /// カタログが引けたときの種別（`ModelSpec::kind`）。カタログ外は `None`。
+    pub kind: Option<&'static str>,
+    /// カタログが引けたときの表示名。カタログ外は `None`（表示はファイル名で代替する）。
+    pub display_name: Option<&'static str>,
+    /// カタログが引けたときのモデル ID。状態マップのキーなので、削除時のエントリ掃除に使う。
+    pub catalog_id: Option<&'static str>,
+}
+
+/// `models/` にあるモデルを列挙する（サイズの大きい順）。データディレクトリが決まらない・
+/// まだ 1 つも取得していない場合は空。
+///
+/// `catalogs` は表示名・種別の解決に使うカタログの一覧（`whisper_model::CATALOG` など）。
+/// **種別非依存**にしてあるので、種別が増えてもここへカタログを 1 つ渡すだけで一覧に並ぶ。
+pub fn installed_models(catalogs: &[&'static [ModelSpec]]) -> Vec<InstalledModel> {
+    let Some(dir) = models_dir() else {
+        return Vec::new();
+    };
+    installed_models_in(&dir, catalogs)
+}
+
+/// `installed_models` の本体（走査するディレクトリを引数で受け、テストから呼べるようにする）。
+///
+/// 走査は `dir` **直下の通常ファイルだけ**にする: ディレクトリとシンボリックリンクは対象外
+/// （`entry.metadata()` はリンクを辿らないので、リンク自身の属性で判断する）。書きかけの
+/// 一時ファイル（`*.part.<pid>`）も除く——成果物ではないし、取得中のものを消させると完了時の
+/// rename が失敗する。取り残しの回収は `sweep_orphaned_part_files` が持つ。
+fn installed_models_in(dir: &Path, catalogs: &[&'static [ModelSpec]]) -> Vec<InstalledModel> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        // 保存先が未作成（まだ一度も取得していない）なども含む。落とさず空一覧にする。
+        // フルパスはログに出さない（`docs/rules/security.md`）。
+        Err(err) => {
+            eprintln!("Skipping the model scan because the folder could not be read: {err}");
+            return Vec::new();
+        }
+    };
+
+    let mut models: Vec<InstalledModel> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(filename) = name.to_str() else {
+            continue; // 非 UTF-8 の名前は扱わない（カタログのファイル名は UTF-8）。
+        };
+        if crate::atomic_replace::is_part_file(Path::new(filename)) {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue; // 読めないものは一覧に出さない（消す対象を確定できない）。
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let spec = catalogs
+            .iter()
+            .flat_map(|catalog| catalog.iter())
+            .find(|spec| spec.filename == filename);
+        models.push(InstalledModel {
+            filename: filename.to_owned(),
+            size_bytes: metadata.len(),
+            kind: spec.map(|spec| spec.kind),
+            display_name: spec.map(|spec| spec.display_name),
+            catalog_id: spec.map(|spec| spec.id),
+        });
+    }
+    // 大きい順（一覧の目的が「何が容量を食っているか」なので、効くものから見せる）。
+    // 同サイズはファイル名で安定させる。
+    models.sort_by(|a, b| {
+        b.size_bytes
+            .cmp(&a.size_bytes)
+            .then_with(|| a.filename.cmp(&b.filename))
+    });
+    models
 }
 
 /// パス要素を持たない素のファイル名か（`/` や `..`、絶対パスを弾く）。
@@ -752,6 +895,173 @@ mod tests {
 
     fn temp_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("shoki-model-{}-{name}", std::process::id()))
+    }
+
+    /// 一覧に出す `InstalledModel` を組む素材（テスト用のディレクトリを作って返す）。
+    fn models_fixture(tag: &str) -> PathBuf {
+        let dir = temp_path(tag);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("creating the fixture dir should succeed");
+        dir
+    }
+
+    fn fake_catalogs() -> Vec<&'static [ModelSpec]> {
+        // カタログは 2 つ渡す（種別非依存であること＝どちらのカタログからも引けることを見る）。
+        static LLM: &[ModelSpec] = std::slice::from_ref(&FAKE_LLM_MODEL);
+        static SPEECH: &[ModelSpec] = std::slice::from_ref(&FAKE_SPEECH_MODEL);
+        vec![LLM, SPEECH]
+    }
+
+    /// 一覧はディスクを正にして、カタログは表示名・種別の解決にだけ使う。カタログ外のファイルも
+    /// 並べる（掃除できるようにするため）。並びはサイズの大きい順。
+    #[test]
+    fn installed_models_resolves_the_catalog_and_keeps_unknown_files() {
+        let dir = models_fixture("installed");
+        std::fs::write(dir.join(FAKE_SPEECH_MODEL.filename), vec![b'x'; 30])
+            .expect("writing the fixture should succeed");
+        std::fs::write(dir.join(FAKE_LLM_MODEL.filename), vec![b'x'; 10])
+            .expect("writing the fixture should succeed");
+        std::fs::write(dir.join("left-over.bin"), vec![b'x'; 20])
+            .expect("writing the fixture should succeed");
+
+        let models = installed_models_in(&dir, &fake_catalogs());
+        let names: Vec<&str> = models.iter().map(|m| m.filename.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                FAKE_SPEECH_MODEL.filename,
+                "left-over.bin",
+                FAKE_LLM_MODEL.filename
+            ],
+            "the biggest file comes first"
+        );
+        assert_eq!(models[0].size_bytes, 30, "the size is the real file length");
+        assert_eq!(models[0].kind, Some(FAKE_SPEECH_MODEL.kind));
+        assert_eq!(models[0].display_name, Some(FAKE_SPEECH_MODEL.display_name));
+        assert_eq!(models[0].catalog_id, Some(FAKE_SPEECH_MODEL.id));
+        // カタログ外はファイル名とサイズだけが分かる。
+        assert_eq!(models[1].kind, None);
+        assert_eq!(models[1].display_name, None);
+        assert_eq!(models[1].catalog_id, None);
+        // 2 つ目のカタログからも引ける（種別非依存）。
+        assert_eq!(models[2].catalog_id, Some(FAKE_LLM_MODEL.id));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 一覧に出すのは直下の通常ファイルだけ。ディレクトリ・シンボリックリンク・書きかけの
+    /// 一時ファイルは出さない（消す対象にしない）。
+    #[test]
+    fn installed_models_lists_only_plain_files() {
+        let dir = models_fixture("installed-kinds");
+        std::fs::write(dir.join("real.bin"), b"x").expect("writing the fixture should succeed");
+        std::fs::create_dir(dir.join("subdir.bin")).expect("creating the subdir should succeed");
+        std::fs::write(dir.join("subdir.bin").join("inner.bin"), b"x")
+            .expect("writing the fixture should succeed");
+        // 取得中・強制終了で残った一時ファイル（回収は `sweep_orphaned_part_files`）。
+        std::fs::write(dir.join("real.bin.part.123"), b"x")
+            .expect("writing the fixture should succeed");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.join("real.bin"), dir.join("linked.bin"))
+            .expect("creating the symlink should succeed");
+
+        let models = installed_models_in(&dir, &fake_catalogs());
+        let names: Vec<&str> = models.iter().map(|m| m.filename.as_str()).collect();
+        assert_eq!(names, vec!["real.bin"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 走査できないディレクトリ（未作成）でも落ちず、空一覧になる。
+    #[test]
+    fn installed_models_degrades_when_the_folder_is_missing() {
+        let dir = temp_path("installed-missing");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(installed_models_in(&dir, &fake_catalogs()).is_empty());
+    }
+
+    /// 削除はファイルを消し、**状態マップのエントリも消す**（消さないと設定画面の 100ms
+    /// ポーリングが「削除したのに Downloaded」と表示し続ける）。
+    #[test]
+    fn delete_removes_the_file_and_forgets_the_status() {
+        let dir = models_fixture("delete");
+        let path = dir.join(FAKE_LLM_MODEL.filename);
+        std::fs::write(&path, b"x").expect("writing the fixture should succeed");
+        let downloader = ModelDownloader::new();
+        downloader
+            .lock()
+            .insert(FAKE_LLM_MODEL.id, DownloadStatus::Downloaded);
+
+        let models = installed_models_in(&dir, &fake_catalogs());
+        assert_eq!(models.len(), 1);
+        downloader
+            .delete_in(&dir, &models[0])
+            .expect("deleting an installed model should succeed");
+
+        assert!(!path.exists(), "the model file should be gone");
+        assert!(
+            downloader.lock().get(FAKE_LLM_MODEL.id).is_none(),
+            "the status entry should be gone so the display falls back to the disk"
+        );
+        assert!(installed_models_in(&dir, &fake_catalogs()).is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 取得中のモデルは削除しない（完了時の rename でファイルが復活し、「削除したのに残って
+    /// いる」ことになる）。UI でも無効化するが、最後の砦はここ。
+    #[test]
+    fn delete_refuses_a_model_that_is_being_downloaded() {
+        let dir = models_fixture("delete-downloading");
+        let path = dir.join(FAKE_LLM_MODEL.filename);
+        std::fs::write(&path, b"x").expect("writing the fixture should succeed");
+        let downloader = ModelDownloader::new();
+        downloader.lock().insert(
+            FAKE_LLM_MODEL.id,
+            DownloadStatus::Downloading {
+                received: 0,
+                total: FAKE_LLM_MODEL.size_bytes,
+            },
+        );
+
+        let models = installed_models_in(&dir, &fake_catalogs());
+        downloader
+            .delete_in(&dir, &models[0])
+            .expect_err("a model that is being downloaded must not be deleted");
+        assert!(path.exists(), "the file must be left alone");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `models/` の外へ出る名前は削除しない（UI 経由で来る値なので形を検証する）。
+    #[test]
+    fn delete_refuses_names_that_leave_the_models_folder() {
+        let dir = models_fixture("delete-escape");
+        let outside = dir.join("victim.bin");
+        std::fs::write(&outside, b"x").expect("writing the fixture should succeed");
+        let inner = dir.join("inner");
+        std::fs::create_dir(&inner).expect("creating the subdir should succeed");
+        let downloader = ModelDownloader::new();
+
+        for filename in [
+            "../victim.bin".to_owned(),
+            outside.to_string_lossy().into_owned(),
+            "inner/../victim.bin".to_owned(),
+        ] {
+            let model = InstalledModel {
+                filename,
+                size_bytes: 1,
+                kind: None,
+                display_name: None,
+                catalog_id: None,
+            };
+            downloader
+                .delete_in(&inner, &model)
+                .expect_err("a name that leaves the folder must be refused");
+        }
+        assert!(outside.exists(), "the file outside must be left alone");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -201,6 +201,17 @@ impl TranscribeWorker {
         lock_status(&self.status).get(session_dir).copied()
     }
 
+    /// いま文字起こしを実行中のセッションが在るか（モデル一覧の削除可否に使う。#117）。
+    ///
+    /// **どのモデルを使っているかは見ない**（ジョブは投入時点の設定を snapshot で持つので、
+    /// 走っているジョブのモデルと現在の選択は違いうる）。whisper のモデルは走行中に読まれるので、
+    /// 実行中は whisper 種別の行をまとめて削除不可にする（種別単位の粗い判定）。
+    pub fn is_running(&self) -> bool {
+        lock_status(&self.status)
+            .values()
+            .any(|status| *status == TranscribeStatus::Transcribing)
+    }
+
     /// セッションの進行状況の記録を破棄する（セッション削除時の掃除）。未登録なら何もしない。
     pub fn forget(&self, session_dir: &Path) {
         lock_status(&self.status).remove(session_dir);

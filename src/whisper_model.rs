@@ -14,7 +14,9 @@ use crate::model_download::ModelSpec;
 /// カタログ単位の属性をエントリごとに複写している（揃っていることは下のテストが見る）。
 /// 種別が 3 つ以上になって文言が揺れるようなら、`ModelKind` の enum か
 /// `struct ModelCatalog { kind, specs }` へ寄せる。
-const KIND: &str = "Whisper speech";
+/// `pub(crate)` なのは、モデル一覧が「この種別のジョブが走っているか」を行ごとに判定するため
+/// （#117。`main::model_row_state`）。
+pub(crate) const KIND: &str = "Whisper speech";
 
 /// 選べるモデルの一覧（小さい順）。設定画面の ComboBox はこの順で並ぶため、
 /// モデルを足すときはここへ 1 エントリ追加するだけでよい。

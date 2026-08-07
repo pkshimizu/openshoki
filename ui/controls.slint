@@ -1,0 +1,50 @@
+import { Palette } from "std-widgets.slint";
+import { Style } from "style.slint";
+
+// 複数のウィンドウで使う自作コントロール。トークン（`style.slint`）と同じ理由でここに集約する:
+// ウィンドウごとに同じ見た目を作り直すと、片方だけ調整が漏れる（`docs/rules/slint.md`）。
+
+// 破壊的操作用のボタン。std-widgets の Button は文字色・背景色を変えられないため、同等の
+// 見た目を Rectangle + TouchArea で作る。filled=false は一覧の Delete（赤文字・通常背景）、
+// filled=true は確認モーダルの確定ボタン（赤背景・白文字）。
+//
+// `enabled` が false のときは淡色化し、クリックも通さない（内側の `TouchArea` の `enabled`）。
+export component DangerButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> enabled: true;
+    in property <bool> filled: false;
+
+    callback clicked();
+
+    border-radius: 6px;
+    border-width: root.filled ? 0 : 1px;
+    border-color: Palette.border;
+    background: root.filled
+        ? (touch.pressed && root.enabled ? Style.danger.darker(15%) : Style.danger)
+        : (touch.pressed && root.enabled
+            ? Palette.control-background.darker(8%)
+            : Palette.control-background);
+    opacity: root.enabled ? 1.0 : Style.disabled-opacity;
+
+    HorizontalLayout {
+        padding-left: 16px;
+        padding-right: 16px;
+        padding-top: 5px;
+        padding-bottom: 5px;
+        Text {
+            text: root.text;
+            font-size: Style.body-size;
+            font-weight: root.filled ? Style.semibold : Style.regular;
+            color: root.filled ? Style.on-accent-foreground : Style.danger;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => {
+            root.clicked();
+        }
+    }
+}

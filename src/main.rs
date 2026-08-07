@@ -65,6 +65,13 @@ const RECORDINGS_HEIGHT: f32 = 540.0;
 const RECORDINGS_X: f32 = 200.0;
 const RECORDINGS_Y: f32 = 120.0;
 
+/// モデル一覧ウィンドウの初期ジオメトリ。幅・高さは `ui/models-window.slint` の min/preferred と
+/// 一致させること（片方だけ変えない）。設定ウィンドウから開くので、それと重ならない位置に出す。
+const MODELS_WIDTH: f32 = 460.0;
+const MODELS_HEIGHT: f32 = 420.0;
+const MODELS_X: f32 = 700.0;
+const MODELS_Y: f32 = 200.0;
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 多重起動ガード。取得したロックは _instance_lock でプロセス終了まで保持し続ける
     // （背景・各分岐の意味・保持理由は `single_instance` モジュール doc / `Acquire` 参照）。
@@ -860,6 +867,79 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             transcriber.forget(&dir);
             summarizer.forget(&dir);
             clear_recordings_selection(&rec, &transcript_segments);
+        });
+    }
+
+    // モデル一覧ウィンドウ（#117）。設定画面のボタンで開く。設定・Recordings と同じく起動時に
+    // 生成して隠しておき、閉じても常駐を保つ。
+    let models_ui = ModelsWindow::new()?;
+    models_ui
+        .window()
+        .on_close_requested(|| slint::CloseRequestResponse::HideWindow);
+    // 一覧に表示中のモデル（インデックス→削除対象の解決に使う。行の並びと 1 対 1）。
+    let installed_models: Rc<RefCell<Vec<model_download::InstalledModel>>> =
+        Rc::new(RefCell::new(Vec::new()));
+    {
+        let models_weak = models_ui.as_weak();
+        let installed_for_delete = Rc::clone(&installed_models);
+        let downloader_for_delete = model_downloader.clone();
+        let transcriber_for_delete = transcriber.clone();
+        let summarizer_for_delete = summarizer.clone();
+        let config_for_delete = Rc::clone(&config);
+        models_ui.on_delete_model(move |index| {
+            let Some(models) = models_weak.upgrade() else {
+                return;
+            };
+            // 境界チェックと要素取得を get(i) で一体にする（他ハンドラと同じパターン）。
+            let Some(target) = usize::try_from(index)
+                .ok()
+                .and_then(|i| installed_for_delete.borrow().get(i).cloned())
+            else {
+                return;
+            };
+            // 失敗（取得中・権限など）はログのみで縮退する。一覧を作り直すので、消えていない
+            // ことは表示から分かる（エラーにフルパスは含めない。`docs/rules/security.md`）。
+            if let Err(err) = downloader_for_delete.delete(&target) {
+                eprintln!("Skipping the model deletion because it failed: {err}");
+            }
+            refresh_models_window(
+                &models,
+                &installed_for_delete,
+                &downloader_for_delete,
+                &transcriber_for_delete,
+                &summarizer_for_delete,
+                &config_for_delete.borrow(),
+            );
+        });
+    }
+    {
+        // 設定画面の「Manage Downloaded Models…」。開くたびに一覧を作り直す。
+        let models_weak = models_ui.as_weak();
+        let installed_for_open = Rc::clone(&installed_models);
+        let downloader_for_open = model_downloader.clone();
+        let transcriber_for_open = transcriber.clone();
+        let summarizer_for_open = summarizer.clone();
+        let config_for_open = Rc::clone(&config);
+        // 初回表示でジオメトリを確定させたか（`show_window` が `&mut bool` を取るので RefCell）。
+        let models_geometry = Rc::new(RefCell::new(false));
+        ui.on_open_models_window(move || {
+            let Some(models) = models_weak.upgrade() else {
+                return;
+            };
+            refresh_models_window(
+                &models,
+                &installed_for_open,
+                &downloader_for_open,
+                &transcriber_for_open,
+                &summarizer_for_open,
+                &config_for_open.borrow(),
+            );
+            show_window(
+                models.window(),
+                &mut models_geometry.borrow_mut(),
+                slint::LogicalPosition::new(MODELS_X, MODELS_Y),
+                slint::LogicalSize::new(MODELS_WIDTH, MODELS_HEIGHT),
+            );
         });
     }
 
@@ -1961,6 +2041,159 @@ fn model_status_text(
     }
 }
 
+/// モデル一覧ウィンドウの中身を作り直す（開いたときと、削除の直後に呼ぶ）。
+///
+/// **100ms tick では作り直さない**: ディスク走査を常時走らせないため（`docs/rules/performance.md`）。
+/// そのぶん、開いている間に始まったダウンロードや文字起こしは一覧に反映されず、削除できない行の
+/// Delete が有効なままになりうる。**最後の砦は基盤側**で、`ModelDownloader::delete` が取得中の
+/// モデルを拒否する（そちらの doc）。
+fn refresh_models_window(
+    models_ui: &ModelsWindow,
+    installed: &Rc<RefCell<Vec<model_download::InstalledModel>>>,
+    downloader: &model_download::ModelDownloader,
+    transcriber: &transcribe::TranscribeWorker,
+    summarizer: &summarize::SummarizeWorker,
+    config: &Config,
+) {
+    // カタログは種別ごとに渡す（種別が増えたらここへ 1 つ足すだけで一覧に並ぶ）。
+    let found = model_download::installed_models(&[whisper_model::CATALOG, summary_model::CATALOG]);
+    // 種別ごとに「いまジョブが走っているか」を 1 回だけ照会する（行ごとにロックを取らない）。
+    let whisper_busy = transcriber.is_running();
+    let summary_busy = summarizer.is_running();
+    let selected_whisper = whisper_model::spec_or_default(&config.whisper_model).id;
+    let selected_summary = summary_model::spec_or_default(&config.summary_model).id;
+
+    let rows: Vec<ModelRow> = found
+        .iter()
+        .map(|model| {
+            let kind_is_busy = match model.kind {
+                Some(kind) if kind == whisper_model::KIND => whisper_busy,
+                Some(kind) if kind == summary_model::KIND => summary_busy,
+                // 種別が増えて判定を足し忘れたら、削除を止める側には転ばせない（消せなくなる
+                // 行が静かに増えるより、基盤側の拒否に任せる）。
+                _ => false,
+            };
+            let is_selected = model
+                .catalog_id
+                .is_some_and(|id| id == selected_whisper || id == selected_summary);
+            let is_downloading = model.catalog_id.is_some_and(|id| {
+                matches!(
+                    downloader.status_of_id(id),
+                    Some(model_download::DownloadStatus::Downloading { .. })
+                )
+            });
+            model_row(
+                model,
+                model_row_state(model, is_downloading, kind_is_busy, is_selected),
+            )
+        })
+        .collect();
+
+    models_ui.set_total_text(models_total_text(&found).into());
+    models_ui.set_models(Rc::new(slint::VecModel::from(rows)).into());
+    // 一覧を作り直したら、モーダルの対象も無効になる（削除後に別の行が対象になるのを防ぐ）。
+    models_ui.set_show_delete_confirm(false);
+    models_ui.set_delete_index(0);
+    *installed.borrow_mut() = found;
+}
+
+/// モデル一覧の 1 行の状態を決める（純粋関数。副作用を持つ照会は呼び出し側が済ませて bool で渡す）。
+///
+/// 優先順位は **取得中 → 使用中 → 選択中 → 取得済み**。削除できない理由（前 2 つ）を、
+/// 単に「選択中」より先に出す。カタログに無いファイルは種別も選択も判定できないので
+/// `Unknown` に落とす（削除は許す。カタログ差し替え後の旧ファイルを掃除するため）。
+fn model_row_state(
+    model: &model_download::InstalledModel,
+    is_downloading: bool,
+    kind_is_busy: bool,
+    is_selected: bool,
+) -> ModelRowState {
+    if model.catalog_id.is_none() {
+        return ModelRowState::Unknown;
+    }
+    if is_downloading {
+        return ModelRowState::Downloading;
+    }
+    if kind_is_busy {
+        return ModelRowState::InUse;
+    }
+    if is_selected {
+        return ModelRowState::Selected;
+    }
+    ModelRowState::Installed
+}
+
+/// 行の状態テキスト（対応表は網羅 match に置く。`docs/rules/slint.md`）。
+/// 削除できない行では**その理由**を出す（UI では Delete が淡色になるだけなので、文字で伝える）。
+fn model_state_text(state: ModelRowState) -> &'static str {
+    match state {
+        ModelRowState::Installed => "Downloaded",
+        ModelRowState::Selected => "Downloaded · selected in Settings",
+        ModelRowState::InUse => "In use right now — cannot be deleted",
+        ModelRowState::Downloading => "Downloading — cannot be deleted",
+        ModelRowState::Unknown => "Not in the model catalog",
+    }
+}
+
+/// 確認モーダルの説明テキスト。解放される容量と、**ゴミ箱へは入らない**こと、そして
+/// 再取得できるかを出す（3.1GB の再取得は分オーダーかかるので、押す前に分かるようにする）。
+fn model_delete_detail(state: ModelRowState, size_bytes: u64) -> String {
+    let freed = format!(
+        "This frees {}. The file is deleted permanently — it does not go to the Trash.",
+        model_download::format_size(size_bytes)
+    );
+    match state {
+        // 取得中・使用中の行は Delete が無効なのでモーダルは開かないが、一覧は開いたときの
+        // 状態なので（tick で作り直さない）念のため同じ文言にしておく。
+        ModelRowState::Installed
+        | ModelRowState::Selected
+        | ModelRowState::InUse
+        | ModelRowState::Downloading => {
+            format!("{freed} It downloads again the next time it is needed.")
+        }
+        // カタログ外は URL も SHA-256 も無いので、消したらアプリでは戻せない。
+        ModelRowState::Unknown => {
+            format!("{freed} The app cannot download this file again.")
+        }
+    }
+}
+
+/// 一覧の末尾（空のときは一覧の中）に出す合計テキスト。
+fn models_total_text(models: &[model_download::InstalledModel]) -> String {
+    if models.is_empty() {
+        // 空のときは合計の代わりにこの文言を一覧の中央へ出す（`ui/models-window.slint`）。
+        return "No models downloaded yet".to_owned();
+    }
+    let total: u64 = models.iter().map(|model| model.size_bytes).sum();
+    format!(
+        "{} {} · {}",
+        models.len(),
+        if models.len() == 1 { "model" } else { "models" },
+        model_download::format_size(total)
+    )
+}
+
+/// 一覧の 1 行を組む（表示名はカタログが引ければ表示名、引けなければファイル名）。
+fn model_row(model: &model_download::InstalledModel, state: ModelRowState) -> ModelRow {
+    // 種別が分からない行では、2 行目はファイル名だけにする（`—` の空欄を並べない）。
+    let detail = match model.kind {
+        Some(kind) => format!("{kind} · {}", model.filename),
+        None => model.filename.clone(),
+    };
+    ModelRow {
+        name: model
+            .display_name
+            .unwrap_or(&model.filename)
+            .to_owned()
+            .into(),
+        detail: detail.into(),
+        size: model_download::format_size(model.size_bytes).into(),
+        state_text: model_state_text(state).into(),
+        delete_detail: model_delete_detail(state, model.size_bytes).into(),
+        state,
+    }
+}
+
 /// macOS で Dock アイコンを隠し、メニューバー常駐アプリとして振る舞わせる。
 ///
 /// activation policy を Accessory にすることで Dock とアプリスイッチャーに出なくなる。
@@ -1982,11 +2215,12 @@ fn hide_dock_icon() {
 #[cfg(test)]
 mod tests {
     use super::{
-        SummaryStatus, TranscriptStatus, app_version_text, breathing_level, model_choices,
-        model_status_text, playback_progress, seek_position_from_ratio, summary_display_status,
-        summary_model_downloads_on_select, summary_model_status_text, summary_placeholder_text,
-        summary_rows, summary_status_text, transcript_display_status, transcript_placeholder_text,
-        transcript_status_text,
+        ModelRowState, SummaryStatus, TranscriptStatus, app_version_text, breathing_level,
+        model_choices, model_delete_detail, model_row, model_row_state, model_state_text,
+        model_status_text, models_total_text, playback_progress, seek_position_from_ratio,
+        summary_display_status, summary_model_downloads_on_select, summary_model_status_text,
+        summary_placeholder_text, summary_rows, summary_status_text, transcript_display_status,
+        transcript_placeholder_text, transcript_status_text,
     };
     use crate::transcribe::TranscribeStatus;
     use std::time::Duration;
@@ -2381,6 +2615,129 @@ mod tests {
             false,
             Some("/tmp/model.gguf")
         )));
+    }
+
+    fn installed(
+        filename: &str,
+        size: u64,
+        from_catalog: bool,
+    ) -> crate::model_download::InstalledModel {
+        crate::model_download::InstalledModel {
+            filename: filename.to_owned(),
+            size_bytes: size,
+            kind: from_catalog.then_some("Test speech"),
+            display_name: from_catalog.then_some("Test Speech"),
+            catalog_id: from_catalog.then_some("test-speech"),
+        }
+    }
+
+    /// 行の状態は「取得中 → 使用中 → 選択中 → 取得済み」の優先順で決まる。削除できない理由を
+    /// 選択中より先に出す（表示が「選択中」だけだと、押せない Delete の理由が分からない）。
+    #[test]
+    fn model_row_state_puts_the_blocking_reasons_first() {
+        let model = installed("test-speech.bin", 10, true);
+        assert_eq!(
+            model_row_state(&model, true, true, true),
+            ModelRowState::Downloading
+        );
+        assert_eq!(
+            model_row_state(&model, false, true, true),
+            ModelRowState::InUse
+        );
+        assert_eq!(
+            model_row_state(&model, false, false, true),
+            ModelRowState::Selected
+        );
+        assert_eq!(
+            model_row_state(&model, false, false, false),
+            ModelRowState::Installed
+        );
+        // カタログ外は種別も選択も判定できないので Unknown（削除は許す）。
+        let unknown = installed("left-over.bin", 10, false);
+        assert_eq!(
+            model_row_state(&unknown, false, false, false),
+            ModelRowState::Unknown
+        );
+        assert_eq!(
+            model_row_state(&unknown, true, true, true),
+            ModelRowState::Unknown,
+            "an unknown file has no catalog id, so no state can apply to it"
+        );
+    }
+
+    /// 状態→文言の対応（全バリアント）。削除できない 2 状態は**理由**を含む。
+    #[test]
+    fn model_state_text_covers_all_states() {
+        assert_eq!(model_state_text(ModelRowState::Installed), "Downloaded");
+        assert_eq!(
+            model_state_text(ModelRowState::Selected),
+            "Downloaded · selected in Settings"
+        );
+        assert_eq!(
+            model_state_text(ModelRowState::InUse),
+            "In use right now — cannot be deleted"
+        );
+        assert_eq!(
+            model_state_text(ModelRowState::Downloading),
+            "Downloading — cannot be deleted"
+        );
+        assert_eq!(
+            model_state_text(ModelRowState::Unknown),
+            "Not in the model catalog"
+        );
+    }
+
+    /// 確認モーダルの説明は、解放される容量と「ゴミ箱に入らない」ことを必ず言う。再取得できるかは
+    /// カタログの有無で変わるので、そこだけ文言を分ける。
+    #[test]
+    fn model_delete_detail_tells_the_freed_space_and_whether_it_returns() {
+        let catalog = model_delete_detail(ModelRowState::Selected, 1_624_555_275);
+        assert_eq!(
+            catalog,
+            "This frees 1.5 GB. The file is deleted permanently — it does not go to the Trash. \
+             It downloads again the next time it is needed."
+        );
+        let unknown = model_delete_detail(ModelRowState::Unknown, 77_691_713);
+        assert_eq!(
+            unknown,
+            "This frees 74 MB. The file is deleted permanently — it does not go to the Trash. \
+             The app cannot download this file again."
+        );
+    }
+
+    /// 合計は件数（単数・複数）とサイズを出す。空のときは一覧の中央に出す文言になる。
+    #[test]
+    fn models_total_text_counts_and_sums() {
+        assert_eq!(models_total_text(&[]), "No models downloaded yet");
+        assert_eq!(
+            models_total_text(&[installed("a.bin", 77_691_713, true)]),
+            "1 model · 74 MB"
+        );
+        assert_eq!(
+            models_total_text(&[
+                installed("a.bin", 1_624_555_275, true),
+                installed("b.bin", 1_624_555_275, false),
+            ]),
+            "2 models · 3.0 GB"
+        );
+    }
+
+    /// 行の表示名はカタログが引ければ表示名、引けなければファイル名。種別が分からない行では
+    /// 2 行目にファイル名だけを出す（空欄の区切りを並べない）。
+    #[test]
+    fn model_row_falls_back_to_the_file_name() {
+        let row = model_row(
+            &installed("test-speech.bin", 10, true),
+            ModelRowState::Installed,
+        );
+        assert_eq!(row.name, "Test Speech");
+        assert_eq!(row.detail, "Test speech · test-speech.bin");
+        let unknown = model_row(
+            &installed("left-over.bin", 10, false),
+            ModelRowState::Unknown,
+        );
+        assert_eq!(unknown.name, "left-over.bin");
+        assert_eq!(unknown.detail, "left-over.bin");
     }
 
     /// 要約 LLM の状態行は取得状況を示す（どのモデルかは ComboBox が示す）。取得の契機が設定で

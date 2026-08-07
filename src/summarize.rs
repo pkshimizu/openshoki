@@ -347,6 +347,16 @@ impl SummarizeWorker {
         }
     }
 
+    /// いま要約を生成中のセッションが在るか（モデル一覧の削除可否に使う。#117）。
+    /// キュー待ちは数えない: まだモデルを読んでいないので、消しても次の取得が走るだけ
+    /// （判定の粗さの理由は `TranscribeWorker::is_running` と同じ）。
+    pub fn is_running(&self) -> bool {
+        lock_queue(&self.queue)
+            .status
+            .values()
+            .any(|(_, status)| *status == SummarizeStatus::Summarizing)
+    }
+
     /// セッションの進行状況の記録を破棄する（セッション削除時の掃除）。未登録なら何もしない。
     /// キュー待ちのジョブが残っていても、記録が無くなるのでワーカーが取り出したときに
     /// 捨てられる（`QueueState`）。
