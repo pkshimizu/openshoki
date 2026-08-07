@@ -83,8 +83,6 @@ impl Drop for PartFile {
 /// 掃除の安全性は「対象ディレクトリを限定していること」に依るので、**ユーザーが中身を置ける
 /// 場所を掃除するときは宛先名まで絞る**（アプリが書いた一時ファイルしか触らないことが名前で
 /// 決まる）。アプリ専有の場所（モデルの保存先）は宛先名がカタログ次第で増えるため絞らない。
-///
-/// 持つのは宛先名だけなので `Debug` を付けてよい（`PartFile` はフルパスを持つので付けない）。
 #[derive(Debug)]
 pub enum PartScope<'a> {
     /// `*.part.<数字>` の形ならすべて。アプリ専有のディレクトリ用。
@@ -130,8 +128,9 @@ pub fn sweep_orphaned_parts(dir: &Path, now: SystemTime, max_age: Duration, scop
     }
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
-        // ディレクトリが無い（初回起動）・読めないのは掃除しないだけで機能に影響しない。
-        // 保存先のフルパスはログに出さない（`docs/rules/security.md`）。
+        // 不在は上のガードで弾いているので、ここに来るのは判定の後に消えた場合（レース）と
+        // 権限エラー。どちらも掃除しないだけで機能に影響しない。保存先のフルパスはログに
+        // 出さない（`docs/rules/security.md`）。
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
         Err(err) => {
             eprintln!(
@@ -405,6 +404,28 @@ mod tests {
         assert!(link.is_symlink(), "a symlink must not be swept");
         assert!(target.exists(), "the target must not be touched");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 掃除するディレクトリ自身がシンボリックリンクなら、辿った先を掃除しない（掛け先が
+    /// 増えても効くよう、判定は原始側が持つ。`recordings` 側の線引きはそちらのテスト）。
+    #[test]
+    #[cfg(unix)]
+    fn sweep_does_not_follow_a_symlinked_directory() {
+        let real = temp_dir("sweep-linked-target");
+        let part = real.join("model.bin.part.123");
+        std::fs::write(&part, b"x").expect("writing the fixture should succeed");
+        let links = temp_dir("sweep-linked");
+        let link = links.join("models");
+        std::os::unix::fs::symlink(&real, &link).expect("creating the symlink should succeed");
+
+        let elapsed = SystemTime::now() + Duration::from_secs(48 * 60 * 60);
+        sweep_orphaned_parts(&link, elapsed, Duration::from_secs(60), PartScope::AnyDest);
+        assert!(
+            part.exists(),
+            "a part file behind a symlinked directory must not be swept"
+        );
+        let _ = std::fs::remove_dir_all(&links);
+        let _ = std::fs::remove_dir_all(&real);
     }
 
     /// mtime が未来（時計のずれ・別マシンからのコピー）の一時ファイルは消さない

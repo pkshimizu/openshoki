@@ -3,8 +3,10 @@
 //! 有無を調べて新しい順に並べる。Recordings ウィンドウの一覧表示に使う。
 //!
 //! 読むだけのモジュールではない: 一覧に出たセッションに取り残された一時ファイルの回収
-//! （`spawn_session_part_sweep`）も持つ。**消す**のはこの 1 箇所だけなので、範囲と時期の判断は
-//! そこの doc に集約する。
+//! （`spawn_session_part_sweep`）も持つ。保存先のファイルを消す経路はほかにもあるが
+//! （書き損じの後始末＝`atomic_replace::PartFile` / `recorder::discard_partial_recording`、
+//! セッションごとゴミ箱へ移す削除＝`main`）、**自分が作ったと確認せず名前だけを頼りに走査して
+//! 消す**のはここだけなので、範囲と時期の判断はそこの doc に集約する。
 //!
 //! `recording_dir` は設定（手編集されうる信頼境界外）由来で、無関係なファイル・ディレクトリが
 //! 混じりうる。名前が日時形式でないもの・音源ファイルが 1 つも無いものは安全にスキップし、
@@ -45,11 +47,16 @@ const STALE_SESSION_PART_AGE: Duration = Duration::from_secs(60 * 60);
 /// （`mix.mp3` は `PartFile` を通さず直接書くので入れない）。絞る理由は
 /// `atomic_replace::PartScope`。
 ///
-/// 参照するのは**書き手側の定数**（この一覧の判定用に置いた `MIC_MP3` などではない）。書き手が
-/// 名前を変えたら掃除も自動で追い、取りこぼしが静かに生まれないようにする。
+/// 参照するのは**そのファイルを書くモジュールの定数**（この一覧の判定用に置いた `MIC_MP3` などの
+/// 写しではない）。一時ファイルの名前は宛先の名前から作られる（`atomic_replace::PartFile`）ので、
+/// 書き手が名前を変えたら掃除も自動で追い、取りこぼしが静かに生まれない。
+///
+/// システム音源は macOS 限定モジュール（`system_audio`）にあるので、他 OS では対象から落ちる
+/// （そこにはシステム音源を書く経路も無い）。
 const SWEPT_PART_DESTS: &[&str] = &[
-    crate::mixdown::MIC_FILENAME,
-    crate::mixdown::SYSTEM_FILENAME,
+    crate::recorder::MIC_FILENAME,
+    #[cfg(target_os = "macos")]
+    crate::system_audio::SYSTEM_FILENAME,
     crate::summarize::SUMMARY_FILENAME,
 ];
 
@@ -189,7 +196,8 @@ pub fn list_sessions(recording_dir: &Path) -> Vec<RecordingSession> {
 /// 残り続けないようにする（`docs/review-perspectives/security.md`）。古さの判定と、そこから
 /// 来る限界（強制終了の直後は回収されない）は `atomic_replace::sweep_orphaned_parts` の doc。
 ///
-/// **これがユーザーの保存先でファイルを消す唯一の経路**なので、範囲を 3 重に絞る:
+/// **名前だけを頼りに走査して消す唯一の経路**なので（ほかの削除経路はモジュール doc）、
+/// 範囲を 3 重に絞る:
 ///
 /// 1. **時期**: ユーザーが Recordings ウィンドウを開いたときだけ（常駐の起動時には走らない。
 ///    #130 で「起動時にユーザーの選んだ保存先を走査するリスクは取らない」と見送った判断を、
@@ -210,6 +218,9 @@ pub fn list_sessions(recording_dir: &Path) -> Vec<RecordingSession> {
 /// 走査は**バックグラウンドスレッドで行い、完了は待たない**（表示には使わない副作用なので待つ
 /// 理由が無く、セッション数に比例する I/O を UI スレッドへ載せない。
 /// `docs/rules/performance.md`）。掃除が終わる前にアプリが終了しても、次に開いたときにまた走る。
+///
+/// `now` を引数で取るのは、経過を作れるようにしてテストの継ぎ目にするため
+/// （`sweep_orphaned_parts` と同じ流儀。本番の呼び出しは 1 箇所で常に `SystemTime::now()`）。
 ///
 /// 音源が 1 つも無いディレクトリは一覧に出ないので掃除されない。一時ファイルを作る経路は
 /// どれも音源が在る状態でしか走らない（録音そのものは `PartFile` を通さず直接書く）ので、
@@ -254,7 +265,7 @@ fn parse_session_datetime(name: &str) -> Option<NaiveDateTime> {
 mod tests {
     use super::{
         RecordingSession, STALE_SESSION_PART_AGE, list_sessions, parse_session_datetime,
-        session_dirs, sweep_session_dirs,
+        session_dirs, spawn_session_part_sweep, sweep_session_dirs,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -362,11 +373,52 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// 閾値そのものの下限（桁）を固定する。相対値のテストでは「5 分」に縮める変異が素通りする。
-    /// 走っている書き出しを消さない余裕（スリープを挟んだ場合を含む）としてこの桁が要る。
+    /// 閾値の桁を上下から固定する。相対値のテスト（`now + AGE`）では、縮める変異も伸ばす変異も
+    /// 素通りしてしまう。下限は書き込み中のファイルを消さない余裕（時計のずれ・mtime の粒度）、
+    /// 上限は「開いたときに回収される」が実質的に機能する範囲。
     #[test]
-    fn the_stale_threshold_leaves_room_for_a_running_write() {
+    fn the_stale_threshold_stays_in_the_intended_order_of_magnitude() {
         assert!(STALE_SESSION_PART_AGE >= Duration::from_secs(30 * 60));
+        assert!(STALE_SESSION_PART_AGE <= Duration::from_secs(3 * 60 * 60));
+    }
+
+    /// 一覧の判定に使う写しが、実際にそのファイルを書くモジュールの定数と一致していること
+    /// （`MIC_MP3` などの doc が「一致させること」と言っている不変条件をここで固定する。
+    /// ずれると一覧の判定と掃除の対象が静かに食い違う）。
+    #[test]
+    fn the_listed_filenames_match_the_modules_that_write_them() {
+        assert_eq!(super::MIC_MP3, crate::recorder::MIC_FILENAME);
+        assert_eq!(super::MIX_MP3, crate::mixdown::MIX_FILENAME);
+        #[cfg(target_os = "macos")]
+        assert_eq!(super::SYSTEM_MP3, crate::system_audio::SYSTEM_FILENAME);
+    }
+
+    /// 公開の入口（別スレッドで走らせる形）でも古い一時ファイルが消えること。上限つきポーリング
+    /// で待つ（`docs/rules/testing.md`。超えたときの第一容疑者はスレッドの起動失敗）。
+    #[test]
+    fn the_public_entry_point_sweeps_in_the_background() {
+        let root = unique_root("sweep-spawn");
+        let _ = fs::remove_dir_all(&root);
+        make_session(&root, "20260628-143025", &["mic.mp3"]);
+        let leftover = root.join("20260628-143025").join("mic.mp3.part.123");
+        fs::write(&leftover, b"x").expect("writing the fixture succeeds in test");
+
+        let sessions = list_sessions(&root);
+        spawn_session_part_sweep(&sessions, SystemTime::now() + STALE_SESSION_PART_AGE);
+        let mut swept = false;
+        for _ in 0..600 {
+            if !leftover.exists() {
+                swept = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            swept,
+            "the background sweep should remove the leftover within 6s (did the thread start?)"
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// セッションディレクトリ自体がシンボリックリンクなら掃除しない（掃除が録音ツリーの外へ

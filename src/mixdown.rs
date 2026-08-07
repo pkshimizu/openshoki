@@ -27,11 +27,10 @@ use rodio::{ChannelCount, Decoder, SampleRate, Source};
 /// ミックス出力のファイル名。セッションディレクトリに固定名で置く（`mic.mp3` / `system.mp3` と同系統。
 /// `recordings.rs` の再生対象判定と一致させること）。
 pub const MIX_FILENAME: &str = "mix.mp3";
-/// 正規化で書き直す音源のファイル名（`recorder.rs` / `system_audio.rs` の出力名と一致させる
-/// こと）。`pub` なのは、取り残された一時ファイルの掃除が**書き手の宛先名**を参照するため
-/// （`recordings::SWEPT_PART_DESTS`。名前を変えたら掃除も自動で追う）。
-pub const MIC_FILENAME: &str = "mic.mp3";
-pub const SYSTEM_FILENAME: &str = "system.mp3";
+/// ミックスの門番と入力に使う音源のファイル名（`recorder.rs` / `system_audio.rs` の出力名と
+/// 一致させること。`system_audio` は macOS 限定なので直接は参照できない）。
+const MIC_FILENAME: &str = "mic.mp3";
+const SYSTEM_FILENAME: &str = "system.mp3";
 
 /// エンコード設定は `recorder.rs` の録音出力と揃える（同じ音質・容量特性で保存する）。
 const BITRATE: Bitrate = Bitrate::Kbps128;

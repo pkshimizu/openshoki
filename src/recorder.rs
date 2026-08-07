@@ -29,7 +29,7 @@ const BITRATE: Bitrate = Bitrate::Kbps128;
 const QUALITY: Quality = Quality::Good;
 /// マイク音源の出力ファイル名。録音セッションのディレクトリ内に固定名で置く
 /// （システム音声は `system.mp3`、文字起こし結果なども同じディレクトリへ）。
-const MIC_FILENAME: &str = "mic.mp3";
+pub(crate) const MIC_FILENAME: &str = "mic.mp3";
 
 /// 実行中の録音セッション。マイク音源は必須、システム音源（macOS）は任意。
 ///
