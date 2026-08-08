@@ -65,7 +65,7 @@ const RECORDINGS_HEIGHT: f32 = 540.0;
 const RECORDINGS_X: f32 = 200.0;
 const RECORDINGS_Y: f32 = 120.0;
 
-/// モデル一覧ウィンドウの初期ジオメトリ。幅・高さは `ui/models-window.slint` の min/preferred と
+/// モデル管理ウィンドウの初期ジオメトリ。幅・高さは `ui/models-window.slint` の min/preferred と
 /// 一致させること（片方だけ変えない）。設定ウィンドウから開くので、それと重ならない位置に出す。
 const MODELS_WIDTH: f32 = 560.0;
 const MODELS_HEIGHT: f32 = 520.0;
@@ -871,22 +871,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     models_ui
         .window()
         .on_close_requested(|| slint::CloseRequestResponse::HideWindow);
-    // 一覧に表示中の行の素材（インデックス→操作対象の解決に使う。行の並びと 1 対 1）。
-    let model_sources: Rc<RefCell<Vec<ModelRowSource>>> = Rc::new(RefCell::new(Vec::new()));
+    // 一覧の素材（インデックス→操作対象の解決に使う）と、UI が参照し続けるモデル。
+    // 差し替えずに行単位で更新する（tick で差し替えるとクリックを取りこぼす）。
+    let model_list = ModelListHandles {
+        sources: Rc::new(RefCell::new(Vec::new())),
+        rows: Rc::new(slint::VecModel::default()),
+    };
+    models_ui.set_models(model_list.rows.clone().into());
+    // 行が 1 つも無いときの縮退表示。カタログの行は必ず並ぶので実際には出ないが、表示の穴を
+    // 残さないために一度だけ入れておく（走査の失敗は通知で伝える。`MODELS_UNREADABLE_NOTICE`）。
+    models_ui.set_empty_text(MODELS_EMPTY_TEXT.into());
     {
         let models_weak = models_ui.as_weak();
         let ui_weak = ui.as_weak();
-        let sources = Rc::clone(&model_sources);
+        let list = model_list.clone();
         let downloader = model_downloader.clone();
         let transcriber_for_models = transcriber.clone();
         let summarizer_for_models = summarizer.clone();
         let config_for_models = Rc::clone(&config);
         // 3 つのハンドラは「対象の行を引く → 操作する → 一覧を作り直す」が共通なので、
-        // 同じクロージャの組で持つ（`ModelAction` で操作だけを分ける）。
-        let refresh = move |models: &ModelsWindow, notice: Option<&str>| {
+        // 作り直しだけを共有のクロージャ（`refresh`）にして、操作ごとにハンドラを分ける。
+        let refresh = move |models: &ModelsWindow, notice: Option<&'static str>| {
             refresh_models_window(
                 models,
-                &sources,
+                &list,
                 &downloader,
                 &transcriber_for_models,
                 &summarizer_for_models,
@@ -900,7 +908,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             let models_weak = models_weak.clone();
             let ui_weak = ui_weak.clone();
-            let sources = Rc::clone(&model_sources);
+            let sources = Rc::clone(&model_list.sources);
             let downloader = model_downloader.clone();
             let config = Rc::clone(&config);
             let refresh = Rc::clone(&refresh);
@@ -927,7 +935,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 「Download」: 選択は変えずに取得だけ始める（未取得・失敗の行にだけ出る）。
         {
             let models_weak = models_weak.clone();
-            let sources = Rc::clone(&model_sources);
+            let sources = Rc::clone(&model_list.sources);
             let downloader = model_downloader.clone();
             let refresh = Rc::clone(&refresh);
             models_ui.on_download_model(move |index| {
@@ -949,7 +957,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 「Delete」: 確認モーダルの確定から呼ばれる。
         {
             let models_weak = models_weak.clone();
-            let sources = Rc::clone(&model_sources);
+            let sources = Rc::clone(&model_list.sources);
             let downloader = model_downloader.clone();
             let transcriber = transcriber.clone();
             let summarizer = summarizer.clone();
@@ -966,7 +974,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     return;
                 };
                 let Some(target) = source.installed().cloned() else {
-                    return; // ディスクに無い行では Delete を出していない。
+                    // Delete はディスクに実体がある行にしか出さないので通常は来ないが、
+                    // 「押しても無反応」に見せないため通知とログを残す（#117 の方針）。
+                    eprintln!("Skipping the model deletion because the file is no longer listed");
+                    refresh(&models, delete_failure_notice(DeleteOutcome::Failed));
+                    return;
                 };
                 let config = config.borrow();
                 // **押された時点で使用中を再確認する**。一覧は tick が状態を追うが、tick と
@@ -992,7 +1004,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         // 設定画面の「Manage Models…」。開くたびに一覧を作り直す（ディスク走査はここだけ）。
         let models_weak = models_ui.as_weak();
-        let sources = Rc::clone(&model_sources);
+        let list = model_list.clone();
         let downloader_for_open = model_downloader.clone();
         let transcriber_for_open = transcriber.clone();
         let summarizer_for_open = summarizer.clone();
@@ -1005,7 +1017,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             refresh_models_window(
                 &models,
-                &sources,
+                &list,
                 &downloader_for_open,
                 &transcriber_for_open,
                 &summarizer_for_open,
@@ -1040,7 +1052,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
             ModelsHandles {
                 ui: models_ui.as_weak(),
-                sources: Rc::clone(&model_sources),
+                list: model_list.clone(),
                 transcriber: transcriber.clone(),
                 summarizer: summarizer.clone(),
                 downloader: model_downloader.clone(),
@@ -1089,8 +1101,8 @@ struct RecordingsHandles {
 /// 同じ理由でまとめる）。
 struct ModelsHandles {
     ui: slint::Weak<ModelsWindow>,
-    /// 一覧の行の素材（開いたときに作り、tick は状態だけ組み直す）。
-    sources: Rc<RefCell<Vec<ModelRowSource>>>,
+    /// 一覧の素材と UI のモデル（組で持つ理由は `ModelListHandles`）。
+    list: ModelListHandles,
     /// 削除できるかの判定に読む（ジョブがある間は消させない）。
     transcriber: transcribe::TranscribeWorker,
     summarizer: summarize::SummarizeWorker,
@@ -1144,6 +1156,9 @@ fn build_menu_event_handler(
     let mut last_rendered_secs: Option<u64> = None;
     // 直前 tick で録音中だったか。録音中→待機の遷移を 1 度だけ拾って待機表示へ戻すのに使う。
     let mut was_recording = false;
+    // モデル管理ウィンドウで「記録が取得済みになっているモデル」の直前の集合。増えた（＝取得が
+    // 完了した）ときだけディスクを走査し直すためのラッチ（`downloaded_ids`）。
+    let mut last_downloaded_models: Vec<&'static str> = Vec::new();
     // 実行中の録音が「登録アプリのマイク使用」由来の自動開始か。true のときだけ、登録アプリのマイク使用の途絶で
     // 自動停止する（手動開始の録音は app の沈黙では止めない）。
     #[cfg(target_os = "macos")]
@@ -1391,15 +1406,23 @@ fn build_menu_event_handler(
         // モデル管理ウィンドウが開いている間だけ、行の状態（取得の進捗・完了・失敗、ジョブの
         // 開始・終了）を追従させる。**ディスクは走査しない**（状態は状態マップだけで分かる。
         // `docs/rules/performance.md`）。取得が完了した行だけは実サイズと合計を追いつかせたい
-        // ので、そのときに 1 回だけ走査し直す（`models_need_rescan`）。
+        // ので、**記録が増えたときに 1 回だけ**走査し直す（毎 tick 走査しないためのラッチ。
+        // 「記録は取得済みだが実体が無い」を条件にすると、外部でファイルを消された場合などに
+        // 条件が解消せず走査が止まらない）。
         if let Some(models_ui) = models.ui.upgrade()
             && models_ui.window().is_visible()
         {
             let config = config.borrow();
-            if models_need_rescan(&models.sources.borrow(), &models.downloader) {
+            let downloaded = downloaded_ids(&models.list.sources.borrow(), &models.downloader);
+            // 確認モーダルが開いている間は素材を作り直さない（行の並びが変わると、モーダルが
+            // 指している行がずれる）。次の tick で拾う。
+            let rescan =
+                downloaded != last_downloaded_models && !models_ui.get_show_delete_confirm();
+            if rescan {
+                last_downloaded_models = downloaded;
                 refresh_models_window(
                     &models_ui,
-                    &models.sources,
+                    &models.list,
                     &models.downloader,
                     &models.transcriber,
                     &models.summarizer,
@@ -1409,12 +1432,12 @@ fn build_menu_event_handler(
             } else {
                 refresh_model_rows(
                     &models_ui,
-                    &models.sources,
+                    &models.list,
                     &models.downloader,
                     &models.transcriber,
                     &models.summarizer,
                     &config,
-                    None,
+                    ModelsRefresh::Poll,
                 );
             }
         }
@@ -2148,6 +2171,14 @@ fn summary_model_status_text(
 }
 
 /// モデルの取得状況を、設定画面の状態行テキストにする（whisper / 要約 LLM で共用）。
+/// 受信済みバイトから進捗のパーセントを出す。
+///
+/// `total` は Content-Length または既知サイズで常に正だが、防御的にゼロ除算を避ける。
+/// Content-Length が実サイズより小さい異常時も 100% を超えて表示しない。
+fn download_percent(received: u64, total: u64) -> u64 {
+    (received.saturating_mul(100) / total.max(1)).min(100)
+}
+
 fn model_status_text(
     spec: &'static model_download::ModelSpec,
     downloader: &model_download::ModelDownloader,
@@ -2160,81 +2191,140 @@ fn model_status_text(
             model_download::format_size(spec.size_bytes)
         ),
         model_download::DownloadStatus::Downloading { received, total } => {
-            // total は Content-Length または既知サイズで常に正だが、防御的にゼロ除算を避ける。
-            // Content-Length が実サイズより小さい異常時も 100% を超えて表示しない。
-            let percent = (received.saturating_mul(100) / total.max(1)).min(100);
-            format!("Downloading… {percent}%")
+            format!("Downloading… {}%", download_percent(received, total))
         }
         model_download::DownloadStatus::Downloaded => "Downloaded".to_owned(),
         model_download::DownloadStatus::Failed(reason) => format!("Download failed: {reason}"),
     }
 }
 
+/// 一覧を作り直す理由。**tick の作り直しがモーダルと通知を消さないよう**、意図を型で渡す
+/// （`docs/rules/slint.md` の「『失敗したら表示を更新しない』は、ポーリング tick の上書きまで
+/// 考える」。#117 は tick で作り直さない前提だったので同じ経路で済んでいた）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelsRefresh {
+    /// ユーザー操作（開く・使う・取得・削除）の直後。**行の並びが変わる**ので、古い添字を
+    /// 指したままにしないよう確認モーダルを畳み、通知を差し替える。
+    AfterOperation(Option<&'static str>),
+    /// tick のポーリング。並びは変わらないので、モーダル・添字・通知には触らない。
+    Poll,
+}
+
+impl ModelsRefresh {
+    /// 確認モーダルと対象の添字を畳むか（行の並びが変わる経路だけ）。
+    fn resets_modal(self) -> bool {
+        matches!(self, Self::AfterOperation(_))
+    }
+
+    /// 通知をどうするか。`None` は「触らない」、`Some(notice)` は「その値へ差し替える」。
+    fn notice(self) -> Option<Option<&'static str>> {
+        match self {
+            Self::AfterOperation(notice) => Some(notice),
+            Self::Poll => None,
+        }
+    }
+}
+
 /// モデル管理ウィンドウの中身を作り直す（開いたとき・削除・選択・取得開始の直後に呼ぶ）。
 ///
 /// **ディスクを走査するのはここだけ**（`docs/rules/performance.md`。100ms tick に載せない）。
-/// 取得の進捗や状態の変化は状態マップだけで分かるので、tick は
-/// `refresh_model_rows`（走査なし）で行を組み直す。
+/// 取得の進捗や状態の変化は状態マップだけで分かるので、tick は `refresh_model_rows`（走査なし）で
+/// 行を組み直す。
 ///
-/// `notice` は直前の操作の失敗（削除できなかった理由）。作り直しと同時に置くので、呼び出し側が
-/// 「作り直したあとに set する」順序を守る必要が無い（順序制約をコメントだけで守らせない）。
+/// 走査に失敗したら**通知**で伝える（カタログの行は必ず並ぶので、空表示では気づけない。
+/// このとき行のサイズと状態はディスクの実体を反映しないので、その旨も文言に含める）。
 fn refresh_models_window(
     models_ui: &ModelsWindow,
-    sources: &RefCell<Vec<ModelRowSource>>,
+    handles: &ModelListHandles,
     downloader: &model_download::ModelDownloader,
     transcriber: &transcribe::TranscribeWorker,
     summarizer: &summarize::SummarizeWorker,
     config: &Config,
-    notice: Option<&str>,
+    notice: Option<&'static str>,
 ) {
-    let (installed, empty_text) = match model_download::installed_models() {
-        Ok(found) => (found, MODELS_EMPTY_TEXT.to_owned()),
+    let (installed, scan_notice) = match model_download::installed_models() {
+        Ok(found) => (found, None),
         Err(err) => {
-            // 走査できないのを「1 つも無い」と混ぜない（実際は数 GB あるのに「まだ何も無い」と
-            // 言ってしまう）。フルパスはログにも表示にも出さない。
-            eprintln!("Showing no models because the models folder could not be listed: {err}");
-            (Vec::new(), MODELS_UNREADABLE_TEXT.to_owned())
+            // 走査できないのを「1 つも無い」と混ぜない（実際は数 GB あるのに全行が未取得に
+            // 見える）。フルパスはログにも表示にも出さない。
+            eprintln!(
+                "Showing no installed models because the models folder could not be listed: {err}"
+            );
+            (Vec::new(), Some(MODELS_UNREADABLE_NOTICE))
         }
     };
-    *sources.borrow_mut() = model_row_sources(installed);
-    models_ui.set_empty_text(empty_text.into());
+    *handles.sources.borrow_mut() = model_row_sources(installed);
     refresh_model_rows(
         models_ui,
-        sources,
+        handles,
         downloader,
         transcriber,
         summarizer,
         config,
-        notice,
+        // 走査の失敗は操作の失敗より先に伝える（行の中身が信用できないため）。
+        ModelsRefresh::AfterOperation(scan_notice.or(notice)),
     );
 }
 
 /// 行だけを組み直す（**ディスクを走査しない**）。開いている間の tick から呼び、取得の進捗・
 /// 完了・失敗と、ジョブの開始・終了を表示へ反映する。
 ///
-/// 走査しないので、取得が完了した行のサイズは**カタログの値**のまま（実ファイルの長さは次の
-/// `refresh_models_window` で入る）。合計も同じ理由で次の作り直しまで追いつかないため、tick 側は
-/// 「完了を見つけたら 1 回だけ走査し直す」（`models_need_rescan`）。
+/// 変わった行だけ差し替える（`VecModel` を毎 tick 差し替えると全行の要素が再生成され、
+/// ホバー・押下中の状態が飛んでクリックを取りこぼす。既存の一覧 tick と同じ流儀）。
 fn refresh_model_rows(
     models_ui: &ModelsWindow,
-    sources: &RefCell<Vec<ModelRowSource>>,
+    handles: &ModelListHandles,
     downloader: &model_download::ModelDownloader,
     transcriber: &transcribe::TranscribeWorker,
     summarizer: &summarize::SummarizeWorker,
     config: &Config,
-    notice: Option<&str>,
+    cause: ModelsRefresh,
 ) {
-    let sources = sources.borrow();
+    let sources = handles.sources.borrow();
     let context = models_context(transcriber, summarizer, downloader, config);
     let rows = model_rows(&sources, &context);
 
-    // モーダルの対象を先に畳んでから一覧を差し替える（`models[delete-index]` を参照するので、
-    // 短くなったモデルへ古い添字が一瞬でも残らないようにする）。
-    models_ui.set_show_delete_confirm(false);
-    models_ui.set_delete_index(0);
-    models_ui.set_notice(notice.unwrap_or_default().into());
-    models_ui.set_total_text(models_total_text(&sources).into());
-    models_ui.set_models(Rc::new(slint::VecModel::from(rows)).into());
+    if cause.resets_modal() {
+        // 並びが変わるので、モーダルが古い行を指したままにしない。
+        models_ui.set_show_delete_confirm(false);
+        models_ui.set_delete_index(0);
+    }
+    if let Some(notice) = cause.notice() {
+        let notice = notice.unwrap_or_default();
+        if models_ui.get_notice() != notice {
+            models_ui.set_notice(notice.into());
+        }
+    }
+    let total = models_total_text(&sources);
+    if models_ui.get_total_text() != total.as_str() {
+        models_ui.set_total_text(total.into());
+    }
+    apply_model_rows(&handles.rows, rows);
+}
+
+/// 組み直した行を UI のモデルへ反映する（**変わった行だけ** `set_row_data` する）。
+fn apply_model_rows(model: &Rc<slint::VecModel<ModelRow>>, rows: Vec<ModelRow>) {
+    use slint::Model as _;
+    if model.row_count() != rows.len() {
+        // 行数が変わるのは素材を作り直したときだけ（取得の完了・削除・カタログ外の増減）。
+        model.set_vec(rows);
+        return;
+    }
+    for (index, row) in rows.into_iter().enumerate() {
+        if model.row_data(index).as_ref() != Some(&row) {
+            model.set_row_data(index, row);
+        }
+    }
+}
+
+/// モデル管理ウィンドウの一覧を組むためのハンドル（素材と UI のモデル）。素材と行は同じ順序で
+/// 1 対 1 なので、必ず組で持つ（別々に持つと**別のモデルを操作する**事故になる）。
+#[derive(Clone)]
+struct ModelListHandles {
+    /// 一覧の行の素材（開いたときに作り、tick は状態だけ組み直す）。
+    sources: Rc<RefCell<Vec<ModelRowSource>>>,
+    /// UI が参照し続けるモデル（差し替えずに行単位で更新する）。
+    rows: Rc<slint::VecModel<ModelRow>>,
 }
 
 /// 一覧の 1 行の素材。**カタログ全件**（未取得を含む）と、`models/` にあるカタログ外のファイルを
@@ -2317,9 +2407,15 @@ struct ModelsContext<'a> {
     /// 設定でいま選ばれている ID。
     selected_speech: &'a str,
     selected_summary: &'a str,
-    /// 設定のモデルパス上書き（`models/` 直下を指すこともある）。
-    speech_override: Option<&'a std::path::Path>,
-    summary_override: Option<&'a std::path::Path>,
+    /// 設定のモデルパス上書きが `models/` 直下を指すなら、そのファイル名（**行ごとに
+    /// `canonicalize` しないよう、種別ごとに 1 回だけ解決しておく**。
+    /// `model_download::override_filename`）。
+    speech_override_file: Option<String>,
+    summary_override_file: Option<String>,
+    /// その種別のモデルパスを上書きしているか（上書き中はカタログの選択が使われないので、
+    /// 「使う」「取得する」を出さない）。
+    speech_overridden: bool,
+    summary_overridden: bool,
     downloader: &'a model_download::ModelDownloader,
 }
 
@@ -2335,8 +2431,14 @@ fn models_context<'a>(
         summary_busy: summarizer.has_pending_jobs(),
         selected_speech: whisper_model::spec_or_default(&config.whisper_model).id,
         selected_summary: summary_model::spec_or_default(&config.summary_model).id,
-        speech_override: config.whisper_model_path.as_deref(),
-        summary_override: config.summary_model_path.as_deref(),
+        speech_override_file: model_download::override_filename(
+            config.whisper_model_path.as_deref(),
+        ),
+        summary_override_file: model_download::override_filename(
+            config.summary_model_path.as_deref(),
+        ),
+        speech_overridden: config.whisper_model_path.is_some(),
+        summary_overridden: config.summary_model_path.is_some(),
         downloader,
     }
 }
@@ -2357,9 +2459,12 @@ enum RowUsage {
     Idle,
     /// 設定でいま選ばれている。
     Selected,
-    /// `config.toml` のモデルパス上書き先。**上書き中はカタログの選択が使われない**うえ、消しても
-    /// 再取得されない（`ensure_model` を通らない）。
+    /// `config.toml` のモデルパス上書きが**この行のファイル**を指している。消しても再取得され
+    /// ない（上書き中は `ensure_model` を通らない）。
     InConfig,
+    /// `config.toml` がこの**種別**のモデルパスを上書きしている（この行のファイルではない）。
+    /// カタログの選択は使われないので、選んでも取得しても意味が無い。
+    Overridden,
     /// カタログに無いファイル。表示名も種別も分からず、消したらアプリでは戻せない。
     Unknown,
 }
@@ -2373,12 +2478,19 @@ struct RowFacts {
 
 fn row_facts(source: &ModelRowSource, context: &ModelsContext) -> RowFacts {
     let filename = match source {
-        ModelRowSource::Heading(_) => "",
+        // 見出しはファイルを持たない（`""` をパスに合成しないよう、ここで打ち切る）。
+        ModelRowSource::Heading(_) => {
+            return RowFacts {
+                usage: RowUsage::Idle,
+                busy: false,
+            };
+        }
         ModelRowSource::Catalog { spec, .. } => spec.filename,
         ModelRowSource::Extra(installed) => installed.filename.as_str(),
     };
-    let speech_override = model_download::is_override_of(filename, context.speech_override);
-    let summary_override = model_download::is_override_of(filename, context.summary_override);
+    let matches_override = |target: &Option<String>| target.as_deref() == Some(filename);
+    let speech_override = matches_override(&context.speech_override_file);
+    let summary_override = matches_override(&context.summary_override_file);
     // 関係する種別を**すべて**見る（同じファイルを 2 つの上書きが指していることもありうるので、
     // 先に一致した 1 つで打ち切らない）。
     let kind = match source {
@@ -2395,8 +2507,17 @@ fn row_facts(source: &ModelRowSource, context: &ModelsContext) -> RowFacts {
         },
         _ => false,
     };
+    // この行のファイルが上書き先 → カタログの内外を問わず InConfig（消しても戻せない）。
+    // そうでなくても種別が上書き中なら Overridden（選んでも取得しても使われない）。
+    let kind_overridden = match kind {
+        Some(model_download::ModelKind::Speech) => context.speech_overridden,
+        Some(model_download::ModelKind::Summary) => context.summary_overridden,
+        None => false,
+    };
     let usage = if speech_override || summary_override {
         RowUsage::InConfig
+    } else if kind_overridden {
+        RowUsage::Overridden
     } else if matches!(source, ModelRowSource::Extra(_)) {
         RowUsage::Unknown
     } else if selected {
@@ -2410,32 +2531,38 @@ fn row_facts(source: &ModelRowSource, context: &ModelsContext) -> RowFacts {
 /// 行の取得の状態。**記録済みの状態を優先**する（`status_of` と同じ流儀）: 取得が完了した直後は
 /// ディスク走査の結果が古いので、記録が `Downloaded` なら取得済みとして出す。
 fn model_status(has_file: bool, recorded: Option<&model_download::DownloadStatus>) -> ModelStatus {
-    match recorded {
-        Some(model_download::DownloadStatus::Downloading { .. }) => ModelStatus::Downloading,
-        Some(model_download::DownloadStatus::Downloaded) => ModelStatus::Installed,
+    match (recorded, has_file) {
+        (Some(model_download::DownloadStatus::Downloading { .. }), _) => ModelStatus::Downloading,
         // 失敗の記録は再試行までメモリに残る。ファイルが在るならそれは前回の成果物なので、
         // 「取得済み」を優先する（消せる状態として見せる）。
-        Some(model_download::DownloadStatus::Failed(_))
-        | Some(model_download::DownloadStatus::NotDownloaded)
-        | None => {
-            if has_file {
-                ModelStatus::Installed
-            } else if matches!(recorded, Some(model_download::DownloadStatus::Failed(_))) {
-                ModelStatus::Failed
-            } else {
-                ModelStatus::NotDownloaded
-            }
-        }
+        (_, true) => ModelStatus::Installed,
+        (Some(model_download::DownloadStatus::Failed(_)), false) => ModelStatus::Failed,
+        (
+            Some(
+                model_download::DownloadStatus::Downloaded
+                | model_download::DownloadStatus::NotDownloaded,
+            )
+            | None,
+            false,
+        ) => ModelStatus::NotDownloaded,
     }
 }
 
-/// 取得の状態の文言（**網羅 match**）。進捗は `Downloading` のときだけ意味を持つ。
-fn model_status_part(status: ModelStatus, percent: u64) -> String {
+/// 取得の状態の文言（**網羅 match**）。進捗は `Downloading`、理由は `Failed` のときだけ意味を持つ。
+///
+/// 失敗の理由まで出すのは、**取得の入口がこのウィンドウにもできた**ため（#138）。設定画面の
+/// 状態行は選択中のモデルしか出さないので、ここに出さないと非選択モデルの失敗理由がどこにも
+/// 出ない（`.app` では stderr も見えない）。理由は `insufficient_space_reason` などが作る文で、
+/// パスを含まない（`docs/rules/security.md`）。
+fn model_status_part(status: ModelStatus, percent: u64, reason: Option<&str>) -> String {
     match status {
         ModelStatus::NotDownloaded => "Not downloaded".to_owned(),
         ModelStatus::Downloading => format!("Downloading… {percent}%"),
         ModelStatus::Installed => "Downloaded".to_owned(),
-        ModelStatus::Failed => "Download failed — see the log".to_owned(),
+        ModelStatus::Failed => match reason {
+            Some(reason) => format!("Download failed: {reason}"),
+            None => "Download failed".to_owned(),
+        },
     }
 }
 
@@ -2445,17 +2572,23 @@ fn model_usage_part(usage: RowUsage) -> Option<&'static str> {
         RowUsage::Idle => None,
         RowUsage::Selected => Some("selected in Settings"),
         RowUsage::InConfig => Some("set in config.toml"),
+        RowUsage::Overridden => Some("not used — config.toml sets the model file"),
         RowUsage::Unknown => Some("not in the model catalog"),
     }
 }
 
 /// 削除できない理由の文言（ボタンが淡色になるだけでは理由が分からないので文字で出す）。
-const MODEL_BUSY_PART: &str = "in use right now — cannot be deleted";
+const MODEL_BUSY_PART: &str = "cannot be deleted while it is in use";
 
 /// 行の状態テキスト。**3 つの表を `—` でつなぐ**（取得の状態・使用状況・使用中）。
 /// 組み合わせを 1 つの表にすると状態 × 状況で行数が掛け算になるため、軸ごとに分ける。
-fn model_row_status_text(status: ModelStatus, percent: u64, facts: &RowFacts) -> String {
-    let mut parts = vec![model_status_part(status, percent)];
+fn model_row_status_text(
+    status: ModelStatus,
+    percent: u64,
+    reason: Option<&str>,
+    facts: &RowFacts,
+) -> String {
+    let mut parts = vec![model_status_part(status, percent, reason)];
     parts.extend(model_usage_part(facts.usage).map(ToOwned::to_owned));
     if facts.busy {
         parts.push(MODEL_BUSY_PART.to_owned());
@@ -2463,16 +2596,33 @@ fn model_row_status_text(status: ModelStatus, percent: u64, facts: &RowFacts) ->
     parts.join(" — ")
 }
 
-/// 「使う」を出せるか。カタログの行で、いま選ばれておらず、`config.toml` の上書きが無いとき
-/// （上書き中はカタログの選択が使われないので、押せても何も変わらない）。
+/// 「使う」を出せるか。カタログの行で、いま選ばれておらず、その種別が `config.toml` で上書き
+/// されていないとき（上書き中はカタログの選択が使われないので、押せても何も変わらない）。
 fn can_use_row(source: &ModelRowSource, facts: &RowFacts) -> bool {
     matches!(source, ModelRowSource::Catalog { .. }) && facts.usage == RowUsage::Idle
 }
 
-/// 削除できるか。ディスクに在って、その種別のジョブが無いとき（取得中は `ModelStatus` が
-/// `Installed` にならないので、ここでは見ない）。
-fn can_delete_row(status: ModelStatus, facts: &RowFacts) -> bool {
-    status == ModelStatus::Installed && !facts.busy
+/// 「取得する」を出せるか。ディスクに実体が無いカタログの行で、その種別が `config.toml` で
+/// 上書きされていないとき（上書き中に数 GB を落としても使われない）。
+///
+/// **状態から導けない**ので Rust 側で決めて渡す（上書きの有無は状態の軸に含まれない）。
+fn can_download_row(status: ModelStatus, source: &ModelRowSource, facts: &RowFacts) -> bool {
+    matches!(source, ModelRowSource::Catalog { .. })
+        && matches!(status, ModelStatus::NotDownloaded | ModelStatus::Failed)
+        && !matches!(facts.usage, RowUsage::Overridden | RowUsage::InConfig)
+}
+
+/// 削除できるか。**素材にファイルの実体がある**（＝消すものがある）かつその種別のジョブが無いとき。
+///
+/// `ModelStatus` ではなく素材を見るのは、状態は表示のための軸で「消せるか」の正ではないため
+/// （取得中は実体が一時ファイルなので `installed()` が `None` になり、ここで落ちる）。
+///
+/// **限界**: 押された時点の再確認（ワーカーのロック）と削除（`ModelDownloader` のロック）は別の
+/// ロックなので、その間に投入されたジョブは拾えない（畳むにはワーカーをまたぐロックが要る）。
+/// そうなってもカタログのモデルなら `ensure_model` が再取得するだけで、失うのは時間。
+/// `config.toml` の上書き先だった場合はそのジョブが失敗する（確認モーダルがその旨を出している）。
+fn can_delete_row(source: &ModelRowSource, facts: &RowFacts) -> bool {
+    source.installed().is_some() && !facts.busy
 }
 
 /// 確認モーダルの説明テキスト。解放される容量と、**ゴミ箱へは入らない**こと、そして
@@ -2483,7 +2633,7 @@ fn model_delete_detail(usage: RowUsage, size_bytes: u64) -> String {
         model_download::format_size(size_bytes)
     );
     match usage {
-        RowUsage::Idle | RowUsage::Selected => {
+        RowUsage::Idle | RowUsage::Selected | RowUsage::Overridden => {
             format!("{freed} It downloads again the next time it is needed.")
         }
         // 上書き中は `ensure_model` を通らないので、消すと設定を直すまでそのジョブが失敗する。
@@ -2495,13 +2645,15 @@ fn model_delete_detail(usage: RowUsage, size_bytes: u64) -> String {
     }
 }
 
-/// 1 つも取得していないときに一覧の中央へ出す文言（走査に失敗したときは別の文言を出すので、
-/// これは「本当に 1 つも無い」ときだけ）。カタログの行は必ず並ぶので、これが出るのは
-/// カタログが空のとき（現状は起こらないが、表示の穴を残さない）。
+/// 行が 1 つも無いときに一覧の中央へ出す文言。**カタログの行は必ず並ぶので実際には出ない**
+/// （表示の穴を残さないために置いてある）。走査の失敗は通知（`MODELS_UNREADABLE_NOTICE`）で
+/// 伝える——空表示に混ぜると「まだ何も無い」と嘘を言うことになる。
 const MODELS_EMPTY_TEXT: &str = "No models available";
 
-/// 走査そのものに失敗したときの空表示（「まだ 1 つも無い」と区別する）。
-const MODELS_UNREADABLE_TEXT: &str = "Could not list the models folder";
+/// 走査そのものに失敗したときの通知（カタログの行は必ず並ぶので、空表示では気づけない。
+/// 行のサイズ・状態がディスクの実体を反映しないことも伝える）。
+const MODELS_UNREADABLE_NOTICE: &str =
+    "Could not list the models folder — sizes and states may be out of date.";
 
 /// 押された時点で使用中だったときの通知（一覧の状態テキストと同じ事実を指すので、語を揃える）。
 const MODEL_IN_USE_NOTICE: &str = "This model is in use right now — it was not deleted.";
@@ -2511,7 +2663,8 @@ const MODEL_IN_USE_NOTICE: &str = "This model is in use right now — it was not
 const MODEL_DELETE_FAILED_NOTICE: &str = "Could not delete this model — see the log for details.";
 
 /// 選択を保存できなかったときの通知（設定の永続化に失敗した場合）。
-const MODEL_SELECT_FAILED_NOTICE: &str = "Could not change the model — see the log for details.";
+const MODEL_SELECT_FAILED_NOTICE: &str =
+    "Could not change the model — the settings could not be saved (see the log).";
 
 /// 削除の結果。bool 2 つで持つと `(busy, !failed)` のような**ありえない組み合わせ**を作れるので、
 /// 3 値の enum にする（`docs/review-perspectives/rust-anti-patterns.md`）。
@@ -2562,17 +2715,20 @@ fn models_total_text(sources: &[ModelRowSource]) -> String {
 fn model_rows(sources: &[ModelRowSource], context: &ModelsContext) -> Vec<ModelRow> {
     sources
         .iter()
-        .map(|source| {
-            let ModelRowSource::Heading(title) = source else {
-                return model_row(source, context);
-            };
-            ModelRow {
-                is_heading: true,
-                name: (*title).into(),
-                ..ModelRow::default()
-            }
+        .map(|source| match source {
+            ModelRowSource::Heading(title) => heading_row(title),
+            _ => model_row(source, context),
         })
         .collect()
+}
+
+/// 種別の区切り行（操作を持たない）。
+fn heading_row(title: &'static str) -> ModelRow {
+    ModelRow {
+        is_heading: true,
+        name: title.into(),
+        ..ModelRow::default()
+    }
 }
 
 /// 1 行を組む（見出し以外）。表示名・説明・サイズはカタログとディスクの実体から、状態と可否は
@@ -2587,12 +2743,14 @@ fn model_row(source: &ModelRowSource, context: &ModelsContext) -> ModelRow {
     };
     let status = model_status(installed.is_some(), recorded.as_ref());
     let percent = match recorded {
-        // total は Content-Length または既知サイズで常に正だが、防御的にゼロ除算を避ける。
-        // Content-Length が実サイズより小さい異常時も 100% を超えて表示しない。
         Some(model_download::DownloadStatus::Downloading { received, total }) => {
-            (received.saturating_mul(100) / total.max(1)).min(100)
+            download_percent(received, total)
         }
         _ => 0,
+    };
+    let failure_reason = match &recorded {
+        Some(model_download::DownloadStatus::Failed(reason)) => Some(reason.as_str()),
+        _ => None,
     };
     // サイズは、ディスクに在れば実ファイルの長さ（壊れた途中ファイルの実サイズを見せたい）、
     // 無ければカタログの値（取得前に大きさが分かるように）。
@@ -2605,6 +2763,7 @@ fn model_row(source: &ModelRowSource, context: &ModelsContext) -> ModelRow {
         ModelRowSource::Catalog { spec, .. } => (spec.display_name.to_owned(), spec.description),
         // カタログ外は表示名がファイル名になるので、2 行目は出さない（同じ文字列を 2 回並べない）。
         ModelRowSource::Extra(installed) => (installed.filename.clone(), ""),
+        // 見出しは `heading_row` が組むので、ここには来ない。
         ModelRowSource::Heading(title) => ((*title).to_owned(), ""),
     };
     ModelRow {
@@ -2612,33 +2771,36 @@ fn model_row(source: &ModelRowSource, context: &ModelsContext) -> ModelRow {
         name: name.into(),
         detail: detail.into(),
         size: model_download::format_size(size_bytes).into(),
-        status_text: model_row_status_text(status, percent, &facts).into(),
+        status_text: model_row_status_text(status, percent, failure_reason, &facts).into(),
         delete_detail: model_delete_detail(facts.usage, size_bytes).into(),
         status,
         can_use: can_use_row(source, &facts),
-        can_delete: can_delete_row(status, &facts),
+        can_download: can_download_row(status, source, &facts),
+        can_delete: can_delete_row(source, &facts),
     }
 }
 
-/// 取得が完了した行があるので、ディスクを走査し直すべきか（tick から呼ぶ）。
+/// 記録が「取得済み」になっているカタログ ID（素材の並び順）。
 ///
-/// tick は走査しないので、完了した行はサイズがカタログの値のまま・合計に載らないままになる。
-/// 「素材はディスクに無いのに記録は取得済み」を見つけたら 1 回だけ作り直して追いつかせる。
-fn models_need_rescan(
+/// tick はディスクを走査しないので、取得が完了しても行のサイズと合計は追いつかない。この集合が
+/// **前の tick から変わったとき**だけ 1 回走査し直す（`build_menu_event_handler` のラッチ）。
+/// 「記録は取得済みなのに実体が無い」を条件にすると、外部でファイルを消された・走査に失敗した
+/// といった**解消しない不一致**で毎 tick 走査が走り続ける。
+fn downloaded_ids(
     sources: &[ModelRowSource],
     downloader: &model_download::ModelDownloader,
-) -> bool {
-    sources.iter().any(|source| match source {
-        ModelRowSource::Catalog {
-            spec,
-            installed: None,
-            ..
-        } => matches!(
-            downloader.recorded_status(spec.id),
-            Some(model_download::DownloadStatus::Downloaded)
-        ),
-        _ => false,
-    })
+) -> Vec<&'static str> {
+    sources
+        .iter()
+        .filter_map(|source| match source {
+            ModelRowSource::Catalog { spec, .. } => matches!(
+                downloader.recorded_status(spec.id),
+                Some(model_download::DownloadStatus::Downloaded)
+            )
+            .then_some(spec.id),
+            _ => None,
+        })
+        .collect()
 }
 
 /// 使うモデルを選び直して設定へ永続化する（設定画面の ComboBox とモデル管理ウィンドウの
@@ -2658,7 +2820,12 @@ fn select_model(
         model_download::ModelKind::Summary => candidate.summary_model = spec.id.to_owned(),
     }
     if let Err(err) = candidate.save() {
-        eprintln!("Not changing the model because saving the settings failed: {err}");
+        // どの種別の話か分かるようにする（3 つの入口＝両方の ComboBox とモデル管理ウィンドウの
+        // 「Use」が同じ関数を通るので、種別が無いと調査で効かない）。
+        eprintln!(
+            "Not changing the {} model because saving the settings failed: {err}",
+            spec.kind
+        );
         return false;
     }
     // 取得の可否は保存する値で決める（移動する前に読む）。取得済み・DL 中は
@@ -2693,7 +2860,7 @@ fn apply_model_selection_to_settings(
     ui.set_summary_model_status(summary_model_status_text(config, downloader).into());
 }
 
-/// macOS で Dock アイコンを隠し、メニューバー常駐アプリとして振る舞わせる。/// macOS で Dock アイコンを隠し、メニューバー常駐アプリとして振る舞わせる。
+/// macOS で Dock アイコンを隠し、メニューバー常駐アプリとして振る舞わせる。
 ///
 /// activation policy を Accessory にすることで Dock とアプリスイッチャーに出なくなる。
 /// **イベントループ開始後に呼ぶこと**。winit は未バンドル起動時に起動処理
@@ -3121,8 +3288,6 @@ mod tests {
             filename: filename.to_owned(),
             size_bytes: size,
             kind: None,
-            kind_label: None,
-            display_name: None,
             catalog_id: None,
         }
     }
@@ -3137,8 +3302,6 @@ mod tests {
             filename: spec.filename.to_owned(),
             size_bytes: size,
             kind: Some(kind),
-            kind_label: Some(spec.kind),
-            display_name: Some(spec.display_name),
             catalog_id: Some(spec.id),
         }
     }
@@ -3223,16 +3386,18 @@ mod tests {
             summary_busy,
             selected_speech: crate::whisper_model::DEFAULT_MODEL_ID,
             selected_summary: crate::summary_model::DEFAULT_MODEL_ID,
-            speech_override: None,
-            summary_override: None,
+            speech_override_file: None,
+            summary_override_file: None,
+            speech_overridden: false,
+            summary_overridden: false,
             downloader,
         }
     }
 
     /// 行の状態は**取得の軸**（`ModelStatus`）と**使用の軸**（`RowUsage`）に分かれる。
-    /// 記録済みの状態を優先するので、取得直後（ディスク走査が古い）でも「取得済み」になる。
+    /// 「取得済み」はディスクに実体があるときだけで、記録は取得中・失敗の判別に使う。
     #[test]
-    fn model_status_prefers_the_recorded_state() {
+    fn model_status_says_installed_only_with_a_file() {
         use crate::model_download::DownloadStatus;
         assert_eq!(super::model_status(false, None), ModelStatus::NotDownloaded);
         assert_eq!(super::model_status(true, None), ModelStatus::Installed);
@@ -3246,10 +3411,11 @@ mod tests {
             ),
             ModelStatus::Downloading
         );
-        // 走査が古くても、記録が取得済みなら取得済みとして出す（tick はディスクを見ない）。
+        // 記録が取得済みでも、ディスクに実体が無ければ「取得済み」とは言わない（言うと
+        // 削除できる行として出てしまい、確認モーダルが無い容量の解放を約束する）。
         assert_eq!(
             super::model_status(false, Some(&DownloadStatus::Downloaded)),
-            ModelStatus::Installed
+            ModelStatus::NotDownloaded
         );
         assert_eq!(
             super::model_status(false, Some(&DownloadStatus::Failed("boom".to_owned()))),
@@ -3333,32 +3499,55 @@ mod tests {
             usage: super::RowUsage::Idle,
             busy: true,
         };
-        assert!(super::can_delete_row(ModelStatus::Installed, &idle));
-        assert!(!super::can_delete_row(ModelStatus::Installed, &busy));
-        // ディスクに無い状態では消すものが無い。
-        assert!(!super::can_delete_row(ModelStatus::NotDownloaded, &idle));
-        assert!(!super::can_delete_row(ModelStatus::Downloading, &idle));
-        assert!(!super::can_delete_row(ModelStatus::Failed, &idle));
+        // 素材に実体があるかで決まる（状態ではない: 記録が取得済みでもファイルが無ければ
+        // 消すものが無い）。
+        let with_file = super::ModelRowSource::Catalog {
+            kind: crate::model_download::ModelKind::Speech,
+            spec: speech_spec(),
+            installed: Some(installed_spec(
+                crate::model_download::ModelKind::Speech,
+                speech_spec(),
+                10,
+            )),
+        };
+        let without_file = super::ModelRowSource::Catalog {
+            kind: crate::model_download::ModelKind::Speech,
+            spec: speech_spec(),
+            installed: None,
+        };
+        assert!(super::can_delete_row(&with_file, &idle));
+        assert!(!super::can_delete_row(&with_file, &busy));
+        assert!(!super::can_delete_row(&without_file, &idle));
+        assert!(!super::can_delete_row(
+            &super::ModelRowSource::Heading("Transcription"),
+            &idle
+        ));
     }
 
     /// 取得の状態の文言（全バリアント）。進捗は `Downloading` のときだけ出る。
     #[test]
     fn model_status_part_covers_all_states() {
         assert_eq!(
-            super::model_status_part(ModelStatus::NotDownloaded, 0),
+            super::model_status_part(ModelStatus::NotDownloaded, 0, None),
             "Not downloaded"
         );
         assert_eq!(
-            super::model_status_part(ModelStatus::Downloading, 42),
+            super::model_status_part(ModelStatus::Downloading, 42, None),
             "Downloading… 42%"
         );
         assert_eq!(
-            super::model_status_part(ModelStatus::Installed, 0),
+            super::model_status_part(ModelStatus::Installed, 0, None),
             "Downloaded"
         );
+        // 取得の入口がこのウィンドウにもできたので、**失敗の理由まで行に出す**（設定画面の
+        // 状態行は選択中のモデルしか出さない）。
         assert_eq!(
-            super::model_status_part(ModelStatus::Failed, 0),
-            "Download failed — see the log"
+            super::model_status_part(ModelStatus::Failed, 0, Some("not enough free disk space")),
+            "Download failed: not enough free disk space"
+        );
+        assert_eq!(
+            super::model_status_part(ModelStatus::Failed, 0, None),
+            "Download failed"
         );
     }
 
@@ -3375,6 +3564,10 @@ mod tests {
             Some("set in config.toml")
         );
         assert_eq!(
+            super::model_usage_part(super::RowUsage::Overridden),
+            Some("not used — config.toml sets the model file")
+        );
+        assert_eq!(
             super::model_usage_part(super::RowUsage::Unknown),
             Some("not in the model catalog")
         );
@@ -3388,7 +3581,7 @@ mod tests {
             busy: false,
         };
         assert_eq!(
-            super::model_row_status_text(ModelStatus::NotDownloaded, 0, &idle),
+            super::model_row_status_text(ModelStatus::NotDownloaded, 0, None, &idle),
             "Not downloaded"
         );
         let selected_busy = super::RowFacts {
@@ -3396,15 +3589,15 @@ mod tests {
             busy: true,
         };
         assert_eq!(
-            super::model_row_status_text(ModelStatus::Installed, 0, &selected_busy),
-            "Downloaded — selected in Settings — in use right now — cannot be deleted"
+            super::model_row_status_text(ModelStatus::Installed, 0, None, &selected_busy),
+            "Downloaded — selected in Settings — cannot be deleted while it is in use"
         );
         let in_config = super::RowFacts {
             usage: super::RowUsage::InConfig,
             busy: false,
         };
         assert_eq!(
-            super::model_row_status_text(ModelStatus::Downloading, 7, &in_config),
+            super::model_row_status_text(ModelStatus::Downloading, 7, None, &in_config),
             "Downloading… 7% — set in config.toml"
         );
     }
@@ -3527,6 +3720,139 @@ mod tests {
         assert_eq!(super::models_total_text(&two), "2 models — 3.0 GB");
     }
 
+    /// tick の作り直しは**モーダルと通知に触らない**（触ると確認モーダルが 100ms で閉じ、
+    /// 削除が完走できず、失敗の理由も読めない）。操作の直後だけ畳む。
+    #[test]
+    fn only_an_operation_resets_the_modal_and_the_notice() {
+        let after = super::ModelsRefresh::AfterOperation(Some("boom"));
+        assert!(after.resets_modal());
+        assert_eq!(after.notice(), Some(Some("boom")));
+        let cleared = super::ModelsRefresh::AfterOperation(None);
+        assert!(cleared.resets_modal());
+        assert_eq!(
+            cleared.notice(),
+            Some(None),
+            "an operation clears the notice"
+        );
+
+        let poll = super::ModelsRefresh::Poll;
+        assert!(!poll.resets_modal(), "the tick must not close the modal");
+        assert_eq!(poll.notice(), None, "the tick must not touch the notice");
+    }
+
+    /// 走査し直す契機は「**記録が取得済みになった ID の集合が変わったとき**」。
+    /// 「記録は取得済みなのに実体が無い」を条件にすると、解消しない不一致で走査が止まらない。
+    #[test]
+    fn downloaded_ids_track_the_recorded_completions() {
+        let downloader = crate::model_download::ModelDownloader::new();
+        let sources = super::model_row_sources(vec![extra_file("left-over.bin", 10)]);
+        assert!(
+            super::downloaded_ids(&sources, &downloader).is_empty(),
+            "nothing is recorded as downloaded yet"
+        );
+
+        // 取得中はまだ数えない（完了で初めて走査し直す）。
+        downloader.set_status_for_test(
+            speech_spec(),
+            crate::model_download::DownloadStatus::Downloading {
+                received: 1,
+                total: 2,
+            },
+        );
+        assert!(super::downloaded_ids(&sources, &downloader).is_empty());
+
+        downloader.set_status_for_test(
+            speech_spec(),
+            crate::model_download::DownloadStatus::Downloaded,
+        );
+        assert_eq!(
+            super::downloaded_ids(&sources, &downloader),
+            vec![speech_spec().id]
+        );
+        // カタログ外のファイルは取得の記録を持たないので数に入らない。
+        assert!(
+            !super::downloaded_ids(&sources, &downloader).contains(&"left-over.bin"),
+            "an unknown file has no download record"
+        );
+    }
+
+    /// `config.toml` がその種別のモデルパスを上書きしている間は、カタログの選択が使われないので
+    /// 「使う」も「取得する」も出さない（数 GB 落としても使われない）。
+    #[test]
+    fn an_overridden_kind_offers_neither_use_nor_download() {
+        let downloader = crate::model_download::ModelDownloader::new();
+        let mut context = context(&downloader, false, false);
+        context.speech_overridden = true;
+        let source = super::ModelRowSource::Catalog {
+            kind: crate::model_download::ModelKind::Speech,
+            spec: speech_spec(),
+            installed: None,
+        };
+
+        let facts = super::row_facts(&source, &context);
+        assert_eq!(facts.usage, super::RowUsage::Overridden);
+        assert!(!super::can_use_row(&source, &facts));
+        assert!(!super::can_download_row(
+            ModelStatus::NotDownloaded,
+            &source,
+            &facts
+        ));
+        // 上書きされていない種別は今までどおり選べる・落とせる。
+        let summary = super::ModelRowSource::Catalog {
+            kind: crate::model_download::ModelKind::Summary,
+            spec: summary_spec(),
+            installed: None,
+        };
+        let summary_facts = super::row_facts(&summary, &context);
+        assert_eq!(summary_facts.usage, super::RowUsage::Selected);
+        assert!(super::can_download_row(
+            ModelStatus::NotDownloaded,
+            &summary,
+            &summary_facts
+        ));
+    }
+
+    /// 「取得する」を出すのは、ディスクに実体が無いカタログの行だけ。
+    #[test]
+    fn can_download_row_only_offers_catalog_rows_without_a_file() {
+        let facts = super::RowFacts {
+            usage: super::RowUsage::Idle,
+            busy: false,
+        };
+        let source = super::ModelRowSource::Catalog {
+            kind: crate::model_download::ModelKind::Speech,
+            spec: speech_spec(),
+            installed: None,
+        };
+        assert!(super::can_download_row(
+            ModelStatus::NotDownloaded,
+            &source,
+            &facts
+        ));
+        assert!(super::can_download_row(
+            ModelStatus::Failed,
+            &source,
+            &facts
+        ));
+        assert!(!super::can_download_row(
+            ModelStatus::Installed,
+            &source,
+            &facts
+        ));
+        assert!(!super::can_download_row(
+            ModelStatus::Downloading,
+            &source,
+            &facts
+        ));
+        // カタログ外・見出しは取得できない（URL が無い）。
+        let extra = super::ModelRowSource::Extra(extra_file("left-over.bin", 10));
+        assert!(!super::can_download_row(
+            ModelStatus::NotDownloaded,
+            &extra,
+            &facts
+        ));
+    }
+
     /// 見出しの文言（全種別）。種別を足したら網羅 match が更新を強制する。
     #[test]
     fn kind_heading_covers_all_kinds() {
@@ -3540,7 +3866,7 @@ mod tests {
         );
     }
 
-    /// 要約 LLM の状態行は取得状況を示す（どのモデルかは ComboBox が示す）。    /// 要約 LLM の状態行は取得状況を示す（どのモデルかは ComboBox が示す）。取得の契機が設定で
+    /// 要約 LLM の状態行は取得状況を示す（どのモデルかは ComboBox が示す）。取得の契機が設定で
     /// 変わるので、選んでも取得が始まらない設定では「自動で落ちる」と読める文言を出さない。
     #[test]
     fn summary_model_status_text_shows_when_the_download_happens() {

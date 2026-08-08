@@ -8,7 +8,7 @@
 //! ```sh
 //! cargo run --example models_view                        # 既定（種別 2 つ＋カタログ外）
 //! cargo run --example models_view -- empty               # 一覧が空（表示の穴を見る）
-//! cargo run --example models_view -- unreadable          # models/ を走査できなかった状態
+//! cargo run --example models_view -- unreadable          # models/ を走査できなかった通知
 //! cargo run --example models_view -- confirm             # 削除の確認モーダルを開いた状態
 //! cargo run --example models_view -- notice              # 失敗の通知を出した状態
 //! cargo run --example models_view -- <上記> snapshot out.png  # PNG に書き出して確認
@@ -36,17 +36,43 @@ fn heading(title: &str) -> ModelRow {
     }
 }
 
+/// 確認モーダルの後半の文言（`src/main.rs` の `model_delete_detail` の写像。使用状況で変わるので、
+/// `can_use` から推測せずに行ごとに渡す）。
+#[derive(Clone, Copy)]
+enum Returns {
+    /// カタログの行（消しても次に必要になったとき取得される）。
+    Redownloads,
+    /// `config.toml` が指している（消したら設定を直すまで戻らない）。
+    InConfig,
+    /// カタログ外（アプリでは戻せない）。
+    Never,
+}
+
 /// 1 行。状態テキストは Rust 側（`src/main.rs` の `model_row_status_text`）の複製を置く
 /// （長さが見え方に効くのが確認の主目的）。
-fn row(
-    name: &str,
-    detail: &str,
-    size: &str,
-    status_text: &str,
+/// 行 1 つの指定（引数が増えすぎないようまとめる）。
+struct Sample<'a> {
+    name: &'a str,
+    detail: &'a str,
+    size: &'a str,
+    status_text: &'a str,
     status: ModelStatus,
+    returns: Returns,
     can_use: bool,
     can_delete: bool,
-) -> ModelRow {
+}
+
+fn row(sample: Sample) -> ModelRow {
+    let Sample {
+        name,
+        detail,
+        size,
+        status_text,
+        status,
+        returns,
+        can_use,
+        can_delete,
+    } = sample;
     ModelRow {
         is_heading: false,
         name: name.into(),
@@ -55,17 +81,18 @@ fn row(
         status_text: status_text.into(),
         delete_detail: format!(
             "This frees {size}. {DELETE_DETAIL_HEAD} {}",
-            // 後半は使用状況で変わる（`model_delete_detail`）。config 上書き先とカタログ外は
-            // 再取得できないので、いちばん長い文言になる。
-            if can_use {
-                "It downloads again the next time it is needed."
-            } else {
-                "config.toml points at this file, so the app cannot download it again."
+            match returns {
+                Returns::Redownloads => "It downloads again the next time it is needed.",
+                Returns::InConfig =>
+                    "config.toml points at this file, so the app cannot download it again.",
+                Returns::Never => "The app cannot download this file again.",
             }
         )
         .into(),
         status,
         can_use,
+        // 取得できるのは、ディスクに実体が無いカタログの行だけ（`can_download_row`）。
+        can_download: matches!(status, ModelStatus::NotDownloaded | ModelStatus::Failed),
         can_delete,
     }
 }
@@ -74,74 +101,82 @@ fn row(
 fn sample_rows() -> Vec<ModelRow> {
     vec![
         heading("Transcription — Whisper"),
-        row(
-            "Small",
-            "balanced speed and accuracy",
-            "465 MB",
-            "Downloaded — selected in Settings",
-            ModelStatus::Installed,
-            false,
-            true,
-        ),
-        row(
-            "Large v3 Turbo",
-            "the most accurate, and the slowest",
-            "1.5 GB",
-            "Downloading… 42%",
-            ModelStatus::Downloading,
-            true,
-            false,
-        ),
-        row(
-            "Tiny",
-            "the fastest, least accurate",
-            "74 MB",
-            "Not downloaded",
-            ModelStatus::NotDownloaded,
-            true,
-            false,
-        ),
+        row(Sample {
+            name: "Small",
+            detail: "balanced speed and accuracy",
+            size: "465 MB",
+            status_text: "Downloaded — selected in Settings",
+            status: ModelStatus::Installed,
+            returns: Returns::Redownloads,
+            can_use: false,
+            can_delete: true,
+        }),
+        row(Sample {
+            name: "Large v3 Turbo",
+            detail: "the most accurate, and the slowest",
+            size: "1.5 GB",
+            status_text: "Downloading… 42%",
+            status: ModelStatus::Downloading,
+            returns: Returns::Redownloads,
+            can_use: true,
+            can_delete: false,
+        }),
+        row(Sample {
+            name: "Tiny",
+            detail: "the fastest, least accurate",
+            size: "74 MB",
+            status_text: "Not downloaded",
+            status: ModelStatus::NotDownloaded,
+            returns: Returns::Redownloads,
+            can_use: true,
+            can_delete: false,
+        }),
         heading("Meeting minutes — LLM"),
-        row(
-            "Qwen2.5 7B Instruct",
-            "54 s and 8.2 GB of memory for a 4-min meeting, more faithful",
-            "4.4 GB",
-            "Downloaded — selected in Settings — in use right now — cannot be deleted",
-            ModelStatus::Installed,
-            false,
-            false,
-        ),
-        row(
-            "Qwen2.5 3B Instruct",
-            "25 s and 3.7 GB of memory for a 4-min meeting, but can invent details",
-            "2.0 GB",
-            "Download failed — see the log",
-            ModelStatus::Failed,
-            true,
-            false,
-        ),
+        row(Sample {
+            name: "Qwen2.5 7B Instruct",
+            detail: "54 s and 8.2 GB of memory for a 4-min meeting, more faithful",
+            size: "4.4 GB",
+            status_text: "Downloaded — selected in Settings — cannot be deleted while it is in use",
+            status: ModelStatus::Installed,
+            returns: Returns::Redownloads,
+            can_use: false,
+            can_delete: false,
+        }),
+        row(Sample {
+            // 失敗の理由まで行に出るので、いちばん長い状態テキストになる（折り返しの確認用）。
+            name: "Qwen2.5 3B Instruct",
+            detail: "25 s and 3.7 GB of memory for a 4-min meeting, but can invent details",
+            size: "2.0 GB",
+            status_text: "Download failed: not enough free disk space for Qwen2.5 3B Instruct — free up about 1.2 GB and try again",
+            status: ModelStatus::Failed,
+            returns: Returns::Redownloads,
+            can_use: true,
+            can_delete: false,
+        }),
         heading("Other files in the models folder"),
-        row(
+        row(Sample {
             // カタログ外はファイル名がそのまま表示名になるので、長いものを入れて縮退を見る
             // （2 行目は空＝行が出ない）。
-            "ggml-distil-large-v3-some-very-long-experimental-name.bin",
-            "",
-            "2.9 GB",
-            "Downloaded — not in the model catalog",
-            ModelStatus::Installed,
-            false,
-            true,
-        ),
-        row(
+            name: "ggml-distil-large-v3-some-very-long-experimental-name.bin",
+            detail: "",
+            size: "2.9 GB",
+            status_text: "Downloaded — not in the model catalog",
+            status: ModelStatus::Installed,
+            returns: Returns::Never,
+            can_use: false,
+            can_delete: true,
+        }),
+        row(Sample {
             // config 上書き先。確認モーダルの説明がいちばん長くなる行。
-            "my-own-model.gguf",
-            "",
-            "3.1 GB",
-            "Downloaded — set in config.toml",
-            ModelStatus::Installed,
-            false,
-            true,
-        ),
+            name: "my-own-model.gguf",
+            detail: "",
+            size: "3.1 GB",
+            status_text: "Downloaded — set in config.toml",
+            status: ModelStatus::Installed,
+            returns: Returns::InConfig,
+            can_use: false,
+            can_delete: true,
+        }),
     ]
 }
 
@@ -152,19 +187,18 @@ fn main() {
     // 一覧の中身を引数で選べるようにする（空・走査失敗・モーダル・通知の確認用）。
     let variant = std::env::args().nth(1).unwrap_or_default();
     let rows = match variant.as_str() {
-        "empty" | "unreadable" => Vec::new(),
+        "empty" => Vec::new(),
         _ => sample_rows(),
     };
-    // 空表示・合計・通知は `src/main.rs` の `MODELS_EMPTY_TEXT` / `MODELS_UNREADABLE_TEXT` /
-    // `models_total_text` / `MODEL_IN_USE_NOTICE` の複製。
-    win.set_empty_text(
-        if variant == "unreadable" {
-            "Could not list the models folder"
-        } else {
-            "No models available"
-        }
-        .into(),
-    );
+    // 空表示・合計・通知は `src/main.rs` の `MODELS_EMPTY_TEXT` / `MODELS_UNREADABLE_NOTICE` /
+    // `models_total_text` / `MODEL_IN_USE_NOTICE` の複製。走査の失敗は**通知**で出る
+    // （カタログの行は必ず並ぶので、空表示では気づけない）。
+    win.set_empty_text("No models available".into());
+    if variant == "unreadable" {
+        win.set_notice(
+            "Could not list the models folder — sizes and states may be out of date.".into(),
+        );
+    }
     win.set_total_text(if rows.is_empty() {
         "".into()
     } else {

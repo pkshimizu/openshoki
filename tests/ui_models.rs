@@ -31,6 +31,7 @@ const WINDOW_HEIGHT: f32 = 520.0;
 struct Row {
     status: ModelStatus,
     can_use: bool,
+    can_download: bool,
     can_delete: bool,
 }
 
@@ -40,14 +41,17 @@ impl Row {
         Self {
             status: ModelStatus::Installed,
             can_use: true,
+            can_download: false,
             can_delete: true,
         }
     }
 
+    /// 状態から素直に導ける可否を持つ行（`main` 側の純粋関数と同じ写像）。
     fn with_status(status: ModelStatus) -> Self {
         Self {
             status,
             can_use: true,
+            can_download: matches!(status, ModelStatus::NotDownloaded | ModelStatus::Failed),
             can_delete: status == ModelStatus::Installed,
         }
     }
@@ -85,6 +89,7 @@ fn set_rows(window: &ModelsWindow, rows: &[Row]) {
             delete_detail: "detail".into(),
             status: row.status,
             can_use: row.can_use,
+            can_download: row.can_download,
             can_delete: row.can_delete,
         })
         .collect();
@@ -109,8 +114,9 @@ fn confirm_button(window: &ModelsWindow) -> ElementHandle {
         .expect("the confirmation should have a Delete Model button")
 }
 
-/// 状態ごとに、行に出るはずのボタン（**網羅 match**。Slint 側は `==`/`||` で出し分けているので、
-/// 状態を足したときにここがコンパイルエラーになって更新漏れに気づけるようにする）。
+/// 状態ごとに、行に出るはずのボタン（**網羅 match**。Slint 側は `can-download` と
+/// `status == installed` で出し分けているので、状態を足したときにここがコンパイルエラーになって
+/// 更新漏れに気づけるようにする）。`Row::with_status` が渡す可否と対で読む。
 fn expected_buttons(status: ModelStatus) -> (bool /* Download */, bool /* Delete */) {
     match status {
         // ディスクに無い＝取得できる／消すものが無い。
@@ -245,6 +251,7 @@ fn a_busy_row_shows_delete_but_does_not_open_the_confirmation() {
     let window = open_window_with(&[Row {
         status: ModelStatus::Installed,
         can_use: false,
+        can_download: false,
         can_delete: false,
     }]);
     let calls: Rc<RefCell<Vec<i32>>> = Rc::new(RefCell::new(Vec::new()));
@@ -277,6 +284,7 @@ fn use_fires_for_the_row_that_can_be_selected() {
         Row {
             status: ModelStatus::Installed,
             can_use: false,
+            can_download: false,
             can_delete: true,
         },
         Row::installed(),

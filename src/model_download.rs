@@ -46,8 +46,8 @@ use sha2::{Digest, Sha256};
 /// ここに置くのは種別をまたいで共通のものだけにする。
 #[derive(Debug)]
 pub struct ModelSpec {
-    /// ログとモデル一覧の行に出す種別の**表示名**（例: `Whisper speech`）。ログでどちらの
-    /// ダウンロードかを見分けるのと、一覧の 2 行目に出すのに使う。
+    /// ログに出す種別の**表示名**（例: `Whisper speech`）。どちらのダウンロードかをログで
+    /// 見分けるために使う（一覧の 2 行目はカタログの `description` を出すので、ここは出さない）。
     ///
     /// **破壊的操作の判定キーにしない**（文言を調整した瞬間に判定が変わる）。種別の識別は
     /// `ModelKind`（登録簿 `REGISTERED_CATALOGS` が持つ）で行う。
@@ -194,6 +194,12 @@ impl ModelDownloader {
     /// 確認に落ちた取得は**待たせずに失敗させる**（この doc の 2 点目のとおり、待たせる害を
     /// 避けるため）。文字起こし中なら当該セッションのジョブが失敗し、次のジョブ・設定画面での
     /// 再選択で再試行される（自動リトライは無い）。
+    ///
+    /// **入口は 3 つ**（設定画面の選択・ワーカーの `ensure_model`・モデル管理ウィンドウの
+    /// 「Download」。#138 で 3 つ目が増えた）。管理ウィンドウからはカタログ全件を個別に始められる
+    /// ので、続けて押せば同時に何本でも走る——上限を持たない判断は変えていないが、まとめて始めると
+    /// **空き容量の事前確認で全部が落ちる**ことがある（各スレッドが他の在庫の残量を必要量へ
+    /// 加算するため）。落ちた取得は状態と行の文言に理由が出るので、順に始め直せる。
     ///
     /// 同種別で別モデルを選び直したときに先の取得を打ち切る仕組みは別件（#124）。
     pub fn request_download(&self, spec: &'static ModelSpec) {
@@ -534,10 +540,10 @@ pub(crate) const REGISTERED_CATALOGS: &[(ModelKind, &[ModelSpec], &str)] = &[
 
 /// `models/` に置かれているモデルファイル 1 件（モデル一覧ウィンドウの 1 行。#117）。
 ///
-/// **一覧の正はディスク**で、カタログは表示名・種別の解決にだけ使う（カタログ全件を並べると
-/// 未取得の行がノイズになる。一覧の目的は「何が容量を食っているか」を見て消すこと）。
-/// カタログを差し替えた後の旧ファイルのように、**カタログに無いファイルも一覧に出す**
-/// （消せないと掃除できない）。その場合は種別・表示名・ID が `None` になる。
+/// 一覧の骨格はカタログの登録簿（`REGISTERED_CATALOGS`）で、**ディスクの走査はその行に実体と
+/// 実サイズを与える**役目（#138。#117 では走査結果そのものが一覧だった）。カタログを差し替えた
+/// 後の旧ファイルのように、**カタログに無いファイルも列挙する**（消せないと掃除できない）。
+/// その場合は種別・表示名・ID が `None` になる。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledModel {
     /// `models/` 直下のファイル名。削除の対象を指すキー（`ModelDownloader::delete`）。
@@ -547,11 +553,8 @@ pub struct InstalledModel {
     pub size_bytes: u64,
     /// カタログが引けたときの**種別**（削除ガードの判定キー。`ModelKind`）。カタログ外は `None`。
     pub kind: Option<ModelKind>,
-    /// カタログが引けたときの種別の**表示名**（`ModelSpec::kind`）。判定には使わない。
-    pub kind_label: Option<&'static str>,
-    /// カタログが引けたときの表示名。カタログ外は `None`（表示はファイル名で代替する）。
-    pub display_name: Option<&'static str>,
     /// カタログが引けたときのモデル ID。状態マップのキーなので、削除時のエントリ掃除に使う。
+    /// 表示名・説明はカタログ（`ModelSpec`）から引くので、ここには持たない。
     pub catalog_id: Option<&'static str>,
 }
 
@@ -564,10 +567,10 @@ pub struct InstalledModel {
 /// 走査そのものに失敗したら `Err`（呼び出し側が「1 つも無い」と区別して表示するため。空一覧に
 /// 畳むと、権限エラーで読めないだけのときに「まだ何も無い」と嘘を言う）。
 ///
-/// **取得中のモデルは並ばない**: 受信中の中身は一時ファイル（`*.part.<pid>`）で、まだモデル
-/// ではないため（取得の進捗は設定画面の状態行が出す）。そのぶん合計使用量は受信中のバイトを
-/// 含まない。完了して rename された時点で一覧に現れる。取り残された一時ファイルの回収は
-/// `sweep_orphaned_part_files` が持つので、ここでは扱わない。
+/// **取得中のモデルはここには出ない**: 受信中の中身は一時ファイル（`*.part.<pid>`）で、まだ
+/// モデルではないため。そのぶん合計使用量は受信中のバイトを含まない（取得中であること自体は
+/// 状態マップから分かるので、モデル管理 UI は行の状態として進捗を出す）。取り残された一時
+/// ファイルの回収は `sweep_orphaned_part_files` が持つので、ここでは扱わない。
 pub fn installed_models() -> std::io::Result<Vec<InstalledModel>> {
     let Some(dir) = models_dir() else {
         return Ok(Vec::new());
@@ -646,8 +649,6 @@ fn installed_models_in(
             filename: filename.to_owned(),
             size_bytes: metadata.len(),
             kind: found.map(|(kind, _)| kind),
-            kind_label: found.map(|(_, spec)| spec.kind),
-            display_name: found.map(|(_, spec)| spec.display_name),
             catalog_id: found.map(|(_, spec)| spec.id),
         });
     }
@@ -676,6 +677,17 @@ pub fn is_override_of(filename: &str, override_path: Option<&Path>) -> bool {
         return false;
     };
     is_override_of_in(&dir, filename, override_path)
+}
+
+/// 設定のモデルパス上書きが `models/` 直下を指しているなら、そのファイル名。
+///
+/// 行ごとに `is_override_of` を呼ぶと、上書きが `models/` の外を指す通常のケースでは毎回
+/// `canonicalize` が走る（一覧は 10Hz で組み直す）。**種別ごとに 1 回だけ**解決して、行の判定は
+/// ファイル名の比較にする（`main::ModelsContext`）。
+pub fn override_filename(override_path: Option<&Path>) -> Option<String> {
+    let path = override_path?;
+    let name = path.file_name()?.to_str()?;
+    is_override_of(name, Some(path)).then(|| name.to_owned())
 }
 
 /// `is_override_of` の本体（基点ディレクトリを引数で受け、テストから呼べるようにする）。
@@ -1058,13 +1070,9 @@ mod tests {
         );
         assert_eq!(models[0].size_bytes, 30, "the size is the real file length");
         assert_eq!(models[0].kind, Some(ModelKind::Speech));
-        assert_eq!(models[0].kind_label, Some(FAKE_SPEECH_MODEL.kind));
-        assert_eq!(models[0].display_name, Some(FAKE_SPEECH_MODEL.display_name));
         assert_eq!(models[0].catalog_id, Some(FAKE_SPEECH_MODEL.id));
         // カタログ外はファイル名とサイズだけが分かる。
         assert_eq!(models[1].kind, None);
-        assert_eq!(models[1].kind_label, None);
-        assert_eq!(models[1].display_name, None);
         assert_eq!(models[1].catalog_id, None);
         // 2 つ目のカタログからも引ける（種別非依存。種別も登録簿の値が入る）。
         assert_eq!(models[2].catalog_id, Some(FAKE_LLM_MODEL.id));
@@ -1181,8 +1189,6 @@ mod tests {
             filename: "victim.bin".to_owned(),
             size_bytes: 1,
             kind: None,
-            kind_label: None,
-            display_name: None,
             catalog_id: None,
         };
         ModelDownloader::new()
@@ -1204,8 +1210,6 @@ mod tests {
             filename: name.to_owned(),
             size_bytes: 1,
             kind: None,
-            kind_label: None,
-            display_name: None,
             catalog_id: None,
         };
 
@@ -1238,8 +1242,6 @@ mod tests {
             filename: "custom.gguf".to_owned(),
             size_bytes: 1,
             kind: None,
-            kind_label: None,
-            display_name: None,
             catalog_id: None,
         };
         let installed = dir.join(&model.filename);
@@ -1263,8 +1265,6 @@ mod tests {
             filename: "not-created.gguf".to_owned(),
             size_bytes: 1,
             kind: None,
-            kind_label: None,
-            display_name: None,
             catalog_id: None,
         };
         assert!(is_override_of_in(
@@ -1359,8 +1359,6 @@ mod tests {
                 filename,
                 size_bytes: 1,
                 kind: None,
-                kind_label: None,
-                display_name: None,
                 catalog_id: None,
             };
             downloader
