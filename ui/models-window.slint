@@ -39,8 +39,9 @@ export struct ModelRow {
     // このモデルを「使う」設定にできるか。**status からは導けない**: いま選ばれている行・
     // カタログ外のファイル・`config.toml` で上書き中はできない（理由は状態の文言に出る）。
     can-use: bool,
-    // 取得を始められるか。**status からは導けない**: `config.toml` がその種別のモデルパスを
-    // 上書きしている間は、落としても使われないので出さない（`main::can_download_row`）。
+    // 取得を始められるか。**status からは導けない**: `config.toml` の上書き先が**別のファイル**
+    // なら、落としても使われないので出さない（上書きがこの行のファイルを指しているなら、落とす
+    // ことが動かす唯一の手段なので出す。`main::can_download_row`）。
     can-download: bool,
     // 削除できるか。**status からは導けない**: その種別のジョブがある間は消させない
     // （`main::can_delete_row`）。
@@ -70,7 +71,8 @@ export component ModelsWindow inherits Window {
     // 実際には出ない。走査の失敗は下の `notice` で伝える）。
     in property <string> empty-text;
     // 直前の操作が失敗したときだけ出す 1 行（削除できなかった等）。空なら出さない。
-    // **ユーザー操作の直後だけ**差し替わる（tick の作り直しでは触らない。`main::ModelsRefresh`）。
+    // **ユーザー操作の直後**に差し替わる（tick の作り直しでは触らない。ただし models/ の走査に
+    // 失敗したときは tick 由来でも出す。`main::ModelsRefresh` / `main::refresh_cause`）。
     in property <string> notice;
     // 削除の確認モーダルの表示状態。Delete 押下で開き、Cancel / 確定で閉じる（Slint 内で完結。
     // Recordings ウィンドウと同じ作り）。
@@ -207,8 +209,8 @@ export component ModelsWindow inherits Window {
                                     }
                                 }
 
-                                // 未取得・失敗の行で、その種別が config.toml で上書きされて
-                                // いないときだけ取得できる（`can-download`）。
+                                // 取得できる行だけ（未取得・失敗で、上書き先が別のファイルで
+                                // ないとき。判断は `can-download`）。
                                 if model.can-download: Button {
                                     text: "Download";
                                     clicked => {

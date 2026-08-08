@@ -38,12 +38,14 @@ fn heading(title: &str) -> ModelRow {
 
 /// 確認モーダルの後半の文言（`src/main.rs` の `model_delete_detail` の写像。使用状況で変わるので、
 /// `can_use` から推測せずに行ごとに渡す）。
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Returns {
     /// カタログの行（消しても次に必要になったとき取得される）。
     Redownloads,
-    /// `config.toml` が指している（消したら設定を直すまで戻らない）。
+    /// `config.toml` がこの行のファイルを指している（自動では戻らないが Download で取り直せる）。
     InConfig,
+    /// その種別が `config.toml` で上書きされている（上書きを外すまで戻らない）。
+    Overridden,
     /// カタログ外（アプリでは戻せない）。
     Never,
 }
@@ -84,20 +86,25 @@ fn row(sample: Sample) -> ModelRow {
             match returns {
                 Returns::Redownloads => "It downloads again the next time it is needed.",
                 Returns::InConfig =>
-                    "config.toml points at this file, so the app cannot download it again.",
+                    "config.toml points at this file, so it does not come back on its own — use Download to fetch it again.",
+                Returns::Overridden =>
+                    "It downloads again once config.toml no longer sets the model file.",
                 Returns::Never => "The app cannot download this file again.",
             }
         )
         .into(),
         status,
         can_use,
-        // 取得できるのは、ディスクに実体が無いカタログの行だけ（`can_download_row`）。
-        // 取得できるのは、ディスクに実体が無いカタログの行で上書き中でないとき
-        // （`can_download_row`）。`can_use` が false の未取得行＝上書き中として扱う。
-        can_download: matches!(status, ModelStatus::NotDownloaded | ModelStatus::Failed) && can_use,
+        // 取得できるのは、ディスクに実体が無いカタログの行で、上書き先が別のファイルでないとき
+        // （`can_download_row`）。この確認用バイナリでは `Overridden` の行だけ出さない。
+        can_download: matches!(status, ModelStatus::NotDownloaded | ModelStatus::Failed)
+            && returns != Returns::Overridden,
         can_delete,
     }
 }
+
+/// 削除の確認モーダルで見る行（説明がいちばん長い）。`sample_rows` の中の名前と一致させること。
+const CONFIRM_SAMPLE_NAME: &str = "my-own-model.gguf";
 
 /// 既定の並び: 種別 2 つ（未取得・取得中・取得済み・選択中・失敗）＋カタログ外・config 上書き先。
 fn sample_rows() -> Vec<ModelRow> {
@@ -163,9 +170,20 @@ fn sample_rows() -> Vec<ModelRow> {
             size: "4.4 GB",
             status_text: "Not downloaded — not used because config.toml sets the model file",
             status: ModelStatus::NotDownloaded,
-            returns: Returns::Redownloads,
+            returns: Returns::Overridden,
             can_use: false,
             can_delete: false,
+        }),
+        row(Sample {
+            // 上書き中の種別で、実体はある行（削除の確認モーダルがこの文言になる）。
+            name: "Qwen2.5 3B Instruct (overridden, on disk)",
+            detail: "25 s and 3.7 GB of memory for a 4-min meeting, but can invent details",
+            size: "2.0 GB",
+            status_text: "Downloaded — not used because config.toml sets the model file",
+            status: ModelStatus::Installed,
+            returns: Returns::Overridden,
+            can_use: false,
+            can_delete: true,
         }),
         heading("Other files in the models folder"),
         row(Sample {
@@ -219,12 +237,17 @@ fn main() {
         // 取得済みは 4 件（Small / Qwen 7B / カタログ外 / config 上書き先）。
         "4 models — 10.9 GB".into()
     });
-    win.set_models(ModelRc::from(Rc::new(VecModel::from(rows))));
     if variant == "confirm" {
-        // 対象は config 上書き先の行（説明がいちばん長いので折り返しを見る）。
-        win.set_delete_index(9);
+        // 対象は config 上書き先の行（説明がいちばん長いので折り返しを見る）。行を足しても
+        // ずれないよう、名前で引く（添字直書きは 1 行足すたびに別の行を指してしまう）。
+        let index = rows
+            .iter()
+            .position(|row| row.name == CONFIRM_SAMPLE_NAME)
+            .expect("the sample rows should contain the config override row");
+        win.set_delete_index(index as i32);
         win.set_show_delete_confirm(true);
     }
+    win.set_models(ModelRc::from(Rc::new(VecModel::from(rows))));
     if variant == "notice" {
         win.set_notice("This model is in use right now — it was not deleted.".into());
     }

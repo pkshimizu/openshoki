@@ -662,32 +662,27 @@ fn installed_models_in(
     Ok(models)
 }
 
-/// 設定のモデルパス上書き（`whisper_model_path` / `summary_model_path`）が、`models/` 直下の
-/// この名前のファイルを指しているか。
+/// 設定のモデルパス上書き（`whisper_model_path` / `summary_model_path`）が `models/` 直下を
+/// 指しているなら、そのファイル名。
 ///
-/// 上書きは `models/` の**外**を指すのが普通だが、`models/` 直下を指すこともできる。その場合、
-/// 上書き先だと分からないと (1) 実行中のジョブが読んでいるファイルを削除できてしまい、
-/// (2) 「消しても再取得される」という誤った案内を出してしまう（上書き中は `ensure_model` を
-/// 通らないので再取得されない）。判定は `main::row_facts`。
+/// 上書きは `models/` の**外**を指すのが普通だが、直下を指すこともできる。その場合、上書き先だと
+/// 分からないと (1) 実行中のジョブが読んでいるファイルを削除できてしまい、(2)「消しても再取得
+/// される」という誤った案内を出してしまう（上書き中は `ensure_model` を通らない）。判定は
+/// `main::row_facts`。
 ///
-/// 受け取るのは**ファイル名**（ディスクに無いカタログの行にも使うため。`InstalledModel` を
-/// 要求すると未取得の行を判定できない）。
-pub fn is_override_of(filename: &str, override_path: Option<&Path>) -> bool {
-    let Some(dir) = models_dir() else {
-        return false;
-    };
-    is_override_of_in(&dir, filename, override_path)
+/// 名前まで還元しておくのは、**行ごと・tick ごとに `canonicalize` を叩かない**ため（一覧は
+/// 10Hz で組み直す）。解決はディスクを走査するタイミングで 1 回だけ行い、行の判定はファイル名の
+/// 比較にする（`main::OverrideFiles`）。
+pub fn override_filename(override_path: Option<&Path>) -> Option<String> {
+    let dir = models_dir()?;
+    override_filename_in(&dir, override_path)
 }
 
-/// 設定のモデルパス上書きが `models/` 直下を指しているなら、そのファイル名。
-///
-/// 行ごとに `is_override_of` を呼ぶと、上書きが `models/` の外を指す通常のケースでは毎回
-/// `canonicalize` が走る（一覧は 10Hz で組み直す）。**種別ごとに 1 回だけ**解決して、行の判定は
-/// ファイル名の比較にする（`main::ModelsContext`）。
-pub fn override_filename(override_path: Option<&Path>) -> Option<String> {
+/// `override_filename` の本体（基点ディレクトリを引数で受け、テストから呼べるようにする）。
+fn override_filename_in(dir: &Path, override_path: Option<&Path>) -> Option<String> {
     let path = override_path?;
     let name = path.file_name()?.to_str()?;
-    is_override_of(name, Some(path)).then(|| name.to_owned())
+    is_override_of_in(dir, name, Some(path)).then(|| name.to_owned())
 }
 
 /// `is_override_of` の本体（基点ディレクトリを引数で受け、テストから呼べるようにする）。
@@ -1276,6 +1271,36 @@ mod tests {
         let outside = temp_path("override-outside");
         std::fs::write(&outside, b"x").expect("writing the fixture should succeed");
         assert!(!is_override_of_in(&dir, &model.filename, Some(&outside)));
+
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 上書きパスが `models/` 直下を指すときだけ、そのファイル名を返す（行の判定を名前の比較だけで
+    /// 済ませるための解決。`models/` の外を指す本来の使い方では `None`）。
+    #[test]
+    fn override_filename_resolves_only_inside_the_models_folder() {
+        let dir = models_fixture("override-filename");
+        let inside = dir.join("custom.gguf");
+        std::fs::write(&inside, b"x").expect("writing the fixture should succeed");
+
+        assert_eq!(
+            override_filename_in(&dir, Some(&inside)),
+            Some("custom.gguf".to_owned())
+        );
+        // `..` を挟んでも解決できる（`canonicalize` で一致を見る）。
+        std::fs::create_dir_all(dir.join("sub")).expect("creating the subdir should succeed");
+        let indirect = dir.join("sub").join("..").join("custom.gguf");
+        assert_eq!(
+            override_filename_in(&dir, Some(&indirect)),
+            Some("custom.gguf".to_owned())
+        );
+        // `models/` の外を指す上書き（本来の使い方）・未設定・ファイル名で終わらないパスは `None`。
+        let outside = temp_path("override-filename-outside");
+        std::fs::write(&outside, b"x").expect("writing the fixture should succeed");
+        assert_eq!(override_filename_in(&dir, Some(&outside)), None);
+        assert_eq!(override_filename_in(&dir, None), None);
+        assert_eq!(override_filename_in(&dir, Some(Path::new("/"))), None);
 
         let _ = std::fs::remove_file(&outside);
         let _ = std::fs::remove_dir_all(&dir);

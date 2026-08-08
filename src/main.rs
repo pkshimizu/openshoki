@@ -875,6 +875,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 差し替えずに行単位で更新する（tick で差し替えるとクリックを取りこぼす）。
     let model_list = ModelListHandles {
         sources: Rc::new(RefCell::new(Vec::new())),
+        override_files: Rc::new(RefCell::new(OverrideFiles::default())),
         rows: Rc::new(slint::VecModel::default()),
         downloaded_seen: Rc::new(RefCell::new(Vec::new())),
     };
@@ -958,7 +959,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 「Delete」: 確認モーダルの確定から呼ばれる。
         {
             let models_weak = models_weak.clone();
-            let sources = Rc::clone(&model_list.sources);
+            let list = model_list.clone();
             let downloader = model_downloader.clone();
             let transcriber = transcriber.clone();
             let summarizer = summarizer.clone();
@@ -970,7 +971,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 let Some(source) = usize::try_from(index)
                     .ok()
-                    .and_then(|i| sources.borrow().get(i).cloned())
+                    .and_then(|i| list.sources.borrow().get(i).cloned())
                 else {
                     return;
                 };
@@ -985,7 +986,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // **押された時点で使用中を再確認する**。一覧は tick が状態を追うが、tick と
                 // クリックの間にジョブが始まることはありうる（限界は
                 // `refresh_models_window` の doc）。取得中の拒否は基盤側が持つ。
-                let context = models_context(&transcriber, &summarizer, &downloader, &config);
+                let override_files = list.override_files.borrow();
+                let context = models_context(
+                    &transcriber,
+                    &summarizer,
+                    &downloader,
+                    &config,
+                    &override_files,
+                );
                 let outcome = if row_facts(&source, &context).busy {
                     DeleteOutcome::InUse
                 } else {
@@ -2168,7 +2176,6 @@ fn summary_model_status_text(
     model_status_text(spec, downloader)
 }
 
-/// モデルの取得状況を、設定画面の状態行テキストにする（whisper / 要約 LLM で共用）。
 /// 受信済みバイトから進捗のパーセントを出す（設定画面の状態行と一覧の行で共用）。
 ///
 /// `total` は Content-Length または既知サイズで常に正だが、防御的にゼロ除算を避ける。
@@ -2262,16 +2269,8 @@ fn refresh_models_window(
             (Vec::new(), Some(MODELS_UNREADABLE_NOTICE))
         }
     };
-    *handles.sources.borrow_mut() = model_row_sources(installed);
-    // 走査した時点の記録を覚える（tick が走査し直す契機の判定に使い、開いた直後に無駄に走査し
-    // 直さないための種にもなる）。
-    *handles.downloaded_seen.borrow_mut() = downloaded_ids(&handles.sources.borrow(), downloader);
-    // 走査の失敗は操作の結果より先に伝える（行の中身が信用できないため）。通知を保持する
-    // `Rescan` でも、これだけは差し替える。
-    let cause = match (cause, scan_notice) {
-        (_, Some(scan)) => ModelsRefresh::AfterOperation(Some(scan)),
-        (cause, None) => cause,
-    };
+    reseed_model_sources(handles, installed, downloader, config);
+    let cause = refresh_cause(cause, scan_notice);
     refresh_model_rows(
         models_ui,
         handles,
@@ -2283,7 +2282,33 @@ fn refresh_models_window(
     );
 }
 
-/// 行だけを組み直す（**ディスクを走査しない**）。開いている間の tick から呼び、取得の進捗・
+/// 走査の失敗を通知へ載せた作り直しの理由。**走査の失敗は操作の結果より先に伝える**（行の中身が
+/// 信用できないため）。通知を保持する `Rescan` でも、これだけは差し替える。
+fn refresh_cause(cause: ModelsRefresh, scan_notice: Option<&'static str>) -> ModelsRefresh {
+    match (cause, scan_notice) {
+        (_, Some(scan)) => ModelsRefresh::AfterOperation(Some(scan)),
+        (cause, None) => cause,
+    }
+}
+
+/// 走査の結果を素材へ入れ、**一緒に更新すべきもの**（tick のラッチと上書き先の解決）も同時に
+/// 書く。3 つを別々に更新すると、片方だけ古い状態が生まれる（ラッチが古いと毎 tick 走査し直し、
+/// 上書き先が古いと守るべき行を守らない）。
+fn reseed_model_sources(
+    handles: &ModelListHandles,
+    installed: Vec<model_download::InstalledModel>,
+    downloader: &model_download::ModelDownloader,
+    config: &Config,
+) {
+    *handles.sources.borrow_mut() = model_row_sources(installed);
+    *handles.downloaded_seen.borrow_mut() = downloaded_ids(&handles.sources.borrow(), downloader);
+    *handles.override_files.borrow_mut() = OverrideFiles {
+        speech: model_download::override_filename(config.whisper_model_path.as_deref()),
+        summary: model_download::override_filename(config.summary_model_path.as_deref()),
+    };
+}
+
+/// 行だけを組み直す（**ディスクを走査しない**。上書き先の解決も走査時に済ませてある）。開いている間の tick から呼び、取得の進捗・
 /// 完了・失敗と、ジョブの開始・終了を表示へ反映する。
 ///
 /// 変わった行だけ差し替える（`VecModel` を毎 tick 差し替えると全行の要素が再生成され、
@@ -2298,7 +2323,8 @@ fn refresh_model_rows(
     cause: ModelsRefresh,
 ) {
     let sources = handles.sources.borrow();
-    let context = models_context(transcriber, summarizer, downloader, config);
+    let override_files = handles.override_files.borrow();
+    let context = models_context(transcriber, summarizer, downloader, config, &override_files);
     let rows = model_rows(&sources, &context);
 
     if cause.resets_modal() {
@@ -2351,8 +2377,11 @@ fn apply_model_rows(model: &Rc<slint::VecModel<ModelRow>>, rows: Vec<ModelRow>) 
     match rows_to_update(&current, &rows) {
         RowUpdate::ReplaceAll => model.set_vec(rows),
         RowUpdate::Changed(changed) => {
-            for index in changed {
-                model.set_row_data(index, rows[index].clone());
+            // 添字で引かず、行を消費しながら該当だけ入れ替える（範囲外パニックの余地を残さない）。
+            for (index, row) in rows.into_iter().enumerate() {
+                if changed.contains(&index) {
+                    model.set_row_data(index, row);
+                }
             }
         }
     }
@@ -2360,10 +2389,22 @@ fn apply_model_rows(model: &Rc<slint::VecModel<ModelRow>>, rows: Vec<ModelRow>) 
 
 /// モデル管理ウィンドウの一覧を組むためのハンドル（素材と UI のモデル）。素材と行は同じ順序で
 /// 1 対 1 なので、必ず組で持つ（別々に持つと**別のモデルを操作する**事故になる）。
+/// `config.toml` のモデルパス上書きが `models/` 直下を指すときのファイル名（種別ごと）。
+///
+/// 上書きは config の手編集でしか変わらないので、**走査と同じタイミングで 1 回だけ解決**して持つ
+/// （行ごと・tick ごとに `canonicalize` を叩かないため。`model_download::override_filename`）。
+#[derive(Debug, Clone, Default)]
+struct OverrideFiles {
+    speech: Option<String>,
+    summary: Option<String>,
+}
+
 #[derive(Clone)]
 struct ModelListHandles {
     /// 一覧の行の素材（走査した時点のもの。tick は状態だけ組み直す）。
     sources: Rc<RefCell<Vec<ModelRowSource>>>,
+    /// 上書き先のファイル名（走査と同じタイミングで解決する）。
+    override_files: Rc<RefCell<OverrideFiles>>,
     /// UI が参照し続けるモデル（差し替えずに行単位で更新する）。
     rows: Rc<slint::VecModel<ModelRow>>,
     /// 直前に走査したときに「取得済みとして記録されていた」ID（tick が走査し直す契機の判定。
@@ -2451,11 +2492,10 @@ struct ModelsContext<'a> {
     /// 設定でいま選ばれている ID。
     selected_speech: &'a str,
     selected_summary: &'a str,
-    /// 設定のモデルパス上書きが `models/` 直下を指すなら、そのファイル名（**行ごとに
-    /// `canonicalize` しないよう、種別ごとに 1 回だけ解決しておく**。
-    /// `model_download::override_filename`）。
-    speech_override_file: Option<String>,
-    summary_override_file: Option<String>,
+    /// 設定のモデルパス上書きが `models/` 直下を指すなら、そのファイル名（**走査と同じ
+    /// タイミングで解決したもの**。`OverrideFiles`）。
+    speech_override_file: Option<&'a str>,
+    summary_override_file: Option<&'a str>,
     /// その種別のモデルパスを上書きしているか（上書き中はカタログの選択が使われないので、
     /// 「使う」「取得する」を出さない）。
     speech_overridden: bool,
@@ -2468,6 +2508,7 @@ fn models_context<'a>(
     summarizer: &summarize::SummarizeWorker,
     downloader: &'a model_download::ModelDownloader,
     config: &'a Config,
+    override_files: &'a OverrideFiles,
 ) -> ModelsContext<'a> {
     ModelsContext {
         // 種別ごとに 1 回だけ照会する（行ごとにワーカーのロックを取らない）。
@@ -2475,12 +2516,8 @@ fn models_context<'a>(
         summary_busy: summarizer.has_pending_jobs(),
         selected_speech: whisper_model::spec_or_default(&config.whisper_model).id,
         selected_summary: summary_model::spec_or_default(&config.summary_model).id,
-        speech_override_file: model_download::override_filename(
-            config.whisper_model_path.as_deref(),
-        ),
-        summary_override_file: model_download::override_filename(
-            config.summary_model_path.as_deref(),
-        ),
+        speech_override_file: override_files.speech.as_deref(),
+        summary_override_file: override_files.summary.as_deref(),
         speech_overridden: config.whisper_model_path.is_some(),
         summary_overridden: config.summary_model_path.is_some(),
         downloader,
@@ -2513,12 +2550,12 @@ enum RowUsage {
     Unknown,
 }
 
-/// その種別のモデルパスが `config.toml` で上書きされているか（**網羅 match**）。
-fn kind_overridden_for(context: &ModelsContext, kind: Option<model_download::ModelKind>) -> bool {
+/// その種別のモデルパスが `config.toml` で上書きされているか（**網羅 match**。種別を足したら
+/// 扱いを書くまでコンパイルが通らない）。
+fn kind_overridden(context: &ModelsContext, kind: model_download::ModelKind) -> bool {
     match kind {
-        Some(model_download::ModelKind::Speech) => context.speech_overridden,
-        Some(model_download::ModelKind::Summary) => context.summary_overridden,
-        None => false,
+        model_download::ModelKind::Speech => context.speech_overridden,
+        model_download::ModelKind::Summary => context.summary_overridden,
     }
 }
 
@@ -2541,9 +2578,8 @@ fn row_facts(source: &ModelRowSource, context: &ModelsContext) -> RowFacts {
         ModelRowSource::Catalog { spec, .. } => spec.filename,
         ModelRowSource::Extra(installed) => installed.filename.as_str(),
     };
-    let matches_override = |target: &Option<String>| target.as_deref() == Some(filename);
-    let speech_override = matches_override(&context.speech_override_file);
-    let summary_override = matches_override(&context.summary_override_file);
+    let speech_override = context.speech_override_file == Some(filename);
+    let summary_override = context.summary_override_file == Some(filename);
     // 関係する種別を**すべて**見る（同じファイルを 2 つの上書きが指していることもありうるので、
     // 先に一致した 1 つで打ち切らない）。
     let kind = match source {
@@ -2552,9 +2588,9 @@ fn row_facts(source: &ModelRowSource, context: &ModelsContext) -> RowFacts {
     };
     // 上書き中の種別では、ジョブはカタログのファイルを開かない（`model_override` を使う）。
     // その行を「使用中で消せない」にすると、確実に使われていない数 GB を掃除できなくなる。
-    let busy = kind.is_some_and(|kind| {
-        kind_is_busy(context, kind) && !kind_overridden_for(context, Some(kind))
-    }) || (speech_override && kind_is_busy(context, model_download::ModelKind::Speech))
+    let busy = kind
+        .is_some_and(|kind| kind_is_busy(context, kind) && !kind_overridden(context, kind))
+        || (speech_override && kind_is_busy(context, model_download::ModelKind::Speech))
         || (summary_override && kind_is_busy(context, model_download::ModelKind::Summary));
     let selected = match source {
         ModelRowSource::Catalog { kind, spec, .. } => match kind {
@@ -2565,10 +2601,10 @@ fn row_facts(source: &ModelRowSource, context: &ModelsContext) -> RowFacts {
     };
     // この行のファイルが上書き先 → カタログの内外を問わず InConfig（消しても戻せない）。
     // そうでなくても種別が上書き中なら Overridden（選んでも取得しても使われない）。
-    let kind_overridden = kind_overridden_for(context, kind);
+    let kind_is_overridden = kind.is_some_and(|kind| kind_overridden(context, kind));
     let usage = if speech_override || summary_override {
         RowUsage::InConfig
-    } else if kind_overridden {
+    } else if kind_is_overridden {
         RowUsage::Overridden
     } else if matches!(source, ModelRowSource::Extra(_)) {
         RowUsage::Unknown
@@ -3525,6 +3561,110 @@ mod tests {
             !super::row_facts(&extra, &context(&downloader, true, true)).busy,
             "a file no job reads must not be treated as busy"
         );
+    }
+
+    /// `config.toml` の上書きが**この行のファイル**を指しているときの扱い。選択中より先に見て
+    /// `InConfig` にし、**その種別のジョブがある間は消させない**（ジョブが読んでいるファイル）。
+    #[test]
+    fn an_override_target_is_in_config_and_protected_while_jobs_run() {
+        let downloader = crate::model_download::ModelDownloader::new();
+        let filename = speech_spec().filename;
+        let source = super::ModelRowSource::Catalog {
+            kind: crate::model_download::ModelKind::Speech,
+            spec: speech_spec(),
+            installed: Some(installed_spec(
+                crate::model_download::ModelKind::Speech,
+                speech_spec(),
+                10,
+            )),
+        };
+
+        let mut idle = context(&downloader, false, false);
+        idle.speech_override_file = Some(filename);
+        idle.speech_overridden = true;
+        let facts = super::row_facts(&source, &idle);
+        assert_eq!(
+            facts.usage,
+            super::RowUsage::InConfig,
+            "the override target is reported as such, not as the Settings selection"
+        );
+        assert!(!facts.busy, "no jobs are running");
+        assert!(super::can_delete_row(&source, &facts));
+        // 上書き先は落とすことが動かす唯一の手段なので、取得は出す。
+        assert!(super::can_download_row(
+            ModelStatus::NotDownloaded,
+            &source,
+            &facts
+        ));
+
+        let mut busy = context(&downloader, true, false);
+        busy.speech_override_file = Some(filename);
+        busy.speech_overridden = true;
+        let busy_facts = super::row_facts(&source, &busy);
+        assert!(
+            busy_facts.busy,
+            "the file a running job reads must not be deletable"
+        );
+        assert!(!super::can_delete_row(&source, &busy_facts));
+    }
+
+    /// 走査の失敗は、tick 由来の作り直し（通知を保持する `Rescan`）でも通知へ載せる
+    /// （行のサイズ・状態がディスクを反映しないので、黙っていると気づけない）。
+    #[test]
+    fn refresh_cause_reports_a_failed_scan_even_from_the_tick() {
+        assert_eq!(
+            super::refresh_cause(super::ModelsRefresh::Rescan, Some("scan failed")),
+            super::ModelsRefresh::AfterOperation(Some("scan failed"))
+        );
+        assert_eq!(
+            super::refresh_cause(super::ModelsRefresh::Rescan, None),
+            super::ModelsRefresh::Rescan,
+            "a successful rescan keeps the notice"
+        );
+        // 走査の失敗は操作の結果より先（行の中身が信用できない）。
+        assert_eq!(
+            super::refresh_cause(
+                super::ModelsRefresh::AfterOperation(Some("delete failed")),
+                Some("scan failed")
+            ),
+            super::ModelsRefresh::AfterOperation(Some("scan failed"))
+        );
+    }
+
+    /// 走査したら**ラッチと上書き先の解決も一緒に**更新する（別々に書くと、ラッチが古くて毎 tick
+    /// 走査し直す／上書き先が古くて守るべき行を守らない、という食い違いが生まれる）。
+    #[test]
+    fn reseeding_the_sources_updates_the_latch() {
+        let downloader = crate::model_download::ModelDownloader::new();
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let handles = super::ModelListHandles {
+            sources: Rc::new(RefCell::new(Vec::new())),
+            override_files: Rc::new(RefCell::new(super::OverrideFiles::default())),
+            rows: Rc::new(slint::VecModel::default()),
+            downloaded_seen: Rc::new(RefCell::new(Vec::new())),
+        };
+        downloader.set_status_for_test(
+            speech_spec(),
+            crate::model_download::DownloadStatus::Downloaded,
+        );
+
+        super::reseed_model_sources(
+            &handles,
+            vec![installed_spec(
+                crate::model_download::ModelKind::Speech,
+                speech_spec(),
+                10,
+            )],
+            &downloader,
+            &crate::config::Config::default(),
+        );
+        assert_eq!(
+            *handles.downloaded_seen.borrow(),
+            super::downloaded_ids(&handles.sources.borrow(), &downloader),
+            "the latch must match the sources it was seeded from"
+        );
+        assert!(!handles.sources.borrow().is_empty());
     }
 
     /// 「使う」を出すのは、カタログの行で選ばれていないときだけ（見出し・カタログ外・選択中・
