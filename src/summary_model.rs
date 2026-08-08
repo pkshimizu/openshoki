@@ -9,9 +9,10 @@
 
 use crate::model_download::ModelSpec;
 
-/// ログに出す種別。`Downloading the Summary LLM model Qwen2.5 7B Instruct (about 4.4 GB)` の
-/// ように使う（whisper 側の `Whisper speech` と見分けるための語）。
-const KIND: &str = "Summary LLM";
+/// **ログとモデル一覧の行**に出す種別名。`Downloading the Summary LLM model Qwen2.5 7B Instruct
+/// (about 4.4 GB)` のように使う（whisper 側の `Whisper speech` と見分けるための語）。
+/// 削除可否の判定キーにはしない（理由は whisper 側の `KIND`）。
+pub(crate) const KIND: &str = "Summary LLM";
 
 /// 選べるモデルの一覧（小さい順）。設定画面の ComboBox はこの順で並ぶため、モデルを足すときは
 /// ここへ 1 エントリ追加するだけでよい（whisper 側と同じ）。

@@ -5,6 +5,8 @@ import { Style } from "style.slint";
 // （build.rs は app-window.slint のみコンパイル）に含める。Rust 側は include_modules! で
 // RecordingsWindow / SessionRow を得る。
 export { RecordingsWindow, SessionRow } from "recordings-window.slint";
+// モデル一覧ウィンドウ（#117）。同じく再エクスポートするだけで `build.rs` の変更は要らない。
+export { ModelsWindow, ModelRow } from "models-window.slint";
 
 // 自動録音のトリガーとして登録したアプリ 1 件。`limitation-note` が空でなければ、そのアプリを
 // 検知できない旨をリストに添えて出す（文言と判定は Rust 側の `auto_record_limitation`）。
@@ -93,7 +95,9 @@ export component AppWindow inherits Window {
     // preferred だけだと中身の最小高さ（≒0）に引っ張られて潰れるため、min も指定する。
     // 幅・高さは src/main.rs の WINDOW_WIDTH/HEIGHT と一致させること（片方だけ変えない）。
     // 幅は 420 固定。高さは 3 セクション＋Transcription の Language/Model 行・状態行・
-    // 議事録要約のトグルとモデル行・説明行・状態行、＋末尾のバージョン行に合わせた値
+    // 議事録要約のトグルとモデル行・説明行・状態行・モデル管理ボタン、＋末尾のバージョン行に
+    // 合わせた値（#117 のボタンは既存の余白に収まったので 900 は据え置き。
+    // `examples/settings_view.rs -- snapshot` で確認済み）
     // （中身を足すときは `examples/settings_view.rs -- snapshot` で見て、ここと
     // `WINDOW_HEIGHT` を揃えて直す）。
     min-width: 420px;
@@ -167,6 +171,8 @@ export component AppWindow inherits Window {
     // 要約 LLM の変更。カタログ内インデックスを渡し、Rust 側で ID へ変換して永続化する。
     // 未取得のモデルの取得を始めるかは設定次第（`summary_model_downloads_on_select`）。
     callback change-summary-model(int);
+    // 「Manage Downloaded Models…」押下。取得済みモデルの一覧ウィンドウを開く（#117）。
+    callback open-models-window();
 
     VerticalLayout {
         alignment: start;
@@ -476,6 +482,20 @@ export component AppWindow inherits Window {
                 wrap: word-wrap;
                 font-size: Style.caption-size;
                 color: Palette.foreground.transparentize(Style.muted-alpha);
+            }
+
+            // 取得済みモデルの管理（#117）。文字起こしと議事録要約の両方のモデルが対象なので、
+            // Transcription セクション内の、どちらのサブグループにも属さない位置に置く。
+            // 自動文字起こしのトグル（`transcribe-deps.enabled-gate`）には従わせない: 取得済み
+            // モデルの掃除は、機能を OFF にした後こそやりたい操作なので。
+            HorizontalLayout {
+                alignment: start;
+                Button {
+                    text: "Manage Downloaded Models…";
+                    clicked => {
+                        root.open-models-window();
+                    }
+                }
             }
         }
 

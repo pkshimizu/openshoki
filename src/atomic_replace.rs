@@ -188,6 +188,12 @@ pub fn sweep_orphaned_parts(dir: &Path, now: SystemTime, max_age: Duration, scop
     }
 }
 
+/// `<宛先名>.part.<数字>`（`PartFile::for_dest` が作る形）か。書きかけの一時ファイルを
+/// 成果物として扱わないために使う（モデル一覧が `models/` を走査するとき等。#117）。
+pub(crate) fn is_part_file(path: &Path) -> bool {
+    part_dest(path).is_some()
+}
+
 /// `<宛先名>.part.<数字>`（`PartFile::for_dest` が作る形）なら、その宛先名を返す。
 /// 形が違えば `None`。
 ///

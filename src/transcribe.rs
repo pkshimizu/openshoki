@@ -89,6 +89,18 @@ pub struct TranscribeWorker {
 /// セッションディレクトリ → 進行状況のマップ（UI スレッドとワーカースレッドで共有）。
 type StatusMap = HashMap<PathBuf, TranscribeStatus>;
 
+/// この状態を「まだ終わっていないジョブ」として数えるか（`TranscribeWorker::has_pending_jobs`）。
+///
+/// **網羅 match**にしてあるので、状態を足したら扱いを書くまでコンパイルが通らない
+/// （`docs/CONTEXT.md` にあるとおり、キュー待ちを分ける対称化は未対応＝将来足しうる。
+/// `_ => false` にしておくと、その日にモデルの削除ガードが静かに外れる）。
+fn counts_as_pending(status: TranscribeStatus) -> bool {
+    match status {
+        TranscribeStatus::Transcribing => true,
+        TranscribeStatus::Done | TranscribeStatus::Failed => false,
+    }
+}
+
 impl TranscribeWorker {
     /// ワーカースレッドを起動する。スレッド生成に失敗しても常駐アプリは落とさず、
     /// 文字起こしだけを無効化してログを残す。
@@ -199,6 +211,25 @@ impl TranscribeWorker {
     /// 「文字起こし前/完了」を解決する）。
     pub fn status_of(&self, session_dir: &Path) -> Option<TranscribeStatus> {
         lock_status(&self.status).get(session_dir).copied()
+    }
+
+    /// 文字起こしのジョブが在るか（**キュー待ちを含む**。`TranscribeStatus::Transcribing` は
+    /// `submit` の時点で入る）。モデル一覧の削除可否に使う（#117）。
+    ///
+    /// **どのモデルを使っているかは見ない**（ジョブは投入時点の設定を snapshot で持つので、
+    /// 走っているジョブのモデルと現在の選択は違いうる）。whisper のモデルはジョブが読むので、
+    /// ジョブが在る間は whisper 種別の行をまとめて削除不可にする（種別単位の粗い判定）。
+    ///
+    /// **範囲**: 数えるのは**投入済みのジョブ**だけ。後処理（`mixdown::PostProcessWorker` の
+    /// 正規化）はまだ投入していないので数えず、その間はモデルを削除できる（消してもジョブは
+    /// 失敗せず `ensure_model` が再取得する）。
+    ///
+    /// **限界**: ワーカースレッドがパニックで死ぬと状態が `Transcribing` のまま残るので
+    /// （上の `catch_unwind` の doc）、その場合は再起動まで whisper のモデルを削除できない。
+    pub fn has_pending_jobs(&self) -> bool {
+        lock_status(&self.status)
+            .values()
+            .any(|status| counts_as_pending(*status))
     }
 
     /// セッションの進行状況の記録を破棄する（セッション削除時の掃除）。未登録なら何もしない。
@@ -565,6 +596,44 @@ mod tests {
             model_override: Some(session_dir.join("missing-model.gguf")),
             language: "en".to_owned(),
             existing_is_stale: true,
+        }
+    }
+
+    /// 削除ガードが読む述語（`has_pending_jobs`）が数える状態を、**全バリアント**で固定する。
+    /// `Transcribing` は `submit` の時点で入るので、キュー待ちのジョブも守られる。
+    #[test]
+    fn counts_as_pending_covers_all_states() {
+        assert!(counts_as_pending(TranscribeStatus::Transcribing));
+        assert!(!counts_as_pending(TranscribeStatus::Done));
+        assert!(!counts_as_pending(TranscribeStatus::Failed));
+    }
+
+    /// ワーカー越しでも同じ判定が効くこと（状態マップを直接組んで、whisper を走らせずに見る）。
+    #[test]
+    fn has_pending_jobs_reads_the_status_map() {
+        let worker = TranscribeWorker::start(
+            crate::model_download::ModelDownloader::new(),
+            crate::summarize::SummarizeWorker::start(
+                crate::model_download::ModelDownloader::new(),
+                crate::inference_slot::InferenceSlot::new(),
+            ),
+            crate::inference_slot::InferenceSlot::new(),
+        );
+        let dir = std::path::PathBuf::from("/tmp/shoki-transcribe-pending");
+        assert!(!worker.has_pending_jobs(), "an empty queue is not pending");
+
+        lock_status(&worker.status).insert(dir.clone(), TranscribeStatus::Transcribing);
+        assert!(
+            worker.has_pending_jobs(),
+            "Transcribing counts as a pending job"
+        );
+        // 終わったジョブは数えない（消してよい）。
+        for status in [TranscribeStatus::Done, TranscribeStatus::Failed] {
+            lock_status(&worker.status).insert(dir.clone(), status);
+            assert!(
+                !worker.has_pending_jobs(),
+                "{status:?} must not count as a pending job"
+            );
         }
     }
 

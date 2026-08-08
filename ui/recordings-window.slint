@@ -1,5 +1,6 @@
 import { Button, ListView, ScrollView, Palette } from "std-widgets.slint";
 import { Style } from "style.slint";
+import { DangerButton } from "controls.slint";
 
 // 文字起こしの表示状態。Rust 側（main.rs の transcript_display_status）がワーカーの
 // 進行状況と JSON の有無から合成して詰める。
@@ -86,49 +87,6 @@ component SpeakerBadge inherits Rectangle {
             font-size: Style.badge-size;
             font-weight: Style.semibold;
             color: root.accent ? Style.on-accent-foreground : Palette.foreground;
-        }
-    }
-}
-
-// 破壊的操作用のボタン。std-widgets の Button は文字色・背景色を変えられないため、同等の
-// 見た目を Rectangle + TouchArea で作る。filled=false はヘッダの Delete（赤文字・通常背景）、
-// filled=true は確認モーダルの確定ボタン（赤背景・白文字）。
-component DangerButton inherits Rectangle {
-    in property <string> text;
-    in property <bool> enabled: true;
-    in property <bool> filled: false;
-
-    callback clicked();
-
-    border-radius: 6px;
-    border-width: root.filled ? 0 : 1px;
-    border-color: Palette.border;
-    background: root.filled
-        ? (touch.pressed && root.enabled ? Style.danger.darker(15%) : Style.danger)
-        : (touch.pressed && root.enabled
-            ? Palette.control-background.darker(8%)
-            : Palette.control-background);
-    opacity: root.enabled ? 1.0 : Style.disabled-opacity;
-
-    HorizontalLayout {
-        padding-left: 16px;
-        padding-right: 16px;
-        padding-top: 5px;
-        padding-bottom: 5px;
-        Text {
-            text: root.text;
-            font-size: Style.body-size;
-            font-weight: root.filled ? Style.semibold : Style.regular;
-            color: root.filled ? Style.on-accent-foreground : Style.danger;
-            horizontal-alignment: center;
-            vertical-alignment: center;
-        }
-    }
-
-    touch := TouchArea {
-        enabled: root.enabled;
-        clicked => {
-            root.clicked();
         }
     }
 }

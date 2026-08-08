@@ -9,12 +9,15 @@
 
 use crate::model_download::ModelSpec;
 
-/// ログに出す種別。`Downloading the Whisper speech model Small (about 465 MB)` のように使う。
+/// ログとモデル一覧の行に出す種別の**表示名**。`Downloading the Whisper speech model Small
+/// (about 465 MB)` のように使い、モデル一覧では 2 行目に出す。
+///
+/// **破壊的操作（削除）の判定キーにしない**: 文言を調整した瞬間に判定が変わる。種別の識別は
+/// `model_download::ModelKind`（登録簿 `REGISTERED_CATALOGS` が持ち、`InstalledModel.kind` へ
+/// 写される）で行う。
 ///
 /// カタログ単位の属性をエントリごとに複写している（揃っていることは下のテストが見る）。
-/// 種別が 3 つ以上になって文言が揺れるようなら、`ModelKind` の enum か
-/// `struct ModelCatalog { kind, specs }` へ寄せる。
-const KIND: &str = "Whisper speech";
+pub(crate) const KIND: &str = "Whisper speech";
 
 /// 選べるモデルの一覧（小さい順）。設定画面の ComboBox はこの順で並ぶため、
 /// モデルを足すときはここへ 1 エントリ追加するだけでよい。

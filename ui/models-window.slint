@@ -1,0 +1,277 @@
+import { Button, Palette, ScrollView } from "std-widgets.slint";
+import { Style } from "style.slint";
+import { DangerButton } from "controls.slint";
+
+// 一覧の 1 行の状態。**ディスクにあるモデル**の行なので「未取得」は無い。
+// Rust 側（main.rs の `model_rows`）が、カタログ・設定・ワーカーの状況から合成して詰める。
+// 先頭が既定値なので、素の「取得済み」を先頭に置く。
+export enum ModelRowState {
+    // 取得済み。いま選ばれてはいない（消しても次の利用まで何も起きない）。
+    installed,
+    // 取得済みで、設定画面でいま選ばれている。消しても次の利用時に再取得されるので削除は許す。
+    selected,
+    // その種別のジョブ（文字起こし・議事録要約）が走っている。ワーカーが読んでいる最中なので
+    // 削除させない。
+    in-use,
+    // 取得中。完了時の rename でファイルが復活するので削除させない。
+    downloading,
+    // `models/` に在るがカタログに無いファイル（カタログ差し替え後の旧ファイルなど）。
+    // 表示名も種別も分からないが、容量を食っているので一覧に出して消せるようにする。
+    unknown,
+    // `config.toml` のモデルパス上書きがこのファイルを指している（カタログの内外を問わない）。
+    // 上書き中は `ensure_model` を通らないので、消しても**再取得されない**（設定を手で直すまで
+    // そのジョブが失敗する）。カタログに載っているファイルでも同じなので、`selected` とは
+    // 別の状態にして、状態行と確認モーダルの両方でそのことを伝える。
+    in-config,
+}
+
+// 一覧の 1 行。文言はすべて Rust 側で組む（状態→文言の対応表は Rust の網羅 match が正。
+// `docs/rules/slint.md`）。
+export struct ModelRow {
+    // 表示名（カタログが引ければ表示名、引けなければファイル名）。
+    name: string,
+    // 2 行目の補助テキスト（種別とファイル名）。
+    detail: string,
+    // 概数のサイズ（例 `1.5 GB`）。
+    size: string,
+    // 状態の文言。削除できない行では**その理由**がここに出る。
+    state-text: string,
+    // 確認モーダルに出す説明（解放される容量、完全削除であること、再取得の有無）。
+    delete-detail: string,
+    state: ModelRowState,
+}
+
+// ダウンロード済みモデルの一覧ウィンドウ。設定画面のボタンから開く。
+// 目的は「何が容量を食っているかを見て消す」ことなので、カタログ全件ではなくディスクにある
+// ものだけを並べる（`model_download::installed_models`）。
+export component ModelsWindow inherits Window {
+    title: "Downloaded Models";
+    // 幅・高さは src/main.rs の MODELS_WIDTH/HEIGHT と一致させること（片方だけ変えない）。
+    // preferred だけだと中身の最小高さに引っ張られて潰れるため min も指定する。
+    min-width: 460px;
+    min-height: 420px;
+    preferred-width: 460px;
+    preferred-height: 420px;
+
+    // ディスクにあるモデル（Rust 側が開いたときと削除後に作り直す）。
+    in property <[ModelRow]> models;
+    // 末尾に出す合計（例 `3 models — 5.9 GB`）。行が無いときは空文字（Rust 側が決める）。
+    in property <string> total-text;
+    // 1 行も無いときに一覧の中央へ出す文言（「まだ 1 つも無い」のか「走査に失敗した」のかを
+    // Rust 側が決める。合計と兼用にすると、どちらの意味で読むのか分からなくなる）。
+    in property <string> empty-text;
+    // 直前の操作が失敗したときだけ出す 1 行（削除できなかった等）。空なら出さない。
+    // 一覧を作り直すとクリアされる（`main::refresh_models_window`）。
+    in property <string> notice;
+    // 削除の確認モーダルの表示状態。Delete 押下で開き、Cancel / 確定で閉じる（Slint 内で完結。
+    // Recordings ウィンドウと同じ作り）。
+    in-out property <bool> show-delete-confirm: false;
+    // 確認中の行。モーダルは対象の名前・サイズをここから引く（`delete-model` に渡す値でもある）。
+    // `in-out` なのは確認用バイナリ（`examples/models_view.rs`）がモーダルの見た目を出すため。
+    in-out property <int> delete-index: 0;
+
+    // 確認モーダルの Delete 押下。その行のモデルファイルを完全削除する（インデックスを渡す）。
+    callback delete-model(int);
+
+    VerticalLayout {
+        padding: 16px;
+        spacing: 12px;
+
+        Text {
+            // 一覧の性質（ディスクにあるものだけ・完全削除）を伝える。**再取得できるかは行ごとに
+            // 違う**（カタログ外のファイルは戻せない）ので、ここでは言わずに確認モーダルの説明
+            // （`main::model_delete_detail`）へ任せる。見出しはウィンドウタイトルが兼ねる
+            // （Recordings ウィンドウと同じ流儀）。
+            text: "Files in the app's models folder. Deleting frees the space immediately — nothing goes to the Trash.";
+            wrap: word-wrap;
+            font-size: Style.caption-size;
+            color: Palette.foreground.transparentize(Style.muted-alpha);
+        }
+
+        // 一覧は取得済みのみで通常 1〜3 行、カタログが増えても十数行なので ScrollView + for で
+        // 足りる（`docs/rules/slint.md` の「固定数行の小さな一覧」）。
+        Rectangle {
+            vertical-stretch: 1;
+            border-width: 1px;
+            border-color: Palette.border;
+            border-radius: 8px;
+            background: Palette.alternate-background;
+
+            if root.models.length == 0: Text {
+                text: root.empty-text;
+                font-size: Style.body-size;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                color: Palette.foreground.transparentize(Style.muted-alpha);
+            }
+
+            if root.models.length > 0: ScrollView {
+                VerticalLayout {
+                    alignment: start;
+
+                    for model[index] in root.models: VerticalLayout {
+                        // 削除できる行かは状態から導く（bool を Rust から別に渡さない。
+                        // `docs/rules/slint.md`）。
+                        property <bool> deletable: model.state != ModelRowState.in-use
+                            && model.state != ModelRowState.downloading;
+
+                        // 行の区切り（先頭行の上には引かない）。
+                        if index > 0: Rectangle {
+                            height: 1px;
+                            background: Palette.border;
+                        }
+
+                        HorizontalLayout {
+                            padding: 12px;
+                            spacing: 12px;
+
+                            VerticalLayout {
+                                alignment: center;
+                                spacing: 2px;
+                                horizontal-stretch: 1;
+
+                                Text {
+                                    text: model.name;
+                                    font-size: Style.body-size;
+                                    font-weight: Style.semibold;
+                                    color: Palette.foreground;
+                                    overflow: elide;
+                                }
+
+                                // 種別が分からない行では空文字が来るので、行ごと出さない。
+                                if model.detail != "": Text {
+                                    text: model.detail;
+                                    font-size: Style.caption-size;
+                                    color: Palette.foreground.transparentize(Style.muted-alpha);
+                                    overflow: elide;
+                                }
+
+                                Text {
+                                    text: model.state-text;
+                                    font-size: Style.caption-size;
+                                    color: Palette.foreground.transparentize(Style.muted-alpha);
+                                    overflow: elide;
+                                }
+                            }
+
+                            Text {
+                                text: model.size;
+                                font-size: Style.body-size;
+                                vertical-alignment: center;
+                                horizontal-alignment: right;
+                                color: Palette.foreground;
+                            }
+
+                            DangerButton {
+                                text: "Delete";
+                                enabled: deletable;
+                                clicked => {
+                                    root.delete-index = index;
+                                    root.show-delete-confirm = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 10px;
+
+            // 失敗の通知（空なら出ない）。合計と同じ行に置き、ウィンドウの高さを変えない。
+            Text {
+                text: root.notice;
+                font-size: Style.caption-size;
+                horizontal-stretch: 1;
+                wrap: word-wrap;
+                color: Style.danger;
+            }
+
+            // 合計使用量（行が無いときは Rust 側が空文字を渡す）。
+            Text {
+                text: root.total-text;
+                font-size: Style.caption-size;
+                vertical-alignment: center;
+                horizontal-alignment: right;
+                color: Palette.foreground.transparentize(Style.muted-alpha);
+            }
+        }
+    }
+
+    // 削除の確認モーダル。Recordings ウィンドウと同じ作り（ウィンドウ内オーバーレイ、スクリムが
+    // クリックを吸収し、閉じる操作は Cancel か確定のみ）。
+    if root.show-delete-confirm: Rectangle {
+        background: #000000.transparentize(0.65);
+
+        TouchArea { }
+
+        Rectangle {
+            width: 340px;
+            height: dialog-layout.preferred-height;
+            background: Palette.alternate-background;
+            border-width: 1px;
+            border-color: Palette.border;
+            border-radius: 12px;
+
+            dialog-layout := VerticalLayout {
+                padding: 22px;
+                padding-bottom: 16px;
+                spacing: 7px;
+
+                Text {
+                    text: "Delete This Model?";
+                    font-size: Style.detail-title-size;
+                    font-weight: Style.semibold;
+                    color: Palette.foreground;
+                    horizontal-alignment: center;
+                }
+
+                Text {
+                    text: root.models[root.delete-index].name;
+                    font-size: Style.body-size;
+                    color: Palette.foreground;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+
+                Text {
+                    // 解放される容量・完全削除であること・再取得の有無（対応表は Rust 側の
+                    // `model_delete_detail`）。
+                    text: root.models[root.delete-index].delete-detail;
+                    font-size: Style.caption-size;
+                    color: Palette.foreground.transparentize(Style.muted-alpha);
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+
+                HorizontalLayout {
+                    padding-top: 11px;
+                    spacing: 10px;
+
+                    Button {
+                        text: "Cancel";
+                        horizontal-stretch: 1;
+                        clicked => {
+                            root.show-delete-confirm = false;
+                        }
+                    }
+
+                    DangerButton {
+                        text: "Delete";
+                        filled: true;
+                        horizontal-stretch: 1;
+                        // 行の Delete と読み上げ・テストの引き当てが衝突しないように分ける
+                        // （行側は自作コントロールなのでラベルを持たない）。
+                        accessible-role: button;
+                        accessible-label: "Delete Model";
+                        clicked => {
+                            root.show-delete-confirm = false;
+                            root.delete-model(root.delete-index);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
