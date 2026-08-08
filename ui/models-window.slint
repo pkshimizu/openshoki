@@ -13,7 +13,7 @@ export enum ModelStatus {
     downloading,
     // ディスクに在る。削除できる（その種別のジョブが無ければ）。
     installed,
-    // 直近の取得が失敗した（理由はログ。Download で再試行できる）。
+    // 直近の取得が失敗した（理由は状態テキストに出る。Download で再試行できる）。
     failed,
 }
 
@@ -66,7 +66,8 @@ export component ModelsWindow inherits Window {
     in property <[ModelRow]> models;
     // 末尾に出す取得済みの合計（例 `3 models — 5.9 GB`）。行が無いときは空文字。
     in property <string> total-text;
-    // 1 行も無いときに一覧の中央へ出す文言（走査に失敗したのかどうかを Rust 側が決める）。
+    // 1 行も無いときに一覧の中央へ出す文言。起動時に一度だけ入れる（カタログの行は必ず並ぶので
+    // 実際には出ない。走査の失敗は下の `notice` で伝える）。
     in property <string> empty-text;
     // 直前の操作が失敗したときだけ出す 1 行（削除できなかった等）。空なら出さない。
     // **ユーザー操作の直後だけ**差し替わる（tick の作り直しでは触らない。`main::ModelsRefresh`）。

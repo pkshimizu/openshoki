@@ -240,6 +240,29 @@ fn the_status_decides_which_buttons_appear() {
     }
 }
 
+/// `can-download` が false の行では Download が出ない（`config.toml` がその種別のモデルパスを
+/// 上書きしているとき。落としても使われないので出さない）。状態は「未取得」のままなので、
+/// 状態からの導出に戻すとここが落ちる。
+#[test]
+#[cfg_attr(
+    not(slint_debug_info),
+    ignore = "needs Slint debug info (SLINT_EMIT_DEBUG_INFO=1)"
+)]
+fn a_row_that_cannot_be_downloaded_hides_the_button() {
+    for status in [ModelStatus::NotDownloaded, ModelStatus::Failed] {
+        let window = open_window_with(&[Row {
+            status,
+            can_use: false,
+            can_download: false,
+            can_delete: false,
+        }]);
+        assert!(
+            buttons_labelled(&window, "Download").is_empty(),
+            "Download must follow can-download, not the status ({status:?})"
+        );
+    }
+}
+
 /// 使用中のジョブがある行では Delete が押せない（`can-delete` が false）。ボタン自体は出す
 /// （消せない理由は状態テキストに出るので、消えると理由が分からなくなる）。
 #[test]

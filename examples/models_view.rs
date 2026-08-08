@@ -92,7 +92,9 @@ fn row(sample: Sample) -> ModelRow {
         status,
         can_use,
         // 取得できるのは、ディスクに実体が無いカタログの行だけ（`can_download_row`）。
-        can_download: matches!(status, ModelStatus::NotDownloaded | ModelStatus::Failed),
+        // 取得できるのは、ディスクに実体が無いカタログの行で上書き中でないとき
+        // （`can_download_row`）。`can_use` が false の未取得行＝上書き中として扱う。
+        can_download: matches!(status, ModelStatus::NotDownloaded | ModelStatus::Failed) && can_use,
         can_delete,
     }
 }
@@ -151,6 +153,18 @@ fn sample_rows() -> Vec<ModelRow> {
             status: ModelStatus::Failed,
             returns: Returns::Redownloads,
             can_use: true,
+            can_delete: false,
+        }),
+        row(Sample {
+            // config.toml が種別を上書きしている行。**未取得なのにボタンが 1 つも出ない**唯一の
+            // 組み合わせなので、ボタン列の幅の見え方をここで見る。
+            name: "Qwen2.5 7B Instruct (overridden)",
+            detail: "54 s and 8.2 GB of memory for a 4-min meeting, more faithful",
+            size: "4.4 GB",
+            status_text: "Not downloaded — not used because config.toml sets the model file",
+            status: ModelStatus::NotDownloaded,
+            returns: Returns::Redownloads,
+            can_use: false,
             can_delete: false,
         }),
         heading("Other files in the models folder"),
