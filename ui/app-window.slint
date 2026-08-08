@@ -171,7 +171,7 @@ export component AppWindow inherits Window {
     // 要約 LLM の変更。カタログ内インデックスを渡し、Rust 側で ID へ変換して永続化する。
     // 未取得のモデルの取得を始めるかは設定次第（`summary_model_downloads_on_select`）。
     callback change-summary-model(int);
-    // 「Manage Downloaded Models…」押下。取得済みモデルの一覧ウィンドウを開く（#117）。
+    // 「Manage Models…」押下。モデル管理ウィンドウを開く（#117 / #138）。
     callback open-models-window();
 
     VerticalLayout {
@@ -484,14 +484,15 @@ export component AppWindow inherits Window {
                 color: Palette.foreground.transparentize(Style.muted-alpha);
             }
 
-            // 取得済みモデルの管理（#117）。文字起こしと議事録要約の両方のモデルが対象なので、
+            // モデルの管理（#117 / #138。取得・削除・使用するモデルの選択）。文字起こしと
+            // 議事録要約の両方のモデルが対象なので、
             // Transcription セクション内の、どちらのサブグループにも属さない位置に置く。
             // 自動文字起こしのトグル（`transcribe-deps.enabled-gate`）には従わせない: 取得済み
             // モデルの掃除は、機能を OFF にした後こそやりたい操作なので。
             HorizontalLayout {
                 alignment: start;
                 Button {
-                    text: "Manage Downloaded Models…";
+                    text: "Manage Models…";
                     clicked => {
                         root.open-models-window();
                     }

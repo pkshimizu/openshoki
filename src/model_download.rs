@@ -156,17 +156,13 @@ impl ModelDownloader {
         }
     }
 
-    /// このモデル ID の取得がいま走っているか。
+    /// 記録済みの取得状況を ID で引く（記録が無ければ `None`）。
     ///
-    /// `status_of` と違い**ディスクを見ない**し、状態を外へ出さない（モデル一覧（#117）は
-    /// ディスク走査の結果を持っているので存在確認は不要で、知りたいのは「いま取得中か」だけ。
-    /// `Failed(String)` を行ごとに clone しないためにも bool で返す）。`&'static ModelSpec` を
-    /// 用意せずに引けるようにしてある（一覧の行はカタログ外もありうる）。
-    pub fn is_downloading(&self, id: &str) -> bool {
-        matches!(
-            self.lock().get(id),
-            Some(DownloadStatus::Downloading { .. })
-        )
+    /// `status_of` と違い**ディスクを見ない**（モデル管理 UI（#138）はディスク走査の結果を
+    /// 持っているので存在確認は不要）。進捗と失敗も要るので状態をそのまま返す
+    /// （`&'static ModelSpec` を用意せずに引けるようにしてある: 一覧の行はカタログ外もありうる）。
+    pub fn recorded_status(&self, id: &str) -> Option<DownloadStatus> {
+        self.lock().get(id).cloned()
     }
 
     /// UI 起点: 未取得（または直近失敗）ならバックグラウンドスレッドでダウンロードを開始する。
@@ -665,25 +661,29 @@ fn installed_models_in(
     Ok(models)
 }
 
-/// 設定のモデルパス上書き（`whisper_model_path` / `summary_model_path`）が、この行のファイルを
-/// 指しているか。
+/// 設定のモデルパス上書き（`whisper_model_path` / `summary_model_path`）が、`models/` 直下の
+/// この名前のファイルを指しているか。
 ///
-/// 上書きは `models/` の**外**を指すのが普通だが、`models/` 直下を指すこともできる。その場合は
-/// カタログ外の行として並ぶので、上書き先だと分からないと「実行中のジョブが読んでいるファイル」を
-/// 削除できてしまう（判定は `main::row_is_busy` と `main::model_row_state`）。
-pub fn is_override_of(model: &InstalledModel, override_path: Option<&Path>) -> bool {
+/// 上書きは `models/` の**外**を指すのが普通だが、`models/` 直下を指すこともできる。その場合、
+/// 上書き先だと分からないと (1) 実行中のジョブが読んでいるファイルを削除できてしまい、
+/// (2) 「消しても再取得される」という誤った案内を出してしまう（上書き中は `ensure_model` を
+/// 通らないので再取得されない）。判定は `main::row_facts`。
+///
+/// 受け取るのは**ファイル名**（ディスクに無いカタログの行にも使うため。`InstalledModel` を
+/// 要求すると未取得の行を判定できない）。
+pub fn is_override_of(filename: &str, override_path: Option<&Path>) -> bool {
     let Some(dir) = models_dir() else {
         return false;
     };
-    is_override_of_in(&dir, model, override_path)
+    is_override_of_in(&dir, filename, override_path)
 }
 
 /// `is_override_of` の本体（基点ディレクトリを引数で受け、テストから呼べるようにする）。
-fn is_override_of_in(dir: &Path, model: &InstalledModel, override_path: Option<&Path>) -> bool {
+fn is_override_of_in(dir: &Path, filename: &str, override_path: Option<&Path>) -> bool {
     let Some(override_path) = override_path else {
         return false;
     };
-    let installed = dir.join(&model.filename);
+    let installed = dir.join(filename);
     if override_path == installed {
         return true;
     }
@@ -1246,18 +1246,18 @@ mod tests {
         std::fs::write(&installed, b"x").expect("writing the fixture should succeed");
 
         // 素の一致。
-        assert!(is_override_of_in(&dir, &model, Some(&installed)));
+        assert!(is_override_of_in(&dir, &model.filename, Some(&installed)));
         // `.` / `..` を挟んだ書き方でも一致する（canonicalize で解決する）。
         let indirect = dir.join("sub").join("..").join(&model.filename);
         std::fs::create_dir_all(dir.join("sub")).expect("creating the subdir should succeed");
-        assert!(is_override_of_in(&dir, &model, Some(&indirect)));
+        assert!(is_override_of_in(&dir, &model.filename, Some(&indirect)));
         // 別のファイル・上書き無しは一致しない。
         assert!(!is_override_of_in(
             &dir,
-            &model,
+            &model.filename,
             Some(&dir.join("other.gguf"))
         ));
-        assert!(!is_override_of_in(&dir, &model, None));
+        assert!(!is_override_of_in(&dir, &model.filename, None));
         // 実ファイルが無くても素の比較で一致する（canonicalize は両方失敗する）。
         let missing = InstalledModel {
             filename: "not-created.gguf".to_owned(),
@@ -1269,13 +1269,13 @@ mod tests {
         };
         assert!(is_override_of_in(
             &dir,
-            &missing,
+            &missing.filename,
             Some(&dir.join(&missing.filename))
         ));
         // `models/` の外を指す上書き（本来の使い方）は、この行とは無関係。
         let outside = temp_path("override-outside");
         std::fs::write(&outside, b"x").expect("writing the fixture should succeed");
-        assert!(!is_override_of_in(&dir, &model, Some(&outside)));
+        assert!(!is_override_of_in(&dir, &model.filename, Some(&outside)));
 
         let _ = std::fs::remove_file(&outside);
         let _ = std::fs::remove_dir_all(&dir);
