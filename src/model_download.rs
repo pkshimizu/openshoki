@@ -670,7 +670,7 @@ fn installed_models_in(
 ///
 /// 上書きは `models/` の**外**を指すのが普通だが、`models/` 直下を指すこともできる。その場合は
 /// カタログ外の行として並ぶので、上書き先だと分からないと「実行中のジョブが読んでいるファイル」を
-/// 削除できてしまう（判定は `main::model_row_kind`）。
+/// 削除できてしまう（判定は `main::row_is_busy` と `main::model_row_state`）。
 pub fn is_override_of(model: &InstalledModel, override_path: Option<&Path>) -> bool {
     let Some(dir) = models_dir() else {
         return false;
@@ -687,7 +687,8 @@ fn is_override_of_in(dir: &Path, model: &InstalledModel, override_path: Option<&
     if override_path == installed {
         return true;
     }
-    // `..` やリンクを挟んだ書き方でも一致を見る（解決できない場合は素の比較の結果に従う）。
+    // `..` やリンクを挟んだ書き方でも一致を見る（どちらかが解決できないなら一致とみなさない。
+    // 素の比較は上で外れているので、ここで false にして「消してよい」側へは倒さない）。
     match (
         std::fs::canonicalize(override_path),
         std::fs::canonicalize(&installed),
@@ -949,6 +950,14 @@ pub(crate) mod catalog_checks {
             assert_valid(catalog, default_id);
         }
 
+        // 同じ種別を 2 回登録していないこと（コピペで `(Speech, summary_model::CATALOG)` と
+        // 登録すると、要約 LLM が文字起こしの busy フラグで守られる＝要約中に消せてしまう）。
+        for (i, (kind, _, _)) in super::REGISTERED_CATALOGS.iter().enumerate() {
+            for (other, _, _) in super::REGISTERED_CATALOGS.iter().skip(i + 1) {
+                assert_ne!(kind, other, "{kind:?} is registered twice");
+            }
+        }
+
         let specs: Vec<&ModelSpec> = super::REGISTERED_CATALOGS
             .iter()
             .flat_map(|(_, catalog, _)| catalog.iter())
@@ -1123,6 +1132,103 @@ mod tests {
         let _ = std::fs::remove_dir_all(&real);
     }
 
+    /// 実カタログ（登録簿）を通した列挙が、**登録簿の種別をそのまま写す**こと。行の種別は削除
+    /// ガードの判定キーなので、写しが壊れると（`kind: None` など）そのモデルはガードの外に落ちる。
+    #[test]
+    fn installed_models_copies_the_kind_from_the_registry() {
+        let dir = models_fixture("installed-registry");
+        let catalogs: Vec<(ModelKind, &'static [ModelSpec])> = REGISTERED_CATALOGS
+            .iter()
+            .map(|(kind, catalog, _)| (*kind, *catalog))
+            .collect();
+        // 登録簿の全 spec のファイル名で 1 バイトのファイルを置く。
+        for (_, catalog, _) in REGISTERED_CATALOGS {
+            for spec in catalog.iter() {
+                std::fs::write(dir.join(spec.filename), b"x")
+                    .expect("writing the fixture should succeed");
+            }
+        }
+
+        let listed = installed_models_in(&dir, &catalogs).expect("the fixture dir is readable");
+        for (kind, catalog, _) in REGISTERED_CATALOGS {
+            for spec in catalog.iter() {
+                let row = listed
+                    .iter()
+                    .find(|model| model.filename == spec.filename)
+                    .unwrap_or_else(|| panic!("{} should be listed", spec.id));
+                assert_eq!(row.kind, Some(*kind), "wrong kind for {}", spec.id);
+                assert_eq!(row.catalog_id, Some(spec.id));
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 削除の直前確認: **基点がディレクトリでない**（`models/` がリンクへ差し替えられた）とき、
+    /// リンク先の同名ファイルを消さずに失敗する。列挙側のガード
+    /// （`installed_models_does_not_follow_a_symlinked_folder`）と対称。
+    #[test]
+    #[cfg(unix)]
+    fn delete_refuses_when_the_models_folder_is_a_symlink() {
+        let real = models_fixture("delete-linked-target");
+        let victim = real.join("victim.bin");
+        std::fs::write(&victim, b"x").expect("writing the fixture should succeed");
+        let root = models_fixture("delete-linked");
+        let link = root.join("models");
+        std::os::unix::fs::symlink(&real, &link).expect("creating the symlink should succeed");
+
+        let model = InstalledModel {
+            filename: "victim.bin".to_owned(),
+            size_bytes: 1,
+            kind: None,
+            kind_label: None,
+            display_name: None,
+            catalog_id: None,
+        };
+        ModelDownloader::new()
+            .delete_in(&link, &model)
+            .expect_err("deleting through a symlinked models folder must be refused");
+        assert!(victim.exists(), "the file behind the symlink must be kept");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&real);
+    }
+
+    /// 削除の直前確認: 対象が通常ファイルでない（ディレクトリ・シンボリックリンク）なら消さない。
+    #[test]
+    fn delete_refuses_targets_that_are_not_regular_files() {
+        let dir = models_fixture("delete-not-a-file");
+        std::fs::create_dir(dir.join("as-a-dir.bin")).expect("creating the fixture should succeed");
+        let downloader = ModelDownloader::new();
+        let model = |name: &str| InstalledModel {
+            filename: name.to_owned(),
+            size_bytes: 1,
+            kind: None,
+            kind_label: None,
+            display_name: None,
+            catalog_id: None,
+        };
+
+        downloader
+            .delete_in(&dir, &model("as-a-dir.bin"))
+            .expect_err("a directory must not be deleted");
+        assert!(dir.join("as-a-dir.bin").is_dir());
+
+        #[cfg(unix)]
+        {
+            let target = dir.join("outside.bin");
+            std::fs::write(&target, b"x").expect("writing the fixture should succeed");
+            std::os::unix::fs::symlink(&target, dir.join("as-a-link.bin"))
+                .expect("creating the symlink should succeed");
+            downloader
+                .delete_in(&dir, &model("as-a-link.bin"))
+                .expect_err("a symlink must not be deleted");
+            assert!(dir.join("as-a-link.bin").is_symlink());
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 設定のモデルパス上書きがこの行を指しているかの判定。`models/` の外を指すのが普通だが、
     /// 直下を指すこともできる（そのときは削除を守る側に効く）。
     #[test]
@@ -1152,6 +1258,20 @@ mod tests {
             Some(&dir.join("other.gguf"))
         ));
         assert!(!is_override_of_in(&dir, &model, None));
+        // 実ファイルが無くても素の比較で一致する（canonicalize は両方失敗する）。
+        let missing = InstalledModel {
+            filename: "not-created.gguf".to_owned(),
+            size_bytes: 1,
+            kind: None,
+            kind_label: None,
+            display_name: None,
+            catalog_id: None,
+        };
+        assert!(is_override_of_in(
+            &dir,
+            &missing,
+            Some(&dir.join(&missing.filename))
+        ));
         // `models/` の外を指す上書き（本来の使い方）は、この行とは無関係。
         let outside = temp_path("override-outside");
         std::fs::write(&outside, b"x").expect("writing the fixture should succeed");

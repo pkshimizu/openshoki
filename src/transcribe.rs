@@ -89,6 +89,18 @@ pub struct TranscribeWorker {
 /// セッションディレクトリ → 進行状況のマップ（UI スレッドとワーカースレッドで共有）。
 type StatusMap = HashMap<PathBuf, TranscribeStatus>;
 
+/// この状態を「まだ終わっていないジョブ」として数えるか（`TranscribeWorker::has_pending_jobs`）。
+///
+/// **網羅 match**にしてあるので、状態を足したら扱いを書くまでコンパイルが通らない
+/// （`docs/CONTEXT.md` にあるとおり、キュー待ちを分ける対称化は未対応＝将来足しうる。
+/// `_ => false` にしておくと、その日にモデルの削除ガードが静かに外れる）。
+fn counts_as_pending(status: TranscribeStatus) -> bool {
+    match status {
+        TranscribeStatus::Transcribing => true,
+        TranscribeStatus::Done | TranscribeStatus::Failed => false,
+    }
+}
+
 impl TranscribeWorker {
     /// ワーカースレッドを起動する。スレッド生成に失敗しても常駐アプリは落とさず、
     /// 文字起こしだけを無効化してログを残す。
@@ -217,7 +229,7 @@ impl TranscribeWorker {
     pub fn has_pending_jobs(&self) -> bool {
         lock_status(&self.status)
             .values()
-            .any(|status| *status == TranscribeStatus::Transcribing)
+            .any(|status| counts_as_pending(*status))
     }
 
     /// セッションの進行状況の記録を破棄する（セッション削除時の掃除）。未登録なら何もしない。
@@ -587,13 +599,18 @@ mod tests {
         }
     }
 
-    /// 手動再実行・状態表示の土台となる状態マップのライフサイクルを、whisper モデルなしで
-    /// 検証する。存在しないモデル上書きパスを渡すと、ネットワークに触れず即 Failed になる。
-    /// 削除ガードが読む述語（`has_pending_jobs`）は**キュー待ちも数える**（`Transcribing` は
-    /// `submit` の時点で入るので、デキュー前のジョブも守られる）。状態マップを直接組んで、
-    /// whisper を走らせずに固定する。
+    /// 削除ガードが読む述語（`has_pending_jobs`）が数える状態を、**全バリアント**で固定する。
+    /// `Transcribing` は `submit` の時点で入るので、キュー待ちのジョブも守られる。
     #[test]
-    fn has_pending_jobs_counts_queued_and_running_jobs() {
+    fn counts_as_pending_covers_all_states() {
+        assert!(counts_as_pending(TranscribeStatus::Transcribing));
+        assert!(!counts_as_pending(TranscribeStatus::Done));
+        assert!(!counts_as_pending(TranscribeStatus::Failed));
+    }
+
+    /// ワーカー越しでも同じ判定が効くこと（状態マップを直接組んで、whisper を走らせずに見る）。
+    #[test]
+    fn has_pending_jobs_reads_the_status_map() {
         let worker = TranscribeWorker::start(
             crate::model_download::ModelDownloader::new(),
             crate::summarize::SummarizeWorker::start(
@@ -608,7 +625,7 @@ mod tests {
         lock_status(&worker.status).insert(dir.clone(), TranscribeStatus::Transcribing);
         assert!(
             worker.has_pending_jobs(),
-            "a submitted job counts even before it is dequeued"
+            "Transcribing counts as a pending job"
         );
         // 終わったジョブは数えない（消してよい）。
         for status in [TranscribeStatus::Done, TranscribeStatus::Failed] {
@@ -620,6 +637,8 @@ mod tests {
         }
     }
 
+    /// 手動再実行・状態表示の土台となる状態マップのライフサイクルを、whisper モデルなしで
+    /// 検証する。存在しないモデル上書きパスを渡すと、ネットワークに触れず即 Failed になる。
     #[test]
     fn submit_tracks_status_until_failure() {
         let worker = TranscribeWorker::start(

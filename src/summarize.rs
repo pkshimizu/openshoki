@@ -154,6 +154,17 @@ impl QueueState {
     }
 }
 
+/// この状態を「まだ終わっていないジョブ」として数えるか（`SummarizeWorker::has_pending_jobs`）。
+///
+/// **網羅 match**にしてあるので、状態を足したら扱いを書くまでコンパイルが通らない
+/// （`_ => false` にしておくと、状態を足した日にモデルの削除ガードが静かに外れる）。
+fn counts_as_pending(status: SummarizeStatus) -> bool {
+    match status {
+        SummarizeStatus::Queued | SummarizeStatus::Summarizing => true,
+        SummarizeStatus::Done | SummarizeStatus::Failed => false,
+    }
+}
+
 /// `cancel_queued` の結果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CancelOutcome {
@@ -354,12 +365,10 @@ impl SummarizeWorker {
     /// ならない）。文字起こし側（`TranscribeWorker::has_pending_jobs`）がキュー待ちを含むのと
     /// 揃える。判定が種別単位である理由と、数える範囲（投入済みのジョブだけ）もそちらと同じ。
     pub fn has_pending_jobs(&self) -> bool {
-        lock_queue(&self.queue).status.values().any(|(_, status)| {
-            matches!(
-                status,
-                SummarizeStatus::Queued | SummarizeStatus::Summarizing
-            )
-        })
+        lock_queue(&self.queue)
+            .status
+            .values()
+            .any(|(_, status)| counts_as_pending(*status))
     }
 
     /// セッションの進行状況の記録を破棄する（セッション削除時の掃除）。未登録なら何もしない。
@@ -1634,11 +1643,20 @@ mod tests {
         }
     }
 
-    /// 削除ガードが読む述語（`has_pending_jobs`）は**キュー待ちも数える**。数えないと、要約が
-    /// 積まれているのに 4.4GB の LLM を消せてしまう（消してもジョブは失敗せず再取得するだけだが、
-    /// 待たせるだけで誰の得にもならない）。状態マップを直接組んで、ジョブを走らせずに固定する。
+    /// 削除ガードが読む述語（`has_pending_jobs`）が数える状態を、**全バリアント**で固定する。
+    /// キュー待ちも数える: 数えないと、要約が積まれているのに 4.4GB の LLM を消せてしまう
+    /// （消してもジョブは失敗せず再取得するだけだが、待たせるだけで誰の得にもならない）。
     #[test]
-    fn has_pending_jobs_counts_queued_and_running_jobs() {
+    fn counts_as_pending_covers_all_states() {
+        assert!(counts_as_pending(SummarizeStatus::Queued));
+        assert!(counts_as_pending(SummarizeStatus::Summarizing));
+        assert!(!counts_as_pending(SummarizeStatus::Done));
+        assert!(!counts_as_pending(SummarizeStatus::Failed));
+    }
+
+    /// ワーカー越しでも同じ判定が効くこと（状態マップを直接組んで、ジョブを走らせずに見る）。
+    #[test]
+    fn has_pending_jobs_reads_the_status_map() {
         let worker = SummarizeWorker::start(
             crate::model_download::ModelDownloader::new(),
             crate::inference_slot::InferenceSlot::new(),

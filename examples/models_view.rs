@@ -10,6 +10,7 @@
 //! cargo run --example models_view -- one                 # 1 行だけ
 //! cargo run --example models_view -- confirm             # 削除の確認モーダルを開いた状態
 //! cargo run --example models_view -- notice              # 失敗の通知を出した状態
+//! cargo run --example models_view -- unreadable          # models/ を走査できなかった状態
 //! cargo run --example models_view -- <上記> snapshot out.png  # PNG に書き出して確認
 //! ```
 
@@ -36,11 +37,12 @@ fn row(name: &str, detail: &str, size: &str, state_text: &str, state: ModelRowSt
         state_text: state_text.into(),
         delete_detail: format!(
             "This frees {size}. {DELETE_DETAIL_HEAD} {}",
-            if state == ModelRowState::Unknown {
-                // カタログ外は再取得できないので後半が変わる（`model_delete_detail`）。
-                "The app cannot download this file again."
-            } else {
-                "It downloads again the next time it is needed."
+            // 後半は状態で変わる（`model_delete_detail`）。
+            match state {
+                ModelRowState::Unknown => "The app cannot download this file again.",
+                ModelRowState::InConfig =>
+                    "config.toml points at this file, so the app cannot download it again.",
+                _ => "It downloads again the next time it is needed.",
             }
         )
         .into(),
@@ -81,6 +83,15 @@ fn sample_rows() -> Vec<ModelRow> {
             "Not in the model catalog",
             ModelRowState::Unknown,
         ),
+        row(
+            // config 上書き先。状態行・モーダル本文ともに全状態でいちばん長いので、折り返しの
+            // 確認はこの行で行う。
+            "my-own-model.gguf",
+            "",
+            "3.1 GB",
+            "Set in config.toml — used instead of the catalog",
+            ModelRowState::InConfig,
+        ),
     ]
 }
 
@@ -91,16 +102,24 @@ fn main() {
     // 一覧の中身を引数で選べるようにする（空・1 行・複数行・モーダルの確認用）。
     let variant = std::env::args().nth(1).unwrap_or_default();
     let rows = match variant.as_str() {
-        "empty" => Vec::new(),
+        "empty" | "unreadable" => Vec::new(),
         "one" => vec![sample_rows().remove(0)],
         _ => sample_rows(),
     };
     // 合計と空表示は `src/main.rs` の `models_total_text` / `MODELS_EMPTY_TEXT` の複製。
-    win.set_empty_text("No models downloaded yet".into());
+    win.set_empty_text(
+        if variant == "unreadable" {
+            // `src/main.rs` の `MODELS_UNREADABLE_TEXT` の複製（走査できなかったときの表示）。
+            "Could not list the models folder"
+        } else {
+            "No models downloaded yet"
+        }
+        .into(),
+    );
     win.set_total_text(match rows.len() {
         0 => "".into(),
         1 => "1 model — 4.4 GB".into(),
-        _ => "4 models — 9.2 GB".into(),
+        _ => "5 models — 12.3 GB".into(),
     });
     // 失敗の通知も見た目の確認対象（合計と同じ行に出る。`src/main.rs` の `MODEL_IN_USE_NOTICE`
     // の複製。あちらを変えたらここも合わせること）。
@@ -109,8 +128,8 @@ fn main() {
     }
     win.set_models(ModelRc::from(Rc::new(VecModel::from(rows))));
     if variant == "confirm" {
-        // 対象は長い名前の行（モーダルの折り返しを見る）。
-        win.set_delete_index(3);
+        // 対象は config 上書き先の行（説明がいちばん長いので折り返しを見る）。
+        win.set_delete_index(4);
         win.set_show_delete_confirm(true);
     }
 
