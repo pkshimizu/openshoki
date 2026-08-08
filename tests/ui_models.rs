@@ -29,19 +29,20 @@ const WINDOW_HEIGHT: f32 = 420.0;
 /// 行を 3 つ（取得済み・使用中・取得中）並べたウィンドウ。文言は Rust 側が組むので、ここでは
 /// 表示の中身ではなく**状態**を意図どおりに置くことだけを目的にする。
 fn open_window() -> ModelsWindow {
+    open_window_with(&[
+        ("Small", ModelRowState::Installed),
+        ("Medium", ModelRowState::InUse),
+        ("Large", ModelRowState::Downloading),
+    ])
+}
+
+fn open_window_with(rows: &[(&str, ModelRowState)]) -> ModelsWindow {
     ui_support::init_backend();
     let window = ModelsWindow::new().expect("create the models window");
     window
         .window()
         .set_size(slint::LogicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT));
-    set_rows(
-        &window,
-        &[
-            ("Small", ModelRowState::Installed),
-            ("Medium", ModelRowState::InUse),
-            ("Large", ModelRowState::Downloading),
-        ],
-    );
+    set_rows(&window, rows);
     window
 }
 
@@ -61,9 +62,30 @@ fn set_rows(window: &ModelsWindow, rows: &[(&str, ModelRowState)]) {
 }
 
 /// 行の Delete ボタン（宣言順＝行の順）。自作の `DangerButton` は accessible-label を持たないので
-/// 型名で引く。確認モーダルの確定ボタンも `DangerButton` なので、モーダルを閉じた状態で数える。
+/// 型名で引く。確認モーダルの確定ボタンだけはラベル（`Delete Model`）を持たせてあるので、
+/// 位置ではなくラベルで引ける（下の `confirm_button`）。
 fn row_delete_buttons(window: &ModelsWindow) -> Vec<ElementHandle> {
-    ElementHandle::find_by_element_type_name(window, "DangerButton").collect()
+    ElementHandle::find_by_element_type_name(window, "DangerButton")
+        .filter(|handle| handle.accessible_label().as_deref() != Some(CONFIRM_LABEL))
+        .collect()
+}
+
+/// 確認モーダルの確定ボタン（ラベルで引く。行の Delete と取り違えないため）。
+const CONFIRM_LABEL: &str = "Delete Model";
+
+fn confirm_button(window: &ModelsWindow) -> ElementHandle {
+    ElementHandle::find_by_accessible_label(window, CONFIRM_LABEL)
+        .next()
+        .expect("the confirmation should have a Delete Model button")
+}
+
+/// 削除できる状態か（**網羅 match**。Slint 側は `!=` 2 連で導出しているので、状態を足したときに
+/// ここがコンパイルエラーになって更新漏れに気づけるようにする）。
+fn deletable(state: ModelRowState) -> bool {
+    match state {
+        ModelRowState::Installed | ModelRowState::Selected | ModelRowState::Unknown => true,
+        ModelRowState::InUse | ModelRowState::Downloading => false,
+    }
 }
 
 fn click(button: &ElementHandle) {
@@ -95,14 +117,7 @@ fn deleting_a_model_goes_through_the_confirmation() {
         "nothing should be deleted before the confirmation"
     );
 
-    // モーダルが開いている間は確定ボタンも `DangerButton` なので、引き直して末尾を押す。
-    let confirm = row_delete_buttons(&window);
-    assert_eq!(
-        confirm.len(),
-        4,
-        "the confirmation adds one more DangerButton"
-    );
-    click(&confirm[3]);
+    click(&confirm_button(&window));
     assert_eq!(*calls.borrow(), vec![0], "the pressed row is passed");
     assert!(
         !window.get_show_delete_confirm(),
@@ -117,22 +132,17 @@ fn deleting_a_model_goes_through_the_confirmation() {
     ignore = "needs Slint debug info (SLINT_EMIT_DEBUG_INFO=1)"
 )]
 fn the_confirmation_targets_the_row_that_was_pressed() {
-    let window = open_window();
-    set_rows(
-        &window,
-        &[
-            ("Small", ModelRowState::Installed),
-            ("Medium", ModelRowState::Selected),
-        ],
-    );
+    let window = open_window_with(&[
+        ("Small", ModelRowState::Installed),
+        ("Medium", ModelRowState::Selected),
+    ]);
     let calls: Rc<RefCell<Vec<i32>>> = Rc::new(RefCell::new(Vec::new()));
     let recorded = Rc::clone(&calls);
     window.on_delete_model(move |index| recorded.borrow_mut().push(index));
 
     click(&row_delete_buttons(&window)[1]);
     assert_eq!(window.get_delete_index(), 1);
-    let confirm = row_delete_buttons(&window);
-    click(&confirm[confirm.len() - 1]);
+    click(&confirm_button(&window));
     assert_eq!(*calls.borrow(), vec![1]);
 }
 
@@ -165,23 +175,20 @@ fn cancelling_the_confirmation_deletes_nothing() {
     ignore = "needs Slint debug info (SLINT_EMIT_DEBUG_INFO=1)"
 )]
 fn the_row_state_decides_whether_delete_can_be_pressed() {
-    // (状態, 確認モーダルが開くか)
-    let expected = [
-        (ModelRowState::Installed, true),
-        (ModelRowState::Selected, true),
-        (ModelRowState::InUse, false),
-        (ModelRowState::Downloading, false),
-        (ModelRowState::Unknown, true),
-    ];
-
     let window = open_window();
-    for (state, opens) in expected {
+    for state in [
+        ModelRowState::Installed,
+        ModelRowState::Selected,
+        ModelRowState::InUse,
+        ModelRowState::Downloading,
+        ModelRowState::Unknown,
+    ] {
         set_rows(&window, &[("Model", state)]);
         window.set_show_delete_confirm(false);
         click(&row_delete_buttons(&window)[0]);
         assert_eq!(
             window.get_show_delete_confirm(),
-            opens,
+            deletable(state),
             "Delete for {state:?}"
         );
     }

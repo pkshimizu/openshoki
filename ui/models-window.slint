@@ -41,7 +41,7 @@ export struct ModelRow {
 // ものだけを並べる（`model_download::installed_models`）。
 export component ModelsWindow inherits Window {
     title: "Downloaded Models";
-    // 幅・高さは src/main.rs の MODELS_WINDOW_WIDTH/HEIGHT と一致させること（片方だけ変えない）。
+    // 幅・高さは src/main.rs の MODELS_WIDTH/HEIGHT と一致させること（片方だけ変えない）。
     // preferred だけだと中身の最小高さに引っ張られて潰れるため min も指定する。
     min-width: 460px;
     min-height: 420px;
@@ -50,8 +50,14 @@ export component ModelsWindow inherits Window {
 
     // ディスクにあるモデル（Rust 側が開いたときと削除後に作り直す）。
     in property <[ModelRow]> models;
-    // 末尾に出す合計（例 `3 models · 5.9 GB`）。空のときの文言も Rust 側が決める。
+    // 末尾に出す合計（例 `3 models — 5.9 GB`）。行が無いときは空文字（Rust 側が決める）。
     in property <string> total-text;
+    // 1 行も無いときに一覧の中央へ出す文言（「まだ 1 つも無い」のか「走査に失敗した」のかを
+    // Rust 側が決める。合計と兼用にすると、どちらの意味で読むのか分からなくなる）。
+    in property <string> empty-text;
+    // 直前の操作が失敗したときだけ出す 1 行（削除できなかった等）。空なら出さない。
+    // 一覧を作り直すとクリアされる（`main::refresh_models_window`）。
+    in property <string> notice;
     // 削除の確認モーダルの表示状態。Delete 押下で開き、Cancel / 確定で閉じる（Slint 内で完結。
     // Recordings ウィンドウと同じ作り）。
     in-out property <bool> show-delete-confirm: false;
@@ -67,16 +73,11 @@ export component ModelsWindow inherits Window {
         spacing: 12px;
 
         Text {
-            text: "Downloaded Models";
-            font-size: Style.detail-title-size;
-            font-weight: Style.semibold;
-            color: Palette.foreground;
-        }
-
-        Text {
-            // 一覧の性質（ディスクにあるものだけ・完全削除）を先に伝える。再取得できることも
-            // ここで言い、行ごとの説明は状態テキストに任せる。
-            text: "Files in the app's models folder. Deleting frees the space now — the model downloads again the next time it is needed.";
+            // 一覧の性質（ディスクにあるものだけ・完全削除）を伝える。**再取得できるかは行ごとに
+            // 違う**（カタログ外のファイルは戻せない）ので、ここでは言わずに確認モーダルの説明
+            // （`main::model_delete_detail`）へ任せる。見出しはウィンドウタイトルが兼ねる
+            // （Recordings ウィンドウと同じ流儀）。
+            text: "Files in the app's models folder. Deleting frees the space immediately — nothing goes to the Trash.";
             wrap: word-wrap;
             font-size: Style.caption-size;
             color: Palette.foreground.transparentize(Style.muted-alpha);
@@ -92,7 +93,7 @@ export component ModelsWindow inherits Window {
             background: Palette.alternate-background;
 
             if root.models.length == 0: Text {
-                text: root.total-text;
+                text: root.empty-text;
                 font-size: Style.body-size;
                 horizontal-alignment: center;
                 vertical-alignment: center;
@@ -132,7 +133,8 @@ export component ModelsWindow inherits Window {
                                     overflow: elide;
                                 }
 
-                                Text {
+                                // 種別が分からない行では空文字が来るので、行ごと出さない。
+                                if model.detail != "": Text {
                                     text: model.detail;
                                     font-size: Style.caption-size;
                                     color: Palette.foreground.transparentize(Style.muted-alpha);
@@ -169,12 +171,26 @@ export component ModelsWindow inherits Window {
             }
         }
 
-        Text {
-            // 合計使用量（空のときは一覧の中に出すので、ここは行があるときだけ）。
-            text: root.models.length > 0 ? root.total-text : "";
-            font-size: Style.caption-size;
-            horizontal-alignment: right;
-            color: Palette.foreground.transparentize(Style.muted-alpha);
+        HorizontalLayout {
+            spacing: 10px;
+
+            // 失敗の通知（空なら出ない）。合計と同じ行に置き、ウィンドウの高さを変えない。
+            Text {
+                text: root.notice;
+                font-size: Style.caption-size;
+                horizontal-stretch: 1;
+                wrap: word-wrap;
+                color: Style.danger;
+            }
+
+            // 合計使用量（行が無いときは Rust 側が空文字を渡す）。
+            Text {
+                text: root.total-text;
+                font-size: Style.caption-size;
+                vertical-alignment: center;
+                horizontal-alignment: right;
+                color: Palette.foreground.transparentize(Style.muted-alpha);
+            }
         }
     }
 
@@ -240,6 +256,10 @@ export component ModelsWindow inherits Window {
                         text: "Delete";
                         filled: true;
                         horizontal-stretch: 1;
+                        // 行の Delete と読み上げ・テストの引き当てが衝突しないように分ける
+                        // （行側は自作コントロールなのでラベルを持たない）。
+                        accessible-role: button;
+                        accessible-label: "Delete Model";
                         clicked => {
                             root.show-delete-confirm = false;
                             root.delete-model(root.delete-index);

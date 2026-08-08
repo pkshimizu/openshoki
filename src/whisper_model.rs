@@ -14,8 +14,9 @@ use crate::model_download::ModelSpec;
 /// カタログ単位の属性をエントリごとに複写している（揃っていることは下のテストが見る）。
 /// 種別が 3 つ以上になって文言が揺れるようなら、`ModelKind` の enum か
 /// `struct ModelCatalog { kind, specs }` へ寄せる。
-/// `pub(crate)` なのは、モデル一覧が「この種別のジョブが走っているか」を行ごとに判定するため
-/// （#117。`main::model_row_state`）。
+/// **ログとモデル一覧の行**に出す種別名（#117 でユーザー向けの表示にもなった）。削除可否の
+/// 判定にこの文字列は使わない（表示文言を判定キーにすると、文言を調整した瞬間に静かに壊れる）。
+/// 種別の識別はカタログ引き（`spec_for`）で行う。`main::model_row_kind` 参照。
 pub(crate) const KIND: &str = "Whisper speech";
 
 /// 選べるモデルの一覧（小さい順）。設定画面の ComboBox はこの順で並ぶため、

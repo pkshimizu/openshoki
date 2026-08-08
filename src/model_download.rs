@@ -151,13 +151,17 @@ impl ModelDownloader {
         }
     }
 
-    /// 記録済みの取得状況を ID で引く（記録が無ければ `None`）。
+    /// このモデル ID の取得がいま走っているか。
     ///
-    /// `status_of` と違い**ディスクを見ない**。モデル一覧（#117）はディスク走査の結果を持って
-    /// いるので存在確認は不要で、知りたいのは「いま取得中か」だけ。`&'static ModelSpec` を
+    /// `status_of` と違い**ディスクを見ない**し、状態を外へ出さない（モデル一覧（#117）は
+    /// ディスク走査の結果を持っているので存在確認は不要で、知りたいのは「いま取得中か」だけ。
+    /// `Failed(String)` を行ごとに clone しないためにも bool で返す）。`&'static ModelSpec` を
     /// 用意せずに引けるようにしてある（一覧の行はカタログ外もありうる）。
-    pub fn status_of_id(&self, id: &str) -> Option<DownloadStatus> {
-        self.lock().get(id).cloned()
+    pub fn is_downloading(&self, id: &str) -> bool {
+        matches!(
+            self.lock().get(id),
+            Some(DownloadStatus::Downloading { .. })
+        )
     }
 
     /// UI 起点: 未取得（または直近失敗）ならバックグラウンドスレッドでダウンロードを開始する。
@@ -291,8 +295,6 @@ impl ModelDownloader {
         self.lock().insert(spec.id, status);
     }
 
-    /// 状態マップのガードを取る。poison（ロック保持中のパニック）でも状態表示・DL 管理を
-    /// 止めないため、ガードを取り出して続行する（`docs/rules/error-handling.md`）。
     /// 取得済みのモデルファイルを**完全削除**する（ゴミ箱へは入れない。#117）。
     ///
     /// ゴミ箱へ送らないのは、カタログに URL と SHA-256 があって再取得できるため。ディスクを
@@ -340,6 +342,8 @@ impl ModelDownloader {
         Ok(())
     }
 
+    /// 状態マップのガードを取る。poison（ロック保持中のパニック）でも状態表示・DL 管理を
+    /// 止めないため、ガードを取り出して続行する（`docs/rules/error-handling.md`）。
     fn lock(&self) -> MutexGuard<'_, HashMap<&'static str, DownloadStatus>> {
         self.status
             .lock()
@@ -487,6 +491,23 @@ pub fn sweep_orphaned_part_files() {
     );
 }
 
+/// 全カタログの登録簿（カタログと、その既定 ID）。**種別を足したらここに 1 行足す**。
+///
+/// これが**カタログ集合の唯一の正**: 取得済みモデルの列挙（`installed_models`）と、横断の
+/// 一意性検査（`catalog_checks`）が同じ登録簿を読む。呼び出し側で別に並べると、種別を足した人が
+/// 片方だけ更新して**その種別のモデルが「カタログ外」に落ちる**（削除の安全弁が効かなくなり、
+/// 「再取得できない」という嘘の警告も出る）。
+pub(crate) const REGISTERED_CATALOGS: &[(&[ModelSpec], &str)] = &[
+    (
+        crate::whisper_model::CATALOG,
+        crate::whisper_model::DEFAULT_MODEL_ID,
+    ),
+    (
+        crate::summary_model::CATALOG,
+        crate::summary_model::DEFAULT_MODEL_ID,
+    ),
+];
+
 /// `models/` に置かれているモデルファイル 1 件（モデル一覧ウィンドウの 1 行。#117）。
 ///
 /// **一覧の正はディスク**で、カタログは表示名・種別の解決にだけ使う（カタログ全件を並べると
@@ -511,43 +532,82 @@ pub struct InstalledModel {
 /// `models/` にあるモデルを列挙する（サイズの大きい順）。データディレクトリが決まらない・
 /// まだ 1 つも取得していない場合は空。
 ///
-/// `catalogs` は表示名・種別の解決に使うカタログの一覧（`whisper_model::CATALOG` など）。
-/// **種別非依存**にしてあるので、種別が増えてもここへカタログを 1 つ渡すだけで一覧に並ぶ。
-pub fn installed_models(catalogs: &[&'static [ModelSpec]]) -> Vec<InstalledModel> {
+/// 表示名・種別は登録簿（`REGISTERED_CATALOGS`）から引く。**種別非依存**なので、種別が増えても
+/// 登録簿に 1 行足すだけで一覧に並ぶ。
+///
+/// 走査そのものに失敗したら `Err`（呼び出し側が「1 つも無い」と区別して表示するため。空一覧に
+/// 畳むと、権限エラーで読めないだけのときに「まだ何も無い」と嘘を言う）。
+///
+/// **取得中のモデルは並ばない**: 受信中の中身は一時ファイル（`*.part.<pid>`）で、まだモデル
+/// ではないため（取得の進捗は設定画面の状態行が出す）。そのぶん合計使用量は受信中のバイトを
+/// 含まない。完了して rename された時点で一覧に現れる。取り残された一時ファイルの回収は
+/// `sweep_orphaned_part_files` が持つので、ここでは扱わない。
+pub fn installed_models() -> std::io::Result<Vec<InstalledModel>> {
     let Some(dir) = models_dir() else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
-    installed_models_in(&dir, catalogs)
+    let catalogs: Vec<&'static [ModelSpec]> = REGISTERED_CATALOGS
+        .iter()
+        .map(|(catalog, _)| *catalog)
+        .collect();
+    installed_models_in(&dir, &catalogs)
 }
 
-/// `installed_models` の本体（走査するディレクトリを引数で受け、テストから呼べるようにする）。
+/// `installed_models` の本体（走査するディレクトリとカタログを引数で受け、テストから呼べる
+/// ようにする）。
 ///
 /// 走査は `dir` **直下の通常ファイルだけ**にする: ディレクトリとシンボリックリンクは対象外
-/// （`entry.metadata()` はリンクを辿らないので、リンク自身の属性で判断する）。書きかけの
-/// 一時ファイル（`*.part.<pid>`）も除く——成果物ではないし、取得中のものを消させると完了時の
-/// rename が失敗する。取り残しの回収は `sweep_orphaned_part_files` が持つ。
-fn installed_models_in(dir: &Path, catalogs: &[&'static [ModelSpec]]) -> Vec<InstalledModel> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        // 保存先が未作成（まだ一度も取得していない）なども含む。落とさず空一覧にする。
-        // フルパスはログに出さない（`docs/rules/security.md`）。
-        Err(err) => {
-            eprintln!("Skipping the model scan because the folder could not be read: {err}");
-            return Vec::new();
+/// （`entry.metadata()` はリンクを辿らないので、リンク自身の属性で判断する）。`dir` 自身が
+/// リンクのときも辿らない——一覧の行はそのまま**完全削除**の対象になるので、`models/` を
+/// 外部ボリュームへのリンクに差し替えられていたら、その先の無関係なファイルを消せてしまう
+/// （`atomic_replace::sweep_orphaned_parts` と同じガード）。書きかけの一時ファイル
+/// （`*.part.<pid>`）も除く: 成果物ではないし、取得中のものを消させると完了時の rename が
+/// 失敗する。取り残しの回収は `sweep_orphaned_part_files` が持つ。
+fn installed_models_in(
+    dir: &Path,
+    catalogs: &[&'static [ModelSpec]],
+) -> std::io::Result<Vec<InstalledModel>> {
+    // リンクを辿らずにディレクトリであることを確かめる（未作成なら「1 つも無い」と同じ扱い）。
+    match dir.symlink_metadata() {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            eprintln!("Skipping the model scan because the models path is not a directory");
+            return Ok(Vec::new());
         }
-    };
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err),
+    }
 
     let mut models: Vec<InstalledModel> = Vec::new();
-    for entry in entries.flatten() {
+    for entry in std::fs::read_dir(dir)? {
+        // 1 件読めなくても残りは並べる（握りつぶさずログに残す。`docs/rules/error-handling.md`）。
+        // ログに出すのはファイル名だけ（フルパスはユーザー名を含む。`docs/rules/security.md`）。
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                eprintln!("Skipping a model entry because it could not be read: {err}");
+                continue;
+            }
+        };
         let name = entry.file_name();
         let Some(filename) = name.to_str() else {
-            continue; // 非 UTF-8 の名前は扱わない（カタログのファイル名は UTF-8）。
+            // 非 UTF-8 の名前は扱わない（カタログのファイル名は UTF-8）。消す対象にもしない。
+            eprintln!("Skipping a model file because its name is not valid UTF-8");
+            continue;
         };
         if crate::atomic_replace::is_part_file(Path::new(filename)) {
             continue;
         }
-        let Ok(metadata) = entry.metadata() else {
-            continue; // 読めないものは一覧に出さない（消す対象を確定できない）。
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                // 一覧にも合計にも出ないと、実際の使用量が表示より大きくなる（この一覧の目的が
+                // 崩れる）ので、消えたことが分かるようログに残す。
+                eprintln!(
+                    "Skipping a model file because its metadata could not be read (file: {filename}, reason: {err})"
+                );
+                continue;
+            }
         };
         if !metadata.is_file() {
             continue;
@@ -571,7 +631,34 @@ fn installed_models_in(dir: &Path, catalogs: &[&'static [ModelSpec]]) -> Vec<Ins
             .cmp(&a.size_bytes)
             .then_with(|| a.filename.cmp(&b.filename))
     });
-    models
+    Ok(models)
+}
+
+/// 設定のモデルパス上書き（`whisper_model_path` / `summary_model_path`）が、この行のファイルを
+/// 指しているか。
+///
+/// 上書きは `models/` の**外**を指すのが普通だが、`models/` 直下を指すこともできる。その場合は
+/// カタログ外の行として並ぶので、上書き先だと分からないと「実行中のジョブが読んでいるファイル」を
+/// 削除できてしまう（判定は `main::model_row_kind`）。
+pub fn is_override_of(model: &InstalledModel, override_path: Option<&Path>) -> bool {
+    let Some(override_path) = override_path else {
+        return false;
+    };
+    let Some(dir) = models_dir() else {
+        return false;
+    };
+    let installed = dir.join(&model.filename);
+    if override_path == installed {
+        return true;
+    }
+    // `..` やリンクを挟んだ書き方でも一致を見る（解決できない場合は素の比較の結果に従う）。
+    match (
+        std::fs::canonicalize(override_path),
+        std::fs::canonicalize(&installed),
+    ) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
 }
 
 /// パス要素を持たない素のファイル名か（`/` や `..`、絶対パスを弾く）。
@@ -814,31 +901,19 @@ pub(crate) mod catalog_checks {
         }
     }
 
-    /// 全カタログの登録簿（カタログと、その既定 ID）。**種別を足したらここに 1 行足す**。
-    /// 下のテストが横断で一意性を見る。
-    const ALL_CATALOGS: &[(&[ModelSpec], &str)] = &[
-        (
-            crate::whisper_model::CATALOG,
-            crate::whisper_model::DEFAULT_MODEL_ID,
-        ),
-        (
-            crate::summary_model::CATALOG,
-            crate::summary_model::DEFAULT_MODEL_ID,
-        ),
-    ];
-
     /// 登録簿のカタログすべてが健全で、ID とファイル名は種別をまたいで一意
     /// （状態マップのキーと保存先が種別で混ざらないように）。
     ///
-    /// `assert_valid` もここで回すので、**カタログを足す側は登録簿へ 1 行足すだけでよい**
-    /// （各カタログのテストからも呼べるが、呼び忘れてもここで捕まる）。
+    /// 登録簿は本番と同じもの（`super::REGISTERED_CATALOGS`）を読む。`assert_valid` もここで
+    /// 回すので、**カタログを足す側は登録簿へ 1 行足すだけでよい**（各カタログのテストからも
+    /// 呼べるが、呼び忘れてもここで捕まる）。
     #[test]
     fn registered_catalogs_are_valid_and_globally_unique() {
-        for (catalog, default_id) in ALL_CATALOGS {
+        for (catalog, default_id) in super::REGISTERED_CATALOGS {
             assert_valid(catalog, default_id);
         }
 
-        let specs: Vec<&ModelSpec> = ALL_CATALOGS
+        let specs: Vec<&ModelSpec> = super::REGISTERED_CATALOGS
             .iter()
             .flat_map(|(catalog, _)| catalog.iter())
             .collect();
@@ -924,7 +999,8 @@ mod tests {
         std::fs::write(dir.join("left-over.bin"), vec![b'x'; 20])
             .expect("writing the fixture should succeed");
 
-        let models = installed_models_in(&dir, &fake_catalogs());
+        let models =
+            installed_models_in(&dir, &fake_catalogs()).expect("the fixture dir is readable");
         let names: Vec<&str> = models.iter().map(|m| m.filename.as_str()).collect();
         assert_eq!(
             names,
@@ -965,7 +1041,8 @@ mod tests {
         std::os::unix::fs::symlink(dir.join("real.bin"), dir.join("linked.bin"))
             .expect("creating the symlink should succeed");
 
-        let models = installed_models_in(&dir, &fake_catalogs());
+        let models =
+            installed_models_in(&dir, &fake_catalogs()).expect("the fixture dir is readable");
         let names: Vec<&str> = models.iter().map(|m| m.filename.as_str()).collect();
         assert_eq!(names, vec!["real.bin"]);
 
@@ -977,7 +1054,34 @@ mod tests {
     fn installed_models_degrades_when_the_folder_is_missing() {
         let dir = temp_path("installed-missing");
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(installed_models_in(&dir, &fake_catalogs()).is_empty());
+        assert!(
+            installed_models_in(&dir, &fake_catalogs())
+                .expect("the fixture dir is readable")
+                .is_empty()
+        );
+    }
+
+    /// **走査するディレクトリ自身がシンボリックリンク**なら辿らない。一覧の行はそのまま完全削除の
+    /// 対象になるので、`models/` をリンクに差し替えられていたらリンク先の無関係なファイルを
+    /// 消せてしまう（エントリ単位のリンク除外では防げない）。
+    #[test]
+    #[cfg(unix)]
+    fn installed_models_does_not_follow_a_symlinked_folder() {
+        let real = models_fixture("installed-linked-target");
+        std::fs::write(real.join("victim.bin"), b"x").expect("writing the fixture should succeed");
+        let root = models_fixture("installed-linked");
+        let link = root.join("models");
+        std::os::unix::fs::symlink(&real, &link).expect("creating the symlink should succeed");
+
+        let listed = installed_models_in(&link, &fake_catalogs())
+            .expect("a symlinked folder is reported as empty, not as an error");
+        assert!(
+            listed.is_empty(),
+            "files behind a symlinked models folder must not be listed"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&real);
     }
 
     /// 削除はファイルを消し、**状態マップのエントリも消す**（消さないと設定画面の 100ms
@@ -992,7 +1096,8 @@ mod tests {
             .lock()
             .insert(FAKE_LLM_MODEL.id, DownloadStatus::Downloaded);
 
-        let models = installed_models_in(&dir, &fake_catalogs());
+        let models =
+            installed_models_in(&dir, &fake_catalogs()).expect("the fixture dir is readable");
         assert_eq!(models.len(), 1);
         downloader
             .delete_in(&dir, &models[0])
@@ -1003,7 +1108,11 @@ mod tests {
             downloader.lock().get(FAKE_LLM_MODEL.id).is_none(),
             "the status entry should be gone so the display falls back to the disk"
         );
-        assert!(installed_models_in(&dir, &fake_catalogs()).is_empty());
+        assert!(
+            installed_models_in(&dir, &fake_catalogs())
+                .expect("the fixture dir is readable")
+                .is_empty()
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1024,7 +1133,8 @@ mod tests {
             },
         );
 
-        let models = installed_models_in(&dir, &fake_catalogs());
+        let models =
+            installed_models_in(&dir, &fake_catalogs()).expect("the fixture dir is readable");
         downloader
             .delete_in(&dir, &models[0])
             .expect_err("a model that is being downloaded must not be deleted");

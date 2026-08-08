@@ -96,7 +96,8 @@ export component AppWindow inherits Window {
     // 幅・高さは src/main.rs の WINDOW_WIDTH/HEIGHT と一致させること（片方だけ変えない）。
     // 幅は 420 固定。高さは 3 セクション＋Transcription の Language/Model 行・状態行・
     // 議事録要約のトグルとモデル行・説明行・状態行・モデル管理ボタン、＋末尾のバージョン行に
-    // 合わせた値
+    // 合わせた値（#117 のボタンは既存の余白に収まったので 900 は据え置き。
+    // `examples/settings_view.rs -- snapshot` で確認済み）
     // （中身を足すときは `examples/settings_view.rs -- snapshot` で見て、ここと
     // `WINDOW_HEIGHT` を揃えて直す）。
     min-width: 420px;
@@ -484,7 +485,9 @@ export component AppWindow inherits Window {
             }
 
             // 取得済みモデルの管理（#117）。文字起こしと議事録要約の両方のモデルが対象なので、
-            // どちらかのセクションの中ではなく、両方を含む Transcription セクションの外に置く。
+            // Transcription セクション内の、どちらのサブグループにも属さない位置に置く。
+            // 自動文字起こしのトグル（`transcribe-deps.enabled-gate`）には従わせない: 取得済み
+            // モデルの掃除は、機能を OFF にした後こそやりたい操作なので。
             HorizontalLayout {
                 alignment: start;
                 Button {

@@ -201,12 +201,16 @@ impl TranscribeWorker {
         lock_status(&self.status).get(session_dir).copied()
     }
 
-    /// いま文字起こしを実行中のセッションが在るか（モデル一覧の削除可否に使う。#117）。
+    /// 文字起こしのジョブが在るか（**キュー待ちを含む**。`TranscribeStatus::Transcribing` は
+    /// `submit` の時点で入る）。モデル一覧の削除可否に使う（#117）。
     ///
     /// **どのモデルを使っているかは見ない**（ジョブは投入時点の設定を snapshot で持つので、
-    /// 走っているジョブのモデルと現在の選択は違いうる）。whisper のモデルは走行中に読まれるので、
-    /// 実行中は whisper 種別の行をまとめて削除不可にする（種別単位の粗い判定）。
-    pub fn is_running(&self) -> bool {
+    /// 走っているジョブのモデルと現在の選択は違いうる）。whisper のモデルはジョブが読むので、
+    /// ジョブが在る間は whisper 種別の行をまとめて削除不可にする（種別単位の粗い判定）。
+    ///
+    /// **限界**: ワーカースレッドがパニックで死ぬと状態が `Transcribing` のまま残るので
+    /// （上の `catch_unwind` の doc）、その場合は再起動まで whisper のモデルを削除できない。
+    pub fn has_pending_jobs(&self) -> bool {
         lock_status(&self.status)
             .values()
             .any(|status| *status == TranscribeStatus::Transcribing)
