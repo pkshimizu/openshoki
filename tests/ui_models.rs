@@ -51,7 +51,7 @@ fn set_rows(window: &ModelsWindow, rows: &[(&str, ModelRowState)]) {
         .iter()
         .map(|(name, state)| ModelRow {
             name: (*name).into(),
-            detail: "Whisper speech · model.bin".into(),
+            detail: "Whisper speech — model.bin".into(),
             size: "1.5 GB".into(),
             state_text: "state".into(),
             delete_detail: "detail".into(),
@@ -83,7 +83,10 @@ fn confirm_button(window: &ModelsWindow) -> ElementHandle {
 /// ここがコンパイルエラーになって更新漏れに気づけるようにする）。
 fn deletable(state: ModelRowState) -> bool {
     match state {
-        ModelRowState::Installed | ModelRowState::Selected | ModelRowState::Unknown => true,
+        ModelRowState::Installed
+        | ModelRowState::Selected
+        | ModelRowState::Unknown
+        | ModelRowState::UnknownSelected => true,
         ModelRowState::InUse | ModelRowState::Downloading => false,
     }
 }
@@ -182,6 +185,7 @@ fn the_row_state_decides_whether_delete_can_be_pressed() {
         ModelRowState::InUse,
         ModelRowState::Downloading,
         ModelRowState::Unknown,
+        ModelRowState::UnknownSelected,
     ] {
         set_rows(&window, &[("Model", state)]);
         window.set_show_delete_confirm(false);

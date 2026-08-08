@@ -352,7 +352,7 @@ impl SummarizeWorker {
     /// キュー待ちも数えるのは、破壊的操作のガードを**安全側に転ばせる**ため
     /// （消してもジョブは失敗せず 4.4GB を再取得するだけだが、それは待たせるだけで誰の得にも
     /// ならない）。文字起こし側（`TranscribeWorker::has_pending_jobs`）がキュー待ちを含むのと
-    /// 揃える。判定が種別単位である理由もそちらと同じ。
+    /// 揃える。判定が種別単位である理由と、数える範囲（投入済みのジョブだけ）もそちらと同じ。
     pub fn has_pending_jobs(&self) -> bool {
         lock_queue(&self.queue).status.values().any(|(_, status)| {
             matches!(
@@ -1630,6 +1630,39 @@ mod tests {
                 queue.status.get(&dir).map(|(_, s)| *s),
                 Some(status),
                 "{status:?} must be left alone"
+            );
+        }
+    }
+
+    /// 削除ガードが読む述語（`has_pending_jobs`）は**キュー待ちも数える**。数えないと、要約が
+    /// 積まれているのに 4.4GB の LLM を消せてしまう（消してもジョブは失敗せず再取得するだけだが、
+    /// 待たせるだけで誰の得にもならない）。状態マップを直接組んで、ジョブを走らせずに固定する。
+    #[test]
+    fn has_pending_jobs_counts_queued_and_running_jobs() {
+        let worker = SummarizeWorker::start(
+            crate::model_download::ModelDownloader::new(),
+            crate::inference_slot::InferenceSlot::new(),
+        );
+        let dir = std::path::PathBuf::from("/tmp/shoki-pending");
+        assert!(!worker.has_pending_jobs(), "an empty queue is not pending");
+
+        for status in [SummarizeStatus::Queued, SummarizeStatus::Summarizing] {
+            lock_queue(&worker.queue)
+                .status
+                .insert(dir.clone(), (1, status));
+            assert!(
+                worker.has_pending_jobs(),
+                "{status:?} must count as a pending job"
+            );
+        }
+        // 終わったジョブは数えない（消してよい）。
+        for status in [SummarizeStatus::Done, SummarizeStatus::Failed] {
+            lock_queue(&worker.queue)
+                .status
+                .insert(dir.clone(), (1, status));
+            assert!(
+                !worker.has_pending_jobs(),
+                "{status:?} must not count as a pending job"
             );
         }
     }

@@ -102,7 +102,8 @@ fn main() {
         1 => "1 model — 4.4 GB".into(),
         _ => "4 models — 9.2 GB".into(),
     });
-    // 失敗の通知も見た目の確認対象（合計と同じ行に出る）。
+    // 失敗の通知も見た目の確認対象（合計と同じ行に出る。`src/main.rs` の `MODEL_IN_USE_NOTICE`
+    // の複製。あちらを変えたらここも合わせること）。
     if variant == "notice" {
         win.set_notice("This model is in use right now — it was not deleted.".into());
     }

@@ -3,7 +3,7 @@ import { Style } from "style.slint";
 import { DangerButton } from "controls.slint";
 
 // 一覧の 1 行の状態。**ディスクにあるモデル**の行なので「未取得」は無い。
-// Rust 側（main.rs の `model_row_state`）が、カタログ・設定・ワーカーの状況から合成して詰める。
+// Rust 側（main.rs の `model_rows`）が、カタログ・設定・ワーカーの状況から合成して詰める。
 // 先頭が既定値なので、素の「取得済み」を先頭に置く。
 export enum ModelRowState {
     // 取得済み。いま選ばれてはいない（消しても次の利用まで何も起きない）。
@@ -18,6 +18,10 @@ export enum ModelRowState {
     // `models/` に在るがカタログに無いファイル（カタログ差し替え後の旧ファイルなど）。
     // 表示名も種別も分からないが、容量を食っているので一覧に出して消せるようにする。
     unknown,
+    // カタログには無いが、設定のモデルパス上書き（config 手編集）がこのファイルを指している。
+    // 消すと設定が存在しないパスを指したままになり、**アプリでは戻せない**ので、そのことを
+    // 状態行と確認モーダルの両方で伝える。
+    unknown-selected,
 }
 
 // 一覧の 1 行。文言はすべて Rust 側で組む（状態→文言の対応表は Rust の網羅 match が正。

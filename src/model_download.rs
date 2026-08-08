@@ -15,7 +15,9 @@
 //! モデル種別ごとのカタログ（`ModelSpec` の配列）は各モジュールが持つ
 //! （whisper なら `crate::whisper_model::CATALOG`）。このモジュールは「1 つの `ModelSpec` を
 //! 取ってきて置く」ことと、**カタログに対する種別非依存の解決・検査**（`catalog_index` と
-//! `catalog_checks`）だけを担う。種別固有の中身（どのモデルを載せるか）には触らない。
+//! `catalog_checks`）、そして**置いたものの列挙と削除**（`installed_models` /
+//! `ModelDownloader::delete`。#117）を担う。種別固有の中身（どのモデルを載せるか）には触らない。
+//! カタログ集合の正は `REGISTERED_CATALOGS`（種別・カタログ・既定 ID の登録簿）。
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -44,8 +46,11 @@ use sha2::{Digest, Sha256};
 /// ここに置くのは種別をまたいで共通のものだけにする。
 #[derive(Debug)]
 pub struct ModelSpec {
-    /// ログに出す種別（例: `Whisper speech`）。モデル種別が増えたとき、どちらの
-    /// ダウンロードかをログで見分けるために使う。
+    /// ログとモデル一覧の行に出す種別の**表示名**（例: `Whisper speech`）。ログでどちらの
+    /// ダウンロードかを見分けるのと、一覧の 2 行目に出すのに使う。
+    ///
+    /// **破壊的操作の判定キーにしない**（文言を調整した瞬間に判定が変わる）。種別の識別は
+    /// `ModelKind`（登録簿 `REGISTERED_CATALOGS` が持つ）で行う。
     pub kind: &'static str,
     /// 設定に保存する識別子。ダウンロード状態マップのキーも兼ねるため、
     /// **種別をまたいで一意**にすること。
@@ -327,6 +332,14 @@ impl ModelDownloader {
         }
         let path = dir.join(&model.filename);
         let mut status = self.lock();
+        // 一覧を作ってから押されるまでの間に差し替えられていないかを、消す直前に見る
+        // （`models/` がリンクへ、対象がリンクへ）。列挙側のガードだけでは、この窓が閉じない。
+        if !dir.symlink_metadata().is_ok_and(|meta| meta.is_dir()) {
+            return Err("the models folder is not a directory".into());
+        }
+        if !path.symlink_metadata().is_ok_and(|meta| meta.is_file()) {
+            return Err("the model file is not a regular file".into());
+        }
         if let Some(id) = model.catalog_id
             && let Some(DownloadStatus::Downloading { .. }) = status.get(id)
         {
@@ -491,18 +504,33 @@ pub fn sweep_orphaned_part_files() {
     );
 }
 
-/// 全カタログの登録簿（カタログと、その既定 ID）。**種別を足したらここに 1 行足す**。
+/// モデルの種別。**破壊的操作（削除）の判定キー**で、表示用の `ModelSpec::kind` とは別物
+/// （文言を調整した瞬間に判定が変わる形にしないため。`docs/rules/coding-conventions.md`）。
+///
+/// 種別を足したら、この enum と `REGISTERED_CATALOGS` に 1 つ足す。使う側は網羅 match で
+/// 受けるので（`main::kind_is_busy`）、足した種別の扱いを書き忘れるとコンパイルが通らない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelKind {
+    /// 文字起こし（whisper）。
+    Speech,
+    /// 議事録要約（LLM）。
+    Summary,
+}
+
+/// 全カタログの登録簿（種別・カタログ・その既定 ID）。**種別を足したらここに 1 行足す**。
 ///
 /// これが**カタログ集合の唯一の正**: 取得済みモデルの列挙（`installed_models`）と、横断の
 /// 一意性検査（`catalog_checks`）が同じ登録簿を読む。呼び出し側で別に並べると、種別を足した人が
 /// 片方だけ更新して**その種別のモデルが「カタログ外」に落ちる**（削除の安全弁が効かなくなり、
 /// 「再取得できない」という嘘の警告も出る）。
-pub(crate) const REGISTERED_CATALOGS: &[(&[ModelSpec], &str)] = &[
+pub(crate) const REGISTERED_CATALOGS: &[(ModelKind, &[ModelSpec], &str)] = &[
     (
+        ModelKind::Speech,
         crate::whisper_model::CATALOG,
         crate::whisper_model::DEFAULT_MODEL_ID,
     ),
     (
+        ModelKind::Summary,
         crate::summary_model::CATALOG,
         crate::summary_model::DEFAULT_MODEL_ID,
     ),
@@ -521,8 +549,10 @@ pub struct InstalledModel {
     /// **実ファイルの長さ**。カタログの `size_bytes` ではない（途中で壊れたファイルの実サイズを
     /// 見せたいため）。
     pub size_bytes: u64,
-    /// カタログが引けたときの種別（`ModelSpec::kind`）。カタログ外は `None`。
-    pub kind: Option<&'static str>,
+    /// カタログが引けたときの**種別**（削除ガードの判定キー。`ModelKind`）。カタログ外は `None`。
+    pub kind: Option<ModelKind>,
+    /// カタログが引けたときの種別の**表示名**（`ModelSpec::kind`）。判定には使わない。
+    pub kind_label: Option<&'static str>,
     /// カタログが引けたときの表示名。カタログ外は `None`（表示はファイル名で代替する）。
     pub display_name: Option<&'static str>,
     /// カタログが引けたときのモデル ID。状態マップのキーなので、削除時のエントリ掃除に使う。
@@ -546,9 +576,9 @@ pub fn installed_models() -> std::io::Result<Vec<InstalledModel>> {
     let Some(dir) = models_dir() else {
         return Ok(Vec::new());
     };
-    let catalogs: Vec<&'static [ModelSpec]> = REGISTERED_CATALOGS
+    let catalogs: Vec<(ModelKind, &'static [ModelSpec])> = REGISTERED_CATALOGS
         .iter()
-        .map(|(catalog, _)| *catalog)
+        .map(|(kind, catalog, _)| (*kind, *catalog))
         .collect();
     installed_models_in(&dir, &catalogs)
 }
@@ -565,7 +595,7 @@ pub fn installed_models() -> std::io::Result<Vec<InstalledModel>> {
 /// 失敗する。取り残しの回収は `sweep_orphaned_part_files` が持つ。
 fn installed_models_in(
     dir: &Path,
-    catalogs: &[&'static [ModelSpec]],
+    catalogs: &[(ModelKind, &'static [ModelSpec])],
 ) -> std::io::Result<Vec<InstalledModel>> {
     // リンクを辿らずにディレクトリであることを確かめる（未作成なら「1 つも無い」と同じ扱い）。
     match dir.symlink_metadata() {
@@ -612,16 +642,17 @@ fn installed_models_in(
         if !metadata.is_file() {
             continue;
         }
-        let spec = catalogs
+        let found = catalogs
             .iter()
-            .flat_map(|catalog| catalog.iter())
-            .find(|spec| spec.filename == filename);
+            .flat_map(|(kind, catalog)| catalog.iter().map(move |spec| (*kind, spec)))
+            .find(|(_, spec)| spec.filename == filename);
         models.push(InstalledModel {
             filename: filename.to_owned(),
             size_bytes: metadata.len(),
-            kind: spec.map(|spec| spec.kind),
-            display_name: spec.map(|spec| spec.display_name),
-            catalog_id: spec.map(|spec| spec.id),
+            kind: found.map(|(kind, _)| kind),
+            kind_label: found.map(|(_, spec)| spec.kind),
+            display_name: found.map(|(_, spec)| spec.display_name),
+            catalog_id: found.map(|(_, spec)| spec.id),
         });
     }
     // 大きい順（一覧の目的が「何が容量を食っているか」なので、効くものから見せる）。
@@ -641,10 +672,15 @@ fn installed_models_in(
 /// カタログ外の行として並ぶので、上書き先だと分からないと「実行中のジョブが読んでいるファイル」を
 /// 削除できてしまう（判定は `main::model_row_kind`）。
 pub fn is_override_of(model: &InstalledModel, override_path: Option<&Path>) -> bool {
-    let Some(override_path) = override_path else {
+    let Some(dir) = models_dir() else {
         return false;
     };
-    let Some(dir) = models_dir() else {
+    is_override_of_in(&dir, model, override_path)
+}
+
+/// `is_override_of` の本体（基点ディレクトリを引数で受け、テストから呼べるようにする）。
+fn is_override_of_in(dir: &Path, model: &InstalledModel, override_path: Option<&Path>) -> bool {
+    let Some(override_path) = override_path else {
         return false;
     };
     let installed = dir.join(&model.filename);
@@ -909,13 +945,13 @@ pub(crate) mod catalog_checks {
     /// 呼べるが、呼び忘れてもここで捕まる）。
     #[test]
     fn registered_catalogs_are_valid_and_globally_unique() {
-        for (catalog, default_id) in super::REGISTERED_CATALOGS {
+        for (_, catalog, default_id) in super::REGISTERED_CATALOGS {
             assert_valid(catalog, default_id);
         }
 
         let specs: Vec<&ModelSpec> = super::REGISTERED_CATALOGS
             .iter()
-            .flat_map(|(catalog, _)| catalog.iter())
+            .flat_map(|(_, catalog, _)| catalog.iter())
             .collect();
         for (i, spec) in specs.iter().enumerate() {
             for other in specs.iter().skip(i + 1) {
@@ -980,11 +1016,11 @@ mod tests {
         dir
     }
 
-    fn fake_catalogs() -> Vec<&'static [ModelSpec]> {
+    fn fake_catalogs() -> Vec<(ModelKind, &'static [ModelSpec])> {
         // カタログは 2 つ渡す（種別非依存であること＝どちらのカタログからも引けることを見る）。
         static LLM: &[ModelSpec] = std::slice::from_ref(&FAKE_LLM_MODEL);
         static SPEECH: &[ModelSpec] = std::slice::from_ref(&FAKE_SPEECH_MODEL);
-        vec![LLM, SPEECH]
+        vec![(ModelKind::Summary, LLM), (ModelKind::Speech, SPEECH)]
     }
 
     /// 一覧はディスクを正にして、カタログは表示名・種別の解決にだけ使う。カタログ外のファイルも
@@ -1012,15 +1048,18 @@ mod tests {
             "the biggest file comes first"
         );
         assert_eq!(models[0].size_bytes, 30, "the size is the real file length");
-        assert_eq!(models[0].kind, Some(FAKE_SPEECH_MODEL.kind));
+        assert_eq!(models[0].kind, Some(ModelKind::Speech));
+        assert_eq!(models[0].kind_label, Some(FAKE_SPEECH_MODEL.kind));
         assert_eq!(models[0].display_name, Some(FAKE_SPEECH_MODEL.display_name));
         assert_eq!(models[0].catalog_id, Some(FAKE_SPEECH_MODEL.id));
         // カタログ外はファイル名とサイズだけが分かる。
         assert_eq!(models[1].kind, None);
+        assert_eq!(models[1].kind_label, None);
         assert_eq!(models[1].display_name, None);
         assert_eq!(models[1].catalog_id, None);
-        // 2 つ目のカタログからも引ける（種別非依存）。
+        // 2 つ目のカタログからも引ける（種別非依存。種別も登録簿の値が入る）。
         assert_eq!(models[2].catalog_id, Some(FAKE_LLM_MODEL.id));
+        assert_eq!(models[2].kind, Some(ModelKind::Summary));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1082,6 +1121,44 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&real);
+    }
+
+    /// 設定のモデルパス上書きがこの行を指しているかの判定。`models/` の外を指すのが普通だが、
+    /// 直下を指すこともできる（そのときは削除を守る側に効く）。
+    #[test]
+    fn is_override_of_matches_only_this_file() {
+        let dir = models_fixture("override");
+        let model = InstalledModel {
+            filename: "custom.gguf".to_owned(),
+            size_bytes: 1,
+            kind: None,
+            kind_label: None,
+            display_name: None,
+            catalog_id: None,
+        };
+        let installed = dir.join(&model.filename);
+        std::fs::write(&installed, b"x").expect("writing the fixture should succeed");
+
+        // 素の一致。
+        assert!(is_override_of_in(&dir, &model, Some(&installed)));
+        // `.` / `..` を挟んだ書き方でも一致する（canonicalize で解決する）。
+        let indirect = dir.join("sub").join("..").join(&model.filename);
+        std::fs::create_dir_all(dir.join("sub")).expect("creating the subdir should succeed");
+        assert!(is_override_of_in(&dir, &model, Some(&indirect)));
+        // 別のファイル・上書き無しは一致しない。
+        assert!(!is_override_of_in(
+            &dir,
+            &model,
+            Some(&dir.join("other.gguf"))
+        ));
+        assert!(!is_override_of_in(&dir, &model, None));
+        // `models/` の外を指す上書き（本来の使い方）は、この行とは無関係。
+        let outside = temp_path("override-outside");
+        std::fs::write(&outside, b"x").expect("writing the fixture should succeed");
+        assert!(!is_override_of_in(&dir, &model, Some(&outside)));
+
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 削除はファイルを消し、**状態マップのエントリも消す**（消さないと設定画面の 100ms
@@ -1162,6 +1239,7 @@ mod tests {
                 filename,
                 size_bytes: 1,
                 kind: None,
+                kind_label: None,
                 display_name: None,
                 catalog_id: None,
             };

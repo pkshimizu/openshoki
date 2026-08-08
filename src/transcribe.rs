@@ -208,6 +208,10 @@ impl TranscribeWorker {
     /// 走っているジョブのモデルと現在の選択は違いうる）。whisper のモデルはジョブが読むので、
     /// ジョブが在る間は whisper 種別の行をまとめて削除不可にする（種別単位の粗い判定）。
     ///
+    /// **範囲**: 数えるのは**投入済みのジョブ**だけ。後処理（`mixdown::PostProcessWorker` の
+    /// 正規化）はまだ投入していないので数えず、その間はモデルを削除できる（消してもジョブは
+    /// 失敗せず `ensure_model` が再取得する）。
+    ///
     /// **限界**: ワーカースレッドがパニックで死ぬと状態が `Transcribing` のまま残るので
     /// （上の `catch_unwind` の doc）、その場合は再起動まで whisper のモデルを削除できない。
     pub fn has_pending_jobs(&self) -> bool {
@@ -585,6 +589,37 @@ mod tests {
 
     /// 手動再実行・状態表示の土台となる状態マップのライフサイクルを、whisper モデルなしで
     /// 検証する。存在しないモデル上書きパスを渡すと、ネットワークに触れず即 Failed になる。
+    /// 削除ガードが読む述語（`has_pending_jobs`）は**キュー待ちも数える**（`Transcribing` は
+    /// `submit` の時点で入るので、デキュー前のジョブも守られる）。状態マップを直接組んで、
+    /// whisper を走らせずに固定する。
+    #[test]
+    fn has_pending_jobs_counts_queued_and_running_jobs() {
+        let worker = TranscribeWorker::start(
+            crate::model_download::ModelDownloader::new(),
+            crate::summarize::SummarizeWorker::start(
+                crate::model_download::ModelDownloader::new(),
+                crate::inference_slot::InferenceSlot::new(),
+            ),
+            crate::inference_slot::InferenceSlot::new(),
+        );
+        let dir = std::path::PathBuf::from("/tmp/shoki-transcribe-pending");
+        assert!(!worker.has_pending_jobs(), "an empty queue is not pending");
+
+        lock_status(&worker.status).insert(dir.clone(), TranscribeStatus::Transcribing);
+        assert!(
+            worker.has_pending_jobs(),
+            "a submitted job counts even before it is dequeued"
+        );
+        // 終わったジョブは数えない（消してよい）。
+        for status in [TranscribeStatus::Done, TranscribeStatus::Failed] {
+            lock_status(&worker.status).insert(dir.clone(), status);
+            assert!(
+                !worker.has_pending_jobs(),
+                "{status:?} must not count as a pending job"
+            );
+        }
+    }
+
     #[test]
     fn submit_tracks_status_until_failure() {
         let worker = TranscribeWorker::start(
