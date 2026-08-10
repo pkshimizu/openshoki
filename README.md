@@ -194,7 +194,9 @@ shoki/
 │   ├── generate-icons.sh アイコン資産の再生成（.icon → Assets.car / .icns、SVG → tray.png）
 │   └── check-icons.sh    生成物がマスターと一致するかの検査（CI でも実行）
 └── src/
-    ├── main.rs           エントリ。トレイ初期化と Slint イベントループ起動
+    ├── main.rs           エントリ。トレイ初期化と Slint イベントループ起動、各画面の配線
+    ├── windows/          ウィンドウごとの配線（main.rs から画面単位で切り出したもの）
+    │   └── models.rs     モデル一覧の合成・可否判定・走査・通知・選択
     ├── tray.rs           トレイアイコン／メニューの構築とイベントのディスパッチ
     ├── recorder.rs       録音セッション（マイク＋システム音声）の開始・停止と MP3 書き出し
     ├── player.rs         録音の再生（rodio でファイルをストリーミング再生）

@@ -1,6 +1,6 @@
 //! モデル一覧の合成・可否判定・走査・通知・選択（#140 で `main.rs` から切り出した）。
 //!
-//! 一覧は**複数のウィンドウへ載せる**（`#141` で文字起こし用と議事録用に分ける）。描画は
+//! 一覧は**複数のウィンドウへ載せる**（#141 で文字起こし用と議事録用に分ける）。描画は
 //! `ui/model-list.slint` の `ModelList` が持ち、そこへ詰める素材をここが作る。
 //!
 //! この境目の要点は 2 つ:
@@ -38,7 +38,7 @@ pub(crate) enum ModelsRefresh {
 
 /// 通知をどう扱うか（`Option<Option<..>>` の 2 層にしないための型）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum NoticeUpdate {
+enum NoticeUpdate {
     /// いま出ている通知をそのまま残す。
     Keep,
     /// この値へ差し替える（`None` は消す）。
@@ -100,10 +100,7 @@ pub(crate) fn refresh_models_window(
 
 /// 走査の失敗を通知へ載せた作り直しの理由。**走査の失敗は操作の結果より先に伝える**（行の中身が
 /// 信用できないため）。通知を保持する `Rescan` でも、これだけは差し替える。
-pub(crate) fn refresh_cause(
-    cause: ModelsRefresh,
-    scan_notice: Option<&'static str>,
-) -> ModelsRefresh {
+fn refresh_cause(cause: ModelsRefresh, scan_notice: Option<&'static str>) -> ModelsRefresh {
     match (cause, scan_notice) {
         (_, Some(scan)) => ModelsRefresh::AfterOperation(Some(scan)),
         (cause, None) => cause,
@@ -113,13 +110,13 @@ pub(crate) fn refresh_cause(
 /// 走査の結果を素材へ入れ、**一緒に更新すべきもの**（tick のラッチと上書き先の解決）も同時に
 /// 書く。3 つを別々に更新すると、片方だけ古い状態が生まれる（ラッチが古いと毎 tick 走査し直し、
 /// 上書き先が古いと守るべき行を守らない）。
-pub(crate) fn reseed_model_sources(
+fn reseed_model_sources(
     handles: &ModelListHandles,
     installed: Vec<model_download::InstalledModel>,
     downloader: &model_download::ModelDownloader,
     config: &Config,
 ) {
-    *handles.sources.borrow_mut() = model_row_sources(installed);
+    *handles.sources.borrow_mut() = model_row_sources(installed, handles.kinds);
     *handles.downloaded_seen.borrow_mut() = downloaded_ids(&handles.sources.borrow(), downloader);
     *handles.override_files.borrow_mut() = OverrideFiles {
         speech: model_download::override_filename(config.whisper_model_path.as_deref()),
@@ -127,8 +124,8 @@ pub(crate) fn reseed_model_sources(
     };
 }
 
-/// 行だけを組み直す（**ディスクを走査しない**。上書き先の解決も走査時に済ませてある）。開いている間の tick から呼び、取得の進捗・
-/// 完了・失敗と、ジョブの開始・終了を表示へ反映する。
+/// 行だけを組み直す（**ディスクを走査しない**。上書き先の解決も走査時に済ませてある）。
+/// 開いている間の tick から呼び、取得の進捗・完了・失敗と、ジョブの開始・終了を表示へ反映する。
 ///
 /// 変わった行だけ差し替える（`VecModel` を毎 tick 差し替えると全行の要素が再生成され、
 /// ホバー・押下中の状態が飛んでクリックを取りこぼす。既存の一覧 tick と同じ流儀）。
@@ -144,7 +141,7 @@ pub(crate) fn refresh_model_rows(
     let sources = handles.sources.borrow();
     let override_files = handles.override_files.borrow();
     let context = models_context(transcriber, summarizer, downloader, config, &override_files);
-    let rows = model_rows(&sources, &context, handles.kinds);
+    let rows = model_rows(&sources, &context);
 
     if cause.resets_modal() {
         // 並びが変わるので、モーダルが古い行を指したままにしない。
@@ -167,7 +164,7 @@ pub(crate) fn refresh_model_rows(
 /// 行の反映の仕方。**全差し替えは行数が変わるときだけ**にする（毎回差し替えると全行の要素が
 /// 再生成され、ホバー・押下中の状態が飛んでクリックを取りこぼす）。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum RowUpdate {
+enum RowUpdate {
     /// モデルごと差し替える（行数が変わった＝素材を作り直した）。
     ReplaceAll,
     /// この添字の行だけ `set_row_data` する（空なら何もしない）。
@@ -175,7 +172,7 @@ pub(crate) enum RowUpdate {
 }
 
 /// いまの行と組み直した行を比べて、反映の仕方を決める（純粋関数）。
-pub(crate) fn rows_to_update(current: &[ModelRow], next: &[ModelRow]) -> RowUpdate {
+fn rows_to_update(current: &[ModelRow], next: &[ModelRow]) -> RowUpdate {
     if current.len() != next.len() {
         return RowUpdate::ReplaceAll;
     }
@@ -190,7 +187,7 @@ pub(crate) fn rows_to_update(current: &[ModelRow], next: &[ModelRow]) -> RowUpda
 }
 
 /// 組み直した行を UI のモデルへ反映する（判断は `rows_to_update`）。
-pub(crate) fn apply_model_rows(model: &Rc<slint::VecModel<ModelRow>>, rows: Vec<ModelRow>) {
+fn apply_model_rows(model: &Rc<slint::VecModel<ModelRow>>, rows: Vec<ModelRow>) {
     use slint::Model as _;
     let current: Vec<ModelRow> = model.iter().collect();
     match rows_to_update(&current, &rows) {
@@ -206,34 +203,42 @@ pub(crate) fn apply_model_rows(model: &Rc<slint::VecModel<ModelRow>>, rows: Vec<
     }
 }
 
-/// モデル管理ウィンドウの一覧を組むためのハンドル（素材と UI のモデル）。素材と行は同じ順序で
-/// 1 対 1 なので、必ず組で持つ（別々に持つと**別のモデルを操作する**事故になる）。
 /// `config.toml` のモデルパス上書きが `models/` 直下を指すときのファイル名（種別ごと）。
 ///
 /// 上書きは config の手編集でしか変わらないので、**走査と同じタイミングで 1 回だけ解決**して持つ
 /// （行ごと・tick ごとに `canonicalize` を叩かないため。`model_download::override_filename`）。
 #[derive(Debug, Clone, Default)]
 pub(crate) struct OverrideFiles {
-    pub(crate) speech: Option<String>,
-    pub(crate) summary: Option<String>,
+    speech: Option<String>,
+    summary: Option<String>,
 }
 
 /// 一覧に出す種別。**登録簿と対で読む**——`model_download::REGISTERED_CATALOGS` に種別を
-/// 足したらここにも足す（足さないとその種別が一覧から静かに消える）。網羅 match で強制できない
-/// のは、これが「全部入り」を表す定数だから。
+/// 足したらここにも足す。足し忘れはその種別が一覧から消えることで現れ、
+/// `all_model_kinds_covers_every_registered_catalog` が検知する（網羅 match で強制できないのは、
+/// これが「全部入り」を表す定数だから）。
 pub(crate) const ALL_MODEL_KINDS: &[model_download::ModelKind] = &[
     model_download::ModelKind::Speech,
     model_download::ModelKind::Summary,
 ];
 
+/// 一覧を組むためのハンドル（素材と UI のモデル）。素材と行は同じ順序で 1 対 1 なので、必ず組で
+/// 持つ（別々に持つと**別のモデルを操作する**事故になる。UI が渡す添字はこの前提で素材を引く）。
+///
+/// **`refresh_models_window` / `refresh_model_rows` を呼ぶ前に、ここの `Ref` を残さないこと。**
+/// 作り直しの経路は `sources` と `override_files` を `borrow_mut` するので、判定のために借りた
+/// まま呼ぶと `BorrowMutError` で**常駐プロセスごと落ちる**。判定はブロックに閉じて先に返す
+/// （`main` の削除ハンドラが実例）。
 #[derive(Clone)]
 pub(crate) struct ModelListHandles {
     /// 一覧の行の素材（走査した時点のもの。tick は状態だけ組み直す）。
     pub(crate) sources: Rc<RefCell<Vec<ModelRowSource>>>,
     /// 上書き先のファイル名（走査と同じタイミングで解決する）。
     pub(crate) override_files: Rc<RefCell<OverrideFiles>>,
-    /// この一覧が出す種別。**カタログ外のファイルはこれに関わらず末尾に出る**
-    /// （`ModelRowSource::belongs_to`）。#141 でウィンドウを分けたとき、ここだけが変わる。
+    /// この一覧が出す種別。素材を作る `model_row_sources` がこれで絞る（**カタログ外の
+    /// ファイルは種別に関わらず末尾に出る**）。#141 でウィンドウを分けるとき、一覧の中身として
+    /// 変わるのはここだけ——ただし `refresh_models_window` / `refresh_model_rows` は
+    /// `ModelsWindow` を具体型で受けているので、そちらは別途一般化が要る。
     pub(crate) kinds: &'static [model_download::ModelKind],
     /// UI が参照し続けるモデル（差し替えずに行単位で更新する）。
     pub(crate) rows: Rc<slint::VecModel<ModelRow>>,
@@ -249,13 +254,8 @@ pub(crate) struct ModelListHandles {
 /// （並べ替えると**別のモデルを消す**）。
 #[derive(Debug, Clone)]
 pub(crate) enum ModelRowSource {
-    /// 種別の見出し（ボタンを持たない行）。**どの種別の区切りかを持つ**——種別で絞ったとき、
-    /// 見出しだけが取り残されないようにするため。`None` はカタログ外のファイルの見出しで、
-    /// これは種別に属さないので絞り込みでも常に残る。
-    Heading {
-        kind: Option<model_download::ModelKind>,
-        title: &'static str,
-    },
+    /// 種別の見出し（ボタンを持たない行）。
+    Heading(&'static str),
     /// カタログのモデル。`installed` はディスクに在るときのその実体。
     Catalog {
         kind: model_download::ModelKind,
@@ -267,27 +267,10 @@ pub(crate) enum ModelRowSource {
 }
 
 impl ModelRowSource {
-    /// 一覧に出す種別に属するか。**カタログ外のファイル（とその見出し）は種別を持たないので
-    /// 常に出す**——`models/` に置き去りのファイルは、どの種別の一覧から見ても掃除できる必要が
-    /// ある（種別ごとに分けた一覧のどれにも出ないと、消す手段が消える）。
-    ///
-    /// 素材の並びは `model_row_sources` が作った順のままにする（`REGISTERED_CATALOGS` を
-    /// 呼び出し側で並べ直さない、という `src/model_download.rs` の約束）。絞るだけなので、
-    /// カタログ外の行は末尾に残る。
-    pub(crate) fn belongs_to(&self, kinds: &[model_download::ModelKind]) -> bool {
-        match self {
-            Self::Heading { kind: None, .. } | Self::Extra(_) => true,
-            Self::Heading {
-                kind: Some(kind), ..
-            }
-            | Self::Catalog { kind, .. } => kinds.contains(kind),
-        }
-    }
-
     /// ディスクに在るならその実体（削除の対象。見出しと未取得の行は `None`）。
     pub(crate) fn installed(&self) -> Option<&model_download::InstalledModel> {
         match self {
-            Self::Heading { .. } => None,
+            Self::Heading(_) => None,
             Self::Catalog { installed, .. } => installed.as_ref(),
             Self::Extra(installed) => Some(installed),
         }
@@ -295,7 +278,7 @@ impl ModelRowSource {
 }
 
 /// 種別の見出しの文言（**網羅 match**。種別を足したら見出しを書くまでコンパイルが通らない）。
-pub(crate) fn kind_heading(kind: model_download::ModelKind) -> &'static str {
+fn kind_heading(kind: model_download::ModelKind) -> &'static str {
     match kind {
         model_download::ModelKind::Speech => "Transcription — Whisper",
         model_download::ModelKind::Summary => "Meeting notes — LLM",
@@ -304,15 +287,17 @@ pub(crate) fn kind_heading(kind: model_download::ModelKind) -> &'static str {
 
 /// 行の素材を組む。**カタログの登録簿の順**（種別ごとに見出し → カタログの並び）で、最後に
 /// カタログ外のファイルを大きい順で置く。
-pub(crate) fn model_row_sources(
+fn model_row_sources(
     installed: Vec<model_download::InstalledModel>,
+    kinds: &[model_download::ModelKind],
 ) -> Vec<ModelRowSource> {
     let mut sources: Vec<ModelRowSource> = Vec::new();
     for (kind, catalog, _) in model_download::REGISTERED_CATALOGS {
-        sources.push(ModelRowSource::Heading {
-            kind: Some(*kind),
-            title: kind_heading(*kind),
-        });
+        // 出さない種別は見出しごと落とす（見出しだけが残ると、中身の無い区切りになる）。
+        if !kinds.contains(kind) {
+            continue;
+        }
+        sources.push(ModelRowSource::Heading(kind_heading(*kind)));
         for spec in catalog.iter() {
             sources.push(ModelRowSource::Catalog {
                 kind: *kind,
@@ -331,17 +316,14 @@ pub(crate) fn model_row_sources(
         .filter(|model| model.catalog_id.is_none())
         .peekable();
     if extras.peek().is_some() {
-        sources.push(ModelRowSource::Heading {
-            kind: None,
-            title: EXTRA_FILES_HEADING,
-        });
+        sources.push(ModelRowSource::Heading(EXTRA_FILES_HEADING));
         sources.extend(extras.map(ModelRowSource::Extra));
     }
     sources
 }
 
 /// カタログ外のファイルの見出し。
-pub(crate) const EXTRA_FILES_HEADING: &str = "Other files in the models folder";
+const EXTRA_FILES_HEADING: &str = "Other files in the models folder";
 
 /// 行の状態を決めるための周辺状況（ワーカーと設定への照会を 1 回ずつに畳んでから渡す）。
 pub(crate) struct ModelsContext<'a> {
@@ -386,7 +368,7 @@ pub(crate) fn models_context<'a>(
 
 /// その種別のジョブが在るか。**網羅 match**にしてあるので、種別を足したら扱いを書くまで
 /// コンパイルが通らない（`_ => false` で「消せる側」へ静かに落ちるのを防ぐ）。
-pub(crate) fn kind_is_busy(context: &ModelsContext, kind: model_download::ModelKind) -> bool {
+fn kind_is_busy(context: &ModelsContext, kind: model_download::ModelKind) -> bool {
     match kind {
         model_download::ModelKind::Speech => context.speech_busy,
         model_download::ModelKind::Summary => context.summary_busy,
@@ -395,7 +377,7 @@ pub(crate) fn kind_is_busy(context: &ModelsContext, kind: model_download::ModelK
 
 /// 行の使用状況（表示と可否の分岐に使う。取得の状態＝`ModelStatus` とは別の軸）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RowUsage {
+enum RowUsage {
     /// カタログの行で、選ばれていない。
     Idle,
     /// 設定でいま選ばれている。
@@ -412,7 +394,7 @@ pub(crate) enum RowUsage {
 
 /// その種別のモデルパスが `config.toml` で上書きされているか（**網羅 match**。種別を足したら
 /// 扱いを書くまでコンパイルが通らない）。
-pub(crate) fn kind_overridden(context: &ModelsContext, kind: model_download::ModelKind) -> bool {
+fn kind_overridden(context: &ModelsContext, kind: model_download::ModelKind) -> bool {
     match kind {
         model_download::ModelKind::Speech => context.speech_overridden,
         model_download::ModelKind::Summary => context.summary_overridden,
@@ -421,7 +403,7 @@ pub(crate) fn kind_overridden(context: &ModelsContext, kind: model_download::Mod
 
 /// 行ごとに求める事実（純粋関数。ワーカー・設定への照会は `ModelsContext` に畳んである）。
 pub(crate) struct RowFacts {
-    pub(crate) usage: RowUsage,
+    usage: RowUsage,
     /// その行のファイルを読むジョブが在るか（削除させない条件）。
     pub(crate) busy: bool,
 }
@@ -429,7 +411,7 @@ pub(crate) struct RowFacts {
 pub(crate) fn row_facts(source: &ModelRowSource, context: &ModelsContext) -> RowFacts {
     let filename = match source {
         // 見出しはファイルを持たない（`""` をパスに合成しないよう、ここで打ち切る）。
-        ModelRowSource::Heading { .. } => {
+        ModelRowSource::Heading(_) => {
             return RowFacts {
                 usage: RowUsage::Idle,
                 busy: false,
@@ -483,10 +465,7 @@ pub(crate) fn row_facts(source: &ModelRowSource, context: &ModelsContext) -> Row
 /// 出てしまい、確認モーダルが**無い容量の解放を約束**したうえで押しても何も起きないため。取得の
 /// 完了直後はディスク走査の結果が古いが、そこは tick が「記録が増えた」ことを見て 1 回だけ走査し
 /// 直して追いつかせる（`downloaded_ids`）。
-pub(crate) fn model_status(
-    has_file: bool,
-    recorded: Option<&model_download::DownloadStatus>,
-) -> ModelStatus {
+fn model_status(has_file: bool, recorded: Option<&model_download::DownloadStatus>) -> ModelStatus {
     match (recorded, has_file) {
         (Some(model_download::DownloadStatus::Downloading { .. }), _) => ModelStatus::Downloading,
         // 失敗の記録は再試行までメモリに残る。ファイルが在るならそれは前回の成果物なので、
@@ -510,7 +489,7 @@ pub(crate) fn model_status(
 /// 状態行は選択中のモデルしか出さないので、ここに出さないと非選択モデルの失敗理由がどこにも
 /// 出ない（`.app` では stderr も見えない）。理由は `insufficient_space_reason` などが作る文で、
 /// パスを含まない（`docs/rules/security.md`）。
-pub(crate) fn model_status_part(status: ModelStatus, percent: u64, reason: Option<&str>) -> String {
+fn model_status_part(status: ModelStatus, percent: u64, reason: Option<&str>) -> String {
     match status {
         ModelStatus::NotDownloaded => "Not downloaded".to_owned(),
         ModelStatus::Downloading => format!("Downloading… {percent}%"),
@@ -523,7 +502,7 @@ pub(crate) fn model_status_part(status: ModelStatus, percent: u64, reason: Optio
 }
 
 /// 使用状況の文言（**網羅 match**。`Idle` は付け足す語が無い）。
-pub(crate) fn model_usage_part(usage: RowUsage) -> Option<&'static str> {
+fn model_usage_part(usage: RowUsage) -> Option<&'static str> {
     match usage {
         RowUsage::Idle => None,
         RowUsage::Selected => Some("selected in Settings"),
@@ -534,11 +513,11 @@ pub(crate) fn model_usage_part(usage: RowUsage) -> Option<&'static str> {
 }
 
 /// 削除できない理由の文言（ボタンが淡色になるだけでは理由が分からないので文字で出す）。
-pub(crate) const MODEL_BUSY_PART: &str = "cannot be deleted while it is in use";
+const MODEL_BUSY_PART: &str = "cannot be deleted while it is in use";
 
 /// 行の状態テキスト。**3 つの表を `—` でつなぐ**（取得の状態・使用状況・使用中）。
 /// 組み合わせを 1 つの表にすると状態 × 状況で行数が掛け算になるため、軸ごとに分ける。
-pub(crate) fn model_row_status_text(
+fn model_row_status_text(
     status: ModelStatus,
     percent: u64,
     reason: Option<&str>,
@@ -554,7 +533,7 @@ pub(crate) fn model_row_status_text(
 
 /// 「使う」を出せるか。カタログの行で、いま選ばれておらず、その種別が `config.toml` で上書き
 /// されていないとき（上書き中はカタログの選択が使われないので、押せても何も変わらない）。
-pub(crate) fn can_use_row(source: &ModelRowSource, facts: &RowFacts) -> bool {
+fn can_use_row(source: &ModelRowSource, facts: &RowFacts) -> bool {
     matches!(source, ModelRowSource::Catalog { .. }) && facts.usage == RowUsage::Idle
 }
 
@@ -567,11 +546,7 @@ pub(crate) fn can_use_row(source: &ModelRowSource, facts: &RowFacts) -> bool {
 /// ない）。
 ///
 /// **状態から導けない**ので Rust 側で決めて渡す（上書きの有無は状態の軸に含まれない）。
-pub(crate) fn can_download_row(
-    status: ModelStatus,
-    source: &ModelRowSource,
-    facts: &RowFacts,
-) -> bool {
+fn can_download_row(status: ModelStatus, source: &ModelRowSource, facts: &RowFacts) -> bool {
     matches!(source, ModelRowSource::Catalog { .. })
         && matches!(status, ModelStatus::NotDownloaded | ModelStatus::Failed)
         && facts.usage != RowUsage::Overridden
@@ -588,13 +563,13 @@ pub(crate) fn can_download_row(
 /// ロックなので、その間に投入されたジョブは拾えない（畳むにはワーカーをまたぐロックが要る）。
 /// そうなってもカタログのモデルなら `ensure_model` が再取得するだけで、失うのは時間。
 /// `config.toml` の上書き先だった場合はそのジョブが失敗する（確認モーダルがその旨を出している）。
-pub(crate) fn can_delete_row(source: &ModelRowSource, facts: &RowFacts) -> bool {
+fn can_delete_row(source: &ModelRowSource, facts: &RowFacts) -> bool {
     source.installed().is_some() && !facts.busy
 }
 
 /// 確認モーダルの説明テキスト。解放される容量と、**ゴミ箱へは入らない**こと、そして
 /// 再取得できるかを出す（4.4GB の再取得は分オーダーかかるので、押す前に分かるようにする）。
-pub(crate) fn model_delete_detail(usage: RowUsage, size_bytes: u64) -> String {
+fn model_delete_detail(usage: RowUsage, size_bytes: u64) -> String {
     let freed = format!(
         "This frees {}. The file is deleted permanently — it does not go to the Trash.",
         model_download::format_size(size_bytes)
@@ -623,16 +598,15 @@ pub(crate) const MODELS_EMPTY_TEXT: &str = "No models available";
 
 /// 走査そのものに失敗したときの通知（カタログの行は必ず並ぶので、空表示では気づけない。
 /// 行のサイズ・状態がディスクの実体を反映しないことも伝える）。
-pub(crate) const MODELS_UNREADABLE_NOTICE: &str =
+const MODELS_UNREADABLE_NOTICE: &str =
     "Could not list the models folder — sizes and states may be out of date.";
 
 /// 押された時点で使用中だったときの通知（一覧の状態テキストと同じ事実を指すので、語を揃える）。
-pub(crate) const MODEL_IN_USE_NOTICE: &str = "This model is in use right now — it was not deleted.";
+const MODEL_IN_USE_NOTICE: &str = "This model is in use right now — it was not deleted.";
 
 /// 削除できなかった理由（`ModelsWindow::notice`）。理由まで出すのは「押しても無反応」に見せない
 /// ため。使用中は UI で押させないのが基本なので、ここへ来るのは一覧が古かったときだけ。
-pub(crate) const MODEL_DELETE_FAILED_NOTICE: &str =
-    "Could not delete this model — see the log for details.";
+const MODEL_DELETE_FAILED_NOTICE: &str = "Could not delete this model — see the log for details.";
 
 /// 選択を保存できなかったときの通知（設定の永続化に失敗した場合）。
 pub(crate) const MODEL_SELECT_FAILED_NOTICE: &str =
@@ -661,7 +635,7 @@ pub(crate) fn delete_failure_notice(outcome: DeleteOutcome) -> Option<&'static s
 
 /// 一覧の末尾に出す合計テキスト（**取得済みのぶんだけ**。未取得の行を足して「使っている容量」を
 /// 膨らませない）。取得済みが無ければ空。
-pub(crate) fn models_total_text(sources: &[ModelRowSource]) -> String {
+fn models_total_text(sources: &[ModelRowSource]) -> String {
     let installed: Vec<&model_download::InstalledModel> = sources
         .iter()
         .filter_map(ModelRowSource::installed)
@@ -684,23 +658,18 @@ pub(crate) fn models_total_text(sources: &[ModelRowSource]) -> String {
 
 /// 一覧の行をまとめて組む。**`sources` と戻り値は同じ順**（UI のインデックスが操作の対象を
 /// 指すので、ここで並べ替えない）。
-pub(crate) fn model_rows(
-    sources: &[ModelRowSource],
-    context: &ModelsContext,
-    kinds: &[model_download::ModelKind],
-) -> Vec<ModelRow> {
+fn model_rows(sources: &[ModelRowSource], context: &ModelsContext) -> Vec<ModelRow> {
     sources
         .iter()
-        .filter(|source| source.belongs_to(kinds))
         .map(|source| match source {
-            ModelRowSource::Heading { title, .. } => heading_row(title),
+            ModelRowSource::Heading(title) => heading_row(title),
             _ => model_row(source, context),
         })
         .collect()
 }
 
 /// 種別の区切り行（操作を持たない）。
-pub(crate) fn heading_row(title: &'static str) -> ModelRow {
+fn heading_row(title: &'static str) -> ModelRow {
     ModelRow {
         is_heading: true,
         name: title.into(),
@@ -710,7 +679,7 @@ pub(crate) fn heading_row(title: &'static str) -> ModelRow {
 
 /// 1 行を組む（見出し以外）。表示名・説明・サイズはカタログとディスクの実体から、状態と可否は
 /// `RowFacts` から決める。
-pub(crate) fn model_row(source: &ModelRowSource, context: &ModelsContext) -> ModelRow {
+fn model_row(source: &ModelRowSource, context: &ModelsContext) -> ModelRow {
     let facts = row_facts(source, context);
     let installed = source.installed();
     let recorded = match source {
@@ -741,7 +710,7 @@ pub(crate) fn model_row(source: &ModelRowSource, context: &ModelsContext) -> Mod
         // カタログ外は表示名がファイル名になるので、2 行目は出さない（同じ文字列を 2 回並べない）。
         ModelRowSource::Extra(installed) => (installed.filename.clone(), ""),
         // 見出しは `heading_row` が組むので、ここには来ない。
-        ModelRowSource::Heading { title, .. } => ((*title).to_owned(), ""),
+        ModelRowSource::Heading(title) => ((*title).to_owned(), ""),
     };
     ModelRow {
         is_heading: false,
@@ -786,7 +755,7 @@ pub(crate) fn downloaded_ids(
 /// **選択中の行でも押せる**ので、ここを外すと「押したら自分のダウンロードが止まって数 GB を
 /// 捨てる」ことになる（`request_download` が拾い直すので止まりっぱなしにはならないが、
 /// 受信済みのぶんは戻らない）。
-pub(crate) fn model_to_cancel_on_select<'a>(
+fn model_to_cancel_on_select<'a>(
     previous_id: &'a str,
     selected: &'static model_download::ModelSpec,
 ) -> Option<&'a str> {
@@ -906,16 +875,19 @@ mod tests {
     /// 見出しは種別の区切りとして行になる（`docs/rules/slint.md` の `SummaryRow` と同じ流儀）。
     #[test]
     fn model_row_sources_list_every_catalog_entry_with_headings() {
-        let sources = super::model_row_sources(vec![
-            installed_spec(crate::model_download::ModelKind::Speech, speech_spec(), 100),
-            extra_file("left-over.bin", 20),
-        ]);
+        let sources = super::model_row_sources(
+            vec![
+                installed_spec(crate::model_download::ModelKind::Speech, speech_spec(), 100),
+                extra_file("left-over.bin", 20),
+            ],
+            super::ALL_MODEL_KINDS,
+        );
 
         // 見出しは登録簿の種別ごとに 1 つ＋カタログ外のぶん。
         let headings: Vec<&str> = sources
             .iter()
             .filter_map(|source| match source {
-                super::ModelRowSource::Heading { title, .. } => Some(*title),
+                super::ModelRowSource::Heading(title) => Some(*title),
                 _ => None,
             })
             .collect();
@@ -954,14 +926,11 @@ mod tests {
     /// カタログ外のファイルが無ければ、その見出しも出さない（空の区切りを残さない）。
     #[test]
     fn model_row_sources_skip_the_extra_heading_when_there_are_none() {
-        let sources = super::model_row_sources(Vec::new());
+        let sources = super::model_row_sources(Vec::new(), super::ALL_MODEL_KINDS);
         assert!(
             !sources.iter().any(|source| matches!(
                 source,
-                super::ModelRowSource::Heading {
-                    kind: None,
-                    title: super::EXTRA_FILES_HEADING,
-                }
+                super::ModelRowSource::Heading(super::EXTRA_FILES_HEADING)
             )),
             "the extra heading must not appear without extra files"
         );
@@ -1180,10 +1149,7 @@ mod tests {
             &extra,
             &facts(super::RowUsage::Unknown)
         ));
-        let heading = super::ModelRowSource::Heading {
-            kind: Some(crate::model_download::ModelKind::Speech),
-            title: "Transcription",
-        };
+        let heading = super::ModelRowSource::Heading("Transcription");
         assert!(!super::can_use_row(&heading, &facts(super::RowUsage::Idle)));
     }
 
@@ -1218,10 +1184,7 @@ mod tests {
         assert!(!super::can_delete_row(&with_file, &busy));
         assert!(!super::can_delete_row(&without_file, &idle));
         assert!(!super::can_delete_row(
-            &super::ModelRowSource::Heading {
-                kind: Some(crate::model_download::ModelKind::Speech),
-                title: "Transcription",
-            },
+            &super::ModelRowSource::Heading("Transcription"),
             &idle
         ));
     }
@@ -1307,17 +1270,19 @@ mod tests {
     /// 種別で絞ると、**その種別の見出しと行だけ**が残る。カタログ外のファイル（と見出し）は
     /// 種別に属さないので常に末尾に残る——どの一覧から見ても掃除できないと、置き去りの
     /// ファイルを消す手段が無くなる。
+    ///
+    /// 絞るのは**素材**で、行ではない。行だけを絞ると UI の添字が素材の添字とずれて、
+    /// **別のモデルを消す・別のモデルを選ぶ**（下の 1 対 1 の検査がそこを押さえる）。
     #[test]
-    fn model_rows_can_be_narrowed_to_one_kind() {
+    fn narrowing_to_one_kind_drops_its_heading_and_rows() {
         let downloader = crate::model_download::ModelDownloader::new();
-        let sources = super::model_row_sources(vec![extra_file("left-over.bin", 20)]);
-        let speech_only = super::model_rows(
-            &sources,
-            &context(&downloader, false, false),
+        let speech_only = super::model_row_sources(
+            vec![extra_file("left-over.bin", 20)],
             &[crate::model_download::ModelKind::Speech],
         );
+        let rows = super::model_rows(&speech_only, &context(&downloader, false, false));
 
-        let names: Vec<&str> = speech_only.iter().map(|row| row.name.as_str()).collect();
+        let names: Vec<&str> = rows.iter().map(|row| row.name.as_str()).collect();
         assert!(
             names.contains(&super::kind_heading(
                 crate::model_download::ModelKind::Speech
@@ -1346,13 +1311,30 @@ mod tests {
             "unknown files stay at the end regardless of the kind: {names:?}"
         );
 
-        // 全種別を渡したときは絞る前と同じ（この issue の呼び出しは出力を変えない）。
-        let all = super::model_rows(
-            &sources,
-            &context(&downloader, false, false),
-            super::ALL_MODEL_KINDS,
-        );
-        assert_eq!(all.len(), sources.len());
+        // **行と素材は同じ添字で同じものを指す**。UI が渡してくる添字はこの前提で素材を引く
+        // （`main` の Use / Download / Delete）ので、ここがずれると別のモデルを操作する。
+        assert_eq!(rows.len(), speech_only.len());
+        for (index, row) in rows.iter().enumerate() {
+            let expected = match &speech_only[index] {
+                super::ModelRowSource::Heading(title) => (*title).to_owned(),
+                super::ModelRowSource::Catalog { spec, .. } => spec.display_name.to_owned(),
+                super::ModelRowSource::Extra(installed) => installed.filename.clone(),
+            };
+            assert_eq!(row.name, expected, "row {index} must match its source");
+        }
+    }
+
+    /// `ALL_MODEL_KINDS` に登録簿の種別が全部入っているか。**足し忘れるとその種別が一覧から
+    /// 静かに消える**ので、登録簿を正として突き合わせる。
+    #[test]
+    fn all_model_kinds_covers_every_registered_catalog() {
+        for (kind, _, _) in crate::model_download::REGISTERED_CATALOGS {
+            assert!(
+                super::ALL_MODEL_KINDS.contains(kind),
+                "{kind:?} is in REGISTERED_CATALOGS but missing from ALL_MODEL_KINDS \
+                 — add it there, or its models disappear from the list"
+            );
+        }
     }
 
     /// 行の並びは素材の順のまま（UI のインデックスが操作対象を指すので、ここで並べ替えると
@@ -1360,24 +1342,23 @@ mod tests {
     #[test]
     fn model_rows_keep_the_order_of_the_sources() {
         let downloader = crate::model_download::ModelDownloader::new();
-        let sources = super::model_row_sources(vec![
-            installed_spec(
-                crate::model_download::ModelKind::Summary,
-                summary_spec(),
-                4_000_000_000,
-            ),
-            extra_file("left-over.bin", 20),
-        ]);
-        let rows = super::model_rows(
-            &sources,
-            &context(&downloader, false, false),
+        let sources = super::model_row_sources(
+            vec![
+                installed_spec(
+                    crate::model_download::ModelKind::Summary,
+                    summary_spec(),
+                    4_000_000_000,
+                ),
+                extra_file("left-over.bin", 20),
+            ],
             super::ALL_MODEL_KINDS,
         );
+        let rows = super::model_rows(&sources, &context(&downloader, false, false));
 
         assert_eq!(rows.len(), sources.len());
         for (row, source) in rows.iter().zip(sources.iter()) {
             match source {
-                super::ModelRowSource::Heading { title, .. } => {
+                super::ModelRowSource::Heading(title) => {
                     assert!(row.is_heading, "{title} should be a heading row");
                     assert_eq!(row.name, *title);
                     assert!(!row.can_use && !row.can_delete);
@@ -1456,24 +1437,30 @@ mod tests {
     #[test]
     fn models_total_text_counts_only_installed_models() {
         // カタログ全件が並んでいても、ディスクに無ければ合計に入らない。
-        let none_installed = super::model_row_sources(Vec::new());
+        let none_installed = super::model_row_sources(Vec::new(), super::ALL_MODEL_KINDS);
         assert_eq!(super::models_total_text(&none_installed), "");
 
-        let one = super::model_row_sources(vec![installed_spec(
-            crate::model_download::ModelKind::Speech,
-            speech_spec(),
-            77_691_713,
-        )]);
-        assert_eq!(super::models_total_text(&one), "1 model — 74 MB");
-
-        let two = super::model_row_sources(vec![
-            installed_spec(
+        let one = super::model_row_sources(
+            vec![installed_spec(
                 crate::model_download::ModelKind::Speech,
                 speech_spec(),
-                1_624_555_275,
-            ),
-            extra_file("left-over.bin", 1_624_555_275),
-        ]);
+                77_691_713,
+            )],
+            super::ALL_MODEL_KINDS,
+        );
+        assert_eq!(super::models_total_text(&one), "1 model — 74 MB");
+
+        let two = super::model_row_sources(
+            vec![
+                installed_spec(
+                    crate::model_download::ModelKind::Speech,
+                    speech_spec(),
+                    1_624_555_275,
+                ),
+                extra_file("left-over.bin", 1_624_555_275),
+            ],
+            super::ALL_MODEL_KINDS,
+        );
         assert_eq!(super::models_total_text(&two), "2 models — 3.0 GB");
     }
 
@@ -1559,7 +1546,10 @@ mod tests {
     #[test]
     fn downloaded_ids_track_the_recorded_completions() {
         let downloader = crate::model_download::ModelDownloader::new();
-        let sources = super::model_row_sources(vec![extra_file("left-over.bin", 10)]);
+        let sources = super::model_row_sources(
+            vec![extra_file("left-over.bin", 10)],
+            super::ALL_MODEL_KINDS,
+        );
         assert!(
             super::downloaded_ids(&sources, &downloader).is_empty(),
             "nothing is recorded as downloaded yet"

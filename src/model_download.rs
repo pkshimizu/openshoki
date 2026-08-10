@@ -339,7 +339,7 @@ impl ModelDownloader {
     /// のは次のチャンクを読む手前。既に最後のチャンクを読み終えていれば、そのまま完走して
     /// 取得済みになる（それで困らない——欲しかったファイルが手に入っただけ）。
     ///
-    /// **使うのは「選び直しでその取得が不要になった」ときだけ**（`main::select_model`）。
+    /// **使うのは「選び直しでその取得が不要になった」ときだけ**（`windows::models::select_model`）。
     /// 打ち切ると受信済みのぶんは捨てられ、再開はできない（部分ファイルは `PartFile` の Drop が
     /// 消す。レジュームの仕組みは持たない）ので、不要になったと言い切れる場面に限る。
     ///
@@ -358,7 +358,7 @@ impl ModelDownloader {
     /// `NotDownloaded` へ戻る（**`Failed` にはしない**。失敗と区別できるようにするため。
     /// 対応表の正は `DownloadGuard::finish`）。
     pub fn cancel_download(&self, id: &str) -> bool {
-        // 戻り値は情報用（テストと調査のため）。本番の呼び出し側（`main::select_model`）は見ない。
+        // 戻り値は情報用（テストと調査のため）。本番の呼び出し側（`windows::models::select_model`）は見ない。
         let mut state = self.lock();
         if state.required.contains_key(id) {
             return false;
@@ -805,7 +805,7 @@ pub fn sweep_orphaned_part_files() {
 /// （文言を調整した瞬間に判定が変わる形にしないため。`docs/rules/coding-conventions.md`）。
 ///
 /// 種別を足したら、この enum と `REGISTERED_CATALOGS` に 1 つ足す。使う側は網羅 match で
-/// 受けるので（`main::kind_is_busy`）、足した種別の扱いを書き忘れるとコンパイルが通らない。
+/// 受けるので（`windows::models::kind_is_busy`）、足した種別の扱いを書き忘れるとコンパイルが通らない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelKind {
     /// 文字起こし（whisper）。
@@ -963,11 +963,11 @@ fn installed_models_in(
 /// 上書きは `models/` の**外**を指すのが普通だが、直下を指すこともできる。その場合、上書き先だと
 /// 分からないと (1) 実行中のジョブが読んでいるファイルを削除できてしまい、(2)「消しても再取得
 /// される」という誤った案内を出してしまう（上書き中は `ensure_model` を通らない）。判定は
-/// `main::row_facts`。
+/// `windows::models::row_facts`。
 ///
 /// 名前まで還元しておくのは、**行ごと・tick ごとに `canonicalize` を叩かない**ため（一覧は
 /// 10Hz で組み直す）。解決はディスクを走査するタイミングで 1 回だけ行い、行の判定はファイル名の
-/// 比較にする（`main::OverrideFiles`）。
+/// 比較にする（`windows::models::OverrideFiles`）。
 pub fn override_filename(override_path: Option<&Path>) -> Option<String> {
     let dir = models_dir()?;
     override_filename_in(&dir, override_path)

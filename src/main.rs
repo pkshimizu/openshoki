@@ -981,19 +981,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     refresh(&models, delete_failure_notice(DeleteOutcome::Failed));
                     return;
                 };
-                let config = config.borrow();
                 // **押された時点で使用中を再確認する**。一覧は tick が状態を追うが、tick と
                 // クリックの間にジョブが始まることはありうる（限界は
                 // `refresh_models_window` の doc）。取得中の拒否は基盤側が持つ。
-                let override_files = list.override_files.borrow();
-                let context = models_context(
-                    &transcriber,
-                    &summarizer,
-                    &downloader,
-                    &config,
-                    &override_files,
-                );
-                let outcome = if row_facts(&source, &context).busy {
+                //
+                // **判定はブロックに閉じてハンドルの借用を先に返す**。この下の `refresh` は
+                // `reseed_model_sources` まで進んで `override_files` を `borrow_mut` するので、
+                // `Ref` を持ったままだと `BorrowMutError` で**アプリごと落ちる**
+                // （`ModelListHandles` の doc）。
+                let busy = {
+                    let config = config.borrow();
+                    let override_files = list.override_files.borrow();
+                    let context = models_context(
+                        &transcriber,
+                        &summarizer,
+                        &downloader,
+                        &config,
+                        &override_files,
+                    );
+                    row_facts(&source, &context).busy
+                };
+                let outcome = if busy {
                     DeleteOutcome::InUse
                 } else {
                     match downloader.delete(&target) {
