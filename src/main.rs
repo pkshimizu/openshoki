@@ -2948,8 +2948,23 @@ fn downloaded_ids(
         .collect()
 }
 
+/// 選び直しで取得を打ち切るモデルの ID（打ち切らないなら `None`）。
+///
+/// 同じモデルを選び直したときに打ち切らないためのガード。モデル管理ウィンドウの「Use」は
+/// **選択中の行でも押せる**ので、ここを外すと「押したら自分のダウンロードが止まって数 GB を
+/// 捨てる」ことになる（`request_download` が拾い直すので止まりっぱなしにはならないが、
+/// 受信済みのぶんは戻らない）。
+fn model_to_cancel_on_select<'a>(
+    previous_id: &'a str,
+    selected: &'static model_download::ModelSpec,
+) -> Option<&'a str> {
+    (previous_id != selected.id).then_some(previous_id)
+}
+
 /// 使うモデルを選び直して設定へ永続化する（設定画面の ComboBox とモデル管理ウィンドウの
 /// 「Use」が**同じ経路**を通る）。成功したら `true`。
+///
+/// 選び直しで不要になった**前のモデルの取得は打ち切る**（#124。`cancel_download`）。
 ///
 /// 取得を始めるかは `model_downloads_on_select` が決める（種別で条件が違う）。保存に失敗したら
 /// 設定は変えない。
@@ -2960,10 +2975,19 @@ fn select_model(
     downloader: &model_download::ModelDownloader,
 ) -> bool {
     let mut candidate = config.borrow().clone();
-    match kind {
-        model_download::ModelKind::Speech => candidate.whisper_model = spec.id.to_owned(),
-        model_download::ModelKind::Summary => candidate.summary_model = spec.id.to_owned(),
-    }
+    // 上書きと同時に、直前に選んでいた ID を取り出す（打ち切る対象はこれ 1 つだけ。種別の全
+    // モデルを止めると、管理ウィンドウの「Download」で別のモデルを明示的に落としている最中に
+    // 選び直しただけでそれが消える。`ModelDownloader::cancel_download` の doc）。
+    // **1 つの match にまとめる**のは、控える側と上書きする側で違うフィールドを触る事故を
+    // 構文で塞ぐため。
+    let superseded_id = match kind {
+        model_download::ModelKind::Speech => {
+            std::mem::replace(&mut candidate.whisper_model, spec.id.to_owned())
+        }
+        model_download::ModelKind::Summary => {
+            std::mem::replace(&mut candidate.summary_model, spec.id.to_owned())
+        }
+    };
     if let Err(err) = candidate.save() {
         // どの種別の話か分かるようにする（3 つの入口＝両方の ComboBox とモデル管理ウィンドウの
         // 「Use」が同じ関数を通るので、種別が無いと調査で効かない）。
@@ -2977,6 +3001,15 @@ fn select_model(
     // request_download 側が早期 return する。
     let downloads_now = model_downloads_on_select(kind, &candidate);
     *config.borrow_mut() = candidate;
+    // 選び直したので、前に選んでいたモデルの取得はもう要らない（#124）。ここでやるのは
+    // フラグを立てることだけで、担当スレッドが気づくのは次のチャンクを読む手前。
+    // **新しい取得を頼む前に**立てるのが要点で、空き容量の事前確認は打ち切り済みの取得を
+    // 数えないので（`in_flight_remaining_bytes`）、新しいほうが要らない容量を要求しなくなる。
+    //
+    // 同じモデルを選び直したときは打ち切らない（自分の取得を止めて数 GB を捨てることになる）。
+    if let Some(id) = model_to_cancel_on_select(&superseded_id, spec) {
+        downloader.cancel_download(id);
+    }
     if downloads_now {
         downloader.request_download(spec);
     }
@@ -3020,10 +3053,11 @@ fn hide_dock_icon() {
 mod tests {
     use super::{
         ModelStatus, SummaryStatus, TranscriptStatus, app_version_text, breathing_level,
-        model_choices, model_downloads_on_select, model_status_text, playback_progress,
-        seek_position_from_ratio, summary_display_status, summary_model_status_text,
-        summary_placeholder_text, summary_rows, summary_status_text, transcript_display_status,
-        transcript_placeholder_text, transcript_status_text, whisper_model_status_text,
+        model_choices, model_downloads_on_select, model_status_text, model_to_cancel_on_select,
+        playback_progress, seek_position_from_ratio, summary_display_status,
+        summary_model_status_text, summary_placeholder_text, summary_rows, summary_status_text,
+        transcript_display_status, transcript_placeholder_text, transcript_status_text,
+        whisper_model_status_text,
     };
     use crate::transcribe::TranscribeStatus;
     use std::time::Duration;
@@ -3416,6 +3450,21 @@ mod tests {
         // 上書きしたファイルが優先されるので、カタログのモデルは落としても使われない。
         assert!(!downloads(&with(true, Some("/tmp/model.gguf"))));
         assert!(!downloads(&with(false, Some("/tmp/model.gguf"))));
+    }
+
+    /// 選び直しで打ち切るのは「別のモデルに変わったとき」だけ。同じモデルを選び直しても
+    /// （モデル管理ウィンドウの「Use」は選択中の行でも押せる）自分の取得は止めない。
+    #[test]
+    fn model_to_cancel_on_select_skips_an_unchanged_selection() {
+        let tiny = crate::whisper_model::spec_for("tiny").expect("tiny is in the catalog");
+        assert_eq!(model_to_cancel_on_select("small", tiny), Some("small"));
+        assert_eq!(model_to_cancel_on_select("tiny", tiny), None);
+        // カタログ外の手編集値から選び直した場合も、その ID の取得を打ち切る対象にする
+        // （走っていなければ `cancel_download` が false を返すだけ）。
+        assert_eq!(
+            model_to_cancel_on_select("no-such-model", tiny),
+            Some("no-such-model")
+        );
     }
 
     /// whisper モデルを選んで取得を始めるのは「モデルパス未上書き」のときだけ。上書き中は
