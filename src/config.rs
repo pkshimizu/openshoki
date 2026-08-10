@@ -172,9 +172,10 @@ pub struct Config {
     #[serde(default, deserialize_with = "deserialize_bool_or_false")]
     pub auto_transcribe: bool,
     /// 使用する内蔵 whisper モデルの識別子（`whisper_model::CATALOG` の `id`。既定 `small`）。
-    /// 設定画面の ComboBox で選び、選択時に未取得ならダウンロードが始まる。カタログ外の
-    /// 手編集値は使用時に既定へフォールバックする。手編集で非文字列が入っても当該項目のみ
-    /// 既定へ丸める（`deserialize_whisper_model`）。
+    /// 設定画面の ComboBox で選ぶ。選択した時点で未取得のモデルの取得を始めるかは設定次第で、
+    /// `whisper_model_path` で上書き中は始めない（正は `main::model_downloads_on_select` の
+    /// doc コメント）。カタログ外の手編集値は使用時に既定へフォールバックする。手編集で
+    /// 非文字列が入っても当該項目のみ既定へ丸める（`deserialize_whisper_model`）。
     #[serde(
         default = "default_whisper_model",
         deserialize_with = "deserialize_whisper_model"
@@ -203,7 +204,7 @@ pub struct Config {
     pub auto_summarize: bool,
     /// 使用する内蔵要約 LLM の識別子（`summary_model::CATALOG` の `id`。既定は 7B）。
     /// 設定画面の ComboBox で選ぶ（軽い 3B も選べる）。選択した時点で未取得のモデルの取得を
-    /// 始めるかは設定次第（正は `main::summary_model_downloads_on_select` の doc コメント）。
+    /// 始めるかは設定次第（正は `main::model_downloads_on_select` の doc コメント）。
     /// カタログ外の手編集値は使用時に既定へフォールバックする。
     #[serde(
         default = "default_summary_model",
