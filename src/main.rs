@@ -266,7 +266,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 「議事録要約を自動生成」トグル: 永続化に成功してから反映する（自動文字起こしトグルと対称）。
     // モデルは内蔵だが、ここでは取得を始めない（数 GB あり、ON にしただけで落とし始めると
-    // 帯域とディスクを黙って使う）。取得の契機は `summary_model_downloads_on_select` の
+    // 帯域とディスクを黙って使う）。取得の契機は `model_downloads_on_select` の
     // doc コメントを参照。
     let config_for_summarize = Rc::clone(&config);
     let ui_for_summarize = ui.as_weak();
@@ -316,9 +316,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // 内蔵 whisper モデルの変更: ComboBox のインデックスをカタログの ID へ変換して永続化し、
-    // 未取得なら即バックグラウンドでダウンロードを開始する（進捗はタイマーが状態行へ反映する）。
-    // 永続化と取得開始そのものは `select_model` が持つ（モデル管理ウィンドウの「Use」と**同じ
-    // 経路**にして、どちらから選んでも同じ結果になるようにする）。
+    // 未取得ならバックグラウンドでダウンロードを開始する（進捗はタイマーが状態行へ反映する）。
+    // 取得を始めない場合もある（`whisper_model_path` で上書き中。契機の正は
+    // `model_downloads_on_select`）。永続化と取得開始そのものは `select_model` が持つ
+    // （モデル管理ウィンドウの「Use」と**同じ経路**にして、どちらから選んでも同じ結果になる
+    // ようにする）。
     // Slint 側は先に選択位置を新値へ更新するため、保存失敗時は表示を保存済みの値へ戻す
     // （docs/rules/slint.md）。
     let config_for_model = Rc::clone(&config);
@@ -344,12 +346,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ) as i32);
             return;
         }
-        ui.set_whisper_model_status(model_status_text(spec, &downloader_for_model).into());
+        ui.set_whisper_model_status(
+            whisper_model_status_text(&config_for_model.borrow(), &downloader_for_model).into(),
+        );
     });
 
     // 要約 LLM の変更: whisper モデルの変更と同じ流儀（インデックス→ID の変換、永続化成功後に
     // 反映、保存失敗時は表示を保存済みの値へ戻す）。取得を始める条件だけ whisper と違うが、
-    // その分岐も `select_model` が持つ（理由は `summary_model_downloads_on_select` の doc）。
+    // その分岐も `select_model` が持つ（理由は `model_downloads_on_select` の doc）。
     let config_for_summary_model = Rc::clone(&config);
     let ui_for_summary_model = ui.as_weak();
     let downloader_for_summary_model = model_downloader.clone();
@@ -1396,10 +1400,7 @@ fn build_menu_event_handler(
         if let Some(ui) = ui.upgrade()
             && ui.window().is_visible()
         {
-            let status = model_status_text(
-                whisper_model::spec_or_default(&config.borrow().whisper_model),
-                &models.downloader,
-            );
+            let status = whisper_model_status_text(&config.borrow(), &models.downloader);
             if ui.get_whisper_model_status() != status.as_str() {
                 ui.set_whisper_model_status(status.into());
             }
@@ -2125,36 +2126,66 @@ fn model_choices(catalog: &[model_download::ModelSpec]) -> slint::ModelRc<slint:
     .into()
 }
 
-/// 設定画面で要約 LLM を選び直した時点で、そのモデルの取得を始めるか。**取得の契機の正**で、
-/// 状態行の文言（`summary_model_status_text`）もこれに合わせる。
+/// モデルを選び直した時点で、そのモデルの取得を始めるか。**取得の契機の正**で、状態行の文言
+/// （`whisper_model_status_text` / `summary_model_status_text`）もこれに合わせる。
 ///
 /// 使われないモデルを数 GB 落とさないための抑止（`docs/rules/security.md` の「通信はユーザーが
-/// 機能を有効化したときだけ」）。抑止する 2 ケースは、その後の取得の仕方も違う:
+/// 機能を有効化したときだけ」）。抑止するケースは、その後の取得の仕方も違う:
 ///
-/// - 要約 OFF: 選択だけ保存する。取得は次に要約が走るとき（設定を ON にした後の初回要約、または
-///   Recordings ウィンドウの「Summarize」による手動生成）に `ensure_model` が行う。
-/// - モデルパスを上書き中: そのファイルが優先されるので、カタログのモデルは以後も取得しない
-///   （`summarize::resolve_model`）。
+/// - **モデルパスを上書き中**（両種別）: そのファイルが優先されるので、カタログのモデルは以後も
+///   取得しない（`TranscribeJob::model_override` / `summarize::resolve_model`）。
+/// - **要約 OFF**（要約のみ）: 選択だけ保存する。取得は次に要約が走るとき（設定を ON にした後の
+///   初回要約、または Recordings ウィンドウの「Summarize」による手動生成）に `ensure_model` が行う。
 ///
-/// なお `auto_transcribe` が OFF でも要約は走らないが、ここでは見ない（その状態では ComboBox
-/// 自体が無効なので選択が起きない）。
+/// 文字起こし側に「自動文字起こし OFF なら取得しない」というゲートは**置かない**（既存挙動のまま）。
+/// 設定画面の ComboBox は自動文字起こしが OFF だと無効なのでそこからは選択が起きず、モデル管理
+/// ウィンドウの「Use」で選ぶのは先行取得の意図が明らかなため。要約側に `auto_summarize` のゲートが
+/// あるのは、要約 LLM が whisper より大きく（最大 4.4 GB）、生成時に `ensure_model` が取得する
+/// 経路が別にあるから。
 ///
-/// whisper 側（`whisper_model_path` の上書き）は同じ抑止を持たない。上書き中も無条件に取得する
-/// 既存挙動のままで、対称にするには状態行の文言追加も要るため別 issue にしてある。
+/// **網羅 match** にしてあるので、種別を足したら取得の契機を書くまでコンパイルが通らない。
 ///
-/// テストでピン留めしてあるのはこの述語まで。呼び出し側のガード（`on_change_summary_model` の
+/// テストでピン留めしてあるのはこの述語まで。呼び出し側のガード（`select_model` の
 /// `if downloads_now`）は、実際に取得を始める副作用を持つためテストから叩けない。
-fn summary_model_downloads_on_select(config: &Config) -> bool {
-    config.auto_summarize && config.summary_model_path.is_none()
+fn model_downloads_on_select(kind: model_download::ModelKind, config: &Config) -> bool {
+    match kind {
+        model_download::ModelKind::Speech => config.whisper_model_path.is_none(),
+        model_download::ModelKind::Summary => {
+            config.auto_summarize && config.summary_model_path.is_none()
+        }
+    }
+}
+
+/// モデルパスを `config.toml` で上書きしているときの、設定画面の状態行。whisper・要約 LLM で
+/// 共用する（同じ状態なので、片方だけ書き換えて種別で違う説明が出るのを防ぐ）。
+const MODEL_OVERRIDDEN_STATUS: &str = "Using the model file set in config.toml";
+
+/// 文字起こしに使う whisper モデルの取得状況を、設定画面の状態行テキストにする。
+///
+/// どのモデルかは ComboBox が示すので、ここは状態だけを出す。ただし上書き中は選んでも取得せず
+/// そのファイルが使われるので、共用の「downloads automatically」だと表示と挙動が食い違う。
+/// 取得の契機の正は `model_downloads_on_select`。
+fn whisper_model_status_text(
+    config: &Config,
+    downloader: &model_download::ModelDownloader,
+) -> String {
+    if config.whisper_model_path.is_some() {
+        return MODEL_OVERRIDDEN_STATUS.to_owned();
+    }
+    model_status_text(
+        whisper_model::spec_or_default(&config.whisper_model),
+        downloader,
+    )
 }
 
 /// 議事録要約に使う LLM の取得状況を、設定画面の状態行テキストにする。
 ///
 /// どのモデルかは ComboBox が示すので、ここは whisper と同じ状態だけを出す。ただし取得の契機は
-/// whisper と違って設定に依存する（`summary_model_downloads_on_select`）ので、共用の
-/// 「downloads automatically」では表示と挙動が食い違う場合がある。その場合は契機を明示する:
+/// whisper より条件が多い（`model_downloads_on_select`）ので、共用の「downloads automatically」
+/// では表示と挙動が食い違う場合がある。その場合は契機を明示する:
 ///
-/// - モデルパスを上書きしている: そのファイルが使われ、カタログのモデルは取得しない。
+/// - モデルパスを上書きしている: そのファイルが使われ、カタログのモデルは取得しない
+///   （whisper と同じなので `whisper_model_status_text` と同じ文言）。
 /// - 要約 OFF: 選んでも取得は始まらない（次に要約が走るときに取得する。設定を ON にした後の
 ///   初回要約か、Recordings ウィンドウからの手動生成）。
 fn summary_model_status_text(
@@ -2162,10 +2193,10 @@ fn summary_model_status_text(
     downloader: &model_download::ModelDownloader,
 ) -> String {
     if config.summary_model_path.is_some() {
-        return "Using the model file set in config.toml".to_owned();
+        return MODEL_OVERRIDDEN_STATUS.to_owned();
     }
     let spec = summary_model::spec_or_default(&config.summary_model);
-    if !summary_model_downloads_on_select(config)
+    if !model_downloads_on_select(model_download::ModelKind::Summary, config)
         && downloader.status_of(spec) == model_download::DownloadStatus::NotDownloaded
     {
         return format!(
@@ -2910,8 +2941,8 @@ fn downloaded_ids(
 /// 使うモデルを選び直して設定へ永続化する（設定画面の ComboBox とモデル管理ウィンドウの
 /// 「Use」が**同じ経路**を通る）。成功したら `true`。
 ///
-/// 取得を始めるかは種別で違う（whisper は選んだ時点で取得、要約 LLM は
-/// `summary_model_downloads_on_select` の判断に従う）。保存に失敗したら設定は変えない。
+/// 取得を始めるかは `model_downloads_on_select` が決める（種別で条件が違う）。保存に失敗したら
+/// 設定は変えない。
 fn select_model(
     kind: model_download::ModelKind,
     spec: &'static model_download::ModelSpec,
@@ -2934,10 +2965,7 @@ fn select_model(
     }
     // 取得の可否は保存する値で決める（移動する前に読む）。取得済み・DL 中は
     // request_download 側が早期 return する。
-    let downloads_now = match kind {
-        model_download::ModelKind::Speech => true,
-        model_download::ModelKind::Summary => summary_model_downloads_on_select(&candidate),
-    };
+    let downloads_now = model_downloads_on_select(kind, &candidate);
     *config.borrow_mut() = candidate;
     if downloads_now {
         downloader.request_download(spec);
@@ -2954,13 +2982,7 @@ fn apply_model_selection_to_settings(
 ) {
     ui.set_whisper_model_index(whisper_model::model_index(&config.whisper_model) as i32);
     ui.set_summary_model_index(summary_model::model_index(&config.summary_model) as i32);
-    ui.set_whisper_model_status(
-        model_status_text(
-            whisper_model::spec_or_default(&config.whisper_model),
-            downloader,
-        )
-        .into(),
-    );
+    ui.set_whisper_model_status(whisper_model_status_text(config, downloader).into());
     ui.set_summary_model_status(summary_model_status_text(config, downloader).into());
 }
 
@@ -2986,10 +3008,10 @@ fn hide_dock_icon() {
 mod tests {
     use super::{
         ModelStatus, SummaryStatus, TranscriptStatus, app_version_text, breathing_level,
-        model_choices, model_status_text, playback_progress, seek_position_from_ratio,
-        summary_display_status, summary_model_downloads_on_select, summary_model_status_text,
+        model_choices, model_downloads_on_select, model_status_text, playback_progress,
+        seek_position_from_ratio, summary_display_status, summary_model_status_text,
         summary_placeholder_text, summary_rows, summary_status_text, transcript_display_status,
-        transcript_placeholder_text, transcript_status_text,
+        transcript_placeholder_text, transcript_status_text, whisper_model_status_text,
     };
     use crate::transcribe::TranscribeStatus;
     use std::time::Duration;
@@ -3361,7 +3383,8 @@ mod tests {
         );
     }
 
-    /// 選択で取得を始めるのは「要約 ON かつモデルパス未上書き」のときだけ（4 通りを固定する）。
+    /// 要約 LLM を選んで取得を始めるのは「要約 ON かつモデルパス未上書き」のときだけ
+    /// （4 通りを固定する）。
     #[test]
     fn summary_model_downloads_on_select_only_when_the_summary_runs() {
         let base = crate::config::Config::default();
@@ -3370,20 +3393,82 @@ mod tests {
             summary_model_path: path.map(std::path::PathBuf::from),
             ..base.clone()
         };
+        let downloads = |config: &crate::config::Config| {
+            model_downloads_on_select(crate::model_download::ModelKind::Summary, config)
+        };
 
-        assert!(summary_model_downloads_on_select(&with(true, None)));
+        assert!(downloads(&with(true, None)));
         // 要約 OFF では使われないモデルを落とさない（既定は OFF なので既定でも落とさない）。
-        assert!(!summary_model_downloads_on_select(&with(false, None)));
-        assert!(!summary_model_downloads_on_select(&base));
+        assert!(!downloads(&with(false, None)));
+        assert!(!downloads(&base));
         // 上書きしたファイルが優先されるので、カタログのモデルは落としても使われない。
-        assert!(!summary_model_downloads_on_select(&with(
-            true,
-            Some("/tmp/model.gguf")
-        )));
-        assert!(!summary_model_downloads_on_select(&with(
-            false,
-            Some("/tmp/model.gguf")
-        )));
+        assert!(!downloads(&with(true, Some("/tmp/model.gguf"))));
+        assert!(!downloads(&with(false, Some("/tmp/model.gguf"))));
+    }
+
+    /// whisper モデルを選んで取得を始めるのは「モデルパス未上書き」のときだけ。上書き中は
+    /// `transcribe` がそのファイルを使うので、カタログのモデルは落としても使われない（#123）。
+    /// 自動文字起こしの ON/OFF では変わらない（要約と違ってゲートを置いていない）ことも固定する。
+    #[test]
+    fn whisper_model_downloads_on_select_unless_the_path_is_overridden() {
+        let base = crate::config::Config::default();
+        let with = |auto_transcribe, path: Option<&str>| crate::config::Config {
+            auto_transcribe,
+            whisper_model_path: path.map(std::path::PathBuf::from),
+            ..base.clone()
+        };
+        let downloads = |config: &crate::config::Config| {
+            model_downloads_on_select(crate::model_download::ModelKind::Speech, config)
+        };
+
+        assert!(downloads(&with(true, None)));
+        assert!(downloads(&with(false, None)));
+        assert!(downloads(&base));
+        assert!(!downloads(&with(true, Some("/tmp/ggml-small.bin"))));
+        assert!(!downloads(&with(false, Some("/tmp/ggml-small.bin"))));
+    }
+
+    /// whisper の状態行は、上書き中だけ取得状況ではなく「上書きを使っている」ことを出す（#123）。
+    /// 上書きが無いときは取得状況をそのまま出す（要約側のような契機の説明は要らない
+    /// ＝選べば必ず取得が始まるため）。
+    #[test]
+    fn whisper_model_status_text_shows_the_override() {
+        let downloader = crate::model_download::ModelDownloader::new();
+        let spec = crate::whisper_model::default_spec();
+        downloader.set_status_for_test(spec, crate::model_download::DownloadStatus::NotDownloaded);
+
+        let base = crate::config::Config::default();
+        assert_eq!(
+            whisper_model_status_text(&base, &downloader),
+            model_status_text(spec, &downloader)
+        );
+        downloader.set_status_for_test(spec, crate::model_download::DownloadStatus::Downloaded);
+        assert_eq!(whisper_model_status_text(&base, &downloader), "Downloaded");
+
+        // カタログ外の手編集値は既定モデルの状況を出す（使用時のフォールバックと整合）。
+        let unknown = crate::config::Config {
+            whisper_model: "no-such-model".to_owned(),
+            ..base.clone()
+        };
+        assert_eq!(
+            whisper_model_status_text(&unknown, &downloader),
+            whisper_model_status_text(&base, &downloader)
+        );
+
+        // 上書き中は取得状況によらず同じ文言（要約側と同じ表現にする）。
+        let overridden = crate::config::Config {
+            whisper_model_path: Some(std::path::PathBuf::from("/tmp/ggml-small.bin")),
+            ..base
+        };
+        assert_eq!(
+            whisper_model_status_text(&overridden, &downloader),
+            "Using the model file set in config.toml"
+        );
+        downloader.set_status_for_test(spec, crate::model_download::DownloadStatus::NotDownloaded);
+        assert_eq!(
+            whisper_model_status_text(&overridden, &downloader),
+            "Using the model file set in config.toml"
+        );
     }
 
     /// カタログ外のファイル 1 件（`models/` に在るが登録簿に無い）。
