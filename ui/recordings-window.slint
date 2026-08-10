@@ -1,6 +1,6 @@
 import { Button, ListView, ScrollView, Palette } from "std-widgets.slint";
 import { Style } from "style.slint";
-import { DangerButton } from "controls.slint";
+import { DangerButton, FocusRing } from "controls.slint";
 
 // 文字起こしの表示状態。Rust 側（main.rs の transcript_display_status）がワーカーの
 // 進行状況と JSON の有無から合成して詰める。
@@ -111,6 +111,8 @@ component ViewTab inherits Rectangle {
             color: root.selected
                 ? Palette.foreground
                 : Palette.foreground.transparentize(Style.muted-alpha);
+            // ラベルを読み上げるのはタブ自身（`accessible-label`）。
+            accessible-role: none;
         }
 
         // 選択中だけ下線を出す（高さは常に確保して、切替でタブの高さが動かないようにする）。
@@ -120,10 +122,38 @@ component ViewTab inherits Rectangle {
         }
     }
 
+    FocusRing {
+        shown: focus.has-focus;
+        radius: 0px;
+    }
+
+    // キーボードでも切り替えられるようにする（#146。自作部品は標準が持っていたものを
+    // 自分で用意する。`docs/rules/slint.md`）。
+    focus := FocusScope {
+        key-pressed(event) => {
+            if (event.text == " " || event.text == "\n") {
+                root.clicked();
+                return accept;
+            }
+            return reject;
+        }
+    }
+
     TouchArea {
         clicked => {
+            focus.focus();
             root.clicked();
         }
+    }
+
+    accessible-role: tab;
+    accessible-label: root.text;
+    // タブの選択は **`checked` ではなく `item-selected`** で伝わる（accesskit がタブの
+    // 役割で見るのはこちら）。`checked` を載せても実 AT には届かない。
+    accessible-item-selectable: true;
+    accessible-item-selected: root.selected;
+    accessible-action-default => {
+        root.clicked();
     }
 }
 
@@ -187,6 +217,41 @@ component SeekBar inherits Rectangle {
         background: Palette.accent-background;
     }
 
+    // キーボードでもシークできるようにする（#146。左右キーで 5% ずつ、Home / End で端へ）。
+    // 押した瞬間に確定する（ドラッグのようなプレビューは挟まない）。
+    function seek-by(delta: float) {
+        root.seek-to-ratio(min(max(root.ratio + delta, 0.0), 1.0));
+    }
+
+    focus := FocusScope {
+        enabled: root.seekable;
+        key-pressed(event) => {
+            // **掴んでいる間はキーを受けない**。掴むとフォーカスもここへ来るのでキーは届くが、
+            // 確定してしまうと「音だけ飛んで、表示は掴んだ位置のまま、離すと元へ戻る」という
+            // 食い違いになる（確定はポインタを離したときの 1 回に集める）。
+            if (!root.seekable || root.scrubbing) {
+                return reject;
+            }
+            if (event.text == Key.RightArrow) {
+                root.seek-by(0.05);
+                return accept;
+            }
+            if (event.text == Key.LeftArrow) {
+                root.seek-by(-0.05);
+                return accept;
+            }
+            if (event.text == Key.Home) {
+                root.seek-to-ratio(0.0);
+                return accept;
+            }
+            if (event.text == Key.End) {
+                root.seek-to-ratio(1.0);
+                return accept;
+            }
+            return reject;
+        }
+    }
+
     TouchArea {
         enabled: root.seekable;
         // ポインタ位置をバー上の比率へ換算した値（バー外へドラッグしても 0.0〜1.0 に収める）。
@@ -203,6 +268,8 @@ component SeekBar inherits Rectangle {
         pointer-event(event) => {
             if (event.kind == PointerEventKind.down
                 && event.button == PointerEventButton.left) {
+                // 掴んだらフォーカスも移す（そのまま左右キーで微調整できる）。
+                focus.focus();
                 root.scrub-ratio = self.pointer-ratio;
                 root.scrubbing = true;
                 root.scrub-preview(root.scrub-ratio);
@@ -216,6 +283,26 @@ component SeekBar inherits Rectangle {
                 // 再生位置の表示へ戻す。
                 root.scrubbing = false;
             }
+        }
+    }
+    // シークできるので **`progress-indicator` ではなく `slider`**（読み取り専用の進捗表示だと、
+    // 支援技術からはフォーカスも操作もできない要素に見える）。値は数値で出す——`"42%"` の
+    // ような文字列にすると、数値ではなく文字列として読まれる。
+    accessible-role: slider;
+    accessible-label: "Playback position";
+    accessible-value: round(root.ratio * 100);
+    accessible-value-minimum: 0;
+    accessible-value-maximum: 100;
+    accessible-value-step: 5;
+    accessible-enabled: root.seekable;
+    accessible-action-increment => {
+        if (root.seekable && !root.scrubbing) {
+            root.seek-by(0.05);
+        }
+    }
+    accessible-action-decrement => {
+        if (root.seekable && !root.scrubbing) {
+            root.seek-by(-0.05);
         }
     }
 }

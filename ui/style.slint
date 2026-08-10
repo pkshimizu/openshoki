@@ -42,6 +42,8 @@ export global Style {
     out property <brush> field: root.dark ? #2b2926 : #f3ede2;
 
     // --- 枠 ---
+    // コントロールの縁（面の縁より一段強い）。
+    out property <brush> rule-strong: root.dark ? #45423a : #cfc5b2;
     // 面の縁。
     out property <brush> rule: root.dark ? #34322d : #e2d9c8;
     // 面の内側の区切り（いちばん弱い）。
@@ -69,6 +71,23 @@ export global Style {
     // （明度ではない: ライトでは文字より明るく、ダークでは文字と同程度になる）。
     out property <brush> caution-mark: root.dark ? #e0a45c : #c98a2b;
     out property <brush> done-mark: root.dark ? #7fa86a : #6b9159;
+
+    // --- 操作部品 ---
+    // ポインタを載せたときの面（枠つきのボタン・ステッパーの ± など）。
+    out property <brush> control-hover: root.dark ? #35322d : #eae2d4;
+    // 枠を持たない控えめなボタン（一覧の Remove）にポインタを載せたときの面。
+    out property <brush> quiet-hover: root.dark ? #2b2926 : #eadfd2;
+    // トグルの軌道と、その上を動くつまみ。ON は朱、OFF は無彩色（#127 のデザイン）。
+    out property <brush> switch-track-off: root.dark ? #3d3a34 : #cfc5b2;
+    out property <brush> switch-knob-on: root.dark ? #1b1a17 : #fdfbf6;
+    out property <brush> switch-knob-off: root.dark ? #8d8779 : #fdfbf6;
+    // キーボードフォーカスの輪郭。朱を淡くして、選択中の標（`seal`）と紛れないようにする。
+    out property <brush> focus-ring: root.seal.transparentize(0.35);
+    // 輪郭は枠の**外側**へ出す（枠線の色を変えるだけだと、面つきのボタンで見えない）。
+    // この 2 つは `FocusRing` だけが使う（`ui/controls.slint`）。
+    out property <length> focus-ring-offset: 3px;
+    out property <length> focus-ring-width: 2px;
+
 
     // 状態の意味 → 文字色 / ドット色。対応表はここ 1 箇所だけに置く。
     //
@@ -113,6 +132,8 @@ export global Style {
 
     // --- 寸法 ---
     out property <length> card-radius: 9px;
+    // コントロール（ボタン・入力・ステッパー・選択）の角丸。
+    out property <length> control-radius: 6px;
     out property <length> badge-radius: 4px;
     // セクション見出しの標（朱の縦棒）。
     out property <length> mark-width: 4px;

@@ -357,3 +357,71 @@ fn not_seekable_ignores_click_and_drag() {
         "a display-only bar must never enter scrubbing"
     );
 }
+
+/// 掴んでいる間は、キーボードのシークが効かない。
+///
+/// 掴むとフォーカスもこの部品へ移る（そのまま矢印キーで微調整できるように）ので、キーは届く。
+/// そこで確定させてしまうと、**音だけ飛んで表示は掴んだ位置のまま**になり、離した瞬間に
+/// 掴んだ位置へ戻る（再生 tick は `scrubbing` 中 `progress` を上書きしないので、表示は
+/// 動かない）。確定はポインタを離したときの 1 回に集める。
+#[test]
+#[cfg_attr(
+    not(slint_debug_info),
+    ignore = "needs Slint debug info (see docs/rules/slint.md)"
+)]
+fn keys_do_not_seek_while_the_bar_is_grabbed() {
+    let probe = Probe::seekable();
+    probe.press_at(0.3);
+    assert!(
+        probe.window.get_scrubbing(),
+        "pressing must start a scrub, otherwise this test checks nothing"
+    );
+
+    probe
+        .window
+        .window()
+        .dispatch_event(WindowEvent::KeyPressed {
+            text: slint::platform::Key::RightArrow.into(),
+        });
+    assert!(
+        probe.seeks().is_empty(),
+        "a key press during a scrub must not move the audio: {:?}",
+        probe.seeks()
+    );
+
+    // 離したぶんだけがシークになる（キーの押下が余分に混ざっていない）。
+    probe.release_at(0.3);
+    assert_eq!(
+        probe.seeks().len(),
+        1,
+        "only the release must seek: {:?}",
+        probe.seeks()
+    );
+}
+
+/// 掴んでいなければ、左右キーでシークできる（上のテストが「キーが常に死んでいる」ことを
+/// 通してしまわないように、生きている側も固定する）。
+#[test]
+#[cfg_attr(
+    not(slint_debug_info),
+    ignore = "needs Slint debug info (see docs/rules/slint.md)"
+)]
+fn keys_seek_once_the_bar_is_released() {
+    let probe = Probe::seekable();
+    probe.press_at(0.3);
+    probe.release_at(0.3);
+    let after_release = probe.seeks().len();
+
+    probe
+        .window
+        .window()
+        .dispatch_event(WindowEvent::KeyPressed {
+            text: slint::platform::Key::RightArrow.into(),
+        });
+    assert_eq!(
+        probe.seeks().len(),
+        after_release + 1,
+        "the right arrow must seek once the pointer is released: {:?}",
+        probe.seeks()
+    );
+}

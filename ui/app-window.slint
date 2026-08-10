@@ -1,6 +1,6 @@
-import { Button, CheckBox, ComboBox, ScrollView, SpinBox } from "std-widgets.slint";
+import { ScrollView } from "std-widgets.slint";
 import { Style, StatusTone } from "style.slint";
-import { SectionHeading, Card, CardDivider, CardBlock, StatusLine, Badge } from "controls.slint";
+import { SectionHeading, Card, CardDivider, CardBlock, StatusLine, Badge, ActionButton, ButtonRole, Toggle, Stepper, Select } from "controls.slint";
 
 // Recordings ウィンドウは別ファイルで定義し、ここから再エクスポートして 1 つのエントリ
 // （build.rs は app-window.slint のみコンパイル）に含める。Rust 側は include_modules! で
@@ -58,8 +58,10 @@ component TriggerAppRow inherits Rectangle {
             }
         }
 
-        Button {
+        ActionButton {
             text: "Remove";
+            role: ButtonRole.quiet;
+            compact: true;
             enabled: root.removable;
             clicked => {
                 root.remove();
@@ -76,10 +78,10 @@ component TriggerAppRow inherits Rectangle {
 // （固定フッタは持たない。モデル管理への導線・通信の注記・バージョンは本文の末尾にある）。
 // 色・文字サイズ・角丸はすべて `Style` のトークンから引く（`ui/style.slint`）。
 //
-// **標準ウィジェット（Button / CheckBox / ComboBox / SpinBox）は OS の配色のまま**になる:
-// Slint の `Palette` は読み取り専用で、こちらのトークンへ差し替えられない。合わせるには
-// 自作コントロールが要り、そのぶんキーボード・フォーカス・アクセシビリティを自前で持つ
-// 必要があるので、この issue では標準ウィジェットを使う（`docs/rules/slint.md`）。
+// **操作部品は `ui/controls.slint` の自作部品を使う**（`ActionButton` / `Toggle` /
+// `Stepper` / `Select`）。Slint の `Palette` は読み取り専用で、std-widgets の配色を
+// こちらのトークンへ差し替えられないため（#146）。std-widgets から使うのは、配色を
+// 持たない `ScrollView` だけ（`docs/rules/slint.md`）。
 export component AppWindow inherits Window {
     title: "shoki";
     // 幅・高さは src/main.rs の WINDOW_WIDTH/HEIGHT と一致させること（片方だけ変えない）。
@@ -98,8 +100,8 @@ export component AppWindow inherits Window {
     in-out property <bool> auto-record-app;
     // 登録アプリの一覧（Rust 側の app_mic_triggers を反映）。
     in property <[TriggerApp]> app-list;
-    // 自動停止のデバウンス秒数。起動時に Rust 側が設定値で初期化し、以後は SpinBox で編集する（in-out）。
-    // 範囲は minimum/maximum（下の SpinBox）で制限し、Rust 側の DEBOUNCE_MIN/MAX_SECS と一致させる。
+    // 自動停止のデバウンス秒数。起動時に Rust 側が設定値で初期化し、以後は Stepper で編集する（in-out）。
+    // 範囲は minimum/maximum（下の Stepper）で制限し、Rust 側の DEBOUNCE_MIN/MAX_SECS と一致させる。
     in-out property <int> auto-stop-debounce-secs;
     // 「録音停止時に自動文字起こし」の ON/OFF。起動時に Rust 側が設定値で初期化し、以後は
     // トグル操作で Slint が状態を保持する（in-out。保存失敗時は Rust 側が書き戻す）。
@@ -107,13 +109,13 @@ export component AppWindow inherits Window {
     // 文字起こしの言語の表示名一覧（Rust 側の TRANSCRIBE_LANGUAGES を反映。並び順も Rust が決める）。
     in property <[string]> transcribe-languages;
     // 選択中の言語のカタログ内インデックス。起動時に Rust 側が設定値で初期化し、以後は
-    // ComboBox で編集する（in-out。保存失敗時は Rust 側が書き戻す）。
+    // Select で編集する（in-out。保存失敗時は Rust 側が書き戻す）。
     in-out property <int> transcribe-language-index;
     // 内蔵 whisper モデルの表示名一覧（Rust 側の whisper_model::CATALOG を反映。名前・サイズ・
     // 説明を 1 行に整形済み）。選択肢の下に出す説明行もここから導出する。
     in property <[string]> whisper-models;
     // 選択中モデルのカタログ内インデックス。起動時に Rust 側が設定値で初期化し、以後は
-    // ComboBox で編集する（in-out。保存失敗時は Rust 側が書き戻す）。
+    // Select で編集する（in-out。保存失敗時は Rust 側が書き戻す）。
     in-out property <int> whisper-model-index;
     // 選択中モデルの取得状況テキスト（Rust 側が定期的に更新する）。
     in property <string> whisper-model-status;
@@ -131,9 +133,9 @@ export component AppWindow inherits Window {
     // 名前・サイズ・説明を 1 行に整形済み）。選択肢の下に出す説明行もここから導出する。
     in property <[string]> summary-models;
     // 選択中モデルのカタログ内インデックス。起動時に Rust 側が設定値で初期化し、以後は
-    // ComboBox で編集する（in-out。保存失敗時は Rust 側が書き戻す）。
+    // Select で編集する（in-out。保存失敗時は Rust 側が書き戻す）。
     in-out property <int> summary-model-index;
-    // 選択中モデルの取得状況（Rust 側が定期的に更新する）。モデル名は ComboBox が出すので
+    // 選択中モデルの取得状況（Rust 側が定期的に更新する）。モデル名は Select が出すので
     // 含めない（`summary_model_status_line`）。
     in property <string> summary-model-status;
     // その状態の意味（whisper 側と同じ）。
@@ -214,7 +216,7 @@ export component AppWindow inherits Window {
                                 horizontal-stretch: 1;
                             }
 
-                            Button {
+                            ActionButton {
                                 text: "Change…";
                                 horizontal-stretch: 0;
                                 clicked => {
@@ -255,13 +257,14 @@ export component AppWindow inherits Window {
                                 }
                             }
 
-                            CheckBox {
+                            Toggle {
                                 // 双方向束縛にする。片方向（`checked: root.…`）だと、ユーザーが一度操作した
-                                // 時点でウィジェット側の代入がバインディングを外し、保存失敗時に Rust が
+                                // 時点で部品側の代入がバインディングを外し、保存失敗時に Rust が
                                 // 書き戻しても表示が戻らない（`docs/rules/slint.md`）。
+                                label: "Record automatically";
                                 checked <=> root.auto-record-app;
-                                toggled => {
-                                    root.toggle-auto-record-app(self.checked);
+                                toggled(checked) => {
+                                    root.toggle-auto-record-app(checked);
                                 }
                             }
                         }
@@ -315,8 +318,10 @@ export component AppWindow inherits Window {
 
                                 HorizontalLayout {
                                     alignment: start;
-                                    Button {
+                                    ActionButton {
+                                        glyph: "+";
                                         text: "Add app…";
+                                        role: ButtonRole.dashed;
                                         enabled: deps.enabled-gate;
                                         clicked => {
                                             root.add-app();
@@ -339,15 +344,16 @@ export component AppWindow inherits Window {
                                         horizontal-stretch: 1;
                                     }
 
-                                    SpinBox {
+                                    Stepper {
                                         // 範囲は src/config.rs の DEBOUNCE_MIN_SECS / DEBOUNCE_MAX_SECS と一致させること。
                                         minimum: 1;
                                         maximum: 60;
                                         // 双方向束縛。Rust 側が丸めた値・保存済みの値を書き戻せるようにする
-                                        // （理由は上のチェックボックスのコメント参照）。
+                                        // （理由は上のトグルのコメント参照）。
                                         value <=> root.auto-stop-debounce-secs;
                                         // 途絶が有効なのは自動録音 ON のときだけなので、OFF では無効化する。
                                         enabled: deps.enabled-gate;
+                                        label: "Auto-stop delay";
                                         edited(secs) => {
                                             root.change-auto-stop-debounce(secs);
                                         }
@@ -395,10 +401,11 @@ export component AppWindow inherits Window {
                                 }
                             }
 
-                            CheckBox {
+                            Toggle {
+                                label: "Transcribe recordings";
                                 checked <=> root.auto-transcribe;
-                                toggled => {
-                                    root.toggle-auto-transcribe(self.checked);
+                                toggled(checked) => {
+                                    root.toggle-auto-transcribe(checked);
                                 }
                             }
                         }
@@ -423,12 +430,13 @@ export component AppWindow inherits Window {
                                         horizontal-stretch: 1;
                                     }
 
-                                    ComboBox {
+                                    Select {
+                                        label: "Language";
                                         model: root.transcribe-languages;
                                         current-index <=> root.transcribe-language-index;
                                         enabled: transcribe-deps.enabled-gate;
-                                        selected => {
-                                            root.change-transcribe-language(self.current-index);
+                                        selected(index) => {
+                                            root.change-transcribe-language(index);
                                         }
                                     }
                                 }
@@ -447,18 +455,19 @@ export component AppWindow inherits Window {
                                         horizontal-stretch: 1;
                                     }
 
-                                    ComboBox {
+                                    Select {
+                                        label: "Transcription model";
                                         model: root.whisper-models;
                                         current-index <=> root.whisper-model-index;
                                         enabled: transcribe-deps.enabled-gate;
-                                        selected => {
-                                            root.change-whisper-model(self.current-index);
+                                        selected(index) => {
+                                            root.change-whisper-model(index);
                                         }
                                     }
                                 }
 
                                 if !root.whisper-model-overridden: Text {
-                                    // 選択中の選択肢の全文（名前・サイズ・特徴）。ComboBox の行は箱幅で
+                                    // 選択中の選択肢の全文（名前・サイズ・特徴）。Select の行は箱幅で
                                     // 省略されるため、選ぶ材料になる目安をここで折り返して読めるようにする。
                                     // 選択位置から導出するので、選択と説明が食い違わない。
                                     text: root.whisper-models[root.whisper-model-index];
@@ -529,11 +538,12 @@ export component AppWindow inherits Window {
                                                     }
                                                 }
 
-                                                CheckBox {
+                                                Toggle {
+                                                    label: "Generate meeting notes";
                                                     checked <=> root.auto-summarize;
                                                     enabled: transcribe-deps.enabled-gate;
-                                                    toggled => {
-                                                        root.toggle-auto-summarize(self.checked);
+                                                    toggled(checked) => {
+                                                        root.toggle-auto-summarize(checked);
                                                     }
                                                 }
                                             }
@@ -548,12 +558,13 @@ export component AppWindow inherits Window {
                                                     horizontal-stretch: 1;
                                                 }
 
-                                                ComboBox {
+                                                Select {
+                                                    label: "Meeting notes model";
                                                     model: root.summary-models;
                                                     current-index <=> root.summary-model-index;
                                                     enabled: transcribe-deps.enabled-gate;
-                                                    selected => {
-                                                        root.change-summary-model(self.current-index);
+                                                    selected(index) => {
+                                                        root.change-summary-model(index);
                                                     }
                                                 }
                                             }
@@ -585,7 +596,7 @@ export component AppWindow inherits Window {
                 spacing: 12px;
                 HorizontalLayout {
                     alignment: start;
-                    Button {
+                    ActionButton {
                         // モデルの管理（#117 / #138。取得・削除・使用するモデルの選択）。文字起こしと
                         // 議事録生成の両方のモデルが対象なので、どちらのセクションにも入れない。
                         // 自動文字起こしのトグルには従わせない: 取得済みモデルの掃除は、機能を

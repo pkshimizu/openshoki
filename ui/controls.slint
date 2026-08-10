@@ -4,51 +4,6 @@ import { Style, StatusTone } from "style.slint";
 // 複数のウィンドウで使う自作コントロール。トークン（`style.slint`）と同じ理由でここに集約する:
 // ウィンドウごとに同じ見た目を作り直すと、片方だけ調整が漏れる（`docs/rules/slint.md`）。
 
-// 破壊的操作用のボタン。std-widgets の Button は文字色・背景色を変えられないため、同等の
-// 見た目を Rectangle + TouchArea で作る。filled=false は一覧の Delete（赤文字・通常背景）、
-// filled=true は確認モーダルの確定ボタン（赤背景・白文字）。
-//
-// `enabled` が false のときは淡色化し、クリックも通さない（内側の `TouchArea` の `enabled`）。
-export component DangerButton inherits Rectangle {
-    in property <string> text;
-    in property <bool> enabled: true;
-    in property <bool> filled: false;
-
-    callback clicked();
-
-    border-radius: 6px;
-    border-width: root.filled ? 0 : 1px;
-    border-color: Palette.border;
-    background: root.filled
-        ? (touch.pressed && root.enabled ? Style.danger.darker(15%) : Style.danger)
-        : (touch.pressed && root.enabled
-            ? Palette.control-background.darker(8%)
-            : Palette.control-background);
-    opacity: root.enabled ? 1.0 : Style.disabled-opacity;
-
-    HorizontalLayout {
-        padding-left: 16px;
-        padding-right: 16px;
-        padding-top: 5px;
-        padding-bottom: 5px;
-        Text {
-            text: root.text;
-            font-size: Style.body-size;
-            font-weight: root.filled ? Style.semibold : Style.regular;
-            color: root.filled ? Style.on-accent-foreground : Style.danger;
-            horizontal-alignment: center;
-            vertical-alignment: center;
-        }
-    }
-
-    touch := TouchArea {
-        enabled: root.enabled;
-        clicked => {
-            root.clicked();
-        }
-    }
-}
-
 // セクションの見出し。朱の縦棒（落款の標）＋大文字・字間広めのラベル。
 // 設定画面と、#141 で足す機能ごとのウィンドウで共有する。
 export component SectionHeading inherits HorizontalLayout {
@@ -171,5 +126,640 @@ export component Badge inherits Rectangle {
             letter-spacing: Style.badge-tracking;
             color: root.mark;
         }
+    }
+}
+
+// キーボードフォーカスの輪郭。**枠の外側**へ出す（枠線の色を変えるだけだと、面つきの
+// ボタンでは輪郭が塗りに埋もれて見えない）。
+//
+// 自作の操作部品はすべてこれを使う。`radius` に外枠の角丸を渡すと、外側へ広げたぶんだけ
+// 大きい角丸になって輪郭が枠と平行に走る（部品ごとに書き写すと、5 つ目で式がずれた）。
+export component FocusRing inherits Rectangle {
+    in property <bool> shown;
+    in property <length> radius;
+
+    background: transparent;
+
+    // 輪郭そのものは一段内側に置く。`component` の直下からは `parent` を参照できないので、
+    // このルートに親を満たさせ、その寸法を内側から読む。
+    Rectangle {
+        x: -Style.focus-ring-offset;
+        y: -Style.focus-ring-offset;
+        width: parent.width + Style.focus-ring-offset * 2;
+        height: parent.height + Style.focus-ring-offset * 2;
+        border-radius: root.radius + Style.focus-ring-offset;
+        border-width: root.shown ? Style.focus-ring-width : 0px;
+        border-color: Style.focus-ring;
+    }
+}
+
+// ボタンの役割。**色そのものではなく役割**を渡す（`StatusTone` と同じ趣旨）。
+// 色の対応表は `ActionButton` の 1 箇所だけに置く。
+//
+// Slint の三項連鎖なので**網羅チェックは効かない**。役割を足したら `ActionButton` の
+// `is-filled` / `tint` / `border-color` / `background` / 文字色の 5 つを必ず見直すこと。
+export enum ButtonRole {
+    // 枠つき・面つきの既定（`Change…` / `Manage models…`）。
+    plain,
+    // 枠も面も持たない控えめな操作（一覧行の `Remove`）。押すと消えるものなので、
+    // ポインタを載せたときだけ危険色に寄せる。
+    quiet,
+    // まだ無いものを足す操作（`＋ Add app…`）。破線で「ここに増える」ことを示す。
+    dashed,
+    // 破壊的操作の枠つき（一覧の `Delete`。文字だけ危険色）。
+    danger,
+    // 破壊的操作の確定（確認モーダルの `Delete file`）。危険色で塗る。
+    danger-filled,
+}
+
+// アプリ共通のボタン。std-widgets の `Button` は OS の配色に従い、こちらのトークンへ
+// 差し替えられないため自前で持つ（理由は `docs/rules/slint.md`）。
+//
+// **自作するぶん、標準ウィジェットが持っていたものを自分で用意する**:
+// キーボードフォーカス（Tab で来て Space / Enter で押せる）、フォーカスの可視化、
+// accessible role / label、`enabled` が false のときの不発、押下中にポインタが外へ
+// 出たときの取り消し（`docs/rules/slint.md` の TouchArea の約束）。
+export component ActionButton inherits Rectangle {
+    in property <string> text;
+    // ラベルの前に置く装飾の記号（`+` など）。**`text` に混ぜない**——`text` はそのまま
+    // `accessible-label` になるので、飾りの記号まで読み上げられる。
+    in property <string> glyph;
+    in property <bool> enabled: true;
+    in property <ButtonRole> role: plain;
+    // 一覧行に並べる小さなボタン（`Remove` / `Use` など）は 1 段小さくする。
+    in property <bool> compact: false;
+
+    callback clicked();
+
+    // 押下は「押している間ポインタが中に居る」ときだけ。**`has-hover` では判定できない**:
+    // ポインタを掴んでいる間、Slint は要素の外へ出ても `has-hover` を落とさない
+    // （落ちるのはウィンドウから出たときだけ）ので、外へドラッグしても押下表示が残る。
+    property <bool> inside: touch.mouse-x >= 0px && touch.mouse-x <= root.width
+        && touch.mouse-y >= 0px && touch.mouse-y <= root.height;
+    property <bool> pressing: touch.pressed && root.inside;
+    property <bool> is-filled: root.role == ButtonRole.danger-filled;
+    property <brush> tint: (root.role == ButtonRole.danger || root.role == ButtonRole.danger-filled)
+        ? Style.danger
+        : Style.ink;
+    // 面を明るくするのは、押している間と、ポインタが載っている間。**破線だけはホバーで
+    // 光らせない**（「ここに増える」という当たりを、触れただけで面にしたくない）。
+    property <bool> lit: root.pressing
+        || (touch.has-hover && root.inside && root.role != ButtonRole.dashed);
+
+    border-radius: Style.control-radius;
+    border-width: root.role == ButtonRole.quiet ? 0px : 1px;
+    border-color: root.is-filled
+        ? root.tint
+        : root.role == ButtonRole.dashed && (root.pressing || focus.has-focus)
+            ? Style.seal
+            : Style.rule-strong;
+    background: root.is-filled
+        ? (root.pressing ? root.tint.darker(12%) : root.tint)
+        : root.lit
+            ? (root.role == ButtonRole.quiet ? Style.quiet-hover : Style.control-hover)
+            : (root.role == ButtonRole.plain ? Style.field : transparent);
+    opacity: root.enabled ? 1.0 : Style.disabled-opacity;
+
+    FocusRing {
+        shown: focus.has-focus;
+        radius: root.border-radius;
+    }
+
+    HorizontalLayout {
+        padding-left: root.compact ? 9px : 12px;
+        padding-right: root.compact ? 9px : 12px;
+        padding-top: root.compact ? 3px : 5px;
+        padding-bottom: root.compact ? 3px : 5px;
+        // 記号とラベルの間。記号を `text` に含めていたときの全角スペースの代わり。
+        spacing: 5px;
+
+        if (root.glyph != ""): Text {
+            text: root.glyph;
+            font-size: root.compact ? Style.caption-size : Style.heading-size;
+            color: Style.ink-faint;
+            vertical-alignment: center;
+            // 飾りなので読み上げない（ラベルはボタン自身が持つ）。
+            accessible-role: none;
+        }
+
+        Text {
+            text: root.text;
+            font-size: root.compact ? Style.caption-size : Style.heading-size;
+            font-weight: root.is-filled ? Style.semibold : Style.regular;
+            color: root.is-filled
+                ? Style.on-accent-foreground
+                : root.role == ButtonRole.quiet
+                    ? ((touch.has-hover && root.inside) ? Style.danger : Style.ink-muted)
+                    : root.role == ButtonRole.dashed
+                        ? ((root.pressing || focus.has-focus) ? Style.seal : Style.ink-muted)
+                        : root.tint;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            // ラベルを読み上げるのは**このボタン自身**（下の `accessible-label`）。中の Text も
+            // 既定では読み上げ対象になり、支援技術に同じ文字列が 2 回出る。
+            accessible-role: none;
+        }
+    }
+
+    focus := FocusScope {
+        enabled: root.enabled;
+        // Space / Enter で押せる（標準ウィジェットと同じ）。
+        key-pressed(event) => {
+            if (root.enabled && (event.text == " " || event.text == "\n")) {
+                root.clicked();
+                return accept;
+            }
+            return reject;
+        }
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => {
+            // クリックでフォーカスも移す（押した先がフォーカスされる、という OS の慣習）。
+            focus.focus();
+            root.clicked();
+        }
+    }
+
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-enabled: root.enabled;
+    // **支援技術からの操作にもガードが要る**（ポインタとキーボードだけ塞いでも、
+    // ここが素通りすると無効なボタンを押せてしまう）。
+    accessible-action-default => {
+        if (root.enabled) {
+            root.clicked();
+        }
+    }
+}
+
+// 破壊的操作用のボタン。`ActionButton` に役割を固定しただけの薄い包み。
+//
+// **公開 API（`text` / `enabled` / `filled` / `clicked`）と型名はそのまま**にしてある:
+// モデル管理・録音一覧の各ウィンドウと `tests/ui_models.rs` が使っており、#146 の時点では
+// それらの画面を触らない（#128 / #141 の再設計で `ActionButton` へ寄せる）。
+// キーボード・フォーカス・アクセシビリティは `ActionButton` から引き継ぐ。
+export component DangerButton inherits ActionButton {
+    // 一覧の Delete（赤文字・通常背景）か、確認モーダルの確定（赤背景・白文字）か。
+    in property <bool> filled: false;
+    role: root.filled ? ButtonRole.danger-filled : ButtonRole.danger;
+}
+
+// ON/OFF のトグル。std-widgets の `CheckBox` の置き換え（#146）。
+//
+// `checked` は `in-out` にして、使う側は `<=>` で束ねること。片方向にすると、保存失敗時に
+// Rust から書き戻しても表示が戻らない（`docs/rules/slint.md`）。`toggled` は**先に `checked` を
+// 更新してから**呼ぶ（標準ウィジェットと同じ慣例。書き戻しの前提）。
+export component Toggle inherits Rectangle {
+    in-out property <bool> checked;
+    in property <bool> enabled: true;
+    // 支援技術が読むラベル。原則として**隣の可視ラベルと同じ文字列**を渡す。ただし同名の
+    // ラベルが画面に複数あるときは、区別できる名前にしてよい（設定画面には `Model` が 2 つ
+    // あるので `Transcription model` / `Meeting notes model` を渡している）。文言の書き方は
+    // `docs/rules/messages.md` の GUI ラベルの規約に従う。
+    in property <string> label;
+
+    callback toggled(bool);
+
+    width: 42px;
+    height: 24px;
+    border-radius: self.height / 2;
+    background: root.checked ? Style.seal : Style.switch-track-off;
+    opacity: root.enabled ? 1.0 : Style.disabled-opacity;
+
+    FocusRing {
+        shown: focus.has-focus;
+        radius: root.border-radius;
+    }
+
+    // つまみ。ON で右、OFF で左（軌道の内側 2px）。
+    Rectangle {
+        width: 20px;
+        height: 20px;
+        border-radius: self.height / 2;
+        x: root.checked ? parent.width - self.width - 2px : 2px;
+        y: 2px;
+        background: root.checked ? Style.switch-knob-on : Style.switch-knob-off;
+        animate x { duration: 120ms; easing: ease-out; }
+    }
+
+    function flip() {
+        root.checked = !root.checked;
+        root.toggled(root.checked);
+    }
+
+    focus := FocusScope {
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if (root.enabled && (event.text == " " || event.text == "\n")) {
+                root.flip();
+                return accept;
+            }
+            return reject;
+        }
+    }
+
+    TouchArea {
+        enabled: root.enabled;
+        clicked => {
+            focus.focus();
+            root.flip();
+        }
+    }
+
+    accessible-role: switch;
+    accessible-label: root.label;
+    // **`accessible-checkable` が無いと、実 AT へは ON/OFF が伝わらない**（accesskit は
+    // checkable を見てから状態を載せる）。テストバックエンドは `checked` を直読みするので、
+    // テストが通っていても伝わっていないことがある。
+    accessible-checkable: true;
+    accessible-checked: root.checked;
+    accessible-enabled: root.enabled;
+    accessible-action-default => {
+        if (root.enabled) {
+            root.flip();
+        }
+    }
+}
+
+// `Stepper` の ± ボタン。枠を持たず、面だけで押せることを示す。
+component StepperButton inherits Rectangle {
+    in property <string> symbol;
+    in property <bool> enabled: true;
+    in property <string> label;
+    callback clicked();
+
+    width: 26px;
+    height: 26px;
+    background: root.enabled && touch.has-hover ? Style.control-hover : transparent;
+
+    Text {
+        text: root.symbol;
+        font-size: Style.detail-title-size - 2px;
+        color: root.enabled ? Style.ink-muted : Style.ink-faint;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        // 読み上げるのはこのボタン自身（`−` という記号を読ませない）。
+        accessible-role: none;
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => {
+            root.clicked();
+        }
+    }
+
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-enabled: root.enabled;
+    accessible-action-default => {
+        if (root.enabled) {
+            root.clicked();
+        }
+    }
+}
+
+// 整数を増減する入力。std-widgets の `SpinBox` の置き換え（#146）。
+//
+// `value` は `in-out`（`<=>` で束ねる。理由は `Toggle` と同じ）。範囲は使う側が渡し、
+// **この部品が丸める**ので、呼び出し側は範囲外の値を受け取らない。
+export component Stepper inherits Rectangle {
+    in-out property <int> value;
+    in property <int> minimum: 0;
+    in property <int> maximum: 100;
+    in property <bool> enabled: true;
+    // 支援技術が読むラベル。原則として**隣の可視ラベルと同じ文字列**を渡す（規約の詳細は
+    // `Toggle` の同名プロパティのコメント）。
+    in property <string> label;
+
+    callback edited(int);
+
+    // **枠と `clip` はルートに置かない**。`clip` は子を枠の内側で切るので、外側へ 3px 出す
+    // フォーカスリングが丸ごと消える（ルートに置いていたときは、ステッパーだけフォーカス位置が
+    // 見えなかった）。枠・面・クリップは内側の箱が持ち、リングはその外側に立てる。
+    background: transparent;
+    opacity: root.enabled ? 1.0 : Style.disabled-opacity;
+
+    FocusRing {
+        shown: focus.has-focus;
+        radius: Style.control-radius;
+    }
+
+    function step(delta: int) {
+        // UI 上の丸めはここが正（呼び出し側は手編集された設定値に備えて丸め直すことがある）。
+        // **端で止まったら通知しない**。値が変わらないのに `edited` を出すと、下限で下キーを
+        // 押し続けるあいだ設定の保存が走り続ける。
+        let next = min(max(root.value + delta, root.minimum), root.maximum);
+        if (next == root.value) {
+            return;
+        }
+        root.value = next;
+        root.edited(root.value);
+    }
+
+    focus := FocusScope {
+        enabled: root.enabled;
+        // 上下キーで増減する（標準の SpinBox と同じ）。
+        key-pressed(event) => {
+            if (!root.enabled) {
+                return reject;
+            }
+            if (event.text == Key.UpArrow) {
+                root.step(1);
+                return accept;
+            }
+            if (event.text == Key.DownArrow) {
+                root.step(-1);
+                return accept;
+            }
+            return reject;
+        }
+    }
+
+    Rectangle {
+        border-width: 1px;
+        border-color: Style.rule-strong;
+        border-radius: Style.control-radius;
+        background: Style.field;
+        clip: true;
+
+        HorizontalLayout {
+        StepperButton {
+            symbol: "−";
+            enabled: root.enabled && root.value > root.minimum;
+            label: root.label + " (decrease)";
+            clicked => {
+                focus.focus();
+                root.step(-1);
+            }
+        }
+
+        Text {
+            width: 36px;
+            text: root.value;
+            font-size: Style.label-size;
+            color: Style.ink;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            // 幅を固定してあるので、桁が変わっても押している ± がずれない。
+            // 値は `Stepper` 自身が `accessible-value` で持つ。
+            accessible-role: none;
+        }
+
+        StepperButton {
+            symbol: "＋";
+            enabled: root.enabled && root.value < root.maximum;
+            label: root.label + " (increase)";
+            clicked => {
+                focus.focus();
+                root.step(1);
+            }
+        }
+        }
+    }
+
+    accessible-role: spinbox;
+    accessible-label: root.label;
+    accessible-value: root.value;
+    accessible-value-minimum: root.minimum;
+    accessible-value-maximum: root.maximum;
+    accessible-value-step: 1;
+    accessible-enabled: root.enabled;
+    // 支援技術からも増減できるようにする（標準の `SpinBox` が持っていた契約）。
+    accessible-action-increment => {
+        if (root.enabled) {
+            root.step(1);
+        }
+    }
+    accessible-action-decrement => {
+        if (root.enabled) {
+            root.step(-1);
+        }
+    }
+}
+
+// 選択肢から 1 つ選ぶ入力。std-widgets の `ComboBox` の置き換え（#146）。
+//
+// `current-index` は `in-out`（`<=>` で束ねる。理由は `Toggle` と同じ）。`selected` は
+// **先に `current-index` を更新してから**呼ぶ。
+//
+// **キーボードだけで選べる**: フォーカスを当てて上下キーで選択が 1 つ動き、その場で確定する
+// （ポップアップを開かずに選べる。macOS の慣習）。ポップアップは一覧を見て選びたいときの
+// 補助で、開かなくても操作が完結する——ヘッドレスのテストでもポップアップに触らずに検証できる。
+export component Select inherits Rectangle {
+    in property <[string]> model;
+    in-out property <int> current-index;
+    in property <bool> enabled: true;
+    // 支援技術が読むラベル。原則として**隣の可視ラベルと同じ文字列**を渡す（規約の詳細は
+    // `Toggle` の同名プロパティのコメント）。
+    in property <string> label;
+
+    callback selected(int);
+
+    // 一覧が開いているか（支援技術へ伝えるために持つ。`accessible-expandable` だけだと
+    // 常に「閉じている」と読まれる）。
+    property <bool> expanded;
+
+    // 箱とポップアップで同じ最小幅を使う（値の一致でしか揃えていないと、片方だけ動く）。
+    property <length> min-box-width: 150px;
+
+    min-width: root.min-box-width;
+    border-width: 1px;
+    border-color: Style.rule-strong;
+    border-radius: Style.control-radius;
+    background: root.enabled && touch.has-hover ? Style.control-hover : Style.field;
+    opacity: root.enabled ? 1.0 : Style.disabled-opacity;
+
+    FocusRing {
+        shown: focus.has-focus;
+        radius: root.border-radius;
+    }
+
+    // 上下キーの割り当て。**閉じているとき用と開いているとき用で 2 つの `FocusScope` が
+    // あるので、表はここ 1 つに持つ**（片方だけ変えると開閉で挙動が割れる）。
+    pure function arrow-delta(text: string) -> int {
+        return text == Key.DownArrow ? 1 : (text == Key.UpArrow ? -1 : 0);
+    }
+
+    function move(delta: int) {
+        // 選択肢が無いなら動かさない。**`length - 1` が -1 になる**ので、下の丸めが
+        // `current-index` を負にして `selected(-1)` を呼んでしまう。
+        if (root.model.length == 0) {
+            return;
+        }
+        // 端で止める（巡回させない。押しっぱなしで一周して戻る挙動を避ける）。
+        let next = min(max(root.current-index + delta, 0), root.model.length - 1);
+        if (next == root.current-index) {
+            return;
+        }
+        root.current-index = next;
+        root.selected(root.current-index);
+    }
+
+    function choose(index: int) {
+        root.current-index = index;
+        root.selected(index);
+    }
+
+    HorizontalLayout {
+        padding-left: 9px;
+        padding-right: 9px;
+        padding-top: 5px;
+        padding-bottom: 5px;
+        spacing: 8px;
+        Text {
+            text: root.model[root.current-index];
+            font-size: Style.label-size;
+            color: Style.ink;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+            // 選択中の値は `Select` 自身が `accessible-value` で持つ。
+            accessible-role: none;
+        }
+
+        Text {
+            text: "▾";
+            font-size: Style.badge-size;
+            color: Style.ink-faint;
+            vertical-alignment: center;
+            accessible-role: none;
+        }
+    }
+
+    focus := FocusScope {
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if (!root.enabled) {
+                return reject;
+            }
+            if (event.text == Key.DownArrow) {
+                root.move(1);
+                return accept;
+            }
+            if (event.text == Key.UpArrow) {
+                root.move(-1);
+                return accept;
+            }
+            if (event.text == " " || event.text == "\n") {
+                root.open-options();
+                return accept;
+            }
+            return reject;
+        }
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => {
+            focus.focus();
+            root.open-options();
+        }
+    }
+
+    // 開く口を 1 つにまとめる（クリック・キー・支援技術の 3 経路から呼ぶ）。
+    // **ガードもここに置く**。呼び出し側 3 つに書き写すと、どれか 1 つが抜ける。
+    function open-options() {
+        if (!root.enabled) {
+            return;
+        }
+        root.expanded = true;
+        options.show();
+    }
+
+    options := PopupWindow {
+        x: 0;
+        y: root.height + 4px;
+        width: max(root.width, root.min-box-width);
+        close-policy: close-on-click-outside;
+        // 開いた時点でキー処理へフォーカスを渡す（渡さないと上下キーが届かない）。
+        forward-focus: popup-keys;
+        // **開いている間はポップアップがキー入力を受ける**ので、上下キーの扱いをここにも持つ
+        // （閉じているときは下の `focus` が受ける）。選択はその場で確定し、Enter / Escape で閉じる。
+        popup-keys := FocusScope {
+            // 一覧はウィンドウ外のクリックでも閉じる（`close-policy`）。閉じたことを拾う
+            // コールバックは無いので、キー処理がフォーカスを失ったことで代用する。
+            focus-changed-event => {
+                if (!self.has-focus) {
+                    root.expanded = false;
+                }
+            }
+
+            key-pressed(event) => {
+                if (root.arrow-delta(event.text) != 0) {
+                    root.move(root.arrow-delta(event.text));
+                    return accept;
+                }
+                if (event.text == "\n" || event.text == Key.Escape) {
+                    options.close();
+                    return accept;
+                }
+                return reject;
+            }
+        }
+
+        Rectangle {
+            border-width: 1px;
+            border-color: Style.rule-strong;
+            border-radius: Style.control-radius;
+            background: Style.sheet;
+            VerticalLayout {
+                padding: 4px;
+                accessible-role: list;
+                accessible-item-count: root.model.length;
+
+                for option[index] in root.model: Rectangle {
+                    accessible-role: list-item;
+                    accessible-label: option;
+                    accessible-item-selectable: true;
+                    accessible-item-selected: index == root.current-index;
+                    accessible-item-index: index;
+                    accessible-action-default => {
+                        root.choose(index);
+                        options.close();
+                    }
+
+                    background: index == root.current-index
+                        ? Style.seal.transparentize(0.88)
+                        : (row.has-hover ? Style.control-hover : transparent);
+                    border-radius: 4px;
+                    HorizontalLayout {
+                        padding-left: 8px;
+                        padding-right: 8px;
+                        padding-top: 5px;
+                        padding-bottom: 5px;
+                        Text {
+                            text: option;
+                            font-size: Style.label-size;
+                            color: Style.ink;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                            // 読み上げるのは行そのもの（上の `accessible-label`）。
+                            accessible-role: none;
+                        }
+                    }
+
+                    row := TouchArea {
+                        clicked => {
+                            root.choose(index);
+                            options.close();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    accessible-role: combobox;
+    accessible-label: root.label;
+    accessible-value: root.model[root.current-index];
+    accessible-enabled: root.enabled;
+    accessible-expandable: true;
+    accessible-expanded: root.expanded;
+    // ガードは `open-options` が持つ（3 経路のどれから来ても同じ口を通る）。
+    accessible-action-expand => {
+        root.open-options();
     }
 }

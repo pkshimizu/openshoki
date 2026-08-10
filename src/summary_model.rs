@@ -14,7 +14,7 @@ use crate::model_download::ModelSpec;
 /// 削除可否の判定キーにはしない（理由は whisper 側の `KIND`）。
 pub(crate) const KIND: &str = "Summary LLM";
 
-/// 選べるモデルの一覧（小さい順）。設定画面の ComboBox はこの順で並ぶため、モデルを足すときは
+/// 選べるモデルの一覧（小さい順）。設定画面の Select はこの順で並ぶため、モデルを足すときは
 /// ここへ 1 エントリ追加するだけでよい（whisper 側と同じ）。
 ///
 /// `description` には **4 分の会議での所要時間とピーク RSS の目安**を先に置く。数 GB の

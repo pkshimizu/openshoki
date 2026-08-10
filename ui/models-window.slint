@@ -81,7 +81,7 @@ export component ModelsWindow inherits Window {
     // `in-out` なのは確認用バイナリ（`examples/models_view.rs`）がモーダルの見た目を出すため。
     in-out property <int> delete-index: 0;
 
-    // 「Use」押下。その行のモデルを使う設定にする（設定画面の ComboBox と同じ経路を通る）。
+    // 「Use」押下。その行のモデルを使う設定にする（設定画面の Select と同じ経路を通る）。
     callback use-model(int);
     // 「Download」押下。その行のモデルの取得を始める（選択は変えない）。
     callback download-model(int);
