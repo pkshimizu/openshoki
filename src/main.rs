@@ -137,24 +137,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 内蔵 whisper モデル: 表示名一覧はカタログから「名前 — サイズ — 説明」を組み立てる。
     // 選択位置は設定のモデル ID から解決し、カタログ外の手編集値は既定（Small）位置に表示される。
     ui.set_whisper_models(model_choices(whisper_model::CATALOG));
-    ui.set_whisper_model_index(whisper_model::model_index(&config.borrow().whisper_model) as i32);
-    ui.set_whisper_model_status(
-        model_status_text(
-            whisper_model::spec_or_default(&config.borrow().whisper_model),
-            &model_downloader,
-        )
-        .into(),
-    );
     // 議事録要約: トグルと、使う LLM の選択・取得状況。選択肢の組み立て・フォールバックは
     // whisper と同じ（選択肢には所要時間とメモリの目安を含める。数 GB のダウンロードと
     // 数十秒・数 GB の実行コストが選択で決まるため）。
     ui.set_auto_summarize(config.borrow().auto_summarize);
     ui.set_summary_models(model_choices(summary_model::CATALOG));
-    ui.set_summary_model_index(summary_model::model_index(&config.borrow().summary_model) as i32);
     ui.set_summary_model_overridden(config.borrow().summary_model_path.is_some());
-    ui.set_summary_model_status(
-        summary_model_status_text(&config.borrow(), &model_downloader).into(),
-    );
+    // 選択位置と状態行は、モデル管理ウィンドウから選び直したときの追従と**同じ関数**で入れる
+    // （両種別ぶんを 1 箇所にまとめ、種別や状態行の導出が増えたときに初期化だけ取り残されない
+    // ようにする）。
+    apply_model_selection_to_settings(&ui, &config.borrow(), &model_downloader);
     // 登録アプリの一覧を Slint のモデルで持ち、追加/削除で更新する。
     let app_list_model = Rc::new(slint::VecModel::<TriggerApp>::from(
         config
@@ -2126,6 +2118,22 @@ fn model_choices(catalog: &[model_download::ModelSpec]) -> slint::ModelRc<slint:
     .into()
 }
 
+/// その種別のモデルファイルを `config.toml` で上書きしているか（上書き先のパス）。上級者向けの
+/// 手編集のみで、UI からは設定できない。
+///
+/// **網羅 match** にしてあるので、種別を足したら上書きの扱いを書くまでコンパイルが通らない。
+/// 取得の契機（`model_downloads_on_select`）と状態行（`*_model_status_text`）の**両方**がここを
+/// 通るので、種別を足した人が片方だけ更新して静かに食い違うことがない。
+fn model_path_override(
+    kind: model_download::ModelKind,
+    config: &Config,
+) -> Option<&std::path::Path> {
+    match kind {
+        model_download::ModelKind::Speech => config.whisper_model_path.as_deref(),
+        model_download::ModelKind::Summary => config.summary_model_path.as_deref(),
+    }
+}
+
 /// モデルを選び直した時点で、そのモデルの取得を始めるか。**取得の契機の正**で、状態行の文言
 /// （`whisper_model_status_text` / `summary_model_status_text`）もこれに合わせる。
 ///
@@ -2143,16 +2151,18 @@ fn model_choices(catalog: &[model_download::ModelSpec]) -> slint::ModelRc<slint:
 /// あるのは、要約 LLM が whisper より大きく（最大 4.4 GB）、生成時に `ensure_model` が取得する
 /// 経路が別にあるから。
 ///
-/// **網羅 match** にしてあるので、種別を足したら取得の契機を書くまでコンパイルが通らない。
+/// 上書きの判定は `model_path_override` に任せ、ここは**上書き以外の契機**だけを種別ごとに
+/// 書く（**網羅 match** なので、種別を足したら契機を書くまでコンパイルが通らない）。
 ///
 /// テストでピン留めしてあるのはこの述語まで。呼び出し側のガード（`select_model` の
 /// `if downloads_now`）は、実際に取得を始める副作用を持つためテストから叩けない。
 fn model_downloads_on_select(kind: model_download::ModelKind, config: &Config) -> bool {
+    if model_path_override(kind, config).is_some() {
+        return false;
+    }
     match kind {
-        model_download::ModelKind::Speech => config.whisper_model_path.is_none(),
-        model_download::ModelKind::Summary => {
-            config.auto_summarize && config.summary_model_path.is_none()
-        }
+        model_download::ModelKind::Speech => true,
+        model_download::ModelKind::Summary => config.auto_summarize,
     }
 }
 
@@ -2169,7 +2179,7 @@ fn whisper_model_status_text(
     config: &Config,
     downloader: &model_download::ModelDownloader,
 ) -> String {
-    if config.whisper_model_path.is_some() {
+    if model_path_override(model_download::ModelKind::Speech, config).is_some() {
         return MODEL_OVERRIDDEN_STATUS.to_owned();
     }
     model_status_text(
@@ -2180,19 +2190,19 @@ fn whisper_model_status_text(
 
 /// 議事録要約に使う LLM の取得状況を、設定画面の状態行テキストにする。
 ///
-/// どのモデルかは ComboBox が示すので、ここは whisper と同じ状態だけを出す。ただし取得の契機は
-/// whisper より条件が多い（`model_downloads_on_select`）ので、共用の「downloads automatically」
-/// では表示と挙動が食い違う場合がある。その場合は契機を明示する:
+/// どのモデルかは ComboBox が示すので、ここは状態だけを出す。ただし取得の契機は whisper より
+/// 条件が多い（`model_downloads_on_select`）ので、共用の「downloads automatically」では表示と
+/// 挙動が食い違う場合がある。その場合は契機を明示する:
 ///
 /// - モデルパスを上書きしている: そのファイルが使われ、カタログのモデルは取得しない
-///   （whisper と同じなので `whisper_model_status_text` と同じ文言）。
+///   （whisper と同じ状態なので `MODEL_OVERRIDDEN_STATUS` を共用する）。
 /// - 要約 OFF: 選んでも取得は始まらない（次に要約が走るときに取得する。設定を ON にした後の
 ///   初回要約か、Recordings ウィンドウからの手動生成）。
 fn summary_model_status_text(
     config: &Config,
     downloader: &model_download::ModelDownloader,
 ) -> String {
-    if config.summary_model_path.is_some() {
+    if model_path_override(model_download::ModelKind::Summary, config).is_some() {
         return MODEL_OVERRIDDEN_STATUS.to_owned();
     }
     let spec = summary_model::spec_or_default(&config.summary_model);
@@ -2973,8 +2983,10 @@ fn select_model(
     true
 }
 
-/// 設定画面の表示を、いまの設定に合わせて更新する（モデル管理ウィンドウから選び直したときに、
-/// 設定画面の ComboBox と状態行を追従させる）。
+/// 設定画面の ComboBox の選択位置と状態行を、いまの設定に合わせて更新する。
+///
+/// 起動時の初期化と、モデル管理ウィンドウから選び直したときの追従が**同じ経路**を通る（状態行の
+/// 導出が種別ごとに増えても、初期化だけ古い経路に取り残されないようにするため）。
 fn apply_model_selection_to_settings(
     ui: &AppWindow,
     config: &Config,
@@ -3386,7 +3398,7 @@ mod tests {
     /// 要約 LLM を選んで取得を始めるのは「要約 ON かつモデルパス未上書き」のときだけ
     /// （4 通りを固定する）。
     #[test]
-    fn summary_model_downloads_on_select_only_when_the_summary_runs() {
+    fn model_downloads_on_select_for_summary_only_when_the_summary_runs() {
         let base = crate::config::Config::default();
         let with = |auto_summarize, path: Option<&str>| crate::config::Config {
             auto_summarize,
@@ -3410,7 +3422,7 @@ mod tests {
     /// `transcribe` がそのファイルを使うので、カタログのモデルは落としても使われない（#123）。
     /// 自動文字起こしの ON/OFF では変わらない（要約と違ってゲートを置いていない）ことも固定する。
     #[test]
-    fn whisper_model_downloads_on_select_unless_the_path_is_overridden() {
+    fn model_downloads_on_select_for_speech_unless_the_path_is_overridden() {
         let base = crate::config::Config::default();
         let with = |auto_transcribe, path: Option<&str>| crate::config::Config {
             auto_transcribe,
@@ -3431,18 +3443,31 @@ mod tests {
     /// whisper の状態行は、上書き中だけ取得状況ではなく「上書きを使っている」ことを出す（#123）。
     /// 上書きが無いときは取得状況をそのまま出す（要約側のような契機の説明は要らない
     /// ＝選べば必ず取得が始まるため）。
+    ///
+    /// **選択中のモデルを解決していること**も固定する: 既定（Small）だけで見ると
+    /// `spec_or_default` を `default_spec` に壊してもテストが緑のままになるため、既定ではない
+    /// カタログモデル（Tiny）でサイズ入りの文言をリテラルで留める。
     #[test]
     fn whisper_model_status_text_shows_the_override() {
         let downloader = crate::model_download::ModelDownloader::new();
-        let spec = crate::whisper_model::default_spec();
-        downloader.set_status_for_test(spec, crate::model_download::DownloadStatus::NotDownloaded);
-
-        let base = crate::config::Config::default();
-        assert_eq!(
-            whisper_model_status_text(&base, &downloader),
-            model_status_text(spec, &downloader)
+        let default_spec = crate::whisper_model::default_spec();
+        let tiny = crate::whisper_model::spec_for("tiny").expect("tiny is in the catalog");
+        downloader.set_status_for_test(
+            default_spec,
+            crate::model_download::DownloadStatus::Downloaded,
         );
-        downloader.set_status_for_test(spec, crate::model_download::DownloadStatus::Downloaded);
+        downloader.set_status_for_test(tiny, crate::model_download::DownloadStatus::NotDownloaded);
+
+        // 既定以外を選んでいれば、その spec の状況とサイズが出る（選択が効いていることの担保）。
+        let base = crate::config::Config::default();
+        let choosing_tiny = crate::config::Config {
+            whisper_model: "tiny".to_owned(),
+            ..base.clone()
+        };
+        assert_eq!(
+            whisper_model_status_text(&choosing_tiny, &downloader),
+            "Not downloaded — downloads automatically (74 MB)"
+        );
         assert_eq!(whisper_model_status_text(&base, &downloader), "Downloaded");
 
         // カタログ外の手編集値は既定モデルの状況を出す（使用時のフォールバックと整合）。
@@ -3452,19 +3477,19 @@ mod tests {
         };
         assert_eq!(
             whisper_model_status_text(&unknown, &downloader),
-            whisper_model_status_text(&base, &downloader)
+            "Downloaded"
         );
 
         // 上書き中は取得状況によらず同じ文言（要約側と同じ表現にする）。
         let overridden = crate::config::Config {
             whisper_model_path: Some(std::path::PathBuf::from("/tmp/ggml-small.bin")),
-            ..base
+            ..choosing_tiny
         };
         assert_eq!(
             whisper_model_status_text(&overridden, &downloader),
             "Using the model file set in config.toml"
         );
-        downloader.set_status_for_test(spec, crate::model_download::DownloadStatus::NotDownloaded);
+        downloader.set_status_for_test(tiny, crate::model_download::DownloadStatus::Downloaded);
         assert_eq!(
             whisper_model_status_text(&overridden, &downloader),
             "Using the model file set in config.toml"
