@@ -276,28 +276,9 @@ impl ModelDownloader {
     /// 入っても変わらないため。打ち切りは並走を減らす方向にしか効かない（走っている取得を
     /// 止めるだけで、新しく待たせはしない）。
     pub fn request_download(&self, spec: &'static ModelSpec) {
-        // 「立てるか」と「どの世代の要求か」を**1 回のロック**で決める（`docs/rules/coding-conventions.md`
-        // の「見てから決めるは 1 回のロックに畳む」）。2 回に分けると、その隙間で担当が
-        // `DownloadGuard::record` を通り、「状態は Downloading・フラグはもう無い」という実在しない
-        // 組み合わせで判定してしまう。
-        let (start, since_epoch) = {
-            let mut state = self.lock();
-            let recorded = state.status.get(spec.id).cloned();
-            let cancelling = state.is_cancelling(spec.id);
-            // 記録が無いときだけディスクを見る（`status_of` と同じく、見つけたら記録して
-            // 以後の照会が stat を打たないようにする）。
-            let on_disk = recorded.is_none() && model_path(spec).is_some_and(|path| path.is_file());
-            if on_disk {
-                state.status.insert(spec.id, DownloadStatus::Downloaded);
-            }
-            (
-                should_start_download(recorded.as_ref(), cancelling, on_disk),
-                state.cancel_epoch_of(spec.id),
-            )
-        };
-        if !start {
+        let Some(since_epoch) = self.begin_ui_request(spec) else {
             return;
-        }
+        };
         let downloader = self.clone();
         let spawned = std::thread::Builder::new()
             .name(format!("model-download-{}", spec.id))
@@ -323,6 +304,32 @@ impl ModelDownloader {
         if let Err(err) = spawned {
             eprintln!("Skipping the model download because the thread failed to start: {err}");
         }
+    }
+
+    /// UI 起点の要求を受け付ける。スレッドを立てるなら、その要求が握る**打ち切り世代**を返す。
+    ///
+    /// 判定・世代の捕捉・ディスクで見つけたときの記録を**1 回のロック**で行うのが要点
+    /// （`docs/rules/coding-conventions.md` の「見てから決めるは 1 回のロックに畳む」）:
+    ///
+    /// - 判定と `is_cancelling` を分けると、その隙間で担当が `DownloadGuard::record` を通り、
+    ///   「状態は `Downloading`・フラグはもう無い」という**実在しない組み合わせ**で判定する。
+    /// - 世代の捕捉を分けると、その隙間に来た打ち切りの**後**の世代を握ってしまい、
+    ///   `acquire_and_transfer` の比較をすり抜けて「捨てたはずのモデルを落とし直す」。
+    ///
+    /// `request_download` から切り出してあるのは、この繋ぎをテストで固定するため
+    /// （spawn を含んだままだとテストから叩けない。`docs/rules/testing.md`）。
+    fn begin_ui_request(&self, spec: &'static ModelSpec) -> Option<u64> {
+        let mut state = self.lock();
+        let recorded = state.status.get(spec.id).cloned();
+        let cancelling = state.is_cancelling(spec.id);
+        // 記録が無いときだけディスクを見る（`status_of` と同じく、見つけたら記録して以後の
+        // 照会が stat を打たないようにする）。
+        let on_disk = recorded.is_none() && model_path(spec).is_some_and(|path| path.is_file());
+        if on_disk {
+            state.status.insert(spec.id, DownloadStatus::Downloaded);
+        }
+        should_start_download(recorded.as_ref(), cancelling, on_disk)
+            .then(|| state.cancel_epoch_of(spec.id))
     }
 
     /// 走っているそのモデルの取得に**打ち切りを要求する**。要求できたら（取得中で、ワーカーも
@@ -362,6 +369,9 @@ impl ModelDownloader {
         // `true` は「要求できた」であって「止まった」ではない。
         // 世代は**担当の有無に関わらず**進める。担当の交代を待っているスレッドは、この世代を
         // 見て「自分が頼まれた後に打ち切りが来た」と分かり、取得を始めずに降りる。
+        // **`required` の確認より後**に置くこと: 先に進めると、ワーカーが待っている最中に UI で
+        // 別モデルを選んだだけで世代が動き、印があるのに `acquire_and_transfer` が降りて
+        // ジョブが失敗する（`ensure_model` の「印が有効な区間では起きえない」が崩れる）。
         *state.cancel_epoch.entry(id.to_owned()).or_insert(0) += 1;
         match state.cancels.get(id) {
             Some(cancel) => {
@@ -2247,22 +2257,82 @@ mod tests {
         let missing = temp_path("never-created-3.bin");
 
         // ワーカー起点（`ensure_model` が通る経路）は印を立てるので、打ち切れない。
+        let worker_ran = std::cell::Cell::new(false);
         downloader
             .ensure_and_transfer(&FAKE_LLM_MODEL, &missing, |cancel| {
+                worker_ran.set(true);
                 assert!(!downloader.cancel_download(FAKE_LLM_MODEL.id));
                 assert!(!cancel.load(Ordering::Relaxed));
                 Ok(DownloadOutcome::Cancelled)
             })
             .expect("cancelling is not a failure");
+        // **担当を引き受けたことまで確かめる**: 世代の不一致で降りても戻り値は同じ
+        // `Ok(Cancelled)` なので、走ったかを見ないとテストが素通りする。
+        assert!(worker_ran.get(), "the worker entry must take the download");
 
-        // UI 起点（`request_download` が通る経路）は印を立てないので、打ち切れる。
+        // UI 起点（`request_download` が通る経路）は印を立てないので、打ち切れる。世代は
+        // ハードコードせず、要求時点の値を読む（前半の副作用に暗黙依存しないため）。
+        let since_epoch = downloader.lock().cancel_epoch_of(FAKE_LLM_MODEL.id);
+        let ui_ran = std::cell::Cell::new(false);
         downloader
-            .acquire_and_transfer(&FAKE_LLM_MODEL, &missing, 0, |cancel| {
+            .acquire_and_transfer(&FAKE_LLM_MODEL, &missing, since_epoch, |cancel| {
+                ui_ran.set(true);
                 assert!(downloader.cancel_download(FAKE_LLM_MODEL.id));
                 assert!(cancel.load(Ordering::Relaxed));
                 Ok(DownloadOutcome::Cancelled)
             })
             .expect("cancelling is not a failure");
+        assert!(ui_ran.get(), "the UI entry must take the download");
+    }
+
+    /// ワーカーが必要としている間は、打ち切りが**世代も進めない**。進めてしまうと、UI で別の
+    /// モデルを選んだだけでワーカーの担当引き受けが世代の不一致で降り、ジョブが失敗する。
+    #[test]
+    fn a_required_model_keeps_its_cancel_epoch() {
+        let downloader = ModelDownloader::new();
+        let before = downloader.lock().cancel_epoch_of(FAKE_LLM_MODEL.id);
+
+        {
+            let _needed = RequiredMark::new(&downloader, FAKE_LLM_MODEL.id);
+            assert!(!downloader.cancel_download(FAKE_LLM_MODEL.id));
+            assert_eq!(downloader.lock().cancel_epoch_of(FAKE_LLM_MODEL.id), before);
+        }
+
+        // 印が外れたら進む（上の assert が「そもそも進まない実装」で通らないようにする対）。
+        assert!(!downloader.cancel_download(FAKE_LLM_MODEL.id));
+        assert_eq!(
+            downloader.lock().cancel_epoch_of(FAKE_LLM_MODEL.id),
+            before + 1
+        );
+    }
+
+    /// UI 起点の要求の受け付け（判定＋世代の捕捉）。`request_download` はこの結果で
+    /// スレッドを立てるかを決めるだけなので、繋ぎの契約はここで固定する。
+    #[test]
+    fn begin_ui_request_starts_only_when_needed_and_carries_the_current_epoch() {
+        let downloader = ModelDownloader::new();
+        let downloading = DownloadStatus::Downloading {
+            received: 0,
+            total: FAKE_LLM_MODEL.size_bytes,
+        };
+
+        // 取得中で打ち切られていなければ立てない。
+        downloader.set_status_for_test(&FAKE_LLM_MODEL, downloading.clone());
+        downloader
+            .lock()
+            .cancels
+            .insert(FAKE_LLM_MODEL.id, Arc::new(AtomicBool::new(false)));
+        assert_eq!(downloader.begin_ui_request(&FAKE_LLM_MODEL), None);
+
+        // 打ち切り待ちなら立てる。返るのは**打ち切りの後**の世代なので、引き継ぎスレッドは
+        // `acquire_and_transfer` の比較で降りずに担当を引き受けられる。
+        assert!(downloader.cancel_download(FAKE_LLM_MODEL.id));
+        let epoch = downloader.lock().cancel_epoch_of(FAKE_LLM_MODEL.id);
+        assert_eq!(downloader.begin_ui_request(&FAKE_LLM_MODEL), Some(epoch));
+
+        // 取得済みなら立てない。
+        downloader.set_status_for_test(&FAKE_LLM_MODEL, DownloadStatus::Downloaded);
+        assert_eq!(downloader.begin_ui_request(&FAKE_LLM_MODEL), None);
     }
 
     /// 同じモデルを 2 つのワーカーが必要としても、片方が抜けただけでは印は外れない
