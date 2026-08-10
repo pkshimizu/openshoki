@@ -1,5 +1,6 @@
-import { Button, CheckBox, ComboBox, ScrollView, SpinBox, Palette } from "std-widgets.slint";
-import { Style } from "style.slint";
+import { Button, CheckBox, ComboBox, ScrollView, SpinBox } from "std-widgets.slint";
+import { Style, StatusTone } from "style.slint";
+import { SectionHeading, Card, CardDivider, CardRow, StatusLine, Badge } from "controls.slint";
 
 // Recordings ウィンドウは別ファイルで定義し、ここから再エクスポートして 1 つのエントリ
 // （build.rs は app-window.slint のみコンパイル）に含める。Rust 側は include_modules! で
@@ -7,6 +8,8 @@ import { Style } from "style.slint";
 export { RecordingsWindow, SessionRow } from "recordings-window.slint";
 // モデル一覧ウィンドウ（#117）。同じく再エクスポートするだけで `build.rs` の変更は要らない。
 export { ModelsWindow, ModelRow } from "models-window.slint";
+// 状態の意味は Rust から渡すので、生成コードに含まれるよう再エクスポートする。
+export { StatusTone } from "style.slint";
 
 // 自動録音のトリガーとして登録したアプリ 1 件。`limitation-note` が空でなければ、そのアプリを
 // 検知できない旨をリストに添えて出す（文言と判定は Rust 側の `auto_record_limitation`）。
@@ -15,34 +18,32 @@ export struct TriggerApp {
     limitation-note: string,
 }
 
-// 「Trigger apps」一覧の 1 行。名前と、検知できないアプリの注記、削除ボタンを持つ。
+// 「Watched apps」一覧の 1 行。名前と、検知できないアプリの注記、削除ボタンを持つ。
 // 行の中身が入れ子のレイアウトになるため、for の中へ直書きせず部品にする。
-component TriggerAppRow inherits VerticalLayout {
+component TriggerAppRow inherits Rectangle {
     in property <TriggerApp> app;
-    // 2 行目以降の先頭に行区切りの罫線を置くか（先頭行では出さない）。
-    in property <bool> separated;
     in property <bool> removable;
     callback remove();
 
-    Rectangle {
-        height: root.separated ? 1px : 0px;
-        background: Palette.border;
-    }
+    border-width: 1px;
+    border-color: Style.rule;
+    border-radius: 7px;
+    background: Style.field;
 
     HorizontalLayout {
-        padding-left: 12px;
-        padding-right: 12px;
-        padding-top: 6px;
-        padding-bottom: 6px;
-        spacing: 8px;
+        padding-left: 10px;
+        padding-right: 10px;
+        padding-top: 9px;
+        padding-bottom: 9px;
+        spacing: 10px;
         // 名前と注記を縦に積む。注記が無いときは行が空くだけにならないよう Text 自体を出さない。
         VerticalLayout {
-            spacing: 2px;
+            spacing: 3px;
             horizontal-stretch: 1;
             Text {
                 text: root.app.name;
-                font-size: Style.body-size;
-                color: Palette.foreground;
+                font-size: Style.label-size;
+                color: Style.ink;
                 vertical-alignment: center;
                 overflow: elide;
             }
@@ -65,45 +66,28 @@ component TriggerAppRow inherits VerticalLayout {
     }
 }
 
-// 設定項目のまとまりを表すセクション枠。GroupBox の既定描画ではなく「角丸・1px 枠線・塗りなし」の
-// 箱＋内側見出しで組み、配色は Palette でライト/ダークに追従させる（色をハードコードしない）。
-component SettingsSection inherits Rectangle {
-    in property <string> title;
-    border-width: 1px;
-    border-color: Palette.border;
-    border-radius: 8px;
-    background: transparent;
-    VerticalLayout {
-        padding: 14px;
-        spacing: 10px;
-        Text {
-            text: root.title;
-            font-size: Style.heading-size;
-            font-weight: Style.semibold;
-            color: Palette.foreground;
-        }
-
-        @children
-    }
-}
-
 // 常駐アプリの設定画面。トレイメニューから表示する。
-// 「録音ファイルの保存先」「登録アプリのマイク使用で自動録音」「自動停止の待ち時間」
-// 「録音停止時の自動文字起こし」を、意味のまとまりでセクション化して設定できる。
+// 「録音ファイルの保存先」「登録アプリのマイク使用で自動録音」「録音停止時の自動文字起こし」
+// 「文字起こしのあとの議事録生成」を、意味のまとまりでセクション化して設定できる。
+//
+// 構成は #127 のデザインに従う: **タイトルバーは OS が描き、本文はまるごとスクロールする**
+// （固定フッタは持たない。モデル管理への導線・通信の注記・バージョンは本文の末尾にある）。
+// 色・文字サイズ・角丸はすべて `Style` のトークンから引く（`ui/style.slint`）。
+//
+// **標準ウィジェット（Button / CheckBox / ComboBox / SpinBox）は OS の配色のまま**になる:
+// Slint の `Palette` は読み取り専用で、こちらのトークンへ差し替えられない。合わせるには
+// 自作コントロールが要り、そのぶんキーボード・フォーカス・アクセシビリティを自前で持つ
+// 必要があるので、この issue では標準ウィジェットを使う（`docs/rules/slint.md`）。
 export component AppWindow inherits Window {
     title: "shoki";
-    // preferred だけだと中身の最小高さ（≒0）に引っ張られて潰れるため、min も指定する。
     // 幅・高さは src/main.rs の WINDOW_WIDTH/HEIGHT と一致させること（片方だけ変えない）。
-    // 幅は 420 固定。高さは 3 セクション＋Transcription の Language/Model 行・状態行・
-    // 議事録要約のトグルとモデル行・説明行・状態行・モデル管理ボタン、＋末尾のバージョン行に
-    // 合わせた値（#117 のボタンは既存の余白に収まったので 900 は据え置き。
-    // `examples/settings_view.rs -- snapshot` で確認済み）
-    // （中身を足すときは `examples/settings_view.rs -- snapshot` で見て、ここと
-    // `WINDOW_HEIGHT` を揃えて直す）。
+    // 標準 460x900 / 最小 420x520（#127 のデザインのサイズ表）。最小まで縮めても、本文が
+    // スクロールするのですべての設定に届く。
     min-width: 420px;
-    min-height: 900px;
-    preferred-width: 420px;
+    min-height: 520px;
+    preferred-width: 460px;
     preferred-height: 900px;
+    background: Style.paper;
 
     // 現在の録音ファイル保存先（表示用）。Rust 側から設定する。
     in property <string> recording-dir;
@@ -124,13 +108,20 @@ export component AppWindow inherits Window {
     // ComboBox で編集する（in-out。保存失敗時は Rust 側が書き戻す）。
     in-out property <int> transcribe-language-index;
     // 内蔵 whisper モデルの表示名一覧（Rust 側の whisper_model::CATALOG を反映。名前・サイズ・
-    // 説明を 1 行に整形済み）。
+    // 説明を 1 行に整形済み）。選択肢の下に出す説明行もここから導出する。
     in property <[string]> whisper-models;
     // 選択中モデルのカタログ内インデックス。起動時に Rust 側が設定値で初期化し、以後は
     // ComboBox で編集する（in-out。保存失敗時は Rust 側が書き戻す）。
     in-out property <int> whisper-model-index;
     // 選択中モデルの取得状況テキスト（Rust 側が定期的に更新する）。
     in property <string> whisper-model-status;
+    // その状態の意味（色を決める。対応表は Rust 側の網羅 match が正）。
+    in property <StatusTone> whisper-model-tone;
+    // 取得中の進捗（0.0〜1.0）。取得中でなければ負の値で、バーを出さない。
+    in property <float> whisper-model-progress: -1;
+    // config.toml でモデルファイルのパスを上書きしているか（`whisper_model_path`）。上書き中は
+    // カタログの選択が使われないので、選択肢の説明行を出さない（状態行がその旨を示す）。
+    in property <bool> whisper-model-overridden;
     // 「文字起こしのあと議事録要約を自動生成」の ON/OFF。起動時に Rust 側が設定値で初期化し、
     // 以後はトグル操作で Slint が状態を保持する（in-out。保存失敗時は Rust 側が書き戻す）。
     in-out property <bool> auto-summarize;
@@ -141,10 +132,13 @@ export component AppWindow inherits Window {
     // ComboBox で編集する（in-out。保存失敗時は Rust 側が書き戻す）。
     in-out property <int> summary-model-index;
     // 選択中モデルの取得状況（Rust 側が定期的に更新する）。モデル名は ComboBox が出すので
-    // 含めない（`summary_model_status_text`）。
+    // 含めない（`summary_model_status_line`）。
     in property <string> summary-model-status;
-    // config.toml でモデルファイルのパスを上書きしているか（`summary_model_path`）。上書き中は
-    // カタログの選択が使われないので、選択肢の説明行を出さない（状態行がその旨を示す）。
+    // その状態の意味（whisper 側と同じ）。
+    in property <StatusTone> summary-model-tone;
+    // 取得中の進捗（whisper 側と同じ）。
+    in property <float> summary-model-progress: -1;
+    // config.toml でモデルファイルのパスを上書きしているか（`summary_model_path`）。
     in property <bool> summary-model-overridden;
     // 設定画面の末尾に出すバージョン表記（例: `shoki v0.1.0`）。組み立てと理由は Rust 側の
     // `app_version_text` を参照。
@@ -171,342 +165,451 @@ export component AppWindow inherits Window {
     // 要約 LLM の変更。カタログ内インデックスを渡し、Rust 側で ID へ変換して永続化する。
     // 未取得のモデルの取得を始めるかは設定次第（`model_downloads_on_select`）。
     callback change-summary-model(int);
-    // 「Manage Models…」押下。モデル管理ウィンドウを開く（#117 / #138）。
+    // 「Manage models…」押下。モデル管理ウィンドウを開く（#117 / #138）。
     callback open-models-window();
 
-    VerticalLayout {
-        alignment: start;
-        spacing: 14px;
-        padding-left: 20px;
-        padding-right: 20px;
-        padding-top: 18px;
-        padding-bottom: 22px;
+    // 本文のスクロール位置。**確認用バイナリ（`examples/settings_view.rs`）が下端を撮るため**に
+    // 外から動かせるようにしてある（本番の Rust 側は触らない）。負の値で下へスクロールする。
+    // 画面の高さより本文が長く、1 枚のスナップショットに収まらないので必要になる
+    // （`ui/recordings-window.slint` の `delete-index` と同じ趣旨）。
+    in-out property <length> body-scroll;
 
-        // --- Recording: 保存先フォルダ ---
-        SettingsSection {
-            title: "Recording";
-            Text {
-                text: "Folder";
-                font-size: Style.body-size;
-                color: Palette.foreground;
-            }
-            // パス（折り返し）とボタン（折り返さない）を同一行・両端揃えにする。
-            HorizontalLayout {
+    ScrollView {
+        viewport-y <=> root.body-scroll;
+        VerticalLayout {
+            alignment: start;
+            spacing: 30px;
+            padding-left: 24px;
+            padding-right: 24px;
+            padding-top: 26px;
+            padding-bottom: 30px;
+
+            // --- Recordings: 保存先フォルダ ---
+            VerticalLayout {
                 spacing: 12px;
-                Text {
-                    text: root.recording-dir;
-                    wrap: word-wrap;
-                    font-size: Style.caption-size;
-                    color: Palette.foreground.transparentize(Style.muted-alpha);
-                    vertical-alignment: center;
-                    horizontal-stretch: 1;
+                SectionHeading {
+                    text: "RECORDINGS";
                 }
 
-                Button {
-                    text: "Choose Folder";
-                    horizontal-stretch: 0;
-                    clicked => {
-                        root.choose-folder();
-                    }
-                }
-            }
-        }
-
-        // --- Auto-record: 登録アプリのマイク使用に連動 ---
-        SettingsSection {
-            title: "Auto-Record";
-            // 複数行ラベルにするため、CheckBox（テキストなし）＋折り返し Text を横並びにする。
-            // トグルはチェックボックス本体で行う。
-            HorizontalLayout {
-                spacing: 8px;
-                CheckBox {
-                    // 双方向束縛にする。片方向（`checked: root.…`）だと、ユーザーが一度操作した
-                    // 時点でウィジェット側の代入がバインディングを外し、保存失敗時に Rust が
-                    // 書き戻しても表示が戻らない（`docs/rules/slint.md`）。
-                    checked <=> root.auto-record-app;
-                    toggled => {
-                        root.toggle-auto-record-app(self.checked);
-                    }
-                }
-
-                Text {
-                    text: "Auto-record while a registered app uses the mic — for calls (macOS 14.4+)";
-                    wrap: word-wrap;
-                    font-size: Style.body-size;
-                    color: Palette.foreground;
-                    vertical-alignment: center;
-                    horizontal-stretch: 1;
-                }
-            }
-
-            // 従属コントロール（delay・Trigger apps）を左インデントし、自動録音 OFF のときは
-            // 淡色化（opacity）＋各操作の無効化（enabled）で従属関係を示す。無効化条件は
-            // enabled-gate に一本化し、opacity と各 enabled が食い違わないようにする。
-            deps := Rectangle {
-                property <bool> enabled-gate: root.auto-record-app;
-                opacity: enabled-gate ? 1.0 : Style.disabled-opacity;
-                VerticalLayout {
-                    padding-left: 23px;
-                    padding-top: 6px;
-                    spacing: 10px;
-
-                    HorizontalLayout {
-                        spacing: 8px;
+                Card {
+                    CardRow {
                         Text {
-                            text: "Auto-stop delay (seconds)";
+                            text: "Save location";
                             font-size: Style.body-size;
-                            vertical-alignment: center;
-                            horizontal-stretch: 1;
-                            color: Palette.foreground;
+                            font-weight: 500;
+                            color: Style.ink;
                         }
 
-                        SpinBox {
-                            // 範囲は src/config.rs の DEBOUNCE_MIN_SECS / DEBOUNCE_MAX_SECS と一致させること。
-                            minimum: 1;
-                            maximum: 60;
-                            // 双方向束縛。Rust 側が丸めた値・保存済みの値を書き戻せるようにする
-                            // （理由は上のチェックボックスのコメント参照）。
-                            value <=> root.auto-stop-debounce-secs;
-                            // 途絶が有効なのは自動録音 ON のときだけなので、OFF では無効化する。
-                            enabled: deps.enabled-gate;
-                            edited(secs) => {
-                                root.change-auto-stop-debounce(secs);
+                        // パス（折り返し）とボタン（折り返さない）を同一行・両端揃えにする。
+                        HorizontalLayout {
+                            spacing: 12px;
+                            Text {
+                                text: root.recording-dir;
+                                wrap: word-wrap;
+                                font-size: Style.caption-size;
+                                color: Style.ink-muted;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                            }
+
+                            Button {
+                                text: "Change…";
+                                horizontal-stretch: 0;
+                                clicked => {
+                                    root.choose-folder();
+                                }
                             }
                         }
                     }
+                }
+            }
 
-                    Text {
-                        text: "Trigger apps";
-                        font-size: Style.body-size;
-                        color: Palette.foreground;
-                    }
+            // --- Auto-record: 登録アプリのマイク使用に連動 ---
+            VerticalLayout {
+                spacing: 12px;
+                SectionHeading {
+                    text: "AUTO-RECORD";
+                }
 
-                    // フィールド風のリストボックス（入力欄と同じ背景＋角丸＋枠）。空でも枠を保つ。
-                    Rectangle {
-                        height: 96px;
-                        border-width: 1px;
-                        border-color: Palette.border;
-                        border-radius: 6px;
-                        background: Palette.control-background;
-                        clip: true;
-                        ScrollView {
+                Card {
+                    CardRow {
+                        HorizontalLayout {
+                            spacing: 14px;
                             VerticalLayout {
-                                alignment: start;
-                                for app[i] in root.app-list: TriggerAppRow {
-                                    app: app;
-                                    separated: i > 0;
-                                    removable: deps.enabled-gate;
-                                    remove => {
-                                        root.remove-app(i);
-                                    }
+                                spacing: 3px;
+                                horizontal-stretch: 1;
+                                Text {
+                                    text: "Record automatically";
+                                    font-size: Style.body-size;
+                                    font-weight: 500;
+                                    color: Style.ink;
+                                }
+
+                                Text {
+                                    text: "Start recording when one of the apps below begins using the microphone (macOS 14.4+).";
+                                    wrap: word-wrap;
+                                    font-size: Style.caption-size;
+                                    color: Style.ink-muted;
+                                }
+                            }
+
+                            CheckBox {
+                                // 双方向束縛にする。片方向（`checked: root.…`）だと、ユーザーが一度操作した
+                                // 時点でウィジェット側の代入がバインディングを外し、保存失敗時に Rust が
+                                // 書き戻しても表示が戻らない（`docs/rules/slint.md`）。
+                                checked <=> root.auto-record-app;
+                                toggled => {
+                                    root.toggle-auto-record-app(self.checked);
                                 }
                             }
                         }
                     }
 
-                    // 注記は既知のアプリ（Safari 等）にしか出せないため、一覧全体への注意書きも置く
-                    // （WKWebView を使う任意のアプリが同じ制約を受けるが、登録時に見分けられない）。
-                    Text {
-                        text: "Safari and other WebKit-based apps can't be detected — record those manually";
-                        font-size: Style.caption-size;
-                        color: Palette.foreground.transparentize(Style.muted-alpha);
-                        wrap: word-wrap;
-                    }
+                    CardDivider { }
 
-                    HorizontalLayout {
-                        alignment: start;
-                        Button {
-                            text: "Add app…";
-                            enabled: deps.enabled-gate;
-                            clicked => {
-                                root.add-app();
+                    // 従属コントロール（監視アプリ・自動停止の秒数）を淡色化（opacity）＋各操作の
+                    // 無効化（enabled）で従属関係を示す。無効化条件は enabled-gate に一本化し、
+                    // opacity と各 enabled が食い違わないようにする。
+                    deps := Rectangle {
+                        property <bool> enabled-gate: root.auto-record-app;
+                        opacity: enabled-gate ? 1.0 : Style.disabled-opacity;
+                        VerticalLayout {
+                            CardRow {
+                                Text {
+                                    text: "WATCHED APPS · " + root.app-list.length;
+                                    font-size: Style.section-size;
+                                    letter-spacing: Style.badge-tracking;
+                                    color: Style.ink-faint;
+                                }
+
+                                // 1 件も無いときは、枠だけの空欄ではなく次にすることを書く。
+                                if root.app-list.length == 0: Text {
+                                    text: "No apps yet. Add one and shoki starts recording as soon as it opens the microphone.";
+                                    wrap: word-wrap;
+                                    font-size: Style.caption-size;
+                                    color: Style.ink-muted;
+                                }
+
+                                if root.app-list.length > 0: VerticalLayout {
+                                    spacing: 6px;
+                                    for app[i] in root.app-list: TriggerAppRow {
+                                        app: app;
+                                        removable: deps.enabled-gate;
+                                        remove => {
+                                            root.remove-app(i);
+                                        }
+                                    }
+                                }
+
+                                // 注記は既知のアプリ（Safari 等）にしか出せないため、一覧全体への注意書きも置く
+                                // （WKWebView を使う任意のアプリが同じ制約を受けるが、登録時に見分けられない）。
+                                Text {
+                                    text: "Safari and other WebKit-based apps can't be detected — record those manually.";
+                                    font-size: Style.caption-size;
+                                    color: Style.ink-faint;
+                                    wrap: word-wrap;
+                                }
+
+                                HorizontalLayout {
+                                    alignment: start;
+                                    Button {
+                                        text: "Add app…";
+                                        enabled: deps.enabled-gate;
+                                        clicked => {
+                                            root.add-app();
+                                        }
+                                    }
+                                }
+                            }
+
+                            CardDivider { }
+
+                            CardRow {
+                                HorizontalLayout {
+                                    spacing: 14px;
+                                    Text {
+                                        text: "Stop recording after the mic is released for";
+                                        font-size: Style.label-size;
+                                        color: Style.ink;
+                                        wrap: word-wrap;
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 1;
+                                    }
+
+                                    SpinBox {
+                                        // 範囲は src/config.rs の DEBOUNCE_MIN_SECS / DEBOUNCE_MAX_SECS と一致させること。
+                                        minimum: 1;
+                                        maximum: 60;
+                                        // 双方向束縛。Rust 側が丸めた値・保存済みの値を書き戻せるようにする
+                                        // （理由は上のチェックボックスのコメント参照）。
+                                        value <=> root.auto-stop-debounce-secs;
+                                        // 途絶が有効なのは自動録音 ON のときだけなので、OFF では無効化する。
+                                        enabled: deps.enabled-gate;
+                                        edited(secs) => {
+                                            root.change-auto-stop-debounce(secs);
+                                        }
+                                    }
+
+                                    Text {
+                                        text: "sec";
+                                        font-size: Style.caption-size;
+                                        color: Style.ink-muted;
+                                        vertical-alignment: center;
+                                    }
+                                }
                             }
                         }
                     }
                 }
             }
-        }
 
-        // --- Transcription: 録音停止時の自動文字起こし ---
-        SettingsSection {
-            title: "Transcription";
-            HorizontalLayout {
-                spacing: 8px;
-                CheckBox {
-                    checked <=> root.auto-transcribe;
-                    toggled => {
-                        root.toggle-auto-transcribe(self.checked);
+            // --- Transcription: 録音停止時の自動文字起こし（議事録生成はその従属） ---
+            VerticalLayout {
+                spacing: 12px;
+                SectionHeading {
+                    text: "TRANSCRIPTION";
+                }
+
+                Card {
+                    CardRow {
+                        HorizontalLayout {
+                            spacing: 14px;
+                            VerticalLayout {
+                                spacing: 3px;
+                                horizontal-stretch: 1;
+                                Text {
+                                    text: "Transcribe recordings";
+                                    font-size: Style.body-size;
+                                    font-weight: 500;
+                                    color: Style.ink;
+                                }
+
+                                Text {
+                                    text: "Runs locally after each recording ends. Audio is never uploaded.";
+                                    wrap: word-wrap;
+                                    font-size: Style.caption-size;
+                                    color: Style.ink-muted;
+                                }
+                            }
+
+                            CheckBox {
+                                checked <=> root.auto-transcribe;
+                                toggled => {
+                                    root.toggle-auto-transcribe(self.checked);
+                                }
+                            }
+                        }
+                    }
+
+                    // 文字起こしに従属するコントロール群。議事録生成もこの中にある（文字起こしの
+                    // 結果を入力にするので、文字起こし OFF では走らない＝実装と表示を一致させる）。
+                    transcribe-deps := Rectangle {
+                        property <bool> enabled-gate: root.auto-transcribe;
+                        opacity: enabled-gate ? 1.0 : Style.disabled-opacity;
+                        VerticalLayout {
+                            CardDivider { }
+
+                            CardRow {
+                                HorizontalLayout {
+                                    spacing: 14px;
+                                    Text {
+                                        text: "Language";
+                                        font-size: Style.label-size;
+                                        color: Style.ink;
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 1;
+                                    }
+
+                                    ComboBox {
+                                        model: root.transcribe-languages;
+                                        current-index <=> root.transcribe-language-index;
+                                        enabled: transcribe-deps.enabled-gate;
+                                        selected => {
+                                            root.change-transcribe-language(self.current-index);
+                                        }
+                                    }
+                                }
+                            }
+
+                            CardDivider { }
+
+                            CardRow {
+                                HorizontalLayout {
+                                    spacing: 14px;
+                                    Text {
+                                        text: "Model";
+                                        font-size: Style.label-size;
+                                        color: Style.ink;
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 1;
+                                    }
+
+                                    ComboBox {
+                                        model: root.whisper-models;
+                                        current-index <=> root.whisper-model-index;
+                                        enabled: transcribe-deps.enabled-gate;
+                                        selected => {
+                                            root.change-whisper-model(self.current-index);
+                                        }
+                                    }
+                                }
+
+                                if !root.whisper-model-overridden: Text {
+                                    // 選択中の選択肢の全文（名前・サイズ・特徴）。ComboBox の行は箱幅で
+                                    // 省略されるため、選ぶ材料になる目安をここで折り返して読めるようにする。
+                                    // 選択位置から導出するので、選択と説明が食い違わない。
+                                    text: root.whisper-models[root.whisper-model-index];
+                                    wrap: word-wrap;
+                                    font-size: Style.caption-size;
+                                    color: Style.ink-muted;
+                                }
+
+                                StatusLine {
+                                    text: root.whisper-model-status;
+                                    tone: root.whisper-model-tone;
+                                    progress: root.whisper-model-progress;
+                                }
+                            }
+
+                            // --- 議事録生成: 文字起こしの従属 ---
+                            // 別セクションにせず、この面の中に沈めた帯として置く（従属関係を
+                            // 入れ子で示す。#127 のデザイン）。左端の細い縦罫が親子の境目。
+                            Rectangle {
+                                background: Style.sheet-sunken;
+                                VerticalLayout {
+                                    CardDivider { }
+
+                                    HorizontalLayout {
+                                        padding-right: 15px;
+                                        padding-top: 14px;
+                                        padding-bottom: 15px;
+                                        // 縦罫は左の余白の中央に立てる（本文の字下げも兼ねる）。
+                                        Rectangle {
+                                            width: 15px;
+                                            Rectangle {
+                                                width: 2px;
+                                                border-radius: 1px;
+                                                background: Style.seal.transparentize(0.55);
+                                            }
+                                        }
+
+                                        VerticalLayout {
+                                            spacing: 11px;
+                                            horizontal-stretch: 1;
+                                            HorizontalLayout {
+                                                spacing: 14px;
+                                                VerticalLayout {
+                                                    spacing: 3px;
+                                                    horizontal-stretch: 1;
+                                                    HorizontalLayout {
+                                                        spacing: 8px;
+                                                        alignment: start;
+                                                        Text {
+                                                            text: "Generate meeting notes";
+                                                            font-size: Style.body-size;
+                                                            font-weight: 500;
+                                                            color: Style.ink;
+                                                            vertical-alignment: center;
+                                                        }
+
+                                                        Badge {
+                                                            text: "NEEDS TRANSCRIPTION";
+                                                            caution: true;
+                                                        }
+                                                    }
+
+                                                    Text {
+                                                        text: "Summarises the transcript into decisions and action items.";
+                                                        wrap: word-wrap;
+                                                        font-size: Style.caption-size;
+                                                        color: Style.ink-muted;
+                                                    }
+                                                }
+
+                                                CheckBox {
+                                                    checked <=> root.auto-summarize;
+                                                    enabled: transcribe-deps.enabled-gate;
+                                                    toggled => {
+                                                        root.toggle-auto-summarize(self.checked);
+                                                    }
+                                                }
+                                            }
+
+                                            HorizontalLayout {
+                                                spacing: 14px;
+                                                Text {
+                                                    text: "Model";
+                                                    font-size: Style.label-size;
+                                                    color: Style.ink;
+                                                    vertical-alignment: center;
+                                                    horizontal-stretch: 1;
+                                                }
+
+                                                ComboBox {
+                                                    model: root.summary-models;
+                                                    current-index <=> root.summary-model-index;
+                                                    enabled: transcribe-deps.enabled-gate;
+                                                    selected => {
+                                                        root.change-summary-model(self.current-index);
+                                                    }
+                                                }
+                                            }
+
+                                            if !root.summary-model-overridden: Text {
+                                                text: root.summary-models[root.summary-model-index];
+                                                wrap: word-wrap;
+                                                font-size: Style.caption-size;
+                                                color: Style.ink-muted;
+                                            }
+
+                                            StatusLine {
+                                                text: root.summary-model-status;
+                                                tone: root.summary-model-tone;
+                                                progress: root.summary-model-progress;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // --- 末尾: モデル管理への導線・通信の注記・バージョン ---
+            // デザインどおり**固定フッタにはしない**（本文と一緒にスクロールする）。
+            VerticalLayout {
+                spacing: 12px;
+                HorizontalLayout {
+                    alignment: start;
+                    Button {
+                        // モデルの管理（#117 / #138。取得・削除・使用するモデルの選択）。文字起こしと
+                        // 議事録生成の両方のモデルが対象なので、どちらのセクションにも入れない。
+                        // 自動文字起こしのトグルには従わせない: 取得済みモデルの掃除は、機能を
+                        // OFF にした後こそやりたい操作なので。
+                        text: "Manage models…";
+                        clicked => {
+                            root.open-models-window();
+                        }
                     }
                 }
 
                 Text {
-                    text: "Transcribe recordings on stop — on-device Whisper";
+                    // モデルは内蔵（初回に自動ダウンロード）。これまで通信ゼロだったアプリで唯一の
+                    // 外部通信になるため、接続先と「音声は送らない」ことを明示する（透明性）。
+                    text: "Models are downloaded from Hugging Face the first time they are used. Audio and transcripts never leave this Mac.";
                     wrap: word-wrap;
-                    font-size: Style.body-size;
-                    color: Palette.foreground;
-                    vertical-alignment: center;
-                    horizontal-stretch: 1;
+                    font-size: Style.caption-size;
+                    color: Style.ink-faint;
+                }
+
+                // どのビルドを動かしているかを確認できるように、末尾へ控えめに出す。
+                Text {
+                    text: root.app-version;
+                    font-size: Style.caption-size;
+                    color: Style.ink-faint;
                 }
             }
-
-            // 文字起こしに従属するコントロール群を左インデントし、文字起こし OFF のときは
-            // 淡色化＋無効化で従属関係を示す（Auto-record セクションの deps と同じ流儀）。
-            transcribe-deps := Rectangle {
-                property <bool> enabled-gate: root.auto-transcribe;
-                opacity: enabled-gate ? 1.0 : Style.disabled-opacity;
-                VerticalLayout {
-                    padding-left: 23px;
-                    padding-top: 6px;
-                    spacing: 10px;
-                    HorizontalLayout {
-                        spacing: 8px;
-                        Text {
-                            text: "Language";
-                            font-size: Style.body-size;
-                            vertical-alignment: center;
-                            horizontal-stretch: 1;
-                            color: Palette.foreground;
-                        }
-
-                        ComboBox {
-                            model: root.transcribe-languages;
-                            current-index <=> root.transcribe-language-index;
-                            enabled: transcribe-deps.enabled-gate;
-                            selected => {
-                                root.change-transcribe-language(self.current-index);
-                            }
-                        }
-                    }
-
-                    HorizontalLayout {
-                        spacing: 8px;
-                        Text {
-                            text: "Model";
-                            font-size: Style.body-size;
-                            vertical-alignment: center;
-                            horizontal-stretch: 1;
-                            color: Palette.foreground;
-                        }
-
-                        ComboBox {
-                            model: root.whisper-models;
-                            current-index <=> root.whisper-model-index;
-                            enabled: transcribe-deps.enabled-gate;
-                            selected => {
-                                root.change-whisper-model(self.current-index);
-                            }
-                        }
-                    }
-
-                    Text {
-                        // 選択中モデルの取得状況（Rust 側が組み立てる。例: Downloaded /
-                        // Downloading… 42% / Not downloaded — downloads automatically (465 MB) /
-                        // Using the model file set in config.toml）。
-                        text: root.whisper-model-status;
-                        font-size: Style.caption-size;
-                        color: Palette.foreground.transparentize(Style.muted-alpha);
-                    }
-
-                    // 議事録要約は文字起こしの結果を入力にするので、文字起こしの従属として置く
-                    // （文字起こし OFF では要約も走らない、という実装と表示を一致させる）。
-                    HorizontalLayout {
-                        spacing: 8px;
-                        CheckBox {
-                            checked <=> root.auto-summarize;
-                            enabled: transcribe-deps.enabled-gate;
-                            toggled => {
-                                root.toggle-auto-summarize(self.checked);
-                            }
-                        }
-
-                        Text {
-                            text: "Write meeting minutes — on-device LLM";
-                            wrap: word-wrap;
-                            font-size: Style.body-size;
-                            color: Palette.foreground;
-                            vertical-alignment: center;
-                            horizontal-stretch: 1;
-                        }
-                    }
-
-                    HorizontalLayout {
-                        spacing: 8px;
-                        Text {
-                            // whisper の「Model」と同じセクションに並ぶので、どちらのモデルか
-                            // 分かるラベルにする（whisper 側は直上のチェックボックス文言
-                            // 「on-device Whisper」で分かるため素の「Model」のまま）。
-                            text: "Minutes Model";
-                            font-size: Style.body-size;
-                            vertical-alignment: center;
-                            horizontal-stretch: 1;
-                            color: Palette.foreground;
-                        }
-
-                        ComboBox {
-                            model: root.summary-models;
-                            current-index <=> root.summary-model-index;
-                            enabled: transcribe-deps.enabled-gate;
-                            selected => {
-                                root.change-summary-model(self.current-index);
-                            }
-                        }
-                    }
-
-                    if !root.summary-model-overridden: Text {
-                        // 選択中の選択肢の全文（例: Qwen2.5 7B Instruct — 4.4 GB — 54 s and
-                        // 8.2 GB of memory for a 4-min meeting, more faithful）。ComboBox の行は
-                        // 箱幅で省略される（開いてもポップアップは箱幅のまま）ため、選ぶ材料になる
-                        // 目安をここで折り返して読めるようにする。選択位置から導出するので、
-                        // 「選択は 3B・説明は 7B」のような食い違いが起こらない。
-                        text: root.summary-models[root.summary-model-index];
-                        wrap: word-wrap;
-                        font-size: Style.caption-size;
-                        color: Palette.foreground.transparentize(Style.muted-alpha);
-                    }
-
-                    Text {
-                        // 選択中モデルの取得状況（Rust 側が組み立てる。例: Not downloaded —
-                        // downloads when minutes are generated (4.4 GB)）。取得の契機が設定で
-                        // 変わるぶん whisper の状態行より長い文言があるので折り返す。
-                        text: root.summary-model-status;
-                        wrap: word-wrap;
-                        font-size: Style.caption-size;
-                        color: Palette.foreground.transparentize(Style.muted-alpha);
-                    }
-                }
-            }
-
-            Text {
-                // モデルは内蔵（初回に自動ダウンロード）。これまで通信ゼロだったアプリで唯一の
-                // 外部通信になるため、接続先と「音声は送らない」ことを明示する（透明性）。
-                text: "Models download from Hugging Face — audio is never uploaded";
-                wrap: word-wrap;
-                font-size: Style.caption-size;
-                color: Palette.foreground.transparentize(Style.muted-alpha);
-            }
-
-            // モデルの管理（#117 / #138。取得・削除・使用するモデルの選択）。文字起こしと
-            // 議事録要約の両方のモデルが対象なので、
-            // Transcription セクション内の、どちらのサブグループにも属さない位置に置く。
-            // 自動文字起こしのトグル（`transcribe-deps.enabled-gate`）には従わせない: 取得済み
-            // モデルの掃除は、機能を OFF にした後こそやりたい操作なので。
-            HorizontalLayout {
-                alignment: start;
-                Button {
-                    text: "Manage Models…";
-                    clicked => {
-                        root.open-models-window();
-                    }
-                }
-            }
-        }
-
-        // どのビルドを動かしているかを確認できるように、末尾へ控えめに出す。
-        Text {
-            text: root.app-version;
-            font-size: Style.caption-size;
-            color: Palette.foreground.transparentize(Style.muted-alpha);
-            horizontal-alignment: center;
         }
     }
 }

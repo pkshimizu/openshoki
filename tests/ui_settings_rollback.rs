@@ -41,6 +41,7 @@ fn spin_box(window: &AppWindow) -> ElementHandle {
 fn rust_can_roll_back_a_toggle_after_the_user_flipped_it() {
     ui_support::init_backend();
     let window = AppWindow::new().expect("create the settings window");
+    ui_support::fit_settings_content(&window);
     window.set_auto_record_app(false);
 
     let boxes = check_boxes(&window);
@@ -74,6 +75,7 @@ fn rust_can_roll_back_a_toggle_after_the_user_flipped_it() {
 fn rust_can_write_back_a_delay_after_the_user_edited_it() {
     ui_support::init_backend();
     let window = AppWindow::new().expect("create the settings window");
+    ui_support::fit_settings_content(&window);
     // SpinBox は自動録音 ON のときだけ操作できる（`deps` のゲート）。
     window.set_auto_record_app(true);
     window.set_auto_stop_debounce_secs(4);
@@ -111,6 +113,7 @@ fn rust_can_roll_back_a_model_choice_after_the_user_changed_it() {
 
     ui_support::init_backend();
     let window = AppWindow::new().expect("create the settings window");
+    ui_support::fit_settings_content(&window);
     // ComboBox は自動文字起こし ON のときだけ操作できる（`transcribe-deps` のゲート）。
     window.set_auto_transcribe(true);
     window.set_summary_models(

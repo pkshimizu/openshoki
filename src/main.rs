@@ -52,7 +52,7 @@ const BLINK_CYCLE_SECS: f32 = 2.0;
 /// ウィンドウの初期ジオメトリ。イベントループ稼働中に初めて show() すると、位置・サイズが
 /// 確定されないまま高さ 0 で表示される。初回表示時にこの値を明示してジオメトリを確定させる。
 /// 幅・高さは `ui/app-window.slint` の min/preferred と一致させること（片方だけ変えない）。
-const WINDOW_WIDTH: f32 = 420.0;
+const WINDOW_WIDTH: f32 = 460.0;
 const WINDOW_HEIGHT: f32 = 900.0;
 /// 初回表示位置（画面左上からの暫定値）。中央寄せ等の調整は後続に回す。
 const WINDOW_X: f32 = 240.0;
@@ -142,7 +142,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 数十秒・数 GB の実行コストが選択で決まるため）。
     ui.set_auto_summarize(config.borrow().auto_summarize);
     ui.set_summary_models(model_choices(summary_model::CATALOG));
-    ui.set_summary_model_overridden(config.borrow().summary_model_path.is_some());
     // 選択位置と状態行は、モデル管理ウィンドウから選び直したときの追従と**同じ関数**で入れる
     // （両種別ぶんを 1 箇所にまとめ、種別や状態行の導出が増えたときに初期化だけ取り残されない
     // ようにする）。
@@ -338,9 +337,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ) as i32);
             return;
         }
-        ui.set_whisper_model_status(
-            whisper_model_status_text(&config_for_model.borrow(), &downloader_for_model).into(),
-        );
+        whisper_model_status_line(&config_for_model.borrow(), &downloader_for_model)
+            .apply_whisper(&ui);
     });
 
     // 要約 LLM の変更: whisper モデルの変更と同じ流儀（インデックス→ID の変換、永続化成功後に
@@ -369,13 +367,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ) as i32);
             return;
         }
-        ui.set_summary_model_status(
-            summary_model_status_text(
-                &config_for_summary_model.borrow(),
-                &downloader_for_summary_model,
-            )
-            .into(),
-        );
+        summary_model_status_line(
+            &config_for_summary_model.borrow(),
+            &downloader_for_summary_model,
+        )
+        .apply_summary(&ui);
     });
 
     // 登録アプリの削除: 一覧のインデックスで設定とモデルから取り除く（永続化成功後に反映）。
@@ -1007,7 +1003,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     {
-        // 設定画面の「Manage Models…」。開くたびに一覧を作り直す（ディスク走査はここだけ）。
+        // 設定画面の「Manage models…」。開くたびに一覧を作り直す（ディスク走査はここだけ）。
         let models_weak = models_ui.as_weak();
         let list = model_list.clone();
         let downloader_for_open = model_downloader.clone();
@@ -1392,13 +1388,15 @@ fn build_menu_event_handler(
         if let Some(ui) = ui.upgrade()
             && ui.window().is_visible()
         {
-            let status = whisper_model_status_text(&config.borrow(), &models.downloader);
-            if ui.get_whisper_model_status() != status.as_str() {
-                ui.set_whisper_model_status(status.into());
+            // 文言が変わったときだけ 3 つまとめて set する（進捗は文言のパーセントと同じ
+            // 粒度で動くので、文言を代表にしてよい）。
+            let status = whisper_model_status_line(&config.borrow(), &models.downloader);
+            if ui.get_whisper_model_status() != status.text.as_str() {
+                status.apply_whisper(&ui);
             }
-            let summary_status = summary_model_status_text(&config.borrow(), &models.downloader);
-            if ui.get_summary_model_status() != summary_status.as_str() {
-                ui.set_summary_model_status(summary_status.into());
+            let summary_status = summary_model_status_line(&config.borrow(), &models.downloader);
+            if ui.get_summary_model_status() != summary_status.text.as_str() {
+                summary_status.apply_summary(&ui);
             }
         }
 
@@ -2122,7 +2120,7 @@ fn model_choices(catalog: &[model_download::ModelSpec]) -> slint::ModelRc<slint:
 /// 手編集のみで、UI からは設定できない。
 ///
 /// **網羅 match** にしてあるので、種別を足したら上書きの扱いを書くまでコンパイルが通らない。
-/// 取得の契機（`model_downloads_on_select`）と状態行（`*_model_status_text`）の**両方**がここを
+/// 取得の契機（`model_downloads_on_select`）と状態行（`*_model_status_line`）の**両方**がここを
 /// 通るので、種別を足した人が片方だけ更新して静かに食い違うことがない。
 fn model_path_override(
     kind: model_download::ModelKind,
@@ -2135,7 +2133,7 @@ fn model_path_override(
 }
 
 /// モデルを選び直した時点で、そのモデルの取得を始めるか。**取得の契機の正**で、状態行の文言
-/// （`whisper_model_status_text` / `summary_model_status_text`）もこれに合わせる。
+/// （`whisper_model_status_line` / `summary_model_status_line`）もこれに合わせる。
 ///
 /// 使われないモデルを数 GB 落とさないための抑止（`docs/rules/security.md` の「通信はユーザーが
 /// 機能を有効化したときだけ」）。抑止するケースは、その後の取得の仕方も違う:
@@ -2175,14 +2173,15 @@ const MODEL_OVERRIDDEN_STATUS: &str = "Using the model file set in config.toml";
 /// どのモデルかは ComboBox が示すので、ここは状態だけを出す。ただし上書き中は選んでも取得せず
 /// そのファイルが使われるので、共用の「downloads automatically」だと表示と挙動が食い違う。
 /// 取得の契機の正は `model_downloads_on_select`。
-fn whisper_model_status_text(
+fn whisper_model_status_line(
     config: &Config,
     downloader: &model_download::ModelDownloader,
-) -> String {
+) -> ModelStatusLine {
     if model_path_override(model_download::ModelKind::Speech, config).is_some() {
-        return MODEL_OVERRIDDEN_STATUS.to_owned();
+        // 壊れてはいないが、選択が使われない状態なので caution（失敗ではない）。
+        return ModelStatusLine::plain(MODEL_OVERRIDDEN_STATUS.to_owned(), StatusTone::Caution);
     }
-    model_status_text(
+    model_status_line(
         whisper_model::spec_or_default(&config.whisper_model),
         downloader,
     )
@@ -2198,23 +2197,26 @@ fn whisper_model_status_text(
 ///   （whisper と同じ状態なので `MODEL_OVERRIDDEN_STATUS` を共用する）。
 /// - 要約 OFF: 選んでも取得は始まらない（次に要約が走るときに取得する。設定を ON にした後の
 ///   初回要約か、Recordings ウィンドウからの手動生成）。
-fn summary_model_status_text(
+fn summary_model_status_line(
     config: &Config,
     downloader: &model_download::ModelDownloader,
-) -> String {
+) -> ModelStatusLine {
     if model_path_override(model_download::ModelKind::Summary, config).is_some() {
-        return MODEL_OVERRIDDEN_STATUS.to_owned();
+        return ModelStatusLine::plain(MODEL_OVERRIDDEN_STATUS.to_owned(), StatusTone::Caution);
     }
     let spec = summary_model::spec_or_default(&config.summary_model);
     if !model_downloads_on_select(model_download::ModelKind::Summary, config)
         && downloader.status_of(spec) == model_download::DownloadStatus::NotDownloaded
     {
-        return format!(
-            "Not downloaded — downloads when minutes are generated ({})",
-            model_download::format_size(spec.size_bytes)
+        return ModelStatusLine::plain(
+            format!(
+                "Not downloaded — downloads when minutes are generated ({})",
+                model_download::format_size(spec.size_bytes)
+            ),
+            StatusTone::Neutral,
         );
     }
-    model_status_text(spec, downloader)
+    model_status_line(spec, downloader)
 }
 
 /// 受信済みバイトから進捗のパーセントを出す（設定画面の状態行と一覧の行で共用）。
@@ -2226,22 +2228,71 @@ fn download_percent(received: u64, total: u64) -> u64 {
 }
 
 /// モデルの取得状況を、設定画面の状態行テキストにする（whisper / 要約 LLM で共用）。
-fn model_status_text(
+/// 設定画面の状態行 1 本ぶん。文言だけでなく**意味（`tone`）と進捗**も一緒に運ぶ。
+///
+/// 色の対応表は Slint 側（`Style.tone-ink` / `Style.tone-mark`）に 1 つだけ置き、こちらは
+/// 「どの意味か」を決める（`docs/rules/slint.md` の「状態→UI の対応表を三項連鎖にしない」）。
+/// `progress` は 0.0〜1.0 で、取得中でなければ負にしてバーを出さない。
+struct ModelStatusLine {
+    text: String,
+    tone: StatusTone,
+    progress: f32,
+}
+
+impl ModelStatusLine {
+    /// 進捗を持たない状態行。
+    fn plain(text: String, tone: StatusTone) -> Self {
+        Self {
+            text,
+            tone,
+            progress: -1.0,
+        }
+    }
+
+    /// 設定画面へ流し込む（3 つを必ずまとめて set する。片方だけ古い値が残らないように）。
+    fn apply_whisper(&self, ui: &AppWindow) {
+        ui.set_whisper_model_status(self.text.as_str().into());
+        ui.set_whisper_model_tone(self.tone);
+        ui.set_whisper_model_progress(self.progress);
+    }
+
+    fn apply_summary(&self, ui: &AppWindow) {
+        ui.set_summary_model_status(self.text.as_str().into());
+        ui.set_summary_model_tone(self.tone);
+        ui.set_summary_model_progress(self.progress);
+    }
+}
+
+/// モデルの取得状況を、設定画面の状態行にする（whisper / 要約 LLM で共用）。
+///
+/// **網羅 match** なので、`DownloadStatus` にバリアントを足したら文言と意味を決めるまで
+/// コンパイルが通らない。
+fn model_status_line(
     spec: &'static model_download::ModelSpec,
     downloader: &model_download::ModelDownloader,
-) -> String {
+) -> ModelStatusLine {
     match downloader.status_of(spec) {
-        model_download::DownloadStatus::NotDownloaded => format!(
-            // 自動取得の契機は複数ある（設定画面で選択した時点、または次の文字起こし・要約時）。
-            // 共用の文言なので、どれかに限定した書き方にしない。
-            "Not downloaded — downloads automatically ({})",
-            model_download::format_size(spec.size_bytes)
+        model_download::DownloadStatus::NotDownloaded => ModelStatusLine::plain(
+            format!(
+                // 自動取得の契機は複数ある（設定画面で選択した時点、または次の文字起こし・要約時）。
+                // 共用の文言なので、どれかに限定した書き方にしない。
+                "Not downloaded — downloads automatically ({})",
+                model_download::format_size(spec.size_bytes)
+            ),
+            StatusTone::Neutral,
         ),
-        model_download::DownloadStatus::Downloading { received, total } => {
-            format!("Downloading… {}%", download_percent(received, total))
+        model_download::DownloadStatus::Downloading { received, total } => ModelStatusLine {
+            text: format!("Downloading… {}%", download_percent(received, total)),
+            tone: StatusTone::Active,
+            // 分母は Content-Length か既知サイズで常に正だが、防御的にゼロ除算を避ける。
+            progress: received as f32 / total.max(1) as f32,
+        },
+        model_download::DownloadStatus::Downloaded => {
+            ModelStatusLine::plain("Downloaded".to_owned(), StatusTone::Done)
         }
-        model_download::DownloadStatus::Downloaded => "Downloaded".to_owned(),
-        model_download::DownloadStatus::Failed(reason) => format!("Download failed: {reason}"),
+        model_download::DownloadStatus::Failed(reason) => {
+            ModelStatusLine::plain(format!("Download failed: {reason}"), StatusTone::Danger)
+        }
     }
 }
 
@@ -3027,8 +3078,14 @@ fn apply_model_selection_to_settings(
 ) {
     ui.set_whisper_model_index(whisper_model::model_index(&config.whisper_model) as i32);
     ui.set_summary_model_index(summary_model::model_index(&config.summary_model) as i32);
-    ui.set_whisper_model_status(whisper_model_status_text(config, downloader).into());
-    ui.set_summary_model_status(summary_model_status_text(config, downloader).into());
+    ui.set_whisper_model_overridden(
+        model_path_override(model_download::ModelKind::Speech, config).is_some(),
+    );
+    ui.set_summary_model_overridden(
+        model_path_override(model_download::ModelKind::Summary, config).is_some(),
+    );
+    whisper_model_status_line(config, downloader).apply_whisper(ui);
+    summary_model_status_line(config, downloader).apply_summary(ui);
 }
 
 /// macOS で Dock アイコンを隠し、メニューバー常駐アプリとして振る舞わせる。
@@ -3052,12 +3109,12 @@ fn hide_dock_icon() {
 #[cfg(test)]
 mod tests {
     use super::{
-        ModelStatus, SummaryStatus, TranscriptStatus, app_version_text, breathing_level,
-        model_choices, model_downloads_on_select, model_status_text, model_to_cancel_on_select,
-        playback_progress, seek_position_from_ratio, summary_display_status,
-        summary_model_status_text, summary_placeholder_text, summary_rows, summary_status_text,
-        transcript_display_status, transcript_placeholder_text, transcript_status_text,
-        whisper_model_status_text,
+        ModelStatus, StatusTone, SummaryStatus, TranscriptStatus, app_version_text,
+        breathing_level, model_choices, model_downloads_on_select, model_status_line,
+        model_to_cancel_on_select, playback_progress, seek_position_from_ratio,
+        summary_display_status, summary_model_status_line, summary_placeholder_text, summary_rows,
+        summary_status_text, transcript_display_status, transcript_placeholder_text,
+        transcript_status_text, whisper_model_status_line,
     };
     use crate::transcribe::TranscribeStatus;
     use std::time::Duration;
@@ -3398,7 +3455,10 @@ mod tests {
                 total: 100,
             },
         );
-        assert_eq!(model_status_text(spec, &downloader), "Downloading… 25%");
+        assert_eq!(
+            model_status_line(spec, &downloader).text,
+            "Downloading… 25%"
+        );
 
         // Content-Length が実サイズより小さい異常時も 100% を超えない。
         downloader.set_status_for_test(
@@ -3408,23 +3468,26 @@ mod tests {
                 total: 100,
             },
         );
-        assert_eq!(model_status_text(spec, &downloader), "Downloading… 100%");
+        assert_eq!(
+            model_status_line(spec, &downloader).text,
+            "Downloading… 100%"
+        );
 
         downloader.set_status_for_test(spec, crate::model_download::DownloadStatus::Downloaded);
-        assert_eq!(model_status_text(spec, &downloader), "Downloaded");
+        assert_eq!(model_status_line(spec, &downloader).text, "Downloaded");
 
         downloader.set_status_for_test(
             spec,
             crate::model_download::DownloadStatus::Failed("boom".into()),
         );
         assert_eq!(
-            model_status_text(spec, &downloader),
+            model_status_line(spec, &downloader).text,
             "Download failed: boom"
         );
 
         downloader.set_status_for_test(spec, crate::model_download::DownloadStatus::NotDownloaded);
         assert_eq!(
-            model_status_text(spec, &downloader),
+            model_status_line(spec, &downloader).text,
             "Not downloaded — downloads automatically (2.9 GB)"
         );
     }
@@ -3450,6 +3513,54 @@ mod tests {
         // 上書きしたファイルが優先されるので、カタログのモデルは落としても使われない。
         assert!(!downloads(&with(true, Some("/tmp/model.gguf"))));
         assert!(!downloads(&with(false, Some("/tmp/model.gguf"))));
+    }
+
+    /// 状態行の**意味（tone）と進捗**が状態ごとに決まること。色は Slint 側の対応表が引くので、
+    /// ここが崩れると「失敗が普通の色で出る」「進捗バーが出ない／出っぱなし」になる。
+    #[test]
+    fn model_status_line_carries_tone_and_progress() {
+        let downloader = crate::model_download::ModelDownloader::new();
+        let spec = crate::whisper_model::default_spec();
+
+        downloader.set_status_for_test(spec, crate::model_download::DownloadStatus::NotDownloaded);
+        let line = model_status_line(spec, &downloader);
+        assert_eq!(line.tone, StatusTone::Neutral);
+        assert!(line.progress < 0.0, "no bar before the download starts");
+
+        downloader.set_status_for_test(
+            spec,
+            crate::model_download::DownloadStatus::Downloading {
+                received: 25,
+                total: 100,
+            },
+        );
+        let line = model_status_line(spec, &downloader);
+        assert_eq!(line.tone, StatusTone::Active);
+        assert!((line.progress - 0.25).abs() < f32::EPSILON);
+
+        downloader.set_status_for_test(spec, crate::model_download::DownloadStatus::Downloaded);
+        let line = model_status_line(spec, &downloader);
+        assert_eq!(line.tone, StatusTone::Done);
+        assert!(line.progress < 0.0);
+
+        downloader.set_status_for_test(
+            spec,
+            crate::model_download::DownloadStatus::Failed("boom".into()),
+        );
+        assert_eq!(
+            model_status_line(spec, &downloader).tone,
+            StatusTone::Danger
+        );
+
+        // 上書き中は「失敗」ではなく「そのままでは選択が使われない」＝ caution。
+        let overridden = crate::config::Config {
+            whisper_model_path: Some(std::path::PathBuf::from("/tmp/ggml-small.bin")),
+            ..crate::config::Config::default()
+        };
+        assert_eq!(
+            whisper_model_status_line(&overridden, &downloader).tone,
+            StatusTone::Caution
+        );
     }
 
     /// 選び直しで打ち切るのは「別のモデルに変わったとき」だけ。同じモデルを選び直しても
@@ -3497,7 +3608,7 @@ mod tests {
     /// `spec_or_default` を `default_spec` に壊してもテストが緑のままになるため、既定ではない
     /// カタログモデル（Tiny）でサイズ入りの文言をリテラルで留める。
     #[test]
-    fn whisper_model_status_text_shows_the_override() {
+    fn whisper_model_status_line_shows_the_override() {
         let downloader = crate::model_download::ModelDownloader::new();
         let default_spec = crate::whisper_model::default_spec();
         let tiny = crate::whisper_model::spec_for("tiny").expect("tiny is in the catalog");
@@ -3514,10 +3625,13 @@ mod tests {
             ..base.clone()
         };
         assert_eq!(
-            whisper_model_status_text(&choosing_tiny, &downloader),
+            whisper_model_status_line(&choosing_tiny, &downloader).text,
             "Not downloaded — downloads automatically (74 MB)"
         );
-        assert_eq!(whisper_model_status_text(&base, &downloader), "Downloaded");
+        assert_eq!(
+            whisper_model_status_line(&base, &downloader).text,
+            "Downloaded"
+        );
 
         // カタログ外の手編集値は既定モデルの状況を出す（使用時のフォールバックと整合）。
         let unknown = crate::config::Config {
@@ -3525,7 +3639,7 @@ mod tests {
             ..base.clone()
         };
         assert_eq!(
-            whisper_model_status_text(&unknown, &downloader),
+            whisper_model_status_line(&unknown, &downloader).text,
             "Downloaded"
         );
 
@@ -3535,12 +3649,12 @@ mod tests {
             ..choosing_tiny
         };
         assert_eq!(
-            whisper_model_status_text(&overridden, &downloader),
+            whisper_model_status_line(&overridden, &downloader).text,
             "Using the model file set in config.toml"
         );
         downloader.set_status_for_test(tiny, crate::model_download::DownloadStatus::Downloaded);
         assert_eq!(
-            whisper_model_status_text(&overridden, &downloader),
+            whisper_model_status_line(&overridden, &downloader).text,
             "Using the model file set in config.toml"
         );
     }
@@ -4312,7 +4426,7 @@ mod tests {
     /// 要約 LLM の状態行は取得状況を示す（どのモデルかは ComboBox が示す）。取得の契機が設定で
     /// 変わるので、選んでも取得が始まらない設定では「自動で落ちる」と読める文言を出さない。
     #[test]
-    fn summary_model_status_text_shows_when_the_download_happens() {
+    fn summary_model_status_line_shows_when_the_download_happens() {
         let downloader = crate::model_download::ModelDownloader::new();
         let spec = crate::summary_model::default_spec();
         downloader.set_status_for_test(spec, crate::model_download::DownloadStatus::NotDownloaded);
@@ -4322,19 +4436,22 @@ mod tests {
             ..crate::config::Config::default()
         };
         assert_eq!(
-            summary_model_status_text(&running, &downloader),
+            summary_model_status_line(&running, &downloader).text,
             "Not downloaded — downloads automatically (4.4 GB)"
         );
 
         // 要約 OFF（既定）では選んでも取得しないので、取得の契機を明示する。
         let idle = crate::config::Config::default();
         assert_eq!(
-            summary_model_status_text(&idle, &downloader),
+            summary_model_status_line(&idle, &downloader).text,
             "Not downloaded — downloads when minutes are generated (4.4 GB)"
         );
         // 取得済みなら契機の説明は不要（状態そのものを出す）。
         downloader.set_status_for_test(spec, crate::model_download::DownloadStatus::Downloaded);
-        assert_eq!(summary_model_status_text(&idle, &downloader), "Downloaded");
+        assert_eq!(
+            summary_model_status_line(&idle, &downloader).text,
+            "Downloaded"
+        );
         downloader.set_status_for_test(spec, crate::model_download::DownloadStatus::NotDownloaded);
 
         // カタログ外の手編集値は既定モデルの状況を出す（使用時のフォールバックと整合）。
@@ -4343,8 +4460,8 @@ mod tests {
             ..running.clone()
         };
         assert_eq!(
-            summary_model_status_text(&unknown, &downloader),
-            summary_model_status_text(&running, &downloader)
+            summary_model_status_line(&unknown, &downloader).text,
+            summary_model_status_line(&running, &downloader).text
         );
 
         let overridden = crate::config::Config {
@@ -4352,7 +4469,7 @@ mod tests {
             ..running
         };
         assert_eq!(
-            summary_model_status_text(&overridden, &downloader),
+            summary_model_status_line(&overridden, &downloader).text,
             "Using the model file set in config.toml"
         );
     }

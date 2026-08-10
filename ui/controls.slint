@@ -1,5 +1,5 @@
 import { Palette } from "std-widgets.slint";
-import { Style } from "style.slint";
+import { Style, StatusTone } from "style.slint";
 
 // 複数のウィンドウで使う自作コントロール。トークン（`style.slint`）と同じ理由でここに集約する:
 // ウィンドウごとに同じ見た目を作り直すと、片方だけ調整が漏れる（`docs/rules/slint.md`）。
@@ -45,6 +45,126 @@ export component DangerButton inherits Rectangle {
         enabled: root.enabled;
         clicked => {
             root.clicked();
+        }
+    }
+}
+
+// セクションの見出し。朱の縦棒（落款の標）＋大文字・字間広めのラベル。
+// 設定画面と、#141 で足す機能ごとのウィンドウで共有する。
+export component SectionHeading inherits HorizontalLayout {
+    in property <string> text;
+    spacing: 9px;
+    // 標はラベルの高さに関係なく 12px の棒にしたいので、伸び縮みする箱の中で縦中央に置く。
+    Rectangle {
+        width: Style.mark-width;
+        Rectangle {
+            width: parent.width;
+            height: 12px;
+            background: Style.seal;
+        }
+    }
+
+    Text {
+        text: root.text;
+        font-size: Style.section-size;
+        font-weight: Style.semibold;
+        letter-spacing: Style.section-tracking;
+        color: Style.ink-muted;
+        vertical-alignment: center;
+        horizontal-stretch: 1;
+    }
+}
+
+// 設定のまとまりを載せる面。中身は呼び出し側が縦に積む（区切りは `CardDivider`）。
+export component Card inherits Rectangle {
+    border-width: 1px;
+    border-color: Style.rule;
+    border-radius: Style.card-radius;
+    background: Style.sheet;
+    clip: true;
+    VerticalLayout {
+        @children
+    }
+}
+
+// 面の中の区切り線。`Card` の中で行と行の間に置く。
+export component CardDivider inherits Rectangle {
+    height: 1px;
+    background: Style.hairline;
+}
+
+// 状態を 1 行で伝える表示（ドット＋文＋任意の進捗バー）。文言と意味（`tone`）は Rust が決める
+// （`docs/rules/slint.md` の「状態→UI 文言の対応表は Rust の網羅 match に置く」）。
+//
+// `progress` が負のときはバーを出さない（「進捗という概念が無い状態」を別の bool で表さない。
+// 0.0 は「始まったが 0%」なので出す）。
+export component StatusLine inherits VerticalLayout {
+    in property <string> text;
+    in property <StatusTone> tone;
+    in property <float> progress: -1;
+    spacing: 5px;
+
+    HorizontalLayout {
+        spacing: 8px;
+        alignment: start;
+        Rectangle {
+            width: 6px;
+            height: 6px;
+            border-radius: 3px;
+            background: Style.tone-mark(root.tone);
+            y: 5px;
+        }
+
+        Text {
+            text: root.text;
+            font-size: Style.caption-size;
+            color: Style.tone-ink(root.tone);
+            wrap: word-wrap;
+            horizontal-stretch: 1;
+        }
+    }
+
+    if root.progress >= 0: Rectangle {
+        height: 3px;
+        border-radius: 1.5px;
+        background: Style.hairline;
+        clip: true;
+        Rectangle {
+            x: 0;
+            width: parent.width * min(max(root.progress, 0), 1);
+            background: Style.caution-mark;
+        }
+    }
+}
+
+// 面の中の 1 行分。左右の余白と行内の間隔を揃える（`Card` の直下に並べる）。
+export component CardRow inherits VerticalLayout {
+    padding-left: 15px;
+    padding-right: 15px;
+    padding-top: 13px;
+    padding-bottom: 13px;
+    spacing: 9px;
+    @children
+}
+
+// 小さな注記のバッジ（`Needs transcription` など）。状態そのものではなく「条件」を短く示す。
+export component Badge inherits Rectangle {
+    in property <string> text;
+    in property <bool> caution: false;
+    border-width: 1px;
+    border-radius: Style.badge-radius;
+    border-color: root.caution ? Style.caution.transparentize(0.6) : Style.rule-strong;
+    background: root.caution ? Style.caution.transparentize(0.88) : Style.sheet-sunken;
+    HorizontalLayout {
+        padding-left: 6px;
+        padding-right: 6px;
+        padding-top: 2px;
+        padding-bottom: 2px;
+        Text {
+            text: root.text;
+            font-size: Style.badge-size;
+            letter-spacing: Style.badge-tracking;
+            color: root.caution ? Style.caution : Style.ink-faint;
         }
     }
 }
