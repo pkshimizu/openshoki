@@ -1386,18 +1386,24 @@ fn build_menu_event_handler(
         // 設定ウィンドウが開いている間だけ、選択中モデルの取得状況（ダウンロード進捗等）を
         // 状態行へ反映する（閉じているときは更新しない。変化したときだけ set して無駄な
         // 再描画を避ける）。
-        if let Some(ui) = ui.upgrade()
-            && ui.window().is_visible()
-        {
-            // 変わったときだけ流す（判定と流し込みは `StatusLineCache` が持つ）。
-            status_lines.apply_if_changed(
-                &ui,
-                whisper_model_status_line(&config.borrow(), &models.downloader),
-            );
-            status_lines.apply_if_changed(
-                &ui,
-                summary_model_status_line(&config.borrow(), &models.downloader),
-            );
+        if let Some(ui) = ui.upgrade() {
+            if ui.window().is_visible() {
+                // 変わったときだけ流す（判定と流し込みは `StatusLineCache` が持つ）。
+                status_lines.apply_if_changed(
+                    &ui,
+                    whisper_model_status_line(&config.borrow(), &models.downloader),
+                );
+                status_lines.apply_if_changed(
+                    &ui,
+                    summary_model_status_line(&config.borrow(), &models.downloader),
+                );
+            } else {
+                // **見えていない間に覚えた値はあてにならない**: この tick は止まるのに、
+                // モデル管理ウィンドウの「Use」（`apply_model_selection_to_settings`）は
+                // 設定画面が閉じていても状態行を直接書く。覚えたままだと、次に開いたときに
+                // 「導出値＝覚えている値」で一致してスキップし、古い表示が固定される。
+                status_lines.forget();
+            }
         }
 
         // モデル管理ウィンドウが開いている間だけ、行の状態（取得の進捗・完了・失敗、ジョブの
@@ -2187,6 +2193,12 @@ impl StatusLineCache {
     ///
     /// 文言だけで比べないこと: 進捗は連続値なので、文言（1% 刻み）が同じまま進捗と色だけ
     /// 変わる区間があり、そこを飛ばすとバーが飛び飛びに動く。
+    /// 覚えている値を捨てる。**UI を直接書く経路がある間**（設定画面が見えていない間）は、
+    /// こちらの記憶と UI が食い違いうるので、次に流すときは必ず流し直す。
+    fn forget(&mut self) {
+        *self = Self::default();
+    }
+
     fn apply_if_changed(&mut self, ui: &AppWindow, line: ModelStatusLine) {
         let slot = match line.kind {
             model_download::ModelKind::Speech => &mut self.whisper,
@@ -3704,6 +3716,18 @@ mod tests {
         );
         assert_eq!(ui.get_summary_model_status(), "summary line");
         assert_eq!(ui.get_whisper_model_status(), "sentinel");
+
+        // **スロットが種別ごとに分かれている**こと: 間に別種別を挟んでも、変わっていない
+        // whisper の行は依然としてスキップされる（スロットを 1 つにまとめる変異がここで落ちる。
+        // 実際の tick は両種別を交互に流すので、1 つだと差分更新が丸ごと効かなくなる）。
+        cache.apply_if_changed(&ui, line(0.26));
+        assert_eq!(ui.get_whisper_model_status(), "sentinel");
+
+        // 覚えている値を捨てたら、同じ行でも流し直す（設定画面を閉じている間に別経路が
+        // UI を直接書くので、開き直したときは必ず反映する）。
+        cache.forget();
+        cache.apply_if_changed(&ui, line(0.26));
+        assert_eq!(ui.get_whisper_model_status(), "Downloading… 25%");
     }
 
     /// 状態行の**意味（tone）と進捗**が状態ごとに決まること。色は Slint 側の対応表が引くので、
