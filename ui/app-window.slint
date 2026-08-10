@@ -163,13 +163,13 @@ export component AppWindow inherits Window {
     callback toggle-auto-transcribe(bool);
     // 文字起こし言語の変更。カタログ内インデックスを渡し、Rust 側でコードへ変換して永続化する。
     callback change-transcribe-language(int);
-    // 内蔵 whisper モデルの変更。カタログ内インデックスを渡し、Rust 側で ID へ変換して永続化し、
-    // 未取得ならダウンロードを開始する。
+    // 内蔵 whisper モデルの変更。カタログ内インデックスを渡し、Rust 側で ID へ変換して永続化する。
+    // 未取得のモデルの取得を始めるかは設定次第（`model_downloads_on_select`）。
     callback change-whisper-model(int);
     // 議事録要約トグルの切り替え。新しい ON/OFF を渡し、Rust 側で設定へ永続化する。
     callback toggle-auto-summarize(bool);
     // 要約 LLM の変更。カタログ内インデックスを渡し、Rust 側で ID へ変換して永続化する。
-    // 未取得のモデルの取得を始めるかは設定次第（`summary_model_downloads_on_select`）。
+    // 未取得のモデルの取得を始めるかは設定次第（`model_downloads_on_select`）。
     callback change-summary-model(int);
     // 「Manage Models…」押下。モデル管理ウィンドウを開く（#117 / #138）。
     callback open-models-window();
