@@ -1,7 +1,7 @@
-//! 設定ウィンドウ（Auto-Record セクション）の描画確認用バイナリ
+//! 設定ウィンドウの描画確認用バイナリ
 //! （`docs/rules/slint.md` の検証手順）。ダミーの登録アプリを流し込んで AppWindow を表示する。
 //!
-//! Trigger apps の一覧は**固定高さ・clip 付き**の箱なので、折り返す注記を入れると潰れやすい。
+//! 監視アプリ（Watched apps）の一覧は注記が折り返すので、行の高さが伸びて下が詰まりやすい。
 //! ビルドやテストバックエンドでは検出できないため、ここで目視する。
 //!
 //! ```sh
@@ -46,6 +46,8 @@ fn sample_apps() -> Vec<TriggerApp> {
 }
 
 fn main() {
+    // 引数は 1 度だけ集める（フラグごとに走査しない）。
+    let args: Vec<String> = std::env::args().collect();
     let win =
         AppWindow::new().expect("creating the window should succeed in this verification binary");
 
@@ -55,9 +57,14 @@ fn main() {
     win.set_recording_dir("/Users/example/Recordings".into());
     win.set_auto_record_app(true);
     win.set_auto_stop_debounce_secs(4);
-    win.set_app_list(ModelRc::from(Rc::new(VecModel::from(sample_apps()))));
+    // 引数に `empty-apps` を渡すと監視アプリ 0 件（空状態の文言）を見られる。
+    let empty_apps = args.iter().any(|arg| arg == "empty-apps");
+    win.set_app_list(ModelRc::from(Rc::new(VecModel::from(if empty_apps {
+        Vec::new()
+    } else {
+        sample_apps()
+    }))));
     // Transcription セクションは従属コントロールが多く、下端の余白を食い潰しやすい。
-    // 状態行は実アプリで出る最長の文言（未取得＋サイズ）で見る。
     win.set_auto_transcribe(true);
     win.set_transcribe_languages(ModelRc::from(Rc::new(VecModel::from(vec![
         slint::SharedString::from("Japanese"),
@@ -65,9 +72,12 @@ fn main() {
     win.set_whisper_models(ModelRc::from(Rc::new(VecModel::from(vec![
         slint::SharedString::from("Small — 465 MB — balanced speed and accuracy"),
     ]))));
-    win.set_whisper_model_status("Not downloaded — downloads automatically (465 MB)".into());
+    // 状態行は「取得中」で見る（ドット・注意色・進捗バーが同時に出る、いちばん背の高い形）。
+    win.set_whisper_model_status("Downloading… 62%".into());
+    win.set_whisper_model_tone(StatusTone::Active);
+    win.set_whisper_model_progress(0.62);
     // 要約 LLM は選択肢・説明行（選択中の選択肢の全文）・状態行の 3 段。いちばん背が高くなる
-    // 組み合わせで見る: 議事録要約は OFF（状態行が取得の契機を説明する長い文言になる）＋
+    // 組み合わせで見る: 議事録生成は OFF（状態行が取得の契機を説明する長い文言になる）＋
     // 説明が最長の 3B を選択中（`src/summary_model.rs` の description の複製。あちらを
     // 変えたらここも合わせること）。
     win.set_auto_summarize(false);
@@ -77,13 +87,31 @@ fn main() {
         ),
     ]))));
     win.set_summary_model_status(
-        "Not downloaded — downloads when meeting minutes are on (2.0 GB)".into(),
+        "Not downloaded — downloads when notes are generated (2.0 GB)".into(),
     );
+    win.set_summary_model_tone(StatusTone::Neutral);
 
     win.window()
         .set_position(slint::LogicalPosition::new(60.0, 60.0));
     // 実アプリと同じ寸法で見る（`src/main.rs` の WINDOW_WIDTH/HEIGHT と一致させること）。
-    win.window().set_size(slint::LogicalSize::new(420.0, 900.0));
+    // 引数に `tall` を渡すと、スクロールせずに本文の全長を 1 枚で見られる高さにする
+    // （末尾の議事録ブロック・注記・バージョンまで確認するため）。
+    // `min` を渡すと最小サイズ（`ui/app-window.slint` の min-width/height）で見る。
+    // 寸法は 1 つの分岐で決める（幅と高さを別々に判定すると片方だけ直す事故になる）。
+    let (width, height) = if args.iter().any(|arg| arg == "min") {
+        (420.0, 520.0) // `ui/app-window.slint` の min-width / min-height
+    } else if args.iter().any(|arg| arg == "tall") {
+        (460.0, 1560.0) // 本文の全長（画面より大きいと OS 側で切り詰められる）
+    } else {
+        (460.0, 900.0) // 実アプリの標準（`src/main.rs` の WINDOW_WIDTH/HEIGHT）
+    };
+    win.window()
+        .set_size(slint::LogicalSize::new(width, height));
+    // 本文は画面の高さより長いので、下端（議事録ブロック・注記・バージョン）は `bottom` を
+    // 渡してスクロールさせてから撮る。
+    if args.iter().any(|arg| arg == "bottom") {
+        win.set_body_scroll(-620.0);
+    }
     win.show()
         .expect("showing the window should succeed in this verification binary");
 

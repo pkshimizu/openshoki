@@ -1,4 +1,4 @@
-//! 設定画面の「Trigger apps」一覧が、自動録音で検知できないアプリの注記を出すことのテスト。
+//! 設定画面の「Watched apps」一覧が、自動録音で検知できないアプリの注記を出すことのテスト。
 //!
 //! 自動録音は登録アプリが対象外（Safari 等の WebKit 系）でも**黙って発火しない**だけなので、
 //! 一覧でその旨が見えることが機能の一部になる（#107。理由は
@@ -13,7 +13,7 @@ use slint::{SharedString, VecModel};
 
 slint::include_modules!();
 
-/// 「Trigger apps」一覧の行が持つアクセシブルラベルを、上から順に集める。
+/// 「Watched apps」一覧の行が持つアクセシブルラベルを、上から順に集める。
 ///
 /// 一覧の外（セクション見出しやチェックボックス等）を拾わないよう、行の部品
 /// `TriggerAppRow` の配下だけを見る。注記の**不在**を等値でアサートしたいので、
@@ -28,6 +28,7 @@ fn row_labels(window: &AppWindow) -> Vec<String> {
 fn open_window(apps: Vec<TriggerApp>) -> AppWindow {
     ui_support::init_backend();
     let window = AppWindow::new().expect("create the settings window");
+    ui_support::fit_settings_content(&window);
     // 一覧は Auto-record が ON のときだけ操作できるが、表示自体は OFF でも行われる。
     // 注記の有無を見るテストなので ON にして通常の見え方に揃える。
     window.set_auto_record_app(true);

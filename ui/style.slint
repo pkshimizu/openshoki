@@ -1,30 +1,130 @@
 import { Palette } from "std-widgets.slint";
 
-// タイポグラフィと淡色のトークン。意味のある繰り返し値を 1 箇所に集約し、トーン調整時の
-// 追従漏れ・不整合を防ぐ（余白やインデントの一回きりの値は各所に直書きのままでよい）。
-// 設定ウィンドウ（app-window.slint）と Recordings ウィンドウ（recordings-window.slint）で共有する。
+// 状態を表す色の役割。**色そのものではなく意味**を渡す（`docs/rules/slint.md` の
+// 「状態→UI 文言の対応表は Rust の網羅 match に置き、Slint の三項連鎖にしない」と同じ趣旨で、
+// 状態→色の対応表もここ 1 箇所に持つ）。Rust 側は文言と一緒にこの値を渡す。
+export enum StatusTone {
+    // 事実を述べるだけ（未取得・件数など）。
+    neutral,
+    // 進行中（ダウンロード中など）。
+    active,
+    // 完了・準備できている。
+    done,
+    // 壊れてはいないが、そのままでは意図どおり動かない（config での上書き、非対応アプリ）。
+    caution,
+    // 失敗した。
+    danger,
+}
+
+// shoki のデザイントークン。アプリアイコンの「和紙の地・墨・朱の落款」を起点にした配色と、
+// タイポグラフィ・淡色の値を 1 箇所へ集約する（#127）。全ウィンドウで共有する。
+//
+// **移行状況（#127 時点）**: このトークンへ移行済みなのは設定画面（`app-window.slint`）だけ。
+// `recordings-window.slint` / `models-window.slint` はまだ `Palette` の色を使っており、
+// それぞれ #128 / #141 で移行する。混在して見えるのはそのため。
+//
+// **OS の `Palette` に色を委ねない**: shoki 固有の紙色を出すため、面・文字・枠は下の値を使う。
+// ライト/ダークの切り替えだけ `Palette.color-scheme` に従う（OS の設定に追従するため）。
+// 個々の `.slint` で色を直書きしないこと——片方のテーマだけ調整が漏れる。
 export global Style {
+    // いまダークテーマか。色の分岐はすべてこの 1 つを見る。
+    out property <bool> dark: Palette.color-scheme == ColorScheme.dark;
+
+    // --- 面（紙） ---
+    // ウィンドウの地。
+    out property <brush> paper: root.dark ? #1b1a17 : #f3ede2;
+    // 設定のまとまりを載せる面。
+    out property <brush> sheet: root.dark ? #232220 : #faf7f0;
+    // 面の中でさらに沈める部分（従属ブロック・一覧の区切り見出し）。
+    out property <brush> sheet-sunken: root.dark ? #1f1e1b : #f6f1e7;
+    // 面の上に置く小さな箱（監視アプリの行など）。**`sheet` の上に載る前提**で、`paper` と
+    // 同値でよい（地の上に直接置くと沈まないので置かないこと）。
+    out property <brush> field: root.dark ? #2b2926 : #f3ede2;
+
+    // --- 枠 ---
+    // 面の縁。
+    out property <brush> rule: root.dark ? #34322d : #e2d9c8;
+    // 面の内側の区切り（いちばん弱い）。
+    out property <brush> hairline: root.dark ? #2c2a26 : #eae2d4;
+
+    // --- 文字（墨） ---
+    out property <brush> ink: root.dark ? #ece6d9 : #221f1a;
+    // 補助テキスト（説明・状態）。
+    out property <brush> ink-muted: root.dark ? #9a9284 : #6b6357;
+    // さらに弱いテキスト（注記・バージョン）。
+    out property <brush> ink-faint: root.dark ? #8a8271 : #8b8274;
+
+    // --- 朱（落款） ---
+    // 唯一のアクセント。多用しない: 見出しの標・選択中の標・主となるボタンだけに使う。
+    out property <brush> seal: root.dark ? #e2704f : #c04a2c;
+
+    // --- 状態色 ---
+    // 「壊れてはいないが、そのままでは動かない」注意色。danger と分ける（直せるエラーに見せない）。
+    out property <brush> caution: root.dark ? #d99b6a : #96601a;
+    // 失敗。
+    out property <brush> danger: root.dark ? #e08172 : #a53326;
+    // 完了・準備できている。
+    out property <brush> done: root.dark ? #6b9159 : #4a6b3f;
+    // 状態のドット。6px の点は文字色のままだと沈むので、**文字より彩度を上げる**
+    // （明度ではない: ライトでは文字より明るく、ダークでは文字と同程度になる）。
+    out property <brush> caution-mark: root.dark ? #e0a45c : #c98a2b;
+    out property <brush> done-mark: root.dark ? #7fa86a : #6b9159;
+
+    // 状態の意味 → 文字色 / ドット色。対応表はここ 1 箇所だけに置く。
+    //
+    // **Slint の三項連鎖なので網羅チェックは効かない**（未処理の意味は暗黙に neutral へ落ちる）。
+    // `StatusTone` にバリアントを足したら、この 2 つの関数も必ず直すこと
+    // （`docs/rules/slint.md` の「三項連鎖にしない」の例外。色は Rust 側へ持てないため）。
+    // `active` が `caution` と同じ色なのは意図的: 進行中と注意は同じ「まだ終わっていない」域で、
+    // 進行中は進捗バーの有無で区別できるため、色を増やさない。
+    pure public function tone-ink(tone: StatusTone) -> brush {
+        return tone == StatusTone.done
+            ? root.done
+            : tone == StatusTone.caution || tone == StatusTone.active
+                ? root.caution
+                : tone == StatusTone.danger ? root.danger : root.ink-muted;
+    }
+    pure public function tone-mark(tone: StatusTone) -> brush {
+        return tone == StatusTone.done
+            ? root.done-mark
+            : tone == StatusTone.caution || tone == StatusTone.active
+                ? root.caution-mark
+                : tone == StatusTone.danger ? root.danger : root.ink-faint;
+    }
+
+    // --- タイポグラフィ ---
     out property <length> detail-title-size: 16px; // 詳細見出し（Recordings の日時）
-    // セクション見出し・タブのラベル用。**本文（body-size）より小さい**ので、本文と並ぶ
-    // 見出し（議事録の `#` 行など）にはサイズを上げず `semibold` で差を付ける
-    // （サイズの逆転を作らない）。
+    // セクション見出し（大文字・字間広め）。本文より小さく、色と字間で見出しだと分かるようにする。
+    out property <length> section-size: 11px;
+    out property <length> section-tracking: 1.4px;
+    // 面の中の小見出し・タブのラベル。
     out property <length> heading-size: 12px;
-    out property <length> body-size: 13px; // 本文ラベル
-    out property <length> caption-size: 12px; // 補助テキスト（パス・注記）
-    out property <length> badge-size: 10px; // 音源バッジ（Mic / System）
+    out property <length> body-size: 13px; // 本文・設定名
+    out property <length> label-size: 12.5px; // 行のラベル（値と対になるもの）
+    out property <length> caption-size: 11.5px; // 補助テキスト（説明・状態・パス）
+    out property <length> badge-size: 9.5px; // バッジ（音源・In use 等）
+    out property <length> badge-tracking: 0.9px;
     out property <int> semibold: 600;
     out property <int> regular: 400; // 通常ウェイト（semibold と対で明示するときに使う）
-    out property <float> muted-alpha: 0.4; // 補助テキストの淡色化（transparentize の引数）
-    out property <float> disabled-opacity: 0.4; // 従属/未選択ブロックの淡色化（opacity）
-    out property <brush> on-accent-foreground: #ffffff; // アクセント背景の上に載る前景（白固定）
-    // 再生中セグメントのハイライト背景（アクセント色の淡色）。カンプの light .12 / dark .20 相当。
-    out property <brush> segment-highlight: Palette.accent-background.transparentize(0.85);
-    // 一覧の区切り見出しの背景（モデル管理の種別ヘッダ）。行の一部として少し沈めるトーン。
-    out property <brush> row-heading-background: Palette.background.transparentize(0.4);
-    // 失敗状態の警告色（文字起こし失敗のドット等）。Palette に危険色が無いため固定値
-    // （ライト/ダーク両テーマで視認できる赤）。
-    out property <brush> danger: #e5484d;
-    // 「壊れてはいないが、そのままでは動かない」ことの注意色（自動録音の対象外アプリの注記）。
-    // danger（失敗）とは分ける: 直せるエラーに見せず、かつ淡色の補助テキストよりは目に入るようにする。
-    out property <brush> caution: #bb7a00;
+    // **旧方式**（`Palette.foreground.transparentize(...)` と組で使う）。まだ移行していない
+    // ウィンドウが使う。新規は `ink-muted` / `ink-faint` を使うこと。
+    out property <float> muted-alpha: 0.4;
+    out property <float> disabled-opacity: 0.45; // 従属/未選択ブロックの淡色化（opacity）
+
+    // --- 寸法 ---
+    out property <length> card-radius: 9px;
+    out property <length> badge-radius: 4px;
+    // セクション見出しの標（朱の縦棒）。
+    out property <length> mark-width: 4px;
+
+    // **濃い塗りの上に載せる白**。用途は 2 つある:
+    // OS のアクセント色の上（`recordings-window.slint` の選択行）と、`danger` の上
+    // （`controls.slint` の `DangerButton` の塗り）。どちらもライト／ダークで白のままでよいので
+    // テーマ分岐を持たない。朱（`seal`）の上に文字を載せる用途はまだ無い（必要になったら
+    // そのとき `on-seal` を足す）。
+    out property <brush> on-accent-foreground: #ffffff;
+    // 再生中セグメントのハイライト背景（朱の淡色）。
+    out property <brush> segment-highlight: root.seal.transparentize(0.88);
+    // 一覧の区切り見出しの背景。
+    out property <brush> row-heading-background: root.sheet-sunken;
 }

@@ -58,6 +58,11 @@ const MAX_REDUCE_ROUNDS: usize = 4;
 
 /// 要約の実行エンジン。いまはオンデバイスのみで、オンライン LLM（Claude / OpenAI / Gemini）は
 /// 後続でバリアントとして足す（設定・API キー基盤も同じ後続が用意する）。
+///
+/// **オンラインのエンジンを足すときは、設定画面の注記も直すこと**（`ui/app-window.slint` の
+/// 「Audio and transcripts never leave this Mac.」）。いまはオンデバイスだけなのでこの断言が
+/// 成り立っているが、送信するエンジンが増えた瞬間に**そのままだと嘘になる**。Slint の文字列
+/// リテラルなので、足してもコンパイルは通ってしまう（#83〜#85）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SummaryEngine {
     /// ローカルの llama.cpp で生成する（外部送信なし）。
