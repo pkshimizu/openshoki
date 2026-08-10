@@ -1149,10 +1149,8 @@ fn build_menu_event_handler(
     let mut rec_geometry_committed = false;
     // 再生の経過時間テキストを、秒が変わったときだけ更新するための前回値。
     let mut last_play_secs: Option<u64> = None;
-    // 設定画面のモデル状態行を、変わったときだけ set するための前回値（種別ごと）。
-    // UI から読み戻さずここで覚える（読み戻すと float の比較になり、行の全項目を見づらい）。
-    let mut last_whisper_status: Option<ModelStatusLine> = None;
-    let mut last_summary_status: Option<ModelStatusLine> = None;
+    // 設定画面のモデル状態行の前回値（種別ごと）。UI から読み戻さずここで覚える。
+    let mut status_lines = StatusLineCache::default();
     // 実行中の録音セッション。None=待機中、Some=録音中。
     let mut recorder: Option<Recorder> = None;
     // 録音中の経過時間テキストを、秒が変わったときだけ更新するための前回値。
@@ -1391,19 +1389,15 @@ fn build_menu_event_handler(
         if let Some(ui) = ui.upgrade()
             && ui.window().is_visible()
         {
-            // **行まるごとが変わったときだけ** set する。文言だけを代表にすると、文言が同じで
-            // 意味や進捗だけ違う状態（進捗は連続値なので文言の 1% 刻みより細かく動く）で
-            // 色とバーが古いまま残る。直前の値と比べるので UI から読み戻さない。
-            let status = whisper_model_status_line(&config.borrow(), &models.downloader);
-            if last_whisper_status.as_ref() != Some(&status) {
-                status.apply(&ui);
-                last_whisper_status = Some(status);
-            }
-            let summary_status = summary_model_status_line(&config.borrow(), &models.downloader);
-            if last_summary_status.as_ref() != Some(&summary_status) {
-                summary_status.apply(&ui);
-                last_summary_status = Some(summary_status);
-            }
+            // 変わったときだけ流す（判定と流し込みは `StatusLineCache` が持つ）。
+            status_lines.apply_if_changed(
+                &ui,
+                whisper_model_status_line(&config.borrow(), &models.downloader),
+            );
+            status_lines.apply_if_changed(
+                &ui,
+                summary_model_status_line(&config.borrow(), &models.downloader),
+            );
         }
 
         // モデル管理ウィンドウが開いている間だけ、行の状態（取得の進捗・完了・失敗、ジョブの
@@ -2173,6 +2167,38 @@ fn model_downloads_on_select(kind: model_download::ModelKind, config: &Config) -
 /// モデルパスを `config.toml` で上書きしているときの、設定画面の状態行。whisper・要約 LLM で
 /// 共用する（同じ状態なので、片方だけ書き換えて種別で違う説明が出るのを防ぐ）。
 const MODEL_OVERRIDDEN_STATUS: &str = "Using the model file set in config.toml";
+
+/// 設定画面の状態行を、**変わったときだけ**流し込むためのキャッシュ（種別ごとに直前の行を持つ）。
+///
+/// 100ms tick から呼ぶので、毎回 set すると変化が無くても再描画が走る。どちらのスロットへ
+/// しまうかは `kind` の網羅 match が決める（`ModelStatusLine::apply` と同じ流儀。種別を足したら
+/// スロットを書くまでコンパイルが通らない）。
+///
+/// `build_menu_event_handler` の中へ直書きしないのは、あのクロージャがテストから呼べないため
+/// （`docs/rules/testing.md` の「配線は繋いでいる関数に継ぎ目を入れてテストする」）。
+#[derive(Default)]
+struct StatusLineCache {
+    whisper: Option<ModelStatusLine>,
+    summary: Option<ModelStatusLine>,
+}
+
+impl StatusLineCache {
+    /// 直前の行と**まるごと**比べ、変わったときだけ設定画面へ流す。
+    ///
+    /// 文言だけで比べないこと: 進捗は連続値なので、文言（1% 刻み）が同じまま進捗と色だけ
+    /// 変わる区間があり、そこを飛ばすとバーが飛び飛びに動く。
+    fn apply_if_changed(&mut self, ui: &AppWindow, line: ModelStatusLine) {
+        let slot = match line.kind {
+            model_download::ModelKind::Speech => &mut self.whisper,
+            model_download::ModelKind::Summary => &mut self.summary,
+        };
+        if slot.as_ref() == Some(&line) {
+            return;
+        }
+        line.apply(ui);
+        *slot = Some(line);
+    }
+}
 
 /// 文字起こしに使う whisper モデルの取得状況を、設定画面の状態行（文言・意味・進捗）にする。
 ///
@@ -3160,12 +3186,12 @@ fn hide_dock_icon() {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppWindow, ModelStatus, ModelStatusLine, StatusTone, SummaryStatus, TranscriptStatus,
-        app_version_text, breathing_level, model_choices, model_downloads_on_select,
-        model_status_line, model_to_cancel_on_select, playback_progress, seek_position_from_ratio,
-        summary_display_status, summary_model_status_line, summary_placeholder_text, summary_rows,
-        summary_status_text, transcript_display_status, transcript_placeholder_text,
-        transcript_status_text, whisper_model_status_line,
+        AppWindow, ModelStatus, ModelStatusLine, StatusLineCache, StatusTone, SummaryStatus,
+        TranscriptStatus, app_version_text, breathing_level, model_choices,
+        model_downloads_on_select, model_status_line, model_to_cancel_on_select, playback_progress,
+        seek_position_from_ratio, summary_display_status, summary_model_status_line,
+        summary_placeholder_text, summary_rows, summary_status_text, transcript_display_status,
+        transcript_placeholder_text, transcript_status_text, whisper_model_status_line,
     };
     use crate::transcribe::TranscribeStatus;
     use std::time::Duration;
@@ -3630,6 +3656,56 @@ mod tests {
         assert_eq!(ui.get_whisper_model_status(), "speech line");
     }
 
+    /// 変わったときだけ流す、が種別ごとに効くこと。
+    ///
+    /// tick の配線（1000 行超のクロージャ）はテストから呼べないので、判定と流し込みを持つ
+    /// `StatusLineCache` を継ぎ目にしてここで固定する。文言だけで比べる形へ戻す変異と、
+    /// 前回値の更新忘れが落ちる。
+    #[test]
+    #[cfg_attr(
+        not(slint_debug_info),
+        ignore = "needs Slint debug info (SLINT_EMIT_DEBUG_INFO=1)"
+    )]
+    fn the_status_line_cache_skips_unchanged_lines_per_kind() {
+        init_test_backend();
+        let ui = AppWindow::new().expect("creating the settings window should succeed");
+        let mut cache = StatusLineCache::default();
+        let line = |progress| ModelStatusLine {
+            kind: crate::model_download::ModelKind::Speech,
+            text: "Downloading… 25%".to_owned(),
+            tone: StatusTone::Active,
+            progress: Some(progress),
+            overridden: false,
+        };
+
+        // 1 回目は流れる。
+        cache.apply_if_changed(&ui, line(0.25));
+        assert_eq!(ui.get_whisper_model_status(), "Downloading… 25%");
+
+        // 同じ行は流さない（番兵を置いて、上書きされないことで確かめる）。
+        ui.set_whisper_model_status("sentinel".into());
+        cache.apply_if_changed(&ui, line(0.25));
+        assert_eq!(ui.get_whisper_model_status(), "sentinel");
+
+        // **文言が同じでも進捗が違えば流す**（文言だけで比べる形へ戻すとここが落ちる）。
+        cache.apply_if_changed(&ui, line(0.26));
+        assert_eq!(ui.get_whisper_model_status(), "Downloading… 25%");
+        assert!((ui.get_whisper_model_progress() - 0.26).abs() < f32::EPSILON);
+
+        // 種別ごとに独立している（要約の行を流しても whisper 側は動かない）。
+        ui.set_whisper_model_status("sentinel".into());
+        cache.apply_if_changed(
+            &ui,
+            ModelStatusLine::plain(
+                crate::model_download::ModelKind::Summary,
+                "summary line".to_owned(),
+                StatusTone::Done,
+            ),
+        );
+        assert_eq!(ui.get_summary_model_status(), "summary line");
+        assert_eq!(ui.get_whisper_model_status(), "sentinel");
+    }
+
     /// 状態行の**意味（tone）と進捗**が状態ごとに決まること。色は Slint 側の対応表が引くので、
     /// ここが崩れると「失敗が普通の色で出る」「進捗バーが出ない／出っぱなし」になる。
     #[test]
@@ -3782,15 +3858,22 @@ mod tests {
             "Downloaded"
         );
 
+        // 上書きが無い間は説明行を出す（`overridden` の逆向きの取り違えもここで落ちる）。
+        assert!(!whisper_model_status_line(&base, &downloader).overridden);
+
         // 上書き中は取得状況によらず同じ文言（要約側と同じ表現にする）。
         let overridden = crate::config::Config {
             whisper_model_path: Some(std::path::PathBuf::from("/tmp/ggml-small.bin")),
             ..choosing_tiny
         };
+        let overridden_line = whisper_model_status_line(&overridden, &downloader);
         assert_eq!(
-            whisper_model_status_line(&overridden, &downloader).text,
+            overridden_line.text,
             "Using the model file set in config.toml"
         );
+        // 「失敗」ではなく「選択が使われない」＝ caution。説明行も出さない。
+        assert_eq!(overridden_line.tone, StatusTone::Caution);
+        assert!(overridden_line.overridden);
         downloader.set_status_for_test(tiny, crate::model_download::DownloadStatus::Downloaded);
         assert_eq!(
             whisper_model_status_line(&overridden, &downloader).text,

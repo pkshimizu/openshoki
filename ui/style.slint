@@ -42,8 +42,6 @@ export global Style {
     out property <brush> field: root.dark ? #2b2926 : #f3ede2;
 
     // --- 枠 ---
-    // コントロール・ウィンドウの縁（いちばん強い）。
-    out property <brush> rule-strong: root.dark ? #45423a : #cfc5b2;
     // 面の縁。
     out property <brush> rule: root.dark ? #34322d : #e2d9c8;
     // 面の内側の区切り（いちばん弱い）。
@@ -59,8 +57,6 @@ export global Style {
     // --- 朱（落款） ---
     // 唯一のアクセント。多用しない: 見出しの標・選択中の標・主となるボタンだけに使う。
     out property <brush> seal: root.dark ? #e2704f : #c04a2c;
-    // 朱の面の上に載る文字。
-    out property <brush> on-seal: root.dark ? #1b1a17 : #fdfbf6;
 
     // --- 状態色 ---
     // 「壊れてはいないが、そのままでは動かない」注意色。danger と分ける（直せるエラーに見せない）。
@@ -121,9 +117,11 @@ export global Style {
     // セクション見出しの標（朱の縦棒）。
     out property <length> mark-width: 4px;
 
-    // **旧方式**。OS のアクセント色（`Palette.accent-background`）の上に載る前景で、白のまま。
-    // shoki の朱（`seal`）の上に載せるものではないので `on-seal` とは別物。まだ移行していない
-    // ウィンドウが使う（新規は `on-seal`）。
+    // **濃い塗りの上に載せる白**。用途は 2 つある:
+    // OS のアクセント色の上（`recordings-window.slint` の選択行）と、`danger` の上
+    // （`controls.slint` の `DangerButton` の塗り）。どちらもライト／ダークで白のままでよいので
+    // テーマ分岐を持たない。朱（`seal`）の上に文字を載せる用途はまだ無い（必要になったら
+    // そのとき `on-seal` を足す）。
     out property <brush> on-accent-foreground: #ffffff;
     // 再生中セグメントのハイライト背景（朱の淡色）。
     out property <brush> segment-highlight: root.seal.transparentize(0.88);
