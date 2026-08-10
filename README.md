@@ -176,7 +176,8 @@ shoki/
 ├── ui/
 │   ├── app-window.slint       設定画面の UI 定義（Slint。他ウィンドウの再エクスポートも行う）
 │   ├── recordings-window.slint 録音一覧・再生ウィンドウの UI 定義（Slint）
-│   ├── models-window.slint    モデル管理（一覧・取得・削除・選択）ウィンドウの UI 定義（Slint）
+│   ├── models-window.slint    モデル管理ウィンドウの UI 定義（Slint。中身は model-list.slint）
+│   ├── model-list.slint       モデル一覧（取得・削除・選択）。複数のウィンドウへ載せる共通部品
 │   ├── controls.slint         自作部品（見出し・カード・状態行・バッジと、ボタン・トグル・ステッパー・選択）
 │   └── style.slint            デザイントークン（配色・タイポグラフィ・寸法。全ウィンドウ共有）
 ├── assets/
