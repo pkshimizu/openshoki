@@ -111,6 +111,8 @@ component ViewTab inherits Rectangle {
             color: root.selected
                 ? Palette.foreground
                 : Palette.foreground.transparentize(Style.muted-alpha);
+            // ラベルを読み上げるのはタブ自身（`accessible-label`）。
+            accessible-role: none;
         }
 
         // 選択中だけ下線を出す（高さは常に確保して、切替でタブの高さが動かないようにする）。
@@ -120,10 +122,40 @@ component ViewTab inherits Rectangle {
         }
     }
 
+    // キーボードでも切り替えられるようにする（#146。自作部品は標準が持っていたものを
+    // 自分で用意する。`docs/rules/slint.md`）。
+    Rectangle {
+        x: -3px;
+        y: -3px;
+        width: parent.width + 6px;
+        height: parent.height + 6px;
+        border-radius: 4px;
+        border-width: focus.has-focus ? 2px : 0px;
+        border-color: Style.focus-ring;
+    }
+
+    focus := FocusScope {
+        key-pressed(event) => {
+            if (event.text == " " || event.text == "\n") {
+                root.clicked();
+                return accept;
+            }
+            return reject;
+        }
+    }
+
     TouchArea {
         clicked => {
+            focus.focus();
             root.clicked();
         }
+    }
+
+    accessible-role: tab;
+    accessible-label: root.text;
+    accessible-checked: root.selected;
+    accessible-action-default => {
+        root.clicked();
     }
 }
 
@@ -187,6 +219,38 @@ component SeekBar inherits Rectangle {
         background: Palette.accent-background;
     }
 
+    // キーボードでもシークできるようにする（#146。左右キーで 5% ずつ、Home / End で端へ）。
+    // 押した瞬間に確定する（ドラッグのようなプレビューは挟まない）。
+    function seek-by(delta: float) {
+        root.seek-to-ratio(min(max(root.ratio + delta, 0.0), 1.0));
+    }
+
+    focus := FocusScope {
+        enabled: root.seekable;
+        key-pressed(event) => {
+            if (!root.seekable) {
+                return reject;
+            }
+            if (event.text == Key.RightArrow) {
+                root.seek-by(0.05);
+                return accept;
+            }
+            if (event.text == Key.LeftArrow) {
+                root.seek-by(-0.05);
+                return accept;
+            }
+            if (event.text == Key.Home) {
+                root.seek-to-ratio(0.0);
+                return accept;
+            }
+            if (event.text == Key.End) {
+                root.seek-to-ratio(1.0);
+                return accept;
+            }
+            return reject;
+        }
+    }
+
     TouchArea {
         enabled: root.seekable;
         // ポインタ位置をバー上の比率へ換算した値（バー外へドラッグしても 0.0〜1.0 に収める）。
@@ -203,6 +267,8 @@ component SeekBar inherits Rectangle {
         pointer-event(event) => {
             if (event.kind == PointerEventKind.down
                 && event.button == PointerEventButton.left) {
+                // 掴んだらフォーカスも移す（そのまま左右キーで微調整できる）。
+                focus.focus();
                 root.scrub-ratio = self.pointer-ratio;
                 root.scrubbing = true;
                 root.scrub-preview(root.scrub-ratio);
@@ -218,7 +284,13 @@ component SeekBar inherits Rectangle {
             }
         }
     }
+    accessible-role: progress-indicator;
+    accessible-label: "Playback position";
+    accessible-value: round(root.ratio * 100) + "%";
+    accessible-enabled: root.seekable;
 }
+
+
 
 // トレイの「Recordings…」から開く録音一覧ウィンドウ。左＝セッション一覧、右＝再生と文字起こし。
 // 配色は Palette でライト/ダークに追従し、サイズ・淡色は共有の Style トークンを使う

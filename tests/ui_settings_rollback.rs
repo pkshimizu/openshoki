@@ -15,22 +15,22 @@ use i_slint_backend_testing::ElementHandle;
 
 slint::include_modules!();
 
-/// 設定画面のチェックボックスはラベルを隣の Text に持たせているため、要素型で探して
+/// 設定画面のトグルはラベルを隣の Text に持たせているため、要素型で探して
 /// 並び順（宣言順 = 上から。Record automatically → Transcribe recordings →
 /// Generate meeting notes）で選ぶ。
-fn check_boxes(window: &AppWindow) -> Vec<ElementHandle> {
-    ElementHandle::find_by_element_type_name(window, "CheckBox").collect()
+fn toggles(window: &AppWindow) -> Vec<ElementHandle> {
+    ElementHandle::find_by_element_type_name(window, "Toggle").collect()
 }
 
-/// 同じく ComboBox を上から順に集める（Language → Model（whisper）→
+/// 同じく Select を上から順に集める（Language → Model（whisper）→
 /// Model（議事録ブロックの中）。後ろ 2 つはラベルが同名なので、所属で見分ける）。
 fn combo_boxes(window: &AppWindow) -> Vec<ElementHandle> {
-    ElementHandle::find_by_element_type_name(window, "ComboBox").collect()
+    ElementHandle::find_by_element_type_name(window, "Select").collect()
 }
 
-/// 同じく SpinBox（「Stop recording after the mic is released for」の 1 つだけ）。
-fn spin_box(window: &AppWindow) -> ElementHandle {
-    ElementHandle::find_by_element_type_name(window, "SpinBox")
+/// 同じく Stepper（「Stop recording after the mic is released for」の 1 つだけ）。
+fn stepper(window: &AppWindow) -> ElementHandle {
+    ElementHandle::find_by_element_type_name(window, "Stepper")
         .next()
         .expect("the settings window has a spin box")
 }
@@ -46,8 +46,8 @@ fn rust_can_roll_back_a_toggle_after_the_user_flipped_it() {
     ui_support::fit_settings_content(&window);
     window.set_auto_record_app(false);
 
-    let boxes = check_boxes(&window);
-    let first = boxes.first().expect("the settings window has a check box");
+    let boxes = toggles(&window);
+    let first = boxes.first().expect("the settings window has a toggle");
     assert_eq!(first.accessible_checked(), Some(false));
 
     // ユーザー操作で ON にする（Slint 側が先に自分の checked を更新してから
@@ -61,11 +61,11 @@ fn rust_can_roll_back_a_toggle_after_the_user_flipped_it() {
     assert_eq!(
         first.accessible_checked(),
         Some(false),
-        "the check box should follow the value Rust wrote back"
+        "the toggle should follow the value Rust wrote back"
     );
 }
 
-/// SpinBox（自動停止の待ち時間）も同じ契約を持つ。ここは保存**成功**時にも Rust から書き戻す
+/// Stepper（自動停止の待ち時間）も同じ契約を持つ。ここは保存**成功**時にも Rust から書き戻す
 /// （範囲へ丸めた値を反映する経路がある）ので、片方向に戻ると失敗時だけでなく丸めも届かなくなる。
 /// 見るのは「操作のあとでも Rust の set が届くこと」までで、丸めの計算自体は
 /// `config::clamp_debounce_secs` のテストが持つ。
@@ -78,14 +78,14 @@ fn rust_can_write_back_a_delay_after_the_user_edited_it() {
     ui_support::init_backend();
     let window = AppWindow::new().expect("create the settings window");
     ui_support::fit_settings_content(&window);
-    // SpinBox は自動録音 ON のときだけ操作できる（`deps` のゲート）。
+    // Stepper は自動録音 ON のときだけ操作できる（`deps` のゲート）。
     window.set_auto_record_app(true);
     window.set_auto_stop_debounce_secs(4);
 
-    let spin = spin_box(&window);
+    let spin = stepper(&window);
     assert_eq!(spin.accessible_value().as_deref(), Some("4"));
 
-    // ユーザー操作で 1 増やす（SpinBox の increment アクション）。
+    // ユーザー操作で 1 増やす（Stepper の increment アクション）。
     spin.invoke_accessible_increment_action();
     assert_eq!(window.get_auto_stop_debounce_secs(), 5);
 
@@ -94,7 +94,7 @@ fn rust_can_write_back_a_delay_after_the_user_edited_it() {
     assert_eq!(
         spin.accessible_value().as_deref(),
         Some("4"),
-        "the spin box should follow the value Rust wrote back"
+        "the stepper should follow the value Rust wrote back"
     );
 }
 
