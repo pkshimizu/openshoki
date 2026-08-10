@@ -75,7 +75,8 @@ export component SectionHeading inherits HorizontalLayout {
     }
 }
 
-// 設定のまとまりを載せる面。中身は呼び出し側が縦に積む（区切りは `CardDivider`）。
+// 設定のまとまりを載せる面。**子要素は内部の `VerticalLayout` が縦に積む**ので、呼び出し側は
+// 並べるだけでよい。直下には `CardBlock` / `CardDivider` を置く（区切りは `CardDivider`）。
 export component Card inherits Rectangle {
     border-width: 1px;
     border-color: Style.rule;
@@ -91,6 +92,18 @@ export component Card inherits Rectangle {
 export component CardDivider inherits Rectangle {
     height: 1px;
     background: Style.hairline;
+}
+
+// 面の中の 1 区画（1 行とは限らない。見出し＋一覧＋ボタン、のような塊も入る）。
+// 左右・上下の余白と要素の間隔を揃える。**`Card` の直下にはこれか `CardDivider` を置く**
+// （生の要素を直接置くと余白が付かない）。
+export component CardBlock inherits VerticalLayout {
+    padding-left: 15px;
+    padding-right: 15px;
+    padding-top: 13px;
+    padding-bottom: 13px;
+    spacing: 9px;
+    @children
 }
 
 // 状態を 1 行で伝える表示（ドット＋文＋任意の進捗バー）。文言と意味（`tone`）は Rust が決める
@@ -132,29 +145,21 @@ export component StatusLine inherits VerticalLayout {
         Rectangle {
             x: 0;
             width: parent.width * min(max(root.progress, 0), 1);
-            background: Style.caution-mark;
+            background: Style.tone-mark(root.tone);
         }
     }
-}
-
-// 面の中の 1 行分。左右の余白と行内の間隔を揃える（`Card` の直下に並べる）。
-export component CardRow inherits VerticalLayout {
-    padding-left: 15px;
-    padding-right: 15px;
-    padding-top: 13px;
-    padding-bottom: 13px;
-    spacing: 9px;
-    @children
 }
 
 // 小さな注記のバッジ（`Needs transcription` など）。状態そのものではなく「条件」を短く示す。
 export component Badge inherits Rectangle {
     in property <string> text;
-    in property <bool> caution: false;
+    // 意味は `StatusTone` で受ける（bool を増やさない。色の対応表は `Style` の 1 箇所）。
+    in property <StatusTone> tone: neutral;
+    property <brush> mark: Style.tone-ink(root.tone);
     border-width: 1px;
     border-radius: Style.badge-radius;
-    border-color: root.caution ? Style.caution.transparentize(0.6) : Style.rule-strong;
-    background: root.caution ? Style.caution.transparentize(0.88) : Style.sheet-sunken;
+    border-color: root.mark.transparentize(0.6);
+    background: root.mark.transparentize(0.88);
     HorizontalLayout {
         padding-left: 6px;
         padding-right: 6px;
@@ -164,7 +169,7 @@ export component Badge inherits Rectangle {
             text: root.text;
             font-size: Style.badge-size;
             letter-spacing: Style.badge-tracking;
-            color: root.caution ? Style.caution : Style.ink-faint;
+            color: root.mark;
         }
     }
 }

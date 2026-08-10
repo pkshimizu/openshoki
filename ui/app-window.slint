@@ -1,6 +1,6 @@
 import { Button, CheckBox, ComboBox, ScrollView, SpinBox } from "std-widgets.slint";
 import { Style, StatusTone } from "style.slint";
-import { SectionHeading, Card, CardDivider, CardRow, StatusLine, Badge } from "controls.slint";
+import { SectionHeading, Card, CardDivider, CardBlock, StatusLine, Badge } from "controls.slint";
 
 // Recordings ウィンドウは別ファイルで定義し、ここから再エクスポートして 1 つのエントリ
 // （build.rs は app-window.slint のみコンパイル）に含める。Rust 側は include_modules! で
@@ -11,7 +11,9 @@ export { ModelsWindow, ModelRow } from "models-window.slint";
 // 状態の意味は Rust から渡すので、生成コードに含まれるよう再エクスポートする。
 export { StatusTone } from "style.slint";
 
-// 自動録音のトリガーとして登録したアプリ 1 件。`limitation-note` が空でなければ、そのアプリを
+// 自動録音のトリガーとして登録したアプリ 1 件。**UI の表示語は「Watched apps」**で、
+// 識別子が `Trigger` なのは「自動録音の引き金」という成り立ちから（`config::AppTrigger` も同じ）。
+// 改名するなら設定側まで含めて別 issue にする。`limitation-note` が空でなければ、そのアプリを
 // 検知できない旨をリストに添えて出す（文言と判定は Rust 側の `auto_record_limitation`）。
 export struct TriggerApp {
     name: string,
@@ -122,7 +124,7 @@ export component AppWindow inherits Window {
     // config.toml でモデルファイルのパスを上書きしているか（`whisper_model_path`）。上書き中は
     // カタログの選択が使われないので、選択肢の説明行を出さない（状態行がその旨を示す）。
     in property <bool> whisper-model-overridden;
-    // 「文字起こしのあと議事録要約を自動生成」の ON/OFF。起動時に Rust 側が設定値で初期化し、
+    // 「文字起こしのあと議事録生成を自動生成」の ON/OFF。起動時に Rust 側が設定値で初期化し、
     // 以後はトグル操作で Slint が状態を保持する（in-out。保存失敗時は Rust 側が書き戻す）。
     in-out property <bool> auto-summarize;
     // 要約に使う LLM の表示名一覧（Rust 側の summary_model::CATALOG を反映。whisper と同じく
@@ -160,7 +162,7 @@ export component AppWindow inherits Window {
     // 内蔵 whisper モデルの変更。カタログ内インデックスを渡し、Rust 側で ID へ変換して永続化する。
     // 未取得のモデルの取得を始めるかは設定次第（`model_downloads_on_select`）。
     callback change-whisper-model(int);
-    // 議事録要約トグルの切り替え。新しい ON/OFF を渡し、Rust 側で設定へ永続化する。
+    // 議事録生成トグルの切り替え。新しい ON/OFF を渡し、Rust 側で設定へ永続化する。
     callback toggle-auto-summarize(bool);
     // 要約 LLM の変更。カタログ内インデックスを渡し、Rust 側で ID へ変換して永続化する。
     // 未取得のモデルの取得を始めるかは設定次第（`model_downloads_on_select`）。
@@ -171,7 +173,7 @@ export component AppWindow inherits Window {
     // 本文のスクロール位置。**確認用バイナリ（`examples/settings_view.rs`）が下端を撮るため**に
     // 外から動かせるようにしてある（本番の Rust 側は触らない）。負の値で下へスクロールする。
     // 画面の高さより本文が長く、1 枚のスナップショットに収まらないので必要になる
-    // （`ui/recordings-window.slint` の `delete-index` と同じ趣旨）。
+    // （`ui/models-window.slint` の `delete-index` と同じ趣旨）。
     in-out property <length> body-scroll;
 
     ScrollView {
@@ -192,7 +194,7 @@ export component AppWindow inherits Window {
                 }
 
                 Card {
-                    CardRow {
+                    CardBlock {
                         Text {
                             text: "Save location";
                             font-size: Style.body-size;
@@ -232,7 +234,7 @@ export component AppWindow inherits Window {
                 }
 
                 Card {
-                    CardRow {
+                    CardBlock {
                         HorizontalLayout {
                             spacing: 14px;
                             VerticalLayout {
@@ -274,17 +276,18 @@ export component AppWindow inherits Window {
                         property <bool> enabled-gate: root.auto-record-app;
                         opacity: enabled-gate ? 1.0 : Style.disabled-opacity;
                         VerticalLayout {
-                            CardRow {
+                            CardBlock {
                                 Text {
+                                    // 面の中の小見出し（セクション見出しより一段弱い）。
                                     text: "WATCHED APPS · " + root.app-list.length;
-                                    font-size: Style.section-size;
-                                    letter-spacing: Style.badge-tracking;
+                                    font-size: Style.heading-size;
+                                    letter-spacing: Style.section-tracking;
                                     color: Style.ink-faint;
                                 }
 
                                 // 1 件も無いときは、枠だけの空欄ではなく次にすることを書く。
                                 if root.app-list.length == 0: Text {
-                                    text: "No apps yet. Add one and shoki starts recording as soon as it opens the microphone.";
+                                    text: "No apps yet. Add one and shoki starts recording when it opens the microphone (macOS 14.4+).";
                                     wrap: word-wrap;
                                     font-size: Style.caption-size;
                                     color: Style.ink-muted;
@@ -324,7 +327,7 @@ export component AppWindow inherits Window {
 
                             CardDivider { }
 
-                            CardRow {
+                            CardBlock {
                                 HorizontalLayout {
                                     spacing: 14px;
                                     Text {
@@ -371,7 +374,7 @@ export component AppWindow inherits Window {
                 }
 
                 Card {
-                    CardRow {
+                    CardBlock {
                         HorizontalLayout {
                             spacing: 14px;
                             VerticalLayout {
@@ -409,7 +412,7 @@ export component AppWindow inherits Window {
                         VerticalLayout {
                             CardDivider { }
 
-                            CardRow {
+                            CardBlock {
                                 HorizontalLayout {
                                     spacing: 14px;
                                     Text {
@@ -433,7 +436,7 @@ export component AppWindow inherits Window {
 
                             CardDivider { }
 
-                            CardRow {
+                            CardBlock {
                                 HorizontalLayout {
                                     spacing: 14px;
                                     Text {
@@ -514,12 +517,12 @@ export component AppWindow inherits Window {
 
                                                         Badge {
                                                             text: "NEEDS TRANSCRIPTION";
-                                                            caution: true;
+                                                            tone: StatusTone.caution;
                                                         }
                                                     }
 
                                                     Text {
-                                                        text: "Summarises the transcript into decisions and action items.";
+                                                        text: "Summarizes the transcript into decisions and action items.";
                                                         wrap: word-wrap;
                                                         font-size: Style.caption-size;
                                                         color: Style.ink-muted;
@@ -597,7 +600,7 @@ export component AppWindow inherits Window {
                 Text {
                     // モデルは内蔵（初回に自動ダウンロード）。これまで通信ゼロだったアプリで唯一の
                     // 外部通信になるため、接続先と「音声は送らない」ことを明示する（透明性）。
-                    text: "Models are downloaded from Hugging Face the first time they are used. Audio and transcripts never leave this Mac.";
+                    text: "Models are downloaded from Hugging Face when you choose them or when they are first needed. Audio and transcripts never leave this Mac.";
                     wrap: word-wrap;
                     font-size: Style.caption-size;
                     color: Style.ink-faint;

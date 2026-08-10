@@ -16,17 +16,19 @@ use i_slint_backend_testing::ElementHandle;
 slint::include_modules!();
 
 /// 設定画面のチェックボックスはラベルを隣の Text に持たせているため、要素型で探して
-/// 並び順（宣言順 = 上から。Auto-record → Auto-transcribe → Write meeting minutes）で選ぶ。
+/// 並び順（宣言順 = 上から。Record automatically → Transcribe recordings →
+/// Generate meeting notes）で選ぶ。
 fn check_boxes(window: &AppWindow) -> Vec<ElementHandle> {
     ElementHandle::find_by_element_type_name(window, "CheckBox").collect()
 }
 
-/// 同じく ComboBox を上から順に集める（Language → Model → Minutes Model）。
+/// 同じく ComboBox を上から順に集める（Language → Model（whisper）→
+/// Model（議事録ブロックの中）。後ろ 2 つはラベルが同名なので、所属で見分ける）。
 fn combo_boxes(window: &AppWindow) -> Vec<ElementHandle> {
     ElementHandle::find_by_element_type_name(window, "ComboBox").collect()
 }
 
-/// 同じく SpinBox（Auto-stop delay の 1 つだけ）。
+/// 同じく SpinBox（「Stop recording after the mic is released for」の 1 つだけ）。
 fn spin_box(window: &AppWindow) -> ElementHandle {
     ElementHandle::find_by_element_type_name(window, "SpinBox")
         .next()

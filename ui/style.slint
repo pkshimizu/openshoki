@@ -19,6 +19,10 @@ export enum StatusTone {
 // shoki のデザイントークン。アプリアイコンの「和紙の地・墨・朱の落款」を起点にした配色と、
 // タイポグラフィ・淡色の値を 1 箇所へ集約する（#127）。全ウィンドウで共有する。
 //
+// **移行状況（#127 時点）**: このトークンへ移行済みなのは設定画面（`app-window.slint`）だけ。
+// `recordings-window.slint` / `models-window.slint` はまだ `Palette` の色を使っており、
+// それぞれ #128 / #141 で移行する。混在して見えるのはそのため。
+//
 // **OS の `Palette` に色を委ねない**: shoki 固有の紙色を出すため、面・文字・枠は下の値を使う。
 // ライト/ダークの切り替えだけ `Palette.color-scheme` に従う（OS の設定に追従するため）。
 // 個々の `.slint` で色を直書きしないこと——片方のテーマだけ調整が漏れる。
@@ -29,13 +33,12 @@ export global Style {
     // --- 面（紙） ---
     // ウィンドウの地。
     out property <brush> paper: root.dark ? #1b1a17 : #f3ede2;
-    // 地より一段持ち上がる帯（一覧のヘッダ・フッタ）。
-    out property <brush> paper-raised: root.dark ? #212019 : #f7f2e9;
     // 設定のまとまりを載せる面。
     out property <brush> sheet: root.dark ? #232220 : #faf7f0;
     // 面の中でさらに沈める部分（従属ブロック・一覧の区切り見出し）。
     out property <brush> sheet-sunken: root.dark ? #1f1e1b : #f6f1e7;
-    // 入力コントロールの面。
+    // 面の上に置く小さな箱（監視アプリの行など）。**`sheet` の上に載る前提**で、`paper` と
+    // 同値でよい（地の上に直接置くと沈まないので置かないこと）。
     out property <brush> field: root.dark ? #2b2926 : #f3ede2;
 
     // --- 枠 ---
@@ -56,7 +59,6 @@ export global Style {
     // --- 朱（落款） ---
     // 唯一のアクセント。多用しない: 見出しの標・選択中の標・主となるボタンだけに使う。
     out property <brush> seal: root.dark ? #e2704f : #c04a2c;
-    out property <brush> seal-pressed: root.dark ? #c9563a : #a83e22;
     // 朱の面の上に載る文字。
     out property <brush> on-seal: root.dark ? #1b1a17 : #fdfbf6;
 
@@ -67,11 +69,18 @@ export global Style {
     out property <brush> danger: root.dark ? #e08172 : #a53326;
     // 完了・準備できている。
     out property <brush> done: root.dark ? #6b9159 : #4a6b3f;
-    // 状態のドットは文字より一段濃くする（6px の点は文字色のままだと沈む）。
-    out property <brush> caution-mark: #c98a2b;
-    out property <brush> done-mark: #6b9159;
+    // 状態のドット。6px の点は文字色のままだと沈むので、**文字より彩度を上げる**
+    // （明度ではない: ライトでは文字より明るく、ダークでは文字と同程度になる）。
+    out property <brush> caution-mark: root.dark ? #e0a45c : #c98a2b;
+    out property <brush> done-mark: root.dark ? #7fa86a : #6b9159;
 
-    // 状態の意味 → 文字色 / ドット色。**網羅の対応表はここだけ**に置く。
+    // 状態の意味 → 文字色 / ドット色。対応表はここ 1 箇所だけに置く。
+    //
+    // **Slint の三項連鎖なので網羅チェックは効かない**（未処理の意味は暗黙に neutral へ落ちる）。
+    // `StatusTone` にバリアントを足したら、この 2 つの関数も必ず直すこと
+    // （`docs/rules/slint.md` の「三項連鎖にしない」の例外。色は Rust 側へ持てないため）。
+    // `active` が `caution` と同じ色なのは意図的: 進行中と注意は同じ「まだ終わっていない」域で、
+    // 進行中は進捗バーの有無で区別できるため、色を増やさない。
     pure public function tone-ink(tone: StatusTone) -> brush {
         return tone == StatusTone.done
             ? root.done
@@ -101,19 +110,21 @@ export global Style {
     out property <length> badge-tracking: 0.9px;
     out property <int> semibold: 600;
     out property <int> regular: 400; // 通常ウェイト（semibold と対で明示するときに使う）
-    out property <float> muted-alpha: 0.4; // 補助テキストの淡色化（transparentize の引数）
+    // **旧方式**（`Palette.foreground.transparentize(...)` と組で使う）。まだ移行していない
+    // ウィンドウが使う。新規は `ink-muted` / `ink-faint` を使うこと。
+    out property <float> muted-alpha: 0.4;
     out property <float> disabled-opacity: 0.45; // 従属/未選択ブロックの淡色化（opacity）
 
     // --- 寸法 ---
     out property <length> card-radius: 9px;
-    out property <length> control-radius: 6px;
     out property <length> badge-radius: 4px;
-    // セクション見出しの標と、選択中の行の標。同じ朱の縦棒で、太さだけ変える。
+    // セクション見出しの標（朱の縦棒）。
     out property <length> mark-width: 4px;
-    out property <length> row-mark-width: 3px;
 
-    // アクセント背景の上に載る前景（既存コードの互換のため残す。中身は `on-seal` と同じ）。
-    out property <brush> on-accent-foreground: root.on-seal;
+    // **旧方式**。OS のアクセント色（`Palette.accent-background`）の上に載る前景で、白のまま。
+    // shoki の朱（`seal`）の上に載せるものではないので `on-seal` とは別物。まだ移行していない
+    // ウィンドウが使う（新規は `on-seal`）。
+    out property <brush> on-accent-foreground: #ffffff;
     // 再生中セグメントのハイライト背景（朱の淡色）。
     out property <brush> segment-highlight: root.seal.transparentize(0.88);
     // 一覧の区切り見出しの背景。
