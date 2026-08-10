@@ -46,8 +46,8 @@ use sha2::{Digest, Sha256};
 /// ここに置くのは種別をまたいで共通のものだけにする。
 #[derive(Debug)]
 pub struct ModelSpec {
-    /// ログとモデル一覧の行に出す種別の**表示名**（例: `Whisper speech`）。ログでどちらの
-    /// ダウンロードかを見分けるのと、一覧の 2 行目に出すのに使う。
+    /// ログに出す種別の**表示名**（例: `Whisper speech`）。どちらのダウンロードかをログで
+    /// 見分けるために使う（一覧の 2 行目はカタログの `description` を出すので、ここは出さない）。
     ///
     /// **破壊的操作の判定キーにしない**（文言を調整した瞬間に判定が変わる）。種別の識別は
     /// `ModelKind`（登録簿 `REGISTERED_CATALOGS` が持つ）で行う。
@@ -156,17 +156,13 @@ impl ModelDownloader {
         }
     }
 
-    /// このモデル ID の取得がいま走っているか。
+    /// 記録済みの取得状況を ID で引く（記録が無ければ `None`）。
     ///
-    /// `status_of` と違い**ディスクを見ない**し、状態を外へ出さない（モデル一覧（#117）は
-    /// ディスク走査の結果を持っているので存在確認は不要で、知りたいのは「いま取得中か」だけ。
-    /// `Failed(String)` を行ごとに clone しないためにも bool で返す）。`&'static ModelSpec` を
-    /// 用意せずに引けるようにしてある（一覧の行はカタログ外もありうる）。
-    pub fn is_downloading(&self, id: &str) -> bool {
-        matches!(
-            self.lock().get(id),
-            Some(DownloadStatus::Downloading { .. })
-        )
+    /// `status_of` と違い**ディスクを見ない**（モデル管理 UI（#138）はディスク走査の結果を
+    /// 持っているので存在確認は不要）。進捗と失敗も要るので状態をそのまま返す
+    /// （`&'static ModelSpec` を用意せずに引けるようにしてある: 一覧の行はカタログ外もありうる）。
+    pub fn recorded_status(&self, id: &str) -> Option<DownloadStatus> {
+        self.lock().get(id).cloned()
     }
 
     /// UI 起点: 未取得（または直近失敗）ならバックグラウンドスレッドでダウンロードを開始する。
@@ -198,6 +194,12 @@ impl ModelDownloader {
     /// 確認に落ちた取得は**待たせずに失敗させる**（この doc の 2 点目のとおり、待たせる害を
     /// 避けるため）。文字起こし中なら当該セッションのジョブが失敗し、次のジョブ・設定画面での
     /// 再選択で再試行される（自動リトライは無い）。
+    ///
+    /// **入口は 3 つ**（設定画面の選択・ワーカーの `ensure_model`・モデル管理ウィンドウの
+    /// 「Download」。#138 で 3 つ目が増えた）。管理ウィンドウからはカタログ全件を個別に始められる
+    /// ので、続けて押せば同時に何本でも走る——上限を持たない判断は変えていないが、まとめて始めると
+    /// **空き容量の事前確認で全部が落ちる**ことがある（各スレッドが他の在庫の残量を必要量へ
+    /// 加算するため）。落ちた取得は状態と行の文言に理由が出るので、順に始め直せる。
     ///
     /// 同種別で別モデルを選び直したときに先の取得を打ち切る仕組みは別件（#124）。
     pub fn request_download(&self, spec: &'static ModelSpec) {
@@ -310,8 +312,8 @@ impl ModelDownloader {
     /// 設定画面の 100ms ポーリングが「削除したのに Downloaded」と表示し続ける。
     ///
     /// 取得中（`Downloading`）のモデルは削除せずエラーにする: 完了時の rename でファイルが復活し、
-    /// 「削除したのに残っている」ことになる。UI でも無効化するが、UI の状態は開いた時点のもの
-    /// （一覧は tick で作り直さない）なので、**ここが最後の砦**。判定・削除・エントリ掃除を
+    /// 「削除したのに残っている」ことになる。UI でも無効化するが、UI の状態は最後の tick 時点の
+    /// もの（tick とクリックの間に取得が始まりうる）なので、**ここが最後の砦**。判定・削除・エントリ掃除を
     /// 1 回のロックの中で行う: ダウンロードの開始も同じロックを取る（`ensure_model` の
     /// check-and-set）ため、この間に取得が始まることはない
     /// （`docs/rules/coding-conventions.md` の「見てから決めるは 1 回のロックに畳む」）。
@@ -538,10 +540,10 @@ pub(crate) const REGISTERED_CATALOGS: &[(ModelKind, &[ModelSpec], &str)] = &[
 
 /// `models/` に置かれているモデルファイル 1 件（モデル一覧ウィンドウの 1 行。#117）。
 ///
-/// **一覧の正はディスク**で、カタログは表示名・種別の解決にだけ使う（カタログ全件を並べると
-/// 未取得の行がノイズになる。一覧の目的は「何が容量を食っているか」を見て消すこと）。
-/// カタログを差し替えた後の旧ファイルのように、**カタログに無いファイルも一覧に出す**
-/// （消せないと掃除できない）。その場合は種別・表示名・ID が `None` になる。
+/// 一覧の骨格はカタログの登録簿（`REGISTERED_CATALOGS`）で、**ディスクの走査はその行に実体と
+/// 実サイズを与える**役目（#138。#117 では走査結果そのものが一覧だった）。カタログを差し替えた
+/// 後の旧ファイルのように、**カタログに無いファイルも列挙する**（消せないと掃除できない）。
+/// その場合は種別・表示名・ID が `None` になる。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledModel {
     /// `models/` 直下のファイル名。削除の対象を指すキー（`ModelDownloader::delete`）。
@@ -551,11 +553,8 @@ pub struct InstalledModel {
     pub size_bytes: u64,
     /// カタログが引けたときの**種別**（削除ガードの判定キー。`ModelKind`）。カタログ外は `None`。
     pub kind: Option<ModelKind>,
-    /// カタログが引けたときの種別の**表示名**（`ModelSpec::kind`）。判定には使わない。
-    pub kind_label: Option<&'static str>,
-    /// カタログが引けたときの表示名。カタログ外は `None`（表示はファイル名で代替する）。
-    pub display_name: Option<&'static str>,
     /// カタログが引けたときのモデル ID。状態マップのキーなので、削除時のエントリ掃除に使う。
+    /// 表示名・説明はカタログ（`ModelSpec`）から引くので、ここには持たない。
     pub catalog_id: Option<&'static str>,
 }
 
@@ -568,10 +567,10 @@ pub struct InstalledModel {
 /// 走査そのものに失敗したら `Err`（呼び出し側が「1 つも無い」と区別して表示するため。空一覧に
 /// 畳むと、権限エラーで読めないだけのときに「まだ何も無い」と嘘を言う）。
 ///
-/// **取得中のモデルは並ばない**: 受信中の中身は一時ファイル（`*.part.<pid>`）で、まだモデル
-/// ではないため（取得の進捗は設定画面の状態行が出す）。そのぶん合計使用量は受信中のバイトを
-/// 含まない。完了して rename された時点で一覧に現れる。取り残された一時ファイルの回収は
-/// `sweep_orphaned_part_files` が持つので、ここでは扱わない。
+/// **取得中のモデルはここには出ない**: 受信中の中身は一時ファイル（`*.part.<pid>`）で、まだ
+/// モデルではないため。そのぶん合計使用量は受信中のバイトを含まない（取得中であること自体は
+/// 状態マップから分かるので、モデル管理 UI は行の状態として進捗を出す）。取り残された一時
+/// ファイルの回収は `sweep_orphaned_part_files` が持つので、ここでは扱わない。
 pub fn installed_models() -> std::io::Result<Vec<InstalledModel>> {
     let Some(dir) = models_dir() else {
         return Ok(Vec::new());
@@ -650,8 +649,6 @@ fn installed_models_in(
             filename: filename.to_owned(),
             size_bytes: metadata.len(),
             kind: found.map(|(kind, _)| kind),
-            kind_label: found.map(|(_, spec)| spec.kind),
-            display_name: found.map(|(_, spec)| spec.display_name),
             catalog_id: found.map(|(_, spec)| spec.id),
         });
     }
@@ -665,25 +662,35 @@ fn installed_models_in(
     Ok(models)
 }
 
-/// 設定のモデルパス上書き（`whisper_model_path` / `summary_model_path`）が、この行のファイルを
-/// 指しているか。
+/// 設定のモデルパス上書き（`whisper_model_path` / `summary_model_path`）が `models/` 直下を
+/// 指しているなら、そのファイル名。
 ///
-/// 上書きは `models/` の**外**を指すのが普通だが、`models/` 直下を指すこともできる。その場合は
-/// カタログ外の行として並ぶので、上書き先だと分からないと「実行中のジョブが読んでいるファイル」を
-/// 削除できてしまう（判定は `main::row_is_busy` と `main::model_row_state`）。
-pub fn is_override_of(model: &InstalledModel, override_path: Option<&Path>) -> bool {
-    let Some(dir) = models_dir() else {
-        return false;
-    };
-    is_override_of_in(&dir, model, override_path)
+/// 上書きは `models/` の**外**を指すのが普通だが、直下を指すこともできる。その場合、上書き先だと
+/// 分からないと (1) 実行中のジョブが読んでいるファイルを削除できてしまい、(2)「消しても再取得
+/// される」という誤った案内を出してしまう（上書き中は `ensure_model` を通らない）。判定は
+/// `main::row_facts`。
+///
+/// 名前まで還元しておくのは、**行ごと・tick ごとに `canonicalize` を叩かない**ため（一覧は
+/// 10Hz で組み直す）。解決はディスクを走査するタイミングで 1 回だけ行い、行の判定はファイル名の
+/// 比較にする（`main::OverrideFiles`）。
+pub fn override_filename(override_path: Option<&Path>) -> Option<String> {
+    let dir = models_dir()?;
+    override_filename_in(&dir, override_path)
+}
+
+/// `override_filename` の本体（基点ディレクトリを引数で受け、テストから呼べるようにする）。
+fn override_filename_in(dir: &Path, override_path: Option<&Path>) -> Option<String> {
+    let path = override_path?;
+    let name = path.file_name()?.to_str()?;
+    is_override_of_in(dir, name, Some(path)).then(|| name.to_owned())
 }
 
 /// `is_override_of` の本体（基点ディレクトリを引数で受け、テストから呼べるようにする）。
-fn is_override_of_in(dir: &Path, model: &InstalledModel, override_path: Option<&Path>) -> bool {
+fn is_override_of_in(dir: &Path, filename: &str, override_path: Option<&Path>) -> bool {
     let Some(override_path) = override_path else {
         return false;
     };
-    let installed = dir.join(&model.filename);
+    let installed = dir.join(filename);
     if override_path == installed {
         return true;
     }
@@ -1058,13 +1065,9 @@ mod tests {
         );
         assert_eq!(models[0].size_bytes, 30, "the size is the real file length");
         assert_eq!(models[0].kind, Some(ModelKind::Speech));
-        assert_eq!(models[0].kind_label, Some(FAKE_SPEECH_MODEL.kind));
-        assert_eq!(models[0].display_name, Some(FAKE_SPEECH_MODEL.display_name));
         assert_eq!(models[0].catalog_id, Some(FAKE_SPEECH_MODEL.id));
         // カタログ外はファイル名とサイズだけが分かる。
         assert_eq!(models[1].kind, None);
-        assert_eq!(models[1].kind_label, None);
-        assert_eq!(models[1].display_name, None);
         assert_eq!(models[1].catalog_id, None);
         // 2 つ目のカタログからも引ける（種別非依存。種別も登録簿の値が入る）。
         assert_eq!(models[2].catalog_id, Some(FAKE_LLM_MODEL.id));
@@ -1181,8 +1184,6 @@ mod tests {
             filename: "victim.bin".to_owned(),
             size_bytes: 1,
             kind: None,
-            kind_label: None,
-            display_name: None,
             catalog_id: None,
         };
         ModelDownloader::new()
@@ -1204,8 +1205,6 @@ mod tests {
             filename: name.to_owned(),
             size_bytes: 1,
             kind: None,
-            kind_label: None,
-            display_name: None,
             catalog_id: None,
         };
 
@@ -1238,44 +1237,70 @@ mod tests {
             filename: "custom.gguf".to_owned(),
             size_bytes: 1,
             kind: None,
-            kind_label: None,
-            display_name: None,
             catalog_id: None,
         };
         let installed = dir.join(&model.filename);
         std::fs::write(&installed, b"x").expect("writing the fixture should succeed");
 
         // 素の一致。
-        assert!(is_override_of_in(&dir, &model, Some(&installed)));
+        assert!(is_override_of_in(&dir, &model.filename, Some(&installed)));
         // `.` / `..` を挟んだ書き方でも一致する（canonicalize で解決する）。
         let indirect = dir.join("sub").join("..").join(&model.filename);
         std::fs::create_dir_all(dir.join("sub")).expect("creating the subdir should succeed");
-        assert!(is_override_of_in(&dir, &model, Some(&indirect)));
+        assert!(is_override_of_in(&dir, &model.filename, Some(&indirect)));
         // 別のファイル・上書き無しは一致しない。
         assert!(!is_override_of_in(
             &dir,
-            &model,
+            &model.filename,
             Some(&dir.join("other.gguf"))
         ));
-        assert!(!is_override_of_in(&dir, &model, None));
+        assert!(!is_override_of_in(&dir, &model.filename, None));
         // 実ファイルが無くても素の比較で一致する（canonicalize は両方失敗する）。
         let missing = InstalledModel {
             filename: "not-created.gguf".to_owned(),
             size_bytes: 1,
             kind: None,
-            kind_label: None,
-            display_name: None,
             catalog_id: None,
         };
         assert!(is_override_of_in(
             &dir,
-            &missing,
+            &missing.filename,
             Some(&dir.join(&missing.filename))
         ));
         // `models/` の外を指す上書き（本来の使い方）は、この行とは無関係。
         let outside = temp_path("override-outside");
         std::fs::write(&outside, b"x").expect("writing the fixture should succeed");
-        assert!(!is_override_of_in(&dir, &model, Some(&outside)));
+        assert!(!is_override_of_in(&dir, &model.filename, Some(&outside)));
+
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 上書きパスが `models/` 直下を指すときだけ、そのファイル名を返す（行の判定を名前の比較だけで
+    /// 済ませるための解決。`models/` の外を指す本来の使い方では `None`）。
+    #[test]
+    fn override_filename_resolves_only_inside_the_models_folder() {
+        let dir = models_fixture("override-filename");
+        let inside = dir.join("custom.gguf");
+        std::fs::write(&inside, b"x").expect("writing the fixture should succeed");
+
+        assert_eq!(
+            override_filename_in(&dir, Some(&inside)),
+            Some("custom.gguf".to_owned())
+        );
+        // `..` を挟んでも解決できる（`canonicalize` で一致を見る）。
+        std::fs::create_dir_all(dir.join("sub")).expect("creating the subdir should succeed");
+        let indirect = dir.join("sub").join("..").join("custom.gguf");
+        assert_eq!(
+            override_filename_in(&dir, Some(&indirect)),
+            Some("custom.gguf".to_owned())
+        );
+        // `models/` の外を指す上書き（本来の使い方）・未設定・ファイル名で終わらないパスは `None`。
+        let outside = temp_path("override-filename-outside");
+        std::fs::write(&outside, b"x").expect("writing the fixture should succeed");
+        assert_eq!(override_filename_in(&dir, Some(&outside)), None);
+        assert_eq!(override_filename_in(&dir, None), None);
+        assert_eq!(override_filename_in(&dir, Some(Path::new("/"))), None);
 
         let _ = std::fs::remove_file(&outside);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1359,8 +1384,6 @@ mod tests {
                 filename,
                 size_bytes: 1,
                 kind: None,
-                kind_label: None,
-                display_name: None,
                 catalog_id: None,
             };
             downloader

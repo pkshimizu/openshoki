@@ -1,16 +1,16 @@
-//! モデル一覧ウィンドウの描画確認用バイナリ（`docs/rules/slint.md` の検証手順）。
+//! モデル管理ウィンドウの描画確認用バイナリ（`docs/rules/slint.md` の検証手順）。
 //!
-//! 一覧の行は「名前・種別＋ファイル名・状態」の 3 段と、右のサイズ・Delete が横に並ぶ。
-//! 長い表示名やカタログ外の長いファイル名で潰れやすく、**空のとき**の縮退表示と確認モーダルは
-//! ビルドやテストバックエンドでは検出できないため、ここで目視する。
+//! 行は「名前・説明・状態」の 3 段と、右のサイズ・最大 2 つのボタン（Use / Download / Delete）が
+//! 横に並ぶ。種別の見出しを挟み、状態によってボタンの数が変わるので**行の高さと横幅が揃わなく
+//! なりやすい**。空のときの縮退表示と確認モーダルも、ビルドやテストバックエンドでは検出できない
+//! ため、ここで目視する。
 //!
 //! ```sh
-//! cargo run --example models_view                        # 既定（複数行＋カタログ外＋長い名前）
-//! cargo run --example models_view -- empty               # 1 つも取得していない状態
-//! cargo run --example models_view -- one                 # 1 行だけ
+//! cargo run --example models_view                        # 既定（種別 2 つ＋カタログ外）
+//! cargo run --example models_view -- empty               # 一覧が空（表示の穴を見る）
+//! cargo run --example models_view -- unreadable          # models/ を走査できなかった通知
 //! cargo run --example models_view -- confirm             # 削除の確認モーダルを開いた状態
 //! cargo run --example models_view -- notice              # 失敗の通知を出した状態
-//! cargo run --example models_view -- unreadable          # models/ を走査できなかった状態
 //! cargo run --example models_view -- <上記> snapshot out.png  # PNG に書き出して確認
 //! ```
 
@@ -27,71 +27,188 @@ use slint::{ComponentHandle, ModelRc, VecModel};
 /// import できない。あちらを変えたらここも合わせること）。
 const DELETE_DETAIL_HEAD: &str = "The file is deleted permanently — it does not go to the Trash.";
 
-/// 状態テキストも Rust 側（`src/main.rs` の `model_state_text`）が組む。同じ理由で複製を置く
-/// （長さが見え方に効くのが確認の主目的）。
-fn row(name: &str, detail: &str, size: &str, state_text: &str, state: ModelRowState) -> ModelRow {
+/// 種別の区切り行。
+fn heading(title: &str) -> ModelRow {
     ModelRow {
-        name: name.into(),
-        detail: detail.into(),
-        size: size.into(),
-        state_text: state_text.into(),
-        delete_detail: format!(
-            "This frees {size}. {DELETE_DETAIL_HEAD} {}",
-            // 後半は状態で変わる（`model_delete_detail`）。
-            match state {
-                ModelRowState::Unknown => "The app cannot download this file again.",
-                ModelRowState::InConfig =>
-                    "config.toml points at this file, so the app cannot download it again.",
-                _ => "It downloads again the next time it is needed.",
-            }
-        )
-        .into(),
-        state,
+        is_heading: true,
+        name: title.into(),
+        ..ModelRow::default()
     }
 }
 
-/// 既定の並び: 選択中・使用中・取得中・カタログ外（長いファイル名）を混ぜる。
+/// 確認モーダルの後半の文言（`src/main.rs` の `model_delete_detail` の写像。使用状況で変わるので、
+/// `can_use` から推測せずに行ごとに渡す）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Returns {
+    /// カタログの行（消しても次に必要になったとき取得される）。
+    Redownloads,
+    /// `config.toml` がこの行のファイルを指している（自動では戻らないが Download で取り直せる）。
+    InConfig,
+    /// その種別が `config.toml` で上書きされている（上書きを外すまで戻らない）。
+    Overridden,
+    /// カタログ外（アプリでは戻せない）。
+    Never,
+}
+
+/// 1 行。状態テキストは Rust 側（`src/main.rs` の `model_row_status_text`）の複製を置く
+/// （長さが見え方に効くのが確認の主目的）。
+/// 行 1 つの指定（引数が増えすぎないようまとめる）。
+struct Sample<'a> {
+    name: &'a str,
+    detail: &'a str,
+    size: &'a str,
+    status_text: &'a str,
+    status: ModelStatus,
+    returns: Returns,
+    can_use: bool,
+    can_delete: bool,
+}
+
+fn row(sample: Sample) -> ModelRow {
+    let Sample {
+        name,
+        detail,
+        size,
+        status_text,
+        status,
+        returns,
+        can_use,
+        can_delete,
+    } = sample;
+    ModelRow {
+        is_heading: false,
+        name: name.into(),
+        detail: detail.into(),
+        size: size.into(),
+        status_text: status_text.into(),
+        delete_detail: format!(
+            "This frees {size}. {DELETE_DETAIL_HEAD} {}",
+            match returns {
+                Returns::Redownloads => "It downloads again the next time it is needed.",
+                Returns::InConfig =>
+                    "config.toml points at this file, so it does not come back on its own — use Download to fetch it again.",
+                Returns::Overridden =>
+                    "It downloads again once config.toml no longer sets the model file.",
+                Returns::Never => "The app cannot download this file again.",
+            }
+        )
+        .into(),
+        status,
+        can_use,
+        // 取得できるのは、ディスクに実体が無いカタログの行で、上書き先が別のファイルでないとき
+        // （`can_download_row`）。この確認用バイナリでは `Overridden` の行だけ出さない。
+        can_download: matches!(status, ModelStatus::NotDownloaded | ModelStatus::Failed)
+            && returns != Returns::Overridden,
+        can_delete,
+    }
+}
+
+/// 削除の確認モーダルで見る行（説明がいちばん長い）。`sample_rows` の中の名前と一致させること。
+const CONFIRM_SAMPLE_NAME: &str = "my-own-model.gguf";
+
+/// 既定の並び: 種別 2 つ（未取得・取得中・取得済み・選択中・失敗）＋カタログ外・config 上書き先。
 fn sample_rows() -> Vec<ModelRow> {
     vec![
-        row(
-            "Qwen2.5 7B Instruct",
-            "Summary LLM — qwen2.5-7b-instruct-q4_k_m.gguf",
-            "4.4 GB",
-            "Downloaded — selected in Settings",
-            ModelRowState::Selected,
-        ),
-        row(
-            "Large v3 Turbo",
-            "Whisper speech — ggml-large-v3-turbo.bin",
-            "1.5 GB",
-            "In use right now — cannot be deleted",
-            ModelRowState::InUse,
-        ),
-        row(
-            "Small",
-            "Whisper speech — ggml-small.bin",
-            "465 MB",
-            "Downloading — cannot be deleted",
-            ModelRowState::Downloading,
-        ),
-        row(
+        heading("Transcription — Whisper"),
+        row(Sample {
+            name: "Small",
+            detail: "balanced speed and accuracy",
+            size: "465 MB",
+            status_text: "Downloaded — selected in Settings",
+            status: ModelStatus::Installed,
+            returns: Returns::Redownloads,
+            can_use: false,
+            can_delete: true,
+        }),
+        row(Sample {
+            name: "Large v3 Turbo",
+            detail: "the most accurate, and the slowest",
+            size: "1.5 GB",
+            status_text: "Downloading… 42%",
+            status: ModelStatus::Downloading,
+            returns: Returns::Redownloads,
+            can_use: true,
+            can_delete: false,
+        }),
+        row(Sample {
+            name: "Tiny",
+            detail: "the fastest, least accurate",
+            size: "74 MB",
+            status_text: "Not downloaded",
+            status: ModelStatus::NotDownloaded,
+            returns: Returns::Redownloads,
+            can_use: true,
+            can_delete: false,
+        }),
+        heading("Meeting minutes — LLM"),
+        row(Sample {
+            name: "Qwen2.5 7B Instruct",
+            detail: "54 s and 8.2 GB of memory for a 4-min meeting, more faithful",
+            size: "4.4 GB",
+            status_text: "Downloaded — selected in Settings — cannot be deleted while it is in use",
+            status: ModelStatus::Installed,
+            returns: Returns::Redownloads,
+            can_use: false,
+            can_delete: false,
+        }),
+        row(Sample {
+            // 失敗の理由まで行に出るので、いちばん長い状態テキストになる（折り返しの確認用）。
+            name: "Qwen2.5 3B Instruct",
+            detail: "25 s and 3.7 GB of memory for a 4-min meeting, but can invent details",
+            size: "2.0 GB",
+            status_text: "Download failed: not enough free disk space for Qwen2.5 3B Instruct — free up about 1.2 GB and try again",
+            status: ModelStatus::Failed,
+            returns: Returns::Redownloads,
+            can_use: true,
+            can_delete: false,
+        }),
+        row(Sample {
+            // config.toml が種別を上書きしている行。**未取得なのにボタンが 1 つも出ない**唯一の
+            // 組み合わせなので、ボタン列の幅の見え方をここで見る。
+            name: "Qwen2.5 7B Instruct (overridden)",
+            detail: "54 s and 8.2 GB of memory for a 4-min meeting, more faithful",
+            size: "4.4 GB",
+            status_text: "Not downloaded — not used because config.toml sets the model file",
+            status: ModelStatus::NotDownloaded,
+            returns: Returns::Overridden,
+            can_use: false,
+            can_delete: false,
+        }),
+        row(Sample {
+            // 上書き中の種別で、実体はある行（削除の確認モーダルがこの文言になる）。
+            name: "Qwen2.5 3B Instruct (overridden, on disk)",
+            detail: "25 s and 3.7 GB of memory for a 4-min meeting, but can invent details",
+            size: "2.0 GB",
+            status_text: "Downloaded — not used because config.toml sets the model file",
+            status: ModelStatus::Installed,
+            returns: Returns::Overridden,
+            can_use: false,
+            can_delete: true,
+        }),
+        heading("Other files in the models folder"),
+        row(Sample {
             // カタログ外はファイル名がそのまま表示名になるので、長いものを入れて縮退を見る
             // （2 行目は空＝行が出ない）。
-            "ggml-distil-large-v3-some-very-long-experimental-name.bin",
-            "",
-            "2.9 GB",
-            "Not in the model catalog",
-            ModelRowState::Unknown,
-        ),
-        row(
-            // config 上書き先。状態行・モーダル本文ともに全状態でいちばん長いので、折り返しの
-            // 確認はこの行で行う。
-            "my-own-model.gguf",
-            "",
-            "3.1 GB",
-            "Set in config.toml — used instead of the catalog",
-            ModelRowState::InConfig,
-        ),
+            name: "ggml-distil-large-v3-some-very-long-experimental-name.bin",
+            detail: "",
+            size: "2.9 GB",
+            status_text: "Downloaded — not in the model catalog",
+            status: ModelStatus::Installed,
+            returns: Returns::Never,
+            can_use: false,
+            can_delete: true,
+        }),
+        row(Sample {
+            // config 上書き先。確認モーダルの説明がいちばん長くなる行。
+            name: "my-own-model.gguf",
+            detail: "",
+            size: "3.1 GB",
+            status_text: "Downloaded — set in config.toml",
+            status: ModelStatus::Installed,
+            returns: Returns::InConfig,
+            can_use: false,
+            can_delete: true,
+        }),
     ]
 }
 
@@ -99,44 +216,46 @@ fn main() {
     let win = ModelsWindow::new()
         .expect("creating the window should succeed in this verification binary");
 
-    // 一覧の中身を引数で選べるようにする（空・1 行・複数行・モーダルの確認用）。
+    // 一覧の中身を引数で選べるようにする（空・走査失敗・モーダル・通知の確認用）。
     let variant = std::env::args().nth(1).unwrap_or_default();
     let rows = match variant.as_str() {
-        "empty" | "unreadable" => Vec::new(),
-        "one" => vec![sample_rows().remove(0)],
+        "empty" => Vec::new(),
         _ => sample_rows(),
     };
-    // 合計と空表示は `src/main.rs` の `models_total_text` / `MODELS_EMPTY_TEXT` の複製。
-    win.set_empty_text(
-        if variant == "unreadable" {
-            // `src/main.rs` の `MODELS_UNREADABLE_TEXT` の複製（走査できなかったときの表示）。
-            "Could not list the models folder"
-        } else {
-            "No models downloaded yet"
-        }
-        .into(),
-    );
-    win.set_total_text(match rows.len() {
-        0 => "".into(),
-        1 => "1 model — 4.4 GB".into(),
-        _ => "5 models — 12.3 GB".into(),
+    // 空表示・合計・通知は `src/main.rs` の `MODELS_EMPTY_TEXT` / `MODELS_UNREADABLE_NOTICE` /
+    // `models_total_text` / `MODEL_IN_USE_NOTICE` の複製。走査の失敗は**通知**で出る
+    // （カタログの行は必ず並ぶので、空表示では気づけない）。
+    win.set_empty_text("No models available".into());
+    if variant == "unreadable" {
+        win.set_notice(
+            "Could not list the models folder — sizes and states may be out of date.".into(),
+        );
+    }
+    win.set_total_text(if rows.is_empty() {
+        "".into()
+    } else {
+        // 取得済みは 4 件（Small / Qwen 7B / カタログ外 / config 上書き先）。
+        "4 models — 10.9 GB".into()
     });
-    // 失敗の通知も見た目の確認対象（合計と同じ行に出る。`src/main.rs` の `MODEL_IN_USE_NOTICE`
-    // の複製。あちらを変えたらここも合わせること）。
-    if variant == "notice" {
-        win.set_notice("This model is in use right now — it was not deleted.".into());
+    if variant == "confirm" {
+        // 対象は config 上書き先の行（説明がいちばん長いので折り返しを見る）。行を足しても
+        // ずれないよう、名前で引く（添字直書きは 1 行足すたびに別の行を指してしまう）。
+        let index = rows
+            .iter()
+            .position(|row| row.name == CONFIRM_SAMPLE_NAME)
+            .expect("the sample rows should contain the config override row");
+        win.set_delete_index(index as i32);
+        win.set_show_delete_confirm(true);
     }
     win.set_models(ModelRc::from(Rc::new(VecModel::from(rows))));
-    if variant == "confirm" {
-        // 対象は config 上書き先の行（説明がいちばん長いので折り返しを見る）。
-        win.set_delete_index(4);
-        win.set_show_delete_confirm(true);
+    if variant == "notice" {
+        win.set_notice("This model is in use right now — it was not deleted.".into());
     }
 
     win.window()
         .set_position(slint::LogicalPosition::new(60.0, 60.0));
     // 実アプリと同じ寸法で見る（`src/main.rs` の MODELS_WIDTH/HEIGHT と一致させること）。
-    win.window().set_size(slint::LogicalSize::new(460.0, 420.0));
+    win.window().set_size(slint::LogicalSize::new(560.0, 520.0));
     win.show()
         .expect("showing the window should succeed in this verification binary");
 

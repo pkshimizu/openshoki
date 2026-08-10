@@ -2,66 +2,77 @@ import { Button, Palette, ScrollView } from "std-widgets.slint";
 import { Style } from "style.slint";
 import { DangerButton } from "controls.slint";
 
-// 一覧の 1 行の状態。**ディスクにあるモデル**の行なので「未取得」は無い。
-// Rust 側（main.rs の `model_rows`）が、カタログ・設定・ワーカーの状況から合成して詰める。
-// 先頭が既定値なので、素の「取得済み」を先頭に置く。
-export enum ModelRowState {
-    // 取得済み。いま選ばれてはいない（消しても次の利用まで何も起きない）。
-    installed,
-    // 取得済みで、設定画面でいま選ばれている。消しても次の利用時に再取得されるので削除は許す。
-    selected,
-    // その種別のジョブ（文字起こし・議事録要約）が走っている。ワーカーが読んでいる最中なので
-    // 削除させない。
-    in-use,
-    // 取得中。完了時の rename でファイルが復活するので削除させない。
+// モデル 1 件の取得の状態。**取得の軸だけ**を持つ（使用中か・削除できるかは状況（ジョブ・
+// `config.toml` の上書き・カタログの有無）が絡むので、この enum からは導けない。それらは
+// Rust 側が畳んで `can-use` / `can-delete` で渡す）。
+// 先頭が既定値なので「未取得」を先頭に置く。
+export enum ModelStatus {
+    // カタログにあるがディスクに無い。Download で取得できる。
+    not-downloaded,
+    // 受信中。中身は一時ファイルなのでまだ消せない（完了時の rename で復活する）。
     downloading,
-    // `models/` に在るがカタログに無いファイル（カタログ差し替え後の旧ファイルなど）。
-    // 表示名も種別も分からないが、容量を食っているので一覧に出して消せるようにする。
-    unknown,
-    // `config.toml` のモデルパス上書きがこのファイルを指している（カタログの内外を問わない）。
-    // 上書き中は `ensure_model` を通らないので、消しても**再取得されない**（設定を手で直すまで
-    // そのジョブが失敗する）。カタログに載っているファイルでも同じなので、`selected` とは
-    // 別の状態にして、状態行と確認モーダルの両方でそのことを伝える。
-    in-config,
+    // ディスクに在る。削除できる（その種別のジョブが無ければ）。
+    installed,
+    // 直近の取得が失敗した（理由は状態テキストに出る。Download で再試行できる）。
+    failed,
 }
 
 // 一覧の 1 行。文言はすべて Rust 側で組む（状態→文言の対応表は Rust の網羅 match が正。
-// `docs/rules/slint.md`）。
+// `docs/rules/slint.md`）。`main::model_rows` が素材（カタログ・ディスク・設定・ワーカー）から
+// 合成して詰める。
 export struct ModelRow {
+    // 種別の見出し行（`Transcription — Whisper` など）。ボタンもサイズも出さない。
+    // 文字起こし用と議事録要約用を 1 つの一覧に混ぜるので、区切りを行として持たせる
+    // （`SummaryRow` の `is-heading` と同じ流儀）。
+    is-heading: bool,
     // 表示名（カタログが引ければ表示名、引けなければファイル名）。
     name: string,
-    // 2 行目の補助テキスト（種別とファイル名）。
+    // 2 行目の補助テキスト（カタログの説明、またはファイル名）。
     detail: string,
-    // 概数のサイズ（例 `1.5 GB`）。
+    // 概数のサイズ（例 `1.5 GB`）。未取得はカタログの値、取得済みは実ファイルの長さ。
     size: string,
-    // 状態の文言。削除できない行では**その理由**がここに出る。
-    state-text: string,
+    // 状態の文言。進捗（`Downloading… 42%`）や、使用中・削除できない理由もここに出る。
+    status-text: string,
     // 確認モーダルに出す説明（解放される容量、完全削除であること、再取得の有無）。
     delete-detail: string,
-    state: ModelRowState,
+    status: ModelStatus,
+    // このモデルを「使う」設定にできるか。**status からは導けない**: いま選ばれている行・
+    // カタログ外のファイル・`config.toml` で上書き中はできない（理由は状態の文言に出る）。
+    can-use: bool,
+    // 取得を始められるか。**status からは導けない**: `config.toml` の上書き先が**別のファイル**
+    // なら、落としても使われないので出さない（上書きがこの行のファイルを指しているなら、落とす
+    // ことが動かす唯一の手段なので出す。`main::can_download_row`）。
+    can-download: bool,
+    // 削除できるか。**status からは導けない**: その種別のジョブがある間は消させない
+    // （`main::can_delete_row`）。
+    can-delete: bool,
 }
 
-// ダウンロード済みモデルの一覧ウィンドウ。設定画面のボタンから開く。
-// 目的は「何が容量を食っているかを見て消す」ことなので、カタログ全件ではなくディスクにある
-// ものだけを並べる（`model_download::installed_models`）。
+// モデル管理ウィンドウ。設定画面のボタンから開く。
+// 文字起こし用（whisper）と議事録要約用（LLM）のカタログ全件を種別ごとに並べ、**取得・削除・
+// 使用するモデルの選択**をここで行う（#138）。`models/` にあるカタログ外のファイルも末尾に並べて
+// 掃除できるようにする（#117）。
 export component ModelsWindow inherits Window {
-    title: "Downloaded Models";
+    title: "Models";
     // 幅・高さは src/main.rs の MODELS_WIDTH/HEIGHT と一致させること（片方だけ変えない）。
     // preferred だけだと中身の最小高さに引っ張られて潰れるため min も指定する。
-    min-width: 460px;
-    min-height: 420px;
-    preferred-width: 460px;
-    preferred-height: 420px;
+    // 行は「名前・説明・状態」の 3 段＋右にサイズと最大 2 つのボタンなので、#117 の 460px では
+    // 横が詰まる。高さはカタログ全件（8 件）＋見出し 2 行が入る値。
+    min-width: 560px;
+    min-height: 520px;
+    preferred-width: 560px;
+    preferred-height: 520px;
 
-    // ディスクにあるモデル（Rust 側が開いたときと削除後に作り直す）。
+    // 一覧の全行（見出しを含む。Rust 側が開いたときに作り、tick が状態だけ作り直す）。
     in property <[ModelRow]> models;
-    // 末尾に出す合計（例 `3 models — 5.9 GB`）。行が無いときは空文字（Rust 側が決める）。
+    // 末尾に出す取得済みの合計（例 `3 models — 5.9 GB`）。行が無いときは空文字。
     in property <string> total-text;
-    // 1 行も無いときに一覧の中央へ出す文言（「まだ 1 つも無い」のか「走査に失敗した」のかを
-    // Rust 側が決める。合計と兼用にすると、どちらの意味で読むのか分からなくなる）。
+    // 1 行も無いときに一覧の中央へ出す文言。起動時に一度だけ入れる（カタログの行は必ず並ぶので
+    // 実際には出ない。走査の失敗は下の `notice` で伝える）。
     in property <string> empty-text;
     // 直前の操作が失敗したときだけ出す 1 行（削除できなかった等）。空なら出さない。
-    // 一覧を作り直すとクリアされる（`main::refresh_models_window`）。
+    // **ユーザー操作の直後**に差し替わる（tick の作り直しでは触らない。ただし models/ の走査に
+    // 失敗したときは tick 由来でも出す。`main::ModelsRefresh` / `main::refresh_cause`）。
     in property <string> notice;
     // 削除の確認モーダルの表示状態。Delete 押下で開き、Cancel / 確定で閉じる（Slint 内で完結。
     // Recordings ウィンドウと同じ作り）。
@@ -70,6 +81,10 @@ export component ModelsWindow inherits Window {
     // `in-out` なのは確認用バイナリ（`examples/models_view.rs`）がモーダルの見た目を出すため。
     in-out property <int> delete-index: 0;
 
+    // 「Use」押下。その行のモデルを使う設定にする（設定画面の ComboBox と同じ経路を通る）。
+    callback use-model(int);
+    // 「Download」押下。その行のモデルの取得を始める（選択は変えない）。
+    callback download-model(int);
     // 確認モーダルの Delete 押下。その行のモデルファイルを完全削除する（インデックスを渡す）。
     callback delete-model(int);
 
@@ -78,18 +93,18 @@ export component ModelsWindow inherits Window {
         spacing: 12px;
 
         Text {
-            // 一覧の性質（ディスクにあるものだけ・完全削除）を伝える。**再取得できるかは行ごとに
-            // 違う**（カタログ外のファイルは戻せない）ので、ここでは言わずに確認モーダルの説明
+            // 一覧でできること（選択・先行取得・削除）と、削除が完全削除であることを伝える。
+            // **再取得できるかは行ごとに違う**ので、そこは確認モーダルの説明
             // （`main::model_delete_detail`）へ任せる。見出しはウィンドウタイトルが兼ねる
             // （Recordings ウィンドウと同じ流儀）。
-            text: "Files in the app's models folder. Deleting frees the space immediately — nothing goes to the Trash.";
+            text: "Choose which model to use, download one ahead of time, or delete the ones you no longer need. Deleting frees the space immediately — nothing goes to the Trash.";
             wrap: word-wrap;
             font-size: Style.caption-size;
             color: Palette.foreground.transparentize(Style.muted-alpha);
         }
 
-        // 一覧は取得済みのみで通常 1〜3 行、カタログが増えても十数行なので ScrollView + for で
-        // 足りる（`docs/rules/slint.md` の「固定数行の小さな一覧」）。
+        // 行数はカタログ全件（現状 8 件）＋見出し＋カタログ外のファイルで、増えても十数行なので
+        // ScrollView + for で足りる（`docs/rules/slint.md` の「固定数行の小さな一覧」）。
         Rectangle {
             vertical-stretch: 1;
             border-width: 1px;
@@ -110,18 +125,25 @@ export component ModelsWindow inherits Window {
                     alignment: start;
 
                     for model[index] in root.models: VerticalLayout {
-                        // 削除できる行かは状態から導く（bool を Rust から別に渡さない。
-                        // `docs/rules/slint.md`）。
-                        property <bool> deletable: model.state != ModelRowState.in-use
-                            && model.state != ModelRowState.downloading;
-
-                        // 行の区切り（先頭行の上には引かない）。
-                        if index > 0: Rectangle {
-                            height: 1px;
-                            background: Palette.border;
+                        if model.is-heading: Rectangle {
+                            // 種別の区切り。行の一部なので背景で少し沈める（トーンは共有の
+                            // トークン。`ui/style.slint`）。
+                            background: Style.row-heading-background;
+                            HorizontalLayout {
+                                padding-left: 12px;
+                                padding-right: 12px;
+                                padding-top: 8px;
+                                padding-bottom: 8px;
+                                Text {
+                                    text: model.name;
+                                    font-size: Style.heading-size;
+                                    font-weight: Style.semibold;
+                                    color: Palette.foreground.transparentize(Style.muted-alpha);
+                                }
+                            }
                         }
 
-                        HorizontalLayout {
+                        if !model.is-heading: HorizontalLayout {
                             padding: 12px;
                             spacing: 12px;
 
@@ -138,7 +160,7 @@ export component ModelsWindow inherits Window {
                                     overflow: elide;
                                 }
 
-                                // 種別が分からない行では空文字が来るので、行ごと出さない。
+                                // 説明が無い行（カタログ外）では空文字が来るので、行ごと出さない。
                                 if model.detail != "": Text {
                                     text: model.detail;
                                     font-size: Style.caption-size;
@@ -147,14 +169,23 @@ export component ModelsWindow inherits Window {
                                 }
 
                                 Text {
-                                    text: model.state-text;
+                                    text: model.status-text;
                                     font-size: Style.caption-size;
-                                    color: Palette.foreground.transparentize(Style.muted-alpha);
-                                    overflow: elide;
+                                    // 失敗だけ警告色にする（他ウィンドウの状態行と揃える）。
+                                    color: model.status == ModelStatus.failed
+                                        ? Style.danger
+                                        : Palette.foreground.transparentize(Style.muted-alpha);
+                                    // ここには削除できない理由も出るので、省略せず折り返す
+                                    // （名前・説明は elide でよいが、理由が切れると読み手が
+                                    // ボタンの淡色の意味を追えない）。
+                                    wrap: word-wrap;
                                 }
                             }
 
+                            // サイズは幅を固定して**列として揃える**（行ごとに桁数が違うので、
+                            // 自然幅に任せると数字がばらける）。
                             Text {
+                                width: 72px;
                                 text: model.size;
                                 font-size: Style.body-size;
                                 vertical-alignment: center;
@@ -162,12 +193,41 @@ export component ModelsWindow inherits Window {
                                 color: Palette.foreground;
                             }
 
-                            DangerButton {
-                                text: "Delete";
-                                enabled: deletable;
-                                clicked => {
-                                    root.delete-index = index;
-                                    root.show-delete-confirm = true;
+                            // ボタンは右端に寄せ、**枠の幅を固定**する（行によって出る数が違うので、
+                            // 固定しないと Use / Delete の位置が行ごとにずれる）。
+                            HorizontalLayout {
+                                min-width: 184px;
+                                alignment: end;
+                                spacing: 8px;
+
+                                // 「使う」。いま選ばれている行・カタログ外・config 上書き中は
+                                // 出ない（理由は状態の文言に出る）。
+                                if model.can-use: Button {
+                                    text: "Use";
+                                    clicked => {
+                                        root.use-model(index);
+                                    }
+                                }
+
+                                // 取得できる行だけ（未取得・失敗で、上書き先が別のファイルで
+                                // ないとき。判断は `can-download`）。
+                                if model.can-download: Button {
+                                    text: "Download";
+                                    clicked => {
+                                        root.download-model(index);
+                                    }
+                                }
+
+                                // 削除はディスクに在る行だけ。押せるかは状況次第（`can-delete`）
+                                // で、押せない理由は状態の文言に出す（ボタンを消すと理由が
+                                // 分からない）。
+                                if model.status == ModelStatus.installed: DangerButton {
+                                    text: "Delete";
+                                    enabled: model.can-delete;
+                                    clicked => {
+                                        root.delete-index = index;
+                                        root.show-delete-confirm = true;
+                                    }
                                 }
                             }
                         }
@@ -188,7 +248,7 @@ export component ModelsWindow inherits Window {
                 color: Style.danger;
             }
 
-            // 合計使用量（行が無いときは Rust 側が空文字を渡す）。
+            // 取得済みの合計使用量（未取得の行は含めない）。
             Text {
                 text: root.total-text;
                 font-size: Style.caption-size;
