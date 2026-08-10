@@ -89,7 +89,7 @@ pub fn format_size(bytes: u64) -> String {
 /// フォールバックする（値自体は書き換えず、表示だけ既定位置になる）。
 ///
 /// 種別ごとのカタログが同じ解決をするための正（`whisper_model::model_index` /
-/// `summary_model::model_index` から呼ぶ）。設定画面の ComboBox の選択位置に使う。
+/// `summary_model::model_index` から呼ぶ）。設定画面の Select の選択位置に使う。
 pub fn catalog_index(catalog: &[ModelSpec], id: &str, default_id: &str) -> usize {
     catalog
         .iter()

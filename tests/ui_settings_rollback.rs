@@ -24,7 +24,7 @@ fn toggles(window: &AppWindow) -> Vec<ElementHandle> {
 
 /// 同じく Select を上から順に集める（Language → Model（whisper）→
 /// Model（議事録ブロックの中）。後ろ 2 つはラベルが同名なので、所属で見分ける）。
-fn combo_boxes(window: &AppWindow) -> Vec<ElementHandle> {
+fn selects(window: &AppWindow) -> Vec<ElementHandle> {
     ElementHandle::find_by_element_type_name(window, "Select").collect()
 }
 
@@ -32,7 +32,7 @@ fn combo_boxes(window: &AppWindow) -> Vec<ElementHandle> {
 fn stepper(window: &AppWindow) -> ElementHandle {
     ElementHandle::find_by_element_type_name(window, "Stepper")
         .next()
-        .expect("the settings window has a spin box")
+        .expect("the settings window has a stepper")
 }
 
 #[test]
@@ -82,28 +82,28 @@ fn rust_can_write_back_a_delay_after_the_user_edited_it() {
     window.set_auto_record_app(true);
     window.set_auto_stop_debounce_secs(4);
 
-    let spin = stepper(&window);
-    assert_eq!(spin.accessible_value().as_deref(), Some("4"));
+    let stepper = stepper(&window);
+    assert_eq!(stepper.accessible_value().as_deref(), Some("4"));
 
     // ユーザー操作で 1 増やす（Stepper の increment アクション）。
-    spin.invoke_accessible_increment_action();
+    stepper.invoke_accessible_increment_action();
     assert_eq!(window.get_auto_stop_debounce_secs(), 5);
 
     // Rust 側が保存済みの値へ書き戻す。
     window.set_auto_stop_debounce_secs(4);
     assert_eq!(
-        spin.accessible_value().as_deref(),
+        stepper.accessible_value().as_deref(),
         Some("4"),
         "the stepper should follow the value Rust wrote back"
     );
 }
 
-/// 要約 LLM の ComboBox も同じ契約を持つ（#119 で足した選択 UI。whisper・言語の ComboBox も
+/// 要約 LLM の Select も同じ契約を持つ（#119 で足した選択 UI。whisper・言語の Select も
 /// 同じ束縛にしてあるので、代表として一番下のものを見る）。
 ///
 /// 選択の変更はキー操作で行う（ポップアップの項目をクリックする経路はヘッドレスでは不安定）。
-/// クリックで `ComboBoxBase` の TouchArea がフォーカスを取ってポップアップを開き、続く矢印キーは
-/// ポップアップ側の FocusScope（`popup-key-handler`）が受けて選択を 1 つ動かす。
+/// クリックでフォーカスが `Select` へ移り、続く矢印キーを `Select` 自身の FocusScope が受けて
+/// 選択を 1 つ動かす（`Select` は一覧を開かなくても上下キーで選べる）。
 #[test]
 #[cfg_attr(
     not(slint_debug_info),
@@ -116,7 +116,7 @@ fn rust_can_roll_back_a_model_choice_after_the_user_changed_it() {
     ui_support::init_backend();
     let window = AppWindow::new().expect("create the settings window");
     ui_support::fit_settings_content(&window);
-    // ComboBox は自動文字起こし ON のときだけ操作できる（`transcribe-deps` のゲート）。
+    // Select は自動文字起こし ON のときだけ操作できる（`transcribe-deps` のゲート）。
     window.set_auto_transcribe(true);
     window.set_summary_models(
         std::rc::Rc::new(slint::VecModel::from(vec![
@@ -127,13 +127,13 @@ fn rust_can_roll_back_a_model_choice_after_the_user_changed_it() {
     );
     window.set_summary_model_index(1);
 
-    let combo = combo_boxes(&window)
+    let select = selects(&window)
         .pop()
-        .expect("the settings window has a summary model combo box");
-    assert_eq!(combo.accessible_value().as_deref(), Some(HEAVY));
+        .expect("the settings window has a summary model select");
+    assert_eq!(select.accessible_value().as_deref(), Some(HEAVY));
 
     // ユーザー操作で軽い方へ移す（クリックでフォーカスを与え、↑ で 1 つ上の選択肢へ）。
-    combo.mock_single_click(slint::platform::PointerEventButton::Left);
+    select.mock_single_click(slint::platform::PointerEventButton::Left);
     window
         .window()
         .dispatch_event(slint::platform::WindowEvent::KeyPressed {
@@ -141,15 +141,13 @@ fn rust_can_roll_back_a_model_choice_after_the_user_changed_it() {
         });
     assert_eq!(window.get_summary_model_index(), 0);
 
-    // 保存に失敗した Rust 側が、保存済みの選択（Heavy）へ書き戻す。表示テキスト（`current-value`）は
-    // ComboBoxBase の `changed current-index` ハンドラ経由で追従し、このハンドラはイベントループの
-    // 次の回で走るので、set 直後には反映されていない。`mock_elapsed_time` は経過量に関係なく
-    // changed ハンドラを流すので、待ち時間としての意味は無い（0 でよい）。
+    // 保存に失敗した Rust 側が、保存済みの選択（Heavy）へ書き戻す。`Select` の表示は
+    // `model[current-index]` の直接束縛なので、set した時点で追従する（`ComboBox` のときに
+    // 要った `mock_elapsed_time` は不要になった）。
     window.set_summary_model_index(1);
-    i_slint_backend_testing::mock_elapsed_time(std::time::Duration::ZERO);
     assert_eq!(
-        combo.accessible_value().as_deref(),
+        select.accessible_value().as_deref(),
         Some(HEAVY),
-        "the combo box should follow the index Rust wrote back"
+        "the select should follow the index Rust wrote back"
     );
 }

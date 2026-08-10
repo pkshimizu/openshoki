@@ -755,7 +755,7 @@ const SAME_LANGUAGE_AS_TRANSCRIPT: &str = "the same language as the transcript";
 
 /// 要約の出力言語の決め方。認識言語設定（`transcribe_language`）から決まる。
 /// **プロンプトの分岐はこの enum だけで決める**（表示名の文字列比較で再導出しない。
-/// 表示名は ComboBox 用の UI 文言なので、変えるとプロンプトの挙動が黙って変わってしまう）。
+/// 表示名は Select 用の UI 文言なので、変えるとプロンプトの挙動が黙って変わってしまう）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OutputLanguage {
     /// 日本語。#78 で検証済みの専用プロンプト（見出しも日本語）を使う。

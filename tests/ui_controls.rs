@@ -98,6 +98,49 @@ fn a_disabled_toggle_ignores_pointer_and_keyboard() {
     );
 }
 
+/// `enabled` が false の部品は、**支援技術からの操作**でも動かない。
+///
+/// ポインタとキーボードを塞いでも `accessible-action-*` が素通りすると、無効な部品を
+/// 押せてしまう（見た目は淡いまま動くので、目視では気づけない静かな壊れ方）。
+#[test]
+#[cfg_attr(
+    not(slint_debug_info),
+    ignore = "needs Slint debug info (SLINT_EMIT_DEBUG_INFO=1)"
+)]
+fn disabled_parts_ignore_accessibility_actions() {
+    let window = open_window();
+    // 自動録音 OFF で「Add app…」とステッパーを、自動文字起こし OFF で議事録トグルと
+    // 選択を無効にする。
+    window.set_auto_record_app(false);
+    window.set_auto_transcribe(false);
+    window.set_auto_summarize(false);
+    window.set_auto_stop_debounce_secs(4);
+    window.set_transcribe_language_index(0);
+
+    let fired = std::rc::Rc::new(std::cell::Cell::new(0));
+    let counter = fired.clone();
+    window.on_add_app(move || counter.set(counter.get() + 1));
+
+    ElementHandle::find_by_accessible_label(&window, "Add app…")
+        .next()
+        .expect("the settings window has an add-app button")
+        .invoke_accessible_default_action();
+    assert_eq!(fired.get(), 0, "a disabled button must not fire");
+
+    nth(&window, "Toggle", 2).invoke_accessible_default_action();
+    assert!(
+        !window.get_auto_summarize(),
+        "a disabled toggle must not flip"
+    );
+
+    nth(&window, "Stepper", 0).invoke_accessible_increment_action();
+    assert_eq!(
+        window.get_auto_stop_debounce_secs(),
+        4,
+        "a disabled stepper must not change its value"
+    );
+}
+
 /// ステッパーは上下キーで増減し、範囲を超えない（丸めは部品が持つ）。
 #[test]
 #[cfg_attr(
@@ -143,6 +186,64 @@ fn a_disabled_stepper_ignores_increment() {
         window.get_auto_stop_debounce_secs(),
         4,
         "a disabled stepper must not change its value"
+    );
+}
+
+/// ステッパーの ± は、**フォーカスが無い状態の 1 回目のクリック**でも値が動く。
+///
+/// `FocusScope` を `TouchArea` より後ろに置くと、フォーカスが無いあいだ最初の押下を
+/// `FocusScope` が吸ってしまい、1 回目が空振りする（2 回目から効くので気づきにくい）。
+#[test]
+#[cfg_attr(
+    not(slint_debug_info),
+    ignore = "needs Slint debug info (SLINT_EMIT_DEBUG_INFO=1)"
+)]
+fn the_first_click_on_a_stepper_button_already_moves_the_value() {
+    let window = open_window();
+    window.set_auto_record_app(true);
+    window.set_auto_stop_debounce_secs(3);
+
+    // ステッパーの中の ± は宣言順に − → ＋。
+    nth(&window, "StepperButton", 1).mock_single_click(slint::platform::PointerEventButton::Left);
+    assert_eq!(
+        window.get_auto_stop_debounce_secs(),
+        4,
+        "the very first click on + must already step the value"
+    );
+}
+
+/// 選択肢が空でも、上下キーで選択位置が範囲外へ出ない。
+///
+/// `model.length - 1` は空のとき -1 になるので、丸めの下限と上限が逆転する。
+#[test]
+#[cfg_attr(
+    not(slint_debug_info),
+    ignore = "needs Slint debug info (SLINT_EMIT_DEBUG_INFO=1)"
+)]
+fn a_select_with_no_options_stays_in_range() {
+    let window = open_window();
+    window.set_auto_transcribe(true);
+    window.set_transcribe_languages(std::rc::Rc::new(slint::VecModel::from(vec![])).into());
+    window.set_transcribe_language_index(0);
+
+    let chosen = std::rc::Rc::new(std::cell::Cell::new(i32::MIN));
+    let seen = chosen.clone();
+    window.on_change_transcribe_language(move |index| seen.set(index));
+
+    let select = nth(&window, "Select", 0);
+    select.mock_single_click(slint::platform::PointerEventButton::Left);
+    press_key(&window, slint::platform::Key::DownArrow);
+    press_key(&window, slint::platform::Key::UpArrow);
+
+    assert_eq!(
+        window.get_transcribe_language_index(),
+        0,
+        "an empty select must not move its index out of range"
+    );
+    assert_eq!(
+        chosen.get(),
+        i32::MIN,
+        "an empty select must not report a selection"
     );
 }
 
@@ -222,7 +323,7 @@ fn a_disabled_button_never_fires() {
     let counter = fired.clone();
     window.on_add_app(move || counter.set(counter.get() + 1));
 
-    let add = ElementHandle::find_by_accessible_label(&window, "＋ Add app…")
+    let add = ElementHandle::find_by_accessible_label(&window, "Add app…")
         .next()
         .expect("the settings window has an add-app button");
     add.mock_single_click(slint::platform::PointerEventButton::Left);

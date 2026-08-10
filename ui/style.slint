@@ -67,6 +67,11 @@ export global Style {
     out property <brush> danger: root.dark ? #e08172 : #a53326;
     // 完了・準備できている。
     out property <brush> done: root.dark ? #6b9159 : #4a6b3f;
+    // 状態のドット。6px の点は文字色のままだと沈むので、**文字より彩度を上げる**
+    // （明度ではない: ライトでは文字より明るく、ダークでは文字と同程度になる）。
+    out property <brush> caution-mark: root.dark ? #e0a45c : #c98a2b;
+    out property <brush> done-mark: root.dark ? #7fa86a : #6b9159;
+
     // --- 操作部品 ---
     // ポインタを載せたときの面（枠つきのボタン・ステッパーの ± など）。
     out property <brush> control-hover: root.dark ? #35322d : #eae2d4;
@@ -78,11 +83,11 @@ export global Style {
     out property <brush> switch-knob-off: root.dark ? #8d8779 : #fdfbf6;
     // キーボードフォーカスの輪郭。朱を淡くして、選択中の標（`seal`）と紛れないようにする。
     out property <brush> focus-ring: root.seal.transparentize(0.35);
+    // 輪郭は枠の**外側**へ出す（枠線の色を変えるだけだと、面つきのボタンで見えない）。
+    // この 2 つは `FocusRing` だけが使う（`ui/controls.slint`）。
+    out property <length> focus-ring-offset: 3px;
+    out property <length> focus-ring-width: 2px;
 
-    // 状態のドット。6px の点は文字色のままだと沈むので、**文字より彩度を上げる**
-    // （明度ではない: ライトでは文字より明るく、ダークでは文字と同程度になる）。
-    out property <brush> caution-mark: root.dark ? #e0a45c : #c98a2b;
-    out property <brush> done-mark: root.dark ? #7fa86a : #6b9159;
 
     // 状態の意味 → 文字色 / ドット色。対応表はここ 1 箇所だけに置く。
     //

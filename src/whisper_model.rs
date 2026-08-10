@@ -19,7 +19,7 @@ use crate::model_download::ModelSpec;
 /// カタログ単位の属性をエントリごとに複写している（揃っていることは下のテストが見る）。
 pub(crate) const KIND: &str = "Whisper speech";
 
-/// 選べるモデルの一覧（小さい順）。設定画面の ComboBox はこの順で並ぶため、
+/// 選べるモデルの一覧（小さい順）。設定画面の Select はこの順で並ぶため、
 /// モデルを足すときはここへ 1 エントリ追加するだけでよい。
 ///
 /// URL・SHA-256 は HuggingFace（whisper.cpp 公式配布）の LFS メタデータより。

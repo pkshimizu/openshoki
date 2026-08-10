@@ -121,7 +121,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ui.set_auto_transcribe(config.borrow().auto_transcribe);
     // 文字起こし言語: 表示名一覧はカタログ（TRANSCRIBE_LANGUAGES）から組み立てる。選択位置は
     // 設定の言語コードから解決し、カタログ外の手編集値は既定（English）位置に表示される
-    // （値は書き換えず、ユーザーが ComboBox を操作した時点で上書き保存される）。
+    // （値は書き換えず、ユーザーが Select を操作した時点で上書き保存される）。
     ui.set_transcribe_languages(
         Rc::new(slint::VecModel::<slint::SharedString>::from(
             config::TRANSCRIBE_LANGUAGES
@@ -208,8 +208,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         *config_for_auto_app.borrow_mut() = candidate;
     });
 
-    // 自動停止デバウンス秒数の変更: SpinBox の値を範囲へ丸めて永続化し、成功後にメモリへ反映する。
-    // SpinBox 側でも minimum/maximum を持つが、手編集された設定値との整合のため保存側でも丸める。
+    // 自動停止デバウンス秒数の変更: Stepper の値を範囲へ丸めて永続化し、成功後にメモリへ反映する。
+    // Stepper 側でも minimum/maximum を持つが、手編集された設定値との整合のため保存側でも丸める。
     let config_for_debounce = Rc::clone(&config);
     let ui_for_debounce = ui.as_weak();
     ui.on_change_auto_stop_debounce(move |secs| {
@@ -228,7 +228,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             return;
         }
-        // 丸めた値を SpinBox へ反映し、表示・メモリ・ディスクを一致させる。
+        // 丸めた値を Stepper へ反映し、表示・メモリ・ディスクを一致させる。
         ui.set_auto_stop_debounce_secs(secs as i32);
         *config_for_debounce.borrow_mut() = candidate;
     });
@@ -277,7 +277,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         *config_for_summarize.borrow_mut() = candidate;
     });
 
-    // 文字起こし言語の変更: ComboBox のインデックスをカタログの言語コードへ変換して永続化する。
+    // 文字起こし言語の変更: Select のインデックスをカタログの言語コードへ変換して永続化する。
     // Slint 側は先に選択位置を新値へ更新するため、保存失敗時は表示を保存済みの値へ戻す
     // （docs/rules/slint.md）。
     let config_for_language = Rc::clone(&config);
@@ -286,7 +286,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let Some(ui) = ui_for_language.upgrade() else {
             return;
         };
-        // ComboBox は Rust が渡したカタログの範囲しか返さないが、防御的に既定（先頭）へ丸める。
+        // Select は Rust が渡したカタログの範囲しか返さないが、防御的に既定（先頭）へ丸める。
         let code = usize::try_from(index)
             .ok()
             .and_then(|i| config::TRANSCRIBE_LANGUAGES.get(i))
@@ -306,7 +306,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         *config_for_language.borrow_mut() = candidate;
     });
 
-    // 内蔵 whisper モデルの変更: ComboBox のインデックスをカタログの ID へ変換して永続化し、
+    // 内蔵 whisper モデルの変更: Select のインデックスをカタログの ID へ変換して永続化し、
     // 未取得ならバックグラウンドでダウンロードを開始する（進捗はタイマーが状態行へ反映する）。
     // 取得を始めない場合もある（`whisper_model_path` で上書き中。契機の正は
     // `model_downloads_on_select`）。永続化と取得開始そのものは `select_model` が持つ
@@ -321,7 +321,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let Some(ui) = ui_for_model.upgrade() else {
             return;
         };
-        // ComboBox は Rust が渡したカタログの範囲しか返さないが、防御的に既定へ丸める。
+        // Select は Rust が渡したカタログの範囲しか返さないが、防御的に既定へ丸める。
         let spec = usize::try_from(index)
             .ok()
             .and_then(|i| whisper_model::CATALOG.get(i))
@@ -350,7 +350,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let Some(ui) = ui_for_summary_model.upgrade() else {
             return;
         };
-        // ComboBox は Rust が渡したカタログの範囲しか返さないが、防御的に既定へ丸める。
+        // Select は Rust が渡したカタログの範囲しか返さないが、防御的に既定へ丸める。
         let spec = usize::try_from(index)
             .ok()
             .and_then(|i| summary_model::CATALOG.get(i))
@@ -897,7 +897,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let refresh = Rc::new(refresh);
 
-        // 「Use」: 使うモデルを選び直す（設定画面の ComboBox と同じ経路）。
+        // 「Use」: 使うモデルを選び直す（設定画面の Select と同じ経路）。
         {
             let models_weak = models_weak.clone();
             let ui_weak = ui_weak.clone();
@@ -918,7 +918,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 let saved = select_model(kind, spec, &config, &downloader);
                 if saved && let Some(ui) = ui_weak.upgrade() {
-                    // 設定画面の ComboBox と状態行を追従させる（どちらから選んでも同じ結果）。
+                    // 設定画面の Select と状態行を追従させる（どちらから選んでも同じ結果）。
                     apply_model_selection_to_settings(&ui, &config.borrow(), &downloader);
                 }
                 refresh(&models, (!saved).then_some(MODEL_SELECT_FAILED_NOTICE));
@@ -2100,10 +2100,10 @@ fn trigger_app_row(trigger: &config::AppTrigger) -> TriggerApp {
     }
 }
 
-/// 設定画面の ComboBox に並べる選択肢（`名前 — サイズ — 説明`）。whisper・要約 LLM で共用し、
+/// 設定画面の Select に並べる選択肢（`名前 — サイズ — 説明`）。whisper・要約 LLM で共用し、
 /// 並び順はカタログのまま（選択位置はカタログ内インデックスで表す）。
 ///
-/// 要約 LLM の説明行はこの文字列を Slint 側で選択位置から引いて出す（ComboBox の行は箱幅で
+/// 要約 LLM の説明行はこの文字列を Slint 側で選択位置から引いて出す（Select の行は箱幅で
 /// 省略されるため。`ui/app-window.slint` の `summary-models`）。
 fn model_choices(catalog: &[model_download::ModelSpec]) -> slint::ModelRc<slint::SharedString> {
     Rc::new(slint::VecModel::<slint::SharedString>::from(
@@ -2150,7 +2150,7 @@ fn model_path_override(
 ///   初回要約、または Recordings ウィンドウの「Summarize」による手動生成）に `ensure_model` が行う。
 ///
 /// 文字起こし側に「自動文字起こし OFF なら取得しない」というゲートは**置かない**（既存挙動のまま）。
-/// 設定画面の ComboBox は自動文字起こしが OFF だと無効なのでそこからは選択が起きず、モデル管理
+/// 設定画面の Select は自動文字起こしが OFF だと無効なのでそこからは選択が起きず、モデル管理
 /// ウィンドウの「Use」で選ぶのは先行取得の意図が明らかなため。要約側に `auto_summarize` のゲートが
 /// あるのは、要約 LLM が whisper より大きく（最大 4.4 GB）、生成時に `ensure_model` が取得する
 /// 経路が別にあるから。
@@ -2214,7 +2214,7 @@ impl StatusLineCache {
 
 /// 文字起こしに使う whisper モデルの取得状況を、設定画面の状態行（文言・意味・進捗）にする。
 ///
-/// どのモデルかは ComboBox が示すので、ここは状態だけを出す。ただし上書き中は選んでも取得せず
+/// どのモデルかは Select が示すので、ここは状態だけを出す。ただし上書き中は選んでも取得せず
 /// そのファイルが使われるので、共用の「downloads automatically」だと表示と挙動が食い違う。
 /// 取得の契機の正は `model_downloads_on_select`。
 fn whisper_model_status_line(
@@ -2242,7 +2242,7 @@ fn whisper_model_status_line(
 
 /// 議事録生成に使う LLM の取得状況を、設定画面の状態行（文言・意味・進捗）にする。
 ///
-/// どのモデルかは ComboBox が示すので、ここは状態だけを出す。ただし取得の契機は whisper より
+/// どのモデルかは Select が示すので、ここは状態だけを出す。ただし取得の契機は whisper より
 /// 条件が多い（`model_downloads_on_select`）ので、共用の「downloads automatically」では表示と
 /// 挙動が食い違う場合がある。その場合は契機を明示する:
 ///
@@ -3105,7 +3105,7 @@ fn model_to_cancel_on_select<'a>(
     (previous_id != selected.id).then_some(previous_id)
 }
 
-/// 使うモデルを選び直して設定へ永続化する（設定画面の ComboBox とモデル管理ウィンドウの
+/// 使うモデルを選び直して設定へ永続化する（設定画面の Select とモデル管理ウィンドウの
 /// 「Use」が**同じ経路**を通る）。成功したら `true`。
 ///
 /// 選び直しで不要になった**前のモデルの取得は打ち切る**（#124。`cancel_download`）。
@@ -3133,7 +3133,7 @@ fn select_model(
         }
     };
     if let Err(err) = candidate.save() {
-        // どの種別の話か分かるようにする（3 つの入口＝両方の ComboBox とモデル管理ウィンドウの
+        // どの種別の話か分かるようにする（3 つの入口＝両方の Select とモデル管理ウィンドウの
         // 「Use」が同じ関数を通るので、種別が無いと調査で効かない）。
         eprintln!(
             "Not changing the {} model because saving the settings failed: {err}",
@@ -3160,7 +3160,7 @@ fn select_model(
     true
 }
 
-/// 設定画面の ComboBox の選択位置・状態行（文言・意味・進捗）・上書きフラグを、いまの設定に
+/// 設定画面の Select の選択位置・状態行（文言・意味・進捗）・上書きフラグを、いまの設定に
 /// 合わせて更新する。
 ///
 /// 起動時の初期化と、モデル管理ウィンドウから選び直したときの追従が**同じ経路**を通る（状態行の
@@ -4669,7 +4669,7 @@ mod tests {
         );
     }
 
-    /// 要約 LLM の状態行は取得状況を示す（どのモデルかは ComboBox が示す）。取得の契機が設定で
+    /// 要約 LLM の状態行は取得状況を示す（どのモデルかは Select が示す）。取得の契機が設定で
     /// 変わるので、選んでも取得が始まらない設定では「自動で落ちる」と読める文言を出さない。
     #[test]
     fn summary_model_status_line_shows_when_the_download_happens() {
@@ -4728,7 +4728,7 @@ mod tests {
         assert!(overridden_line.overridden);
     }
 
-    /// ComboBox の選択肢は「名前 — サイズ — 説明」で、カタログの順・件数どおりに並ぶ。
+    /// Select の選択肢は「名前 — サイズ — 説明」で、カタログの順・件数どおりに並ぶ。
     /// 要約 LLM の説明行はこの文字列を Slint 側で引くので、目安が入っていることもここで固定する。
     #[test]
     fn model_choices_follow_the_catalog_order() {

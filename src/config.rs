@@ -30,12 +30,12 @@ const DEFAULT_DIR_NAME: &str = "shoki";
 const DEFAULT_DEBOUNCE_SECS: u32 = 4;
 
 /// 自動停止デバウンス秒数の設定可能範囲。設定 TOML は手編集されうるため、この範囲へ丸めて使う。
-/// 値は `ui/app-window.slint` の SpinBox の minimum/maximum と一致させること。
+/// 値は `ui/app-window.slint` の Stepper の minimum/maximum と一致させること。
 pub const DEBOUNCE_MIN_SECS: u32 = 1;
 pub const DEBOUNCE_MAX_SECS: u32 = 60;
 
 /// 文字起こしの認識言語カタログ（whisper の言語コード, 設定画面の表示名）。
-/// 先頭が既定（英語）。設定画面の ComboBox はこの順で並ぶため、言語を足すときは
+/// 先頭が既定（英語）。設定画面の Select はこの順で並ぶため、言語を足すときは
 /// ここへ 1 行追加するだけでよい（`ui/app-window.slint` 側は Rust から model を渡す）。
 /// `auto` は whisper の自動判定（whisper.cpp が `auto` を特別値として解釈する）。
 pub const TRANSCRIBE_LANGUAGES: &[(&str, &str)] = &[
@@ -118,7 +118,7 @@ where
 }
 
 /// 言語コード → カタログ内インデックス。カタログ外（手編集値）は既定（先頭 = English）位置へ
-/// フォールバックする（値自体は書き換えず、表示だけ既定位置になる。ユーザーが ComboBox を
+/// フォールバックする（値自体は書き換えず、表示だけ既定位置になる。ユーザーが Select を
 /// 操作した時点で上書き保存される）。
 pub fn transcribe_language_index(code: &str) -> usize {
     TRANSCRIBE_LANGUAGES
@@ -172,7 +172,7 @@ pub struct Config {
     #[serde(default, deserialize_with = "deserialize_bool_or_false")]
     pub auto_transcribe: bool,
     /// 使用する内蔵 whisper モデルの識別子（`whisper_model::CATALOG` の `id`。既定 `small`）。
-    /// 設定画面の ComboBox で選ぶ。選択した時点で未取得のモデルの取得を始めるかは設定次第で、
+    /// 設定画面の Select で選ぶ。選択した時点で未取得のモデルの取得を始めるかは設定次第で、
     /// `whisper_model_path` で上書き中は始めない（正は `main::model_downloads_on_select` の
     /// doc コメント）。カタログ外の手編集値は使用時に既定へフォールバックする。手編集で
     /// 非文字列が入っても当該項目のみ既定へ丸める（`deserialize_whisper_model`）。
@@ -187,7 +187,7 @@ pub struct Config {
     #[serde(default)]
     pub whisper_model_path: Option<PathBuf>,
     /// 文字起こしの認識言語（whisper の言語コード。既定 `en`）。`auto` は自動判定。
-    /// 設定画面の ComboBox（`TRANSCRIBE_LANGUAGES`）から選ぶが、手編集でカタログ外の
+    /// 設定画面の Select（`TRANSCRIBE_LANGUAGES`）から選ぶが、手編集でカタログ外の
     /// 言語コードを入れてもそのまま whisper へ渡す（不正なら whisper.cpp 側が検証して
     /// 当該音源をスキップする）。旧 config で未指定の場合も `en` になる
     /// （従来も whisper の既定言語が `en` のため、実挙動は変わらない）。
@@ -203,7 +203,7 @@ pub struct Config {
     #[serde(default, deserialize_with = "deserialize_bool_or_false")]
     pub auto_summarize: bool,
     /// 使用する内蔵要約 LLM の識別子（`summary_model::CATALOG` の `id`。既定は 7B）。
-    /// 設定画面の ComboBox で選ぶ（軽い 3B も選べる）。選択した時点で未取得のモデルの取得を
+    /// 設定画面の Select で選ぶ（軽い 3B も選べる）。選択した時点で未取得のモデルの取得を
     /// 始めるかは設定次第（正は `main::model_downloads_on_select` の doc コメント）。
     /// カタログ外の手編集値は使用時に既定へフォールバックする。
     #[serde(
