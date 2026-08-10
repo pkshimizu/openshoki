@@ -2960,6 +2960,13 @@ fn select_model(
     downloader: &model_download::ModelDownloader,
 ) -> bool {
     let mut candidate = config.borrow().clone();
+    // 直前に選んでいた ID を、上書きする前に控える（打ち切る対象はこれ 1 つだけ。
+    // 種別の全モデルを止めると、管理ウィンドウの「Download」で明示的に始めた取得まで
+    // 巻き添えになる。`ModelDownloader::cancel_download` の doc）。
+    let superseded_id = match kind {
+        model_download::ModelKind::Speech => candidate.whisper_model.clone(),
+        model_download::ModelKind::Summary => candidate.summary_model.clone(),
+    };
     match kind {
         model_download::ModelKind::Speech => candidate.whisper_model = spec.id.to_owned(),
         model_download::ModelKind::Summary => candidate.summary_model = spec.id.to_owned(),
@@ -2977,6 +2984,14 @@ fn select_model(
     // request_download 側が早期 return する。
     let downloads_now = model_downloads_on_select(kind, &candidate);
     *config.borrow_mut() = candidate;
+    // 選び直したので、前に選んでいたモデルの取得はもう要らない（#124）。打ち切りはフラグを
+    // 立てるだけで、担当スレッドが気づくのは次のチャンク（最大 64 KiB）を読む手前なので、
+    // ここでは**止め始める**だけ。それでも新しい取得を頼む前に立てておく（空き容量の事前確認は
+    // 走っている取得の残りバイトを必要量へ加算するので、止まるのが早いほど新しいほうが
+    // 容量不足で断られにくい）。
+    if superseded_id != spec.id {
+        downloader.cancel_download(&superseded_id);
+    }
     if downloads_now {
         downloader.request_download(spec);
     }

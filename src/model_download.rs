@@ -22,6 +22,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use sha2::{Digest, Sha256};
@@ -115,13 +116,37 @@ pub enum DownloadStatus {
     Failed(String),
 }
 
+/// 取得の結末。**打ち切りは失敗ではない**ので、`Err` に畳まず分けて返す（状態行とログで
+/// 「途中でやめた」と「失敗した」を混同させないため。#124）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransferEnd {
+    /// 最後まで受信し、SHA-256 の検証にも通った。
+    Completed,
+    /// 中断フラグが立ったので受信ループを抜けた（受信済みのぶんは捨てる）。
+    Cancelled,
+}
+
+/// ダウンローダが 1 つのロックで守る状態。**「見てから決める」操作を 1 回のロックに畳む**ため
+/// 3 つのマップを 1 つの Mutex にまとめてある（`docs/rules/coding-conventions.md`）。
+/// 別々のロックにすると、状態を見てから中断フラグを立てるまでの間に取得が終わりうる。
+#[derive(Default)]
+struct State {
+    /// モデル ID → 取得状況。エントリが無いモデルはディスクの有無で判定する
+    /// （`Downloaded` / `NotDownloaded` は必ずしもマップに載らない）。
+    status: HashMap<&'static str, DownloadStatus>,
+    /// 取得中のモデル ID → 中断フラグ。担当スレッドが受信ループで見て、立っていたら抜ける。
+    /// エントリが在るのは担当を引き受けている間だけ（`CancelToken` が抜けるときに掃除する）。
+    cancels: HashMap<&'static str, Arc<AtomicBool>>,
+    /// 逐次ワーカーが**いま完了を必要としている**モデル ID → その本数。ここに載っている間は
+    /// 打ち切らない（`cancel_download` の doc）。`ensure_model` の呼び出し区間で増減する。
+    required: HashMap<&'static str, usize>,
+}
+
 /// モデルのダウンロードと状態を管理するハンドル。`Clone` で共有し、UI（設定画面）と
 /// ワーカーの両方から同じ状態を参照・更新する。
 #[derive(Clone)]
 pub struct ModelDownloader {
-    /// モデル ID → 取得状況。エントリが無いモデルはディスクの有無で判定する
-    /// （`Downloaded` / `NotDownloaded` は必ずしもマップに載らない）。
-    status: Arc<Mutex<HashMap<&'static str, DownloadStatus>>>,
+    state: Arc<Mutex<State>>,
 }
 
 impl Default for ModelDownloader {
@@ -133,7 +158,7 @@ impl Default for ModelDownloader {
 impl ModelDownloader {
     pub fn new() -> Self {
         Self {
-            status: Arc::new(Mutex::new(HashMap::new())),
+            state: Arc::new(Mutex::new(State::default())),
         }
     }
 
@@ -143,13 +168,13 @@ impl ModelDownloader {
     /// 取得後にファイルを外部で消しても表示は Downloaded のまま（実際の利用時は
     /// `ensure_model` がディスクを再確認するので機能は壊れない）。
     pub fn status_of(&self, spec: &'static ModelSpec) -> DownloadStatus {
-        let mut status = self.lock();
-        if let Some(current) = status.get(spec.id) {
+        let mut state = self.lock();
+        if let Some(current) = state.status.get(spec.id) {
             return current.clone();
         }
         match model_path(spec) {
             Some(path) if path.is_file() => {
-                status.insert(spec.id, DownloadStatus::Downloaded);
+                state.status.insert(spec.id, DownloadStatus::Downloaded);
                 DownloadStatus::Downloaded
             }
             _ => DownloadStatus::NotDownloaded,
@@ -162,7 +187,7 @@ impl ModelDownloader {
     /// 持っているので存在確認は不要）。進捗と失敗も要るので状態をそのまま返す
     /// （`&'static ModelSpec` を用意せずに引けるようにしてある: 一覧の行はカタログ外もありうる）。
     pub fn recorded_status(&self, id: &str) -> Option<DownloadStatus> {
-        self.lock().get(id).cloned()
+        self.lock().status.get(id).cloned()
     }
 
     /// UI 起点: 未取得（または直近失敗）ならバックグラウンドスレッドでダウンロードを開始する。
@@ -201,7 +226,11 @@ impl ModelDownloader {
     /// **空き容量の事前確認で全部が落ちる**ことがある（各スレッドが他の在庫の残量を必要量へ
     /// 加算するため）。落ちた取得は状態と行の文言に理由が出るので、順に始め直せる。
     ///
-    /// 同種別で別モデルを選び直したときに先の取得を打ち切る仕組みは別件（#124）。
+    /// **#124 で「選び直したら前の取得を打ち切る」を入れた**（`cancel_download`）ので、上の
+    /// 「同種別で別モデルを選び直しても止まらない」という最悪ケースは無くなった。それでも
+    /// 上限を設けない判断は変えていない: 上の 3 点の根拠はどれも同時本数ではなく**待たせる害**に
+    /// ついてのもので、打ち切りが入っても変わらないため。打ち切りは並走を減らす方向にしか
+    /// 効かない（走っている取得を止めるだけで、新しく待たせはしない）。
     pub fn request_download(&self, spec: &'static ModelSpec) {
         match self.status_of(spec) {
             DownloadStatus::Downloaded | DownloadStatus::Downloading { .. } => return,
@@ -211,13 +240,60 @@ impl ModelDownloader {
         let spawned = std::thread::Builder::new()
             .name(format!("model-download-{}", spec.id))
             .spawn(move || {
-                // ensure_model が check-and-set・進捗更新・結果記録まで行う。取得済みなら即返る。
-                if let Err(err) = downloader.ensure_model(spec) {
-                    eprintln!("Skipping the model download because it failed: {err}");
+                // check-and-set・進捗更新・結果記録まで `acquire_and_download` が行う。
+                // **`ensure_model` は通らない**: あちらは「ワーカーがいま必要としている」印を
+                // 立てるので、UI 起点の先行取得まで打ち切れなくなってしまう（`cancel_download`）。
+                match downloader.acquire_and_download(spec) {
+                    Ok(TransferEnd::Completed) => {}
+                    // 打ち切りは失敗ではないので `eprintln!` にしない（ユーザーが選び直した
+                    // 結果として起きる正常な経路）。
+                    Ok(TransferEnd::Cancelled) => {
+                        println!(
+                            "Cancelled the {} model download because another model was selected",
+                            spec.kind
+                        );
+                    }
+                    Err(err) => {
+                        eprintln!("Skipping the model download because it failed: {err}");
+                    }
                 }
             });
         if let Err(err) = spawned {
             eprintln!("Skipping the model download because the thread failed to start: {err}");
+        }
+    }
+
+    /// 走っているそのモデルの取得を打ち切る。打ち切ったら `true`。
+    ///
+    /// **使うのは「選び直しでその取得が不要になった」ときだけ**（`main::select_model`）。
+    /// 打ち切ると受信済みのぶんは捨てられ、再開はできない（部分ファイルは `PartFile` の Drop が
+    /// 消す。レジュームの仕組みは持たない）ので、不要になったと言い切れる場面に限る。
+    ///
+    /// 次の 2 つは打ち切らない:
+    ///
+    /// - **ワーカーが必要としているモデル**（`State::required` に載っている）。文字起こし／要約の
+    ///   ジョブは投入時点のモデル ID を握っているので、設定を変えても**そのジョブが要るのは
+    ///   古いモデル**。ここで止めると `ensure_model` の待ちが解けた瞬間に同じものを取り直すか、
+    ///   ジョブが失敗するだけで、誰も得をしない。
+    /// - **管理ウィンドウの「Download」で始めた取得**。呼び出し側が「直前に選んでいたモデル」
+    ///   だけを渡す形にしてあるので、明示的に押して始めた取得はそもそも対象にならない。
+    ///
+    /// 打ち切りの結果は `TransferEnd::Cancelled` として担当スレッドが受け取り、状態は
+    /// `NotDownloaded` へ戻る（**`Failed` にはしない**。失敗と区別できるようにするため。
+    /// `DownloadGuard::finish_cancelled`）。
+    pub fn cancel_download(&self, id: &str) -> bool {
+        let state = self.lock();
+        if state.required.contains_key(id) {
+            return false;
+        }
+        // 見てから決める操作なので、状態の確認と中断フラグを 1 回のロックで行う
+        // （放すと、その隙間に取得が終わって「終わった取得を打ち切った」ことになる）。
+        match state.cancels.get(id) {
+            Some(cancel) => {
+                cancel.store(true, Ordering::Relaxed);
+                true
+            }
+            None => false,
         }
     }
 
@@ -231,6 +307,25 @@ impl ModelDownloader {
         &self,
         spec: &'static ModelSpec,
     ) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        // 「いま必要」の印を呼び出し区間ぜんぶに掛ける（待っている間も含む）。この印がある間は
+        // 選び直しで打ち切られない（理由は `cancel_download` の doc）。
+        let _needed = RequiredMark::new(self, spec.id);
+        match self.acquire_and_download(spec)? {
+            TransferEnd::Completed => {
+                model_path(spec).ok_or_else(|| "Cannot determine the data directory".into())
+            }
+            // 印がある間は打ち切られないので通常は起きない。起きたらジョブは失敗として縮退する
+            // （検証していないファイルを黙って使わない）。
+            TransferEnd::Cancelled => Err("the model download was cancelled".into()),
+        }
+    }
+
+    /// 担当を引き受けて（または他スレッドの完了を待って）モデルを配置する。`ensure_model` と
+    /// `request_download` の共通部で、**違うのは「いま必要」の印を立てるかどうかだけ**。
+    fn acquire_and_download(
+        &self,
+        spec: &'static ModelSpec,
+    ) -> Result<TransferEnd, Box<dyn std::error::Error>> {
         let path = model_path(spec).ok_or("Cannot determine the data directory")?;
         // 待機の上限。担当スレッドが**進まない**（無応答接続、Drop が走らない `abort` 等）と
         // 状態が Downloading のまま残り、上限なしでは待機側（逐次のワーカー等）が永久に固まって
@@ -238,27 +333,31 @@ impl ModelDownloader {
         // 返す（次のジョブ・次の選択で再試行される）。unwind するパニックで担当が消えた場合は
         // `DownloadGuard` が `Failed` へ倒すので、待機側は次の周回で担当を引き継げる。
         let wait_deadline = std::time::Instant::now() + WAIT_FOR_OTHER_DOWNLOAD_TIMEOUT;
-        loop {
+        let cancel = loop {
             {
-                let mut status = self.lock();
-                match status.get(spec.id) {
+                let mut state = self.lock();
+                match state.status.get(spec.id) {
                     // 他スレッドがダウンロード中。ロックを放して完了を待つ。
                     Some(DownloadStatus::Downloading { .. }) => {}
                     _ => {
                         if path.is_file() {
-                            status.insert(spec.id, DownloadStatus::Downloaded);
-                            return Ok(path);
+                            state.status.insert(spec.id, DownloadStatus::Downloaded);
+                            return Ok(TransferEnd::Completed);
                         }
                         // 自分がダウンロード担当になる（check-and-set。ロック内で遷移させ、
                         // 同じモデルを同時に見た 2 スレッドが両方ダウンロードするのを防ぐ）。
-                        status.insert(
+                        // 中断フラグも**同じロックの中で**登録する（放してから登録すると、その
+                        // 隙間に来た `cancel_download` が「取得中なのに打ち切れない」で落ちる）。
+                        state.status.insert(
                             spec.id,
                             DownloadStatus::Downloading {
                                 received: 0,
                                 total: spec.size_bytes,
                             },
                         );
-                        break;
+                        let cancel = Arc::new(AtomicBool::new(false));
+                        state.cancels.insert(spec.id, Arc::clone(&cancel));
+                        break cancel;
                     }
                 }
             }
@@ -268,14 +367,23 @@ impl ModelDownloader {
                 );
             }
             std::thread::sleep(std::time::Duration::from_millis(200));
-        }
+        };
 
         // 担当を引き受けた区間は番人で囲み、結果の記録もそれに任せる（理由と後始末の契約は
         // `DownloadGuard` の doc）。この 2 行の組（囲む・`finish` に記録させる）を崩すと、
         // 取得中のパニックで状態が `Downloading` のまま残る——テストでは捕まらないので崩さないこと。
+        // 中断フラグの掃除も番人に任せる（パニックで抜けても、次の取得が古いフラグを掴まない）。
         let guard = DownloadGuard::new(self, spec.id);
-        guard.finish(download_model(spec, &path, self))?;
-        Ok(path)
+        match download_model(spec, &path, self, &cancel) {
+            Ok(TransferEnd::Cancelled) => {
+                guard.finish_cancelled();
+                Ok(TransferEnd::Cancelled)
+            }
+            result => {
+                guard.finish(result.map(|_| ()))?;
+                Ok(TransferEnd::Completed)
+            }
+        }
     }
 
     /// 走っている**他の**ダウンロードの残りバイト合計（`except_model_id` 自身は除く。
@@ -286,6 +394,7 @@ impl ModelDownloader {
     /// `PROGRESS_STEP_BYTES` 刻みで遅れるが、その遅れは残りを多めに見る＝安全側に転ぶ。
     fn in_flight_remaining_bytes(&self, except_model_id: &str) -> u64 {
         self.lock()
+            .status
             .iter()
             .filter_map(|(id, status)| match status {
                 DownloadStatus::Downloading { received, total } if *id != except_model_id => {
@@ -299,7 +408,7 @@ impl ModelDownloader {
     /// テスト用: 状態を直接注入する（表示ロジックをディスク・ネットワーク非依存で検証する）。
     #[cfg(test)]
     pub(crate) fn set_status_for_test(&self, spec: &'static ModelSpec, status: DownloadStatus) {
-        self.lock().insert(spec.id, status);
+        self.lock().status.insert(spec.id, status);
     }
 
     /// 取得済みのモデルファイルを**完全削除**する（ゴミ箱へは入れない。#117）。
@@ -333,7 +442,7 @@ impl ModelDownloader {
             return Err("the model file name is not a plain file name".into());
         }
         let path = dir.join(&model.filename);
-        let mut status = self.lock();
+        let mut state = self.lock();
         // 一覧を作ってから押されるまでの間に差し替えられていないかを、消す直前に見る
         // （`models/` がリンクへ、対象がリンクへ）。列挙側のガードだけでは、この窓が閉じない。
         if !dir.symlink_metadata().is_ok_and(|meta| meta.is_dir()) {
@@ -343,7 +452,7 @@ impl ModelDownloader {
             return Err("the model file is not a regular file".into());
         }
         if let Some(id) = model.catalog_id
-            && let Some(DownloadStatus::Downloading { .. }) = status.get(id)
+            && let Some(DownloadStatus::Downloading { .. }) = state.status.get(id)
         {
             return Err("the model is being downloaded".into());
         }
@@ -352,15 +461,15 @@ impl ModelDownloader {
         std::fs::remove_file(&path)
             .map_err(|err| format!("{} ({})", err.kind(), model.filename))?;
         if let Some(id) = model.catalog_id {
-            status.remove(id);
+            state.status.remove(id);
         }
         Ok(())
     }
 
     /// 状態マップのガードを取る。poison（ロック保持中のパニック）でも状態表示・DL 管理を
     /// 止めないため、ガードを取り出して続行する（`docs/rules/error-handling.md`）。
-    fn lock(&self) -> MutexGuard<'_, HashMap<&'static str, DownloadStatus>> {
-        self.status
+    fn lock(&self) -> MutexGuard<'_, State> {
+        self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -407,9 +516,24 @@ impl<'a> DownloadGuard<'a> {
             Ok(()) => DownloadStatus::Downloaded,
             Err(err) => DownloadStatus::Failed(err.to_string()),
         };
-        self.downloader.lock().insert(self.id, status);
-        self.recorded = true;
+        self.record(status);
         result
+    }
+
+    /// 打ち切られたときの記録。**`Failed` にはしない**（ユーザーが選び直した結果なので、
+    /// 失敗として見せると「途中でやめた」と「落とせなかった」が混ざる。#124）。受信ぶんは
+    /// 捨てて部分ファイルも消えているので、素直に未取得へ戻すのが実態と合う。
+    fn finish_cancelled(mut self) {
+        self.record(DownloadStatus::NotDownloaded);
+    }
+
+    /// 結果を記録して番人を解除する。中断フラグの掃除も同じロックで行う
+    /// （`Downloading` を抜けたのにフラグだけ残ると、次の取得が立った直後に打ち切られる）。
+    fn record(&mut self, status: DownloadStatus) {
+        let mut state = self.downloader.lock();
+        state.status.insert(self.id, status);
+        state.cancels.remove(self.id);
+        self.recorded = true;
     }
 }
 
@@ -419,10 +543,39 @@ impl Drop for DownloadGuard<'_> {
             return;
         }
         // 失敗として記録し、次の要求（次のジョブ・設定画面での再選択）で再試行できる状態に戻す。
-        self.downloader.lock().insert(
-            self.id,
-            DownloadStatus::Failed("the download stopped unexpectedly".to_owned()),
-        );
+        self.record(DownloadStatus::Failed(
+            "the download stopped unexpectedly".to_owned(),
+        ));
+    }
+}
+
+/// `ensure_model` の呼び出し区間に「このモデルはいまワーカーが必要としている」印を立てる番人。
+/// 印がある間は `cancel_download` が打ち切らない（理由はそちらの doc）。
+///
+/// 同じモデルを複数のワーカーが待つことがあるので本数で持ち、drop で減らす。パニックで抜けても
+/// 減るので、印が残って**そのモデルを二度と打ち切れなくなる**ことはない。
+struct RequiredMark<'a> {
+    downloader: &'a ModelDownloader,
+    id: &'static str,
+}
+
+impl<'a> RequiredMark<'a> {
+    fn new(downloader: &'a ModelDownloader, id: &'static str) -> Self {
+        *downloader.lock().required.entry(id).or_insert(0) += 1;
+        Self { downloader, id }
+    }
+}
+
+impl Drop for RequiredMark<'_> {
+    fn drop(&mut self) {
+        let mut state = self.downloader.lock();
+        match state.required.get_mut(self.id) {
+            Some(count) if *count > 1 => *count -= 1,
+            // 最後の 1 本ならエントリごと消す（0 を残すと `contains_key` が真のままになる）。
+            _ => {
+                state.required.remove(self.id);
+            }
+        }
     }
 }
 
@@ -799,7 +952,8 @@ fn download_model(
     spec: &'static ModelSpec,
     dest: &Path,
     downloader: &ModelDownloader,
-) -> Result<(), Box<dyn std::error::Error>> {
+    cancel: &AtomicBool,
+) -> Result<TransferEnd, Box<dyn std::error::Error>> {
     if let Some(parent) = dest.parent() {
         // モデルは公開配布物で機微データではないため、権限は OS 既定でよい
         // （録音データの 0700/0600 とは扱いが異なる）。
@@ -844,31 +998,43 @@ fn download_model(
     let on_progress = |received: u64| {
         downloader
             .lock()
+            .status
             .insert(spec.id, DownloadStatus::Downloading { received, total });
     };
-    write_verified(
+    let end = write_verified(
         reader,
         part.path(),
         spec.sha256,
         max_download_bytes(spec),
         on_progress,
+        || cancel.load(Ordering::Relaxed),
     )?;
+    if end == TransferEnd::Cancelled {
+        // `part` はここで drop され、書きかけの一時ファイルを消す（`PartFile` の契約）。
+        // commit しないので `dest` は生まれない＝中途半端なモデルは残らない。
+        return Ok(TransferEnd::Cancelled);
+    }
     part.commit()?;
     println!("Downloaded the {} model {}", spec.kind, spec.display_name);
-    Ok(())
+    Ok(TransferEnd::Completed)
 }
 
 /// `reader` の内容を `dest` へ書き出しつつ SHA-256 を計算し、`expected_sha256` と一致しなければ
 /// エラーを返す（ファイルは書かれたまま残る。後始末は呼び出し側の `PartFile` が持つ）。
 /// `max_bytes` を超える受信は打ち切る（想定外の応答でディスクを埋めない保険。テスト容易性の
 /// ため引数で受ける）。`on_progress` には累積受信バイトを `PROGRESS_STEP_BYTES` ごとに渡す。
+///
+/// `is_cancelled` が真を返したら受信をやめて `TransferEnd::Cancelled` を返す（**`Err` ではない**。
+/// 打ち切りは失敗ではないので、呼び出し側が状態行とログで区別できるようにする。#124）。
+/// この場合ハッシュの検証は行わない——途中までのバイト列に意味は無いため。
 fn write_verified(
     mut reader: impl Read,
     dest: &Path,
     expected_sha256: &str,
     max_bytes: u64,
     mut on_progress: impl FnMut(u64),
-) -> Result<(), Box<dyn std::error::Error>> {
+    is_cancelled: impl Fn() -> bool,
+) -> Result<TransferEnd, Box<dyn std::error::Error>> {
     let file = std::fs::File::create(dest)?;
     let mut writer = std::io::BufWriter::new(file);
     let mut hasher = Sha256::new();
@@ -876,6 +1042,12 @@ fn write_verified(
     let mut written: u64 = 0;
     let mut last_reported: u64 = 0;
     loop {
+        // 中断の確認は**読む前**に置く（`read` は次のチャンクが届くまで戻らないので、後ろに
+        // 置くと最後の 1 回ぶん待たされる）。粒度は 1 チャンク＝最大 64 KiB なので、
+        // 打ち切りの体感は「押した直後」になる。
+        if is_cancelled() {
+            return Ok(TransferEnd::Cancelled);
+        }
         let read = reader.read(&mut buf)?;
         if read == 0 {
             break;
@@ -897,7 +1069,7 @@ fn write_verified(
     if digest != expected_sha256 {
         return Err(format!("checksum mismatch (expected {expected_sha256}, got {digest})").into());
     }
-    Ok(())
+    Ok(TransferEnd::Completed)
 }
 
 /// カタログの静的な健全性チェック。**正はここ 1 箇所**にして、種別が増えても同じ検査が
@@ -991,6 +1163,11 @@ mod tests {
 
     /// テスト用の緩い上限。
     const TEST_MAX: u64 = u64::MAX;
+
+    /// 打ち切りを見ない `is_cancelled`（中断を扱わないテストの既定）。
+    fn never_cancelled() -> bool {
+        false
+    }
 
     /// ダウンロード経路を通らないダミー定義で使う SHA-256。値に意味は無く、形式
     /// （64 桁の 16 進）だけを満たす。
@@ -1316,6 +1493,7 @@ mod tests {
         let downloader = ModelDownloader::new();
         downloader
             .lock()
+            .status
             .insert(FAKE_LLM_MODEL.id, DownloadStatus::Downloaded);
 
         let models =
@@ -1327,7 +1505,7 @@ mod tests {
 
         assert!(!path.exists(), "the model file should be gone");
         assert!(
-            downloader.lock().get(FAKE_LLM_MODEL.id).is_none(),
+            !downloader.lock().status.contains_key(FAKE_LLM_MODEL.id),
             "the status entry should be gone so the display falls back to the disk"
         );
         assert!(
@@ -1347,7 +1525,7 @@ mod tests {
         let path = dir.join(FAKE_LLM_MODEL.filename);
         std::fs::write(&path, b"x").expect("writing the fixture should succeed");
         let downloader = ModelDownloader::new();
-        downloader.lock().insert(
+        downloader.lock().status.insert(
             FAKE_LLM_MODEL.id,
             DownloadStatus::Downloading {
                 received: 0,
@@ -1572,8 +1750,16 @@ mod tests {
     #[test]
     fn write_verified_accepts_matching_checksum() {
         let dest = temp_path("ok.bin");
-        write_verified(b"hello".as_slice(), &dest, HELLO_SHA256, TEST_MAX, |_| {})
-            .expect("matching checksum should succeed");
+        let end = write_verified(
+            b"hello".as_slice(),
+            &dest,
+            HELLO_SHA256,
+            TEST_MAX,
+            |_| {},
+            never_cancelled,
+        )
+        .expect("matching checksum should succeed");
+        assert_eq!(end, TransferEnd::Completed);
         assert_eq!(std::fs::read(&dest).expect("readable"), b"hello");
         let _ = std::fs::remove_file(&dest);
     }
@@ -1587,6 +1773,7 @@ mod tests {
             HELLO_SHA256,
             TEST_MAX,
             |_| {},
+            never_cancelled,
         )
         .expect_err("checksum mismatch should fail");
         assert!(err.to_string().contains("checksum mismatch"));
@@ -1602,9 +1789,14 @@ mod tests {
         let expected = format!("{:x}", Sha256::digest(&data));
         let dest = temp_path("multi.bin");
         let mut reported: Vec<u64> = Vec::new();
-        write_verified(data.as_slice(), &dest, &expected, TEST_MAX, |received| {
-            reported.push(received);
-        })
+        write_verified(
+            data.as_slice(),
+            &dest,
+            &expected,
+            TEST_MAX,
+            |received| reported.push(received),
+            never_cancelled,
+        )
         .expect("matching checksum should succeed");
         assert_eq!(
             std::fs::metadata(&dest).expect("metadata").len(),
@@ -1628,10 +1820,135 @@ mod tests {
             HELLO_SHA256,
             limit,
             |_| {},
+            never_cancelled,
         )
         .expect_err("exceeding the size limit should fail");
         assert!(err.to_string().contains("size limit"));
         let _ = std::fs::remove_file(&dest);
+    }
+
+    /// 中断フラグが立ったら、受信をやめて `Cancelled` を返す（`Err` にしない）。
+    ///
+    /// reader は `HELLO_SHA256` と**合わない**中身にしてあり、長さも打ち切り予定より十分長い。
+    /// そのため中断チェックを消すと、最後まで読んでハッシュ不一致の `Err` になり
+    /// `expect` で落ちる（ハングせずに落ちるよう、無限 reader ではなく `take` で有限にしてある）。
+    /// 打ち切り時にハッシュを検証しないことも、これで同時に固定できる。
+    #[test]
+    fn write_verified_stops_when_cancelled() {
+        let dest = temp_path("cancelled.bin");
+        let chunk = DOWNLOAD_BUF_SIZE as u64;
+        // `is_cancelled` は `Fn`（受信ループから何度も呼ぶ）なので、回数はセルで数える。
+        let checks = std::cell::Cell::new(0u32);
+        let end = write_verified(
+            std::io::Read::take(std::io::repeat(0), chunk * 10),
+            &dest,
+            HELLO_SHA256,
+            TEST_MAX,
+            |_| {},
+            || {
+                // 2 チャンク読ませてから立てる（開始直後だけの経路にしない）。
+                checks.set(checks.get() + 1);
+                checks.get() > 2
+            },
+        )
+        .expect("cancelling is not a failure");
+        assert_eq!(end, TransferEnd::Cancelled);
+        // 全部は読まずに抜けている（読み切っていたら打ち切りが効いていない）。
+        let written = std::fs::metadata(&dest).expect("metadata").len();
+        assert!(
+            (0..chunk * 10).contains(&written),
+            "the transfer should stop partway, wrote {written} bytes"
+        );
+        // 部分ファイルは残る（後始末は呼び出し側の `PartFile`）。
+        assert!(dest.is_file());
+        let _ = std::fs::remove_file(&dest);
+    }
+
+    /// 打ち切りは「取得中で、かつワーカーが必要としていない」ときだけ効く。
+    #[test]
+    fn cancel_download_only_targets_an_unneeded_in_flight_download() {
+        let downloader = ModelDownloader::new();
+
+        // 取得中でなければ打ち切るものが無い。
+        assert!(!downloader.cancel_download(FAKE_LLM_MODEL.id));
+
+        // 担当を引き受けている状態を作る（`acquire_and_download` が入れるのと同じ 2 つ）。
+        let cancel = Arc::new(AtomicBool::new(false));
+        {
+            let mut state = downloader.lock();
+            state.status.insert(
+                FAKE_LLM_MODEL.id,
+                DownloadStatus::Downloading {
+                    received: 0,
+                    total: FAKE_LLM_MODEL.size_bytes,
+                },
+            );
+            state.cancels.insert(FAKE_LLM_MODEL.id, Arc::clone(&cancel));
+        }
+
+        // ワーカーが必要としている間は打ち切らない（ジョブは投入時のモデルを要る）。
+        {
+            let _needed = RequiredMark::new(&downloader, FAKE_LLM_MODEL.id);
+            assert!(!downloader.cancel_download(FAKE_LLM_MODEL.id));
+            assert!(!cancel.load(Ordering::Relaxed));
+        }
+
+        // 印が外れたら打ち切れる。
+        assert!(downloader.cancel_download(FAKE_LLM_MODEL.id));
+        assert!(cancel.load(Ordering::Relaxed));
+    }
+
+    /// 同じモデルを 2 つのワーカーが必要としても、片方が抜けただけでは印は外れない
+    /// （本数で持つ理由。片方の終了で打ち切れるようになると、残った側のジョブが巻き添えになる）。
+    #[test]
+    fn required_marks_nest_by_count() {
+        let downloader = ModelDownloader::new();
+        let cancel = Arc::new(AtomicBool::new(false));
+        downloader
+            .lock()
+            .cancels
+            .insert(FAKE_LLM_MODEL.id, Arc::clone(&cancel));
+
+        let outer = RequiredMark::new(&downloader, FAKE_LLM_MODEL.id);
+        {
+            let _inner = RequiredMark::new(&downloader, FAKE_LLM_MODEL.id);
+        }
+        assert!(
+            !downloader.cancel_download(FAKE_LLM_MODEL.id),
+            "the outer worker still needs it"
+        );
+        drop(outer);
+        assert!(downloader.cancel_download(FAKE_LLM_MODEL.id));
+    }
+
+    /// 打ち切りの記録は `NotDownloaded`（`Failed` ではない）で、中断フラグも掃除される。
+    /// 掃除しないと、次に始めた取得が立った直後に古いフラグで打ち切られる。
+    #[test]
+    fn finish_cancelled_clears_the_flag_and_records_not_downloaded() {
+        let downloader = ModelDownloader::new();
+        {
+            let mut state = downloader.lock();
+            state.status.insert(
+                FAKE_LLM_MODEL.id,
+                DownloadStatus::Downloading {
+                    received: 0,
+                    total: FAKE_LLM_MODEL.size_bytes,
+                },
+            );
+            state
+                .cancels
+                .insert(FAKE_LLM_MODEL.id, Arc::new(AtomicBool::new(true)));
+        }
+
+        DownloadGuard::new(&downloader, FAKE_LLM_MODEL.id).finish_cancelled();
+
+        assert_eq!(
+            downloader.recorded_status(FAKE_LLM_MODEL.id),
+            Some(DownloadStatus::NotDownloaded)
+        );
+        assert!(downloader.lock().cancels.is_empty());
+        // フラグが残っていないので、次の取得は打ち切り済み扱いにならない。
+        assert!(!downloader.cancel_download(FAKE_LLM_MODEL.id));
     }
 
     #[test]
