@@ -334,3 +334,87 @@ fn a_disabled_button_never_fires() {
         "a disabled button must not fire from pointer or keyboard"
     );
 }
+
+/// 押したままボタンの外へ出て離しても発火しない（標準ウィジェットと同じ取り消しの約束。
+/// `docs/rules/slint.md` の TouchArea の約束）。
+#[test]
+#[cfg_attr(
+    not(slint_debug_info),
+    ignore = "needs Slint debug info (SLINT_EMIT_DEBUG_INFO=1)"
+)]
+fn a_button_does_not_fire_when_the_pointer_leaves_while_pressed() {
+    let window = open_window();
+    let fired = std::rc::Rc::new(std::cell::Cell::new(0));
+    let counter = fired.clone();
+    window.on_choose_folder(move || counter.set(counter.get() + 1));
+
+    let button = nth(&window, "ActionButton", 0);
+    let origin = button.absolute_position();
+    let size = button.size();
+    // ボタンの真下、高さ 2 つぶん外れた位置まで引いてから離す。
+    let outside =
+        slint::LogicalPosition::new(origin.x + size.width / 2.0, origin.y + size.height * 2.5);
+    button.mock_drag(outside, slint::platform::PointerEventButton::Left);
+
+    assert_eq!(
+        fired.get(),
+        0,
+        "releasing outside the button must cancel the press"
+    );
+}
+
+/// 状態を支援技術へ伝えるための属性が揃っている。
+///
+/// 状態プロパティ（`accessible-checked` など）だけでは実際の支援技術に届かない——
+/// 対になる `checkable` / `expandable` が無いと、accesskit は状態そのものを載せない。
+/// テストバックエンドは状態プロパティを直読みするので、**これを見ていないと「テストは
+/// 通るのに読み上げられない」状態に気づけない**（`docs/rules/slint.md`）。
+#[test]
+#[cfg_attr(
+    not(slint_debug_info),
+    ignore = "needs Slint debug info (SLINT_EMIT_DEBUG_INFO=1)"
+)]
+fn state_carrying_parts_declare_how_their_state_is_read() {
+    let window = open_window();
+
+    let toggle = nth(&window, "Toggle", 0);
+    assert_eq!(
+        toggle.accessible_checkable(),
+        Some(true),
+        "a toggle must declare that it is checkable, or its on/off is never announced"
+    );
+
+    let select = nth(&window, "Select", 0);
+    assert_eq!(
+        select.accessible_expandable(),
+        Some(true),
+        "a select must declare that it expands"
+    );
+    assert_eq!(
+        select.accessible_expanded(),
+        Some(false),
+        "a closed select must report itself as collapsed"
+    );
+}
+
+/// 無効な選択は、支援技術からも開けない。
+///
+/// 開く口は 1 つ（`open-options`）に集めてあるので、ここが塞がっていればクリック・キー・
+/// 支援技術の 3 経路すべてが塞がる。
+#[test]
+#[cfg_attr(
+    not(slint_debug_info),
+    ignore = "needs Slint debug info (SLINT_EMIT_DEBUG_INFO=1)"
+)]
+fn a_disabled_select_does_not_expand() {
+    let window = open_window();
+    window.set_auto_transcribe(false); // 言語の選択を無効にするゲート
+
+    let select = nth(&window, "Select", 0);
+    select.invoke_accessible_expand_action();
+    assert_eq!(
+        select.accessible_expanded(),
+        Some(false),
+        "a disabled select must stay collapsed"
+    );
+}

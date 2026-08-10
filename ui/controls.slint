@@ -758,9 +758,8 @@ export component Select inherits Rectangle {
     accessible-enabled: root.enabled;
     accessible-expandable: true;
     accessible-expanded: root.expanded;
+    // ガードは `open-options` が持つ（3 経路のどれから来ても同じ口を通る）。
     accessible-action-expand => {
-        if (root.enabled) {
-            root.open-options();
-        }
+        root.open-options();
     }
 }
