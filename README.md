@@ -176,7 +176,8 @@ shoki/
 ├── ui/
 │   ├── app-window.slint       設定画面の UI 定義（Slint。他ウィンドウの再エクスポートも行う）
 │   ├── recordings-window.slint 録音一覧・再生ウィンドウの UI 定義（Slint）
-│   ├── models-window.slint    モデル管理（一覧・取得・削除・選択）ウィンドウの UI 定義（Slint）
+│   ├── models-window.slint    モデル管理ウィンドウの UI 定義（Slint。中身は model-list.slint）
+│   ├── model-list.slint       モデル一覧（取得・削除・選択）。複数のウィンドウへ載せる共通部品
 │   ├── controls.slint         自作部品（見出し・カード・状態行・バッジと、ボタン・トグル・ステッパー・選択）
 │   └── style.slint            デザイントークン（配色・タイポグラフィ・寸法。全ウィンドウ共有）
 ├── assets/
@@ -193,7 +194,9 @@ shoki/
 │   ├── generate-icons.sh アイコン資産の再生成（.icon → Assets.car / .icns、SVG → tray.png）
 │   └── check-icons.sh    生成物がマスターと一致するかの検査（CI でも実行）
 └── src/
-    ├── main.rs           エントリ。トレイ初期化と Slint イベントループ起動
+    ├── main.rs           エントリ。トレイ初期化と Slint イベントループ起動、各画面の配線
+    ├── windows/          ウィンドウごとの配線（main.rs から画面単位で切り出したもの）
+    │   └── models.rs     モデル一覧の合成・可否判定・走査・通知・選択
     ├── tray.rs           トレイアイコン／メニューの構築とイベントのディスパッチ
     ├── recorder.rs       録音セッション（マイク＋システム音声）の開始・停止と MP3 書き出し
     ├── player.rs         録音の再生（rodio でファイルをストリーミング再生）

@@ -23,7 +23,7 @@ use std::rc::Rc;
 
 use slint::{ComponentHandle, ModelRc, VecModel};
 
-/// 確認モーダルの説明の共通部分（`src/main.rs` の `model_delete_detail` の複製。bin クレートなので
+/// 確認モーダルの説明の共通部分（`src/windows/models.rs` の `model_delete_detail` の複製。bin クレートなので
 /// import できない。あちらを変えたらここも合わせること）。
 const DELETE_DETAIL_HEAD: &str = "The file is deleted permanently — it does not go to the Trash.";
 
@@ -36,7 +36,7 @@ fn heading(title: &str) -> ModelRow {
     }
 }
 
-/// 確認モーダルの後半の文言（`src/main.rs` の `model_delete_detail` の写像。使用状況で変わるので、
+/// 確認モーダルの後半の文言（`src/windows/models.rs` の `model_delete_detail` の写像。使用状況で変わるので、
 /// `can_use` から推測せずに行ごとに渡す）。
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Returns {
@@ -50,7 +50,7 @@ enum Returns {
     Never,
 }
 
-/// 1 行。状態テキストは Rust 側（`src/main.rs` の `model_row_status_text`）の複製を置く
+/// 1 行。状態テキストは Rust 側（`src/windows/models.rs` の `model_row_status_text`）の複製を置く
 /// （長さが見え方に効くのが確認の主目的）。
 /// 行 1 つの指定（引数が増えすぎないようまとめる）。
 struct Sample<'a> {
@@ -222,7 +222,7 @@ fn main() {
         "empty" => Vec::new(),
         _ => sample_rows(),
     };
-    // 空表示・合計・通知は `src/main.rs` の `MODELS_EMPTY_TEXT` / `MODELS_UNREADABLE_NOTICE` /
+    // 空表示・合計・通知は `src/windows/models.rs` の `MODELS_EMPTY_TEXT` / `MODELS_UNREADABLE_NOTICE` /
     // `models_total_text` / `MODEL_IN_USE_NOTICE` の複製。走査の失敗は**通知**で出る
     // （カタログの行は必ず並ぶので、空表示では気づけない）。
     win.set_empty_text("No models available".into());
