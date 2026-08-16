@@ -46,7 +46,7 @@ export component TranscriptionWindow inherits Window {
 
     ModelList {
         models: root.models;
-        heading: "Speech models on this Mac";
+        heading: "Transcription models on this Mac";
         heading-note: "The one marked In use is what transcription runs. This list is the only place that choice is made.";
         footnote: "Models are downloaded from Hugging Face when you choose them or when they are first needed. Audio and transcripts never leave this Mac.";
         total-text: root.total-text;
@@ -77,7 +77,7 @@ export component TranscriptionWindow inherits Window {
             VerticalLayout {
                 spacing: 12px;
                 SectionHeading {
-                    text: "BEHAVIOUR";
+                    text: "BEHAVIOR";
                 }
 
                 Card {

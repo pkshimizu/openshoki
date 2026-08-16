@@ -49,16 +49,25 @@ enum NoticeUpdate {
 }
 
 impl ModelsRefresh {
-    /// 確認モーダルと対象の添字を畳むか（**素材を作り直す経路はすべて畳む**）。
+    /// 確認モーダルと対象の添字を畳むか（**ユーザー操作で並びが変わる経路だけ**）。
     ///
     /// 畳まないまま並びが変わると、モーダルが指す添字が別の行を指し、**表示と違うモデルを
-    /// 消す**。だから「素材を作り直す」と「モーダルを畳む」を別々に選べないようにしてある——
-    /// `Rescan` はモーダルが閉じているときだけ走らせる、が呼び出し側の約束。
+    /// 消す**。`Rescan` も素材を作り直すが畳まない——**モーダルが開いている間は `Rescan` を
+    /// 呼ばない**のが呼び出し側の約束だから（ガードは `main` の tick。表示中のウィンドウの
+    /// モーダルだけを見る）。
     fn resets_modal(self) -> bool {
         matches!(
             self,
             Self::AfterOperation(_) | Self::AfterOperationElsewhere
         )
+    }
+
+    /// 巻き込まれた側の理由。操作でなければそのまま（`Rescan` / `Poll` は元から通知に触らない）。
+    pub(crate) fn elsewhere(self) -> Self {
+        match self {
+            Self::AfterOperation(_) => Self::AfterOperationElsewhere,
+            other => other,
+        }
     }
 
     fn notice(self) -> NoticeUpdate {
@@ -299,11 +308,21 @@ pub(crate) const SPEECH_KINDS: &[model_download::ModelKind] = &[model_download::
 pub(crate) const SUMMARY_KINDS: &[model_download::ModelKind] =
     &[model_download::ModelKind::Summary];
 
+/// どのウィンドウの操作で作り直すか。**操作元と巻き込まれた側で理由が変わる**ので、
+/// 呼び出し側が必ず自分を名乗る（名乗らないと、片方の通知がもう片方へ出る）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ListOrigin {
+    Transcription,
+    Minutes,
+    /// どちらのウィンドウでもない（tick）。通知に触らない理由しか来ないので、区別は要らない。
+    Tick,
+}
+
 /// 「作り直して、生きているウィンドウへ反映する」処理。
 ///
 /// **2 つのウィンドウが互いを更新し合う**ので、実体は両方を作ってからでないと組めない。そこで
 /// 各ウィンドウには「あとで入る箱」を渡し、`main` が最後に実体を入れる。
-pub(crate) type RefreshLists = Rc<dyn Fn(ModelsRefresh)>;
+pub(crate) type RefreshLists = Rc<dyn Fn(ModelsRefresh, ListOrigin)>;
 /// その箱（生成順の都合で後入れになる。`main` が 1 つだけ持つ）。
 pub(crate) type RefreshSlot = Rc<RefCell<Option<RefreshLists>>>;
 
@@ -328,6 +347,55 @@ pub(crate) trait ModelListView {
     fn set_show_delete_confirm(&self, value: bool);
     fn set_delete_index(&self, value: i32);
 }
+
+/// 一覧の 3 操作（Use / Download / Delete）を、そのウィンドウのハンドルへ配線する。
+///
+/// **マクロにするのは、2 つのウィンドウで取り違えないため**。手で 2 回書くと、議事録ウィンドウに
+/// 文字起こしのハンドルを渡してもコンパイルが通り、**添字は正しいのに別のモデルを消す**
+/// （行数が同じなら例外も出ない）。ここを通せば、ウィンドウと一覧の組は呼び出し 1 か所でしか
+/// 決まらない。Slint の生成型に共通のコールバック登録トレイトが無いので、ジェネリクスにはできない。
+macro_rules! wire_model_list {
+    ($window:expr, $field:ident, $origin:expr, $config:expr, $workers:expr, $refresh:expr) => {{
+        {
+            let handles = $workers.lists.$field.clone();
+            let config = std::rc::Rc::clone($config);
+            let downloader = $workers.downloader.clone();
+            let refresh = std::rc::Rc::clone(&$refresh);
+            $window.on_use_model(move |index| {
+                if let RowAction::Done(notice) =
+                    models::use_model_at(&handles, index, &config, &downloader)
+                {
+                    refresh(ModelsRefresh::AfterOperation(notice), $origin);
+                }
+            });
+        }
+        {
+            let handles = $workers.lists.$field.clone();
+            let downloader = $workers.downloader.clone();
+            let refresh = std::rc::Rc::clone(&$refresh);
+            $window.on_download_model(move |index| {
+                if let RowAction::Done(notice) =
+                    models::download_model_at(&handles, index, &downloader)
+                {
+                    refresh(ModelsRefresh::AfterOperation(notice), $origin);
+                }
+            });
+        }
+        {
+            let workers = $workers.clone();
+            let config = std::rc::Rc::clone($config);
+            let refresh = std::rc::Rc::clone(&$refresh);
+            $window.on_delete_model(move |index| {
+                if let RowAction::Done(notice) =
+                    models::delete_model_at(&workers, &workers.lists.$field, index, &config)
+                {
+                    refresh(ModelsRefresh::AfterOperation(notice), $origin);
+                }
+            });
+        }
+    }};
+}
+pub(crate) use wire_model_list;
 
 /// Slint が生成したウィンドウ型へ `ModelListView` を実装する（委譲するだけ）。
 macro_rules! impl_model_list_view {
@@ -504,7 +572,7 @@ fn kind_is_on(context: &ModelsContext, kind: model_download::ModelKind) -> bool 
 fn kind_noun(kind: model_download::ModelKind) -> &'static str {
     match kind {
         model_download::ModelKind::Speech => "transcription",
-        model_download::ModelKind::Summary => "notes",
+        model_download::ModelKind::Summary => "meeting notes",
     }
 }
 
@@ -512,7 +580,7 @@ fn kind_noun(kind: model_download::ModelKind) -> &'static str {
 fn kind_job_phrase(kind: model_download::ModelKind) -> &'static str {
     match kind {
         model_download::ModelKind::Speech => "a recording is being transcribed now",
-        model_download::ModelKind::Summary => "a recording is being summarised now",
+        model_download::ModelKind::Summary => "a recording is being summarized now",
     }
 }
 
@@ -664,7 +732,7 @@ fn model_usage_part(
         }),
         RowUsage::Overridden => Some("not used because config.toml sets the model file".to_owned()),
         RowUsage::Unknown => Some(
-            "not recognised, so shoki cannot tell which feature it belongs to. It is never used; \
+            "not recognized, so shoki cannot tell which feature it belongs to. It is never used; \
              deleting it here only removes the file"
                 .to_owned(),
         ),
@@ -701,7 +769,7 @@ fn model_row_status_text(
     format!("{}.", parts.join(" · "))
 }
 
-/// 「使う」を出せるか。/// 「使う」を出せるか。カタログの行で、いま選ばれておらず、その種別が `config.toml` で上書き
+/// 「使う」を出せるか。カタログの行で、いま選ばれておらず、その種別が `config.toml` で上書き
 /// されていないとき（上書き中はカタログの選択が使われないので、押せても何も変わらない）。
 fn can_use_row(source: &ModelRowSource, facts: &RowFacts) -> bool {
     matches!(source, ModelRowSource::Catalog { .. }) && facts.usage == RowUsage::Idle
@@ -1020,7 +1088,8 @@ pub(crate) fn downloaded_count_text(
 pub(crate) enum RowAction {
     /// 何かした（`Some` は出す通知）。**素材を作り直す必要がある**。
     Done(Option<&'static str>),
-    /// その行では何も起きない（見出し・カタログ外など、その操作を出していない行）。
+    /// **その行にそのボタンを出していない**（見出し・カタログ外など）ので、押しようがない。
+    /// 「押したのに無反応」に見える経路をここへ落とさないこと——失敗は `Done` で通知を出す。
     Ignored,
 }
 
@@ -1066,19 +1135,19 @@ pub(crate) fn download_model_at(
 /// **押された時点で使用中を再確認する**。一覧は tick が状態を追うが、tick とクリックの間に
 /// ジョブが始まることはありうる。取得中の拒否は基盤側が持つ。
 pub(crate) fn delete_model_at(
-    lists: &ModelLists,
+    workers: &ModelWorkers,
     handles: &ModelListHandles,
     index: i32,
     config: &Rc<RefCell<Config>>,
-    downloader: &model_download::ModelDownloader,
-    transcriber: &transcribe::TranscribeWorker,
-    summarizer: &summarize::SummarizeWorker,
 ) -> RowAction {
     let Some(source) = usize::try_from(index)
         .ok()
         .and_then(|i| handles.sources.borrow().get(i).cloned())
     else {
-        return RowAction::Ignored;
+        // 添字が範囲外なのは、モーダルを開いている間に並びが変わったとき（本来は畳んでいる）。
+        // **`Ignored` にしない**——確定を押したのに何も起きない、という見え方を残さない。
+        eprintln!("Skipping the model deletion because the row is no longer listed");
+        return RowAction::Done(delete_failure_notice(DeleteOutcome::Failed));
     };
     let Some(target) = source.installed().cloned() else {
         // Delete はディスクに実体がある行にしか出さないので通常は来ないが、「押しても無反応」に
@@ -1091,11 +1160,11 @@ pub(crate) fn delete_model_at(
     // **アプリごと落ちる**（`ModelScanShared` の doc）。
     let busy = {
         let config = config.borrow();
-        let override_files = lists.shared.override_files.borrow().clone();
+        let override_files = workers.lists.shared.override_files.borrow().clone();
         let context = models_context(
-            transcriber,
-            summarizer,
-            downloader,
+            &workers.transcriber,
+            &workers.summarizer,
+            &workers.downloader,
             &config,
             &override_files,
         );
@@ -1104,7 +1173,7 @@ pub(crate) fn delete_model_at(
     let outcome = if busy {
         DeleteOutcome::InUse
     } else {
-        match downloader.delete(&target) {
+        match workers.downloader.delete(&target) {
             Ok(()) => DeleteOutcome::Deleted,
             Err(err) => {
                 // 文言にフルパスは含めない（`docs/rules/security.md`）。
@@ -1118,7 +1187,7 @@ pub(crate) fn delete_model_at(
 
 /// 選び直しで取得を打ち切るモデルの ID（打ち切らないなら `None`）。
 ///
-/// 同じモデルを選び直したときに打ち切らないためのガード。モデル管理ウィンドウの「Use」は
+/// 同じモデルを選び直したときに打ち切らないためのガード。一覧の「Use」は
 /// **選択中の行でも押せる**ので、ここを外すと「押したら自分のダウンロードが止まって数 GB を
 /// 捨てる」ことになる（`request_download` が拾い直すので止まりっぱなしにはならないが、
 /// 受信済みのぶんは戻らない）。
@@ -1129,8 +1198,9 @@ fn model_to_cancel_on_select<'a>(
     (previous_id != selected.id).then_some(previous_id)
 }
 
-/// 使うモデルを選び直して設定へ永続化する（設定画面の Select とモデル管理ウィンドウの
-/// 「Use」が**同じ経路**を通る）。成功したら `true`。
+/// 使うモデルを選び直して設定へ永続化する。成功したら `true`。
+///
+/// **入口は一覧の「Use」だけ**（#141 で設定画面の選択 UI を廃した）。
 ///
 /// 選び直しで不要になった**前のモデルの取得は打ち切る**（#124。`cancel_download`）。
 ///
@@ -1157,7 +1227,7 @@ pub(crate) fn select_model(
         }
     };
     if let Err(err) = candidate.save() {
-        // どの種別の話か分かるようにする（3 つの入口＝両方の Select とモデル管理ウィンドウの
+        // どの種別の話か分かるようにする（入口は 2 つ＝それぞれの機能ウィンドウの
         // 「Use」が同じ関数を通るので、種別が無いと調査で効かない）。
         eprintln!(
             "Not changing the {} model because saving the settings failed: {err}",
@@ -1196,7 +1266,7 @@ mod tests {
     ];
 
     /// 選び直しで打ち切るのは「別のモデルに変わったとき」だけ。同じモデルを選び直しても
-    /// （モデル管理ウィンドウの「Use」は選択中の行でも押せる）自分の取得は止めない。
+    /// （一覧の「Use」は選択中の行でも押せる）自分の取得は止めない。
     #[test]
     fn model_to_cancel_on_select_skips_an_unchanged_selection() {
         let tiny = crate::whisper_model::spec_for("tiny").expect("tiny is in the catalog");
@@ -1634,7 +1704,7 @@ mod tests {
         );
         assert!(
             super::model_usage_part(super::RowUsage::Unknown, None, &on)
-                .is_some_and(|text| text.starts_with("not recognised")),
+                .is_some_and(|text| text.starts_with("not recognized")),
             "an unknown file must say why it is not used"
         );
     }
@@ -1757,6 +1827,20 @@ mod tests {
         }
     }
 
+    /// 通知の宛先は**操作元だけ**。議事録側で失敗した通知が文字起こし側に出てはいけないし、
+    /// その逆もいけない（`ListOrigin` を渡し忘れると、片方の画面が無反応になる）。
+    #[test]
+    fn only_the_window_that_acted_gets_the_notice() {
+        let failed = super::ModelsRefresh::AfterOperation(Some("boom"));
+        // 操作元はそのまま、他方は通知に触らない理由へ落ちる。
+        assert_eq!(failed.notice(), super::NoticeUpdate::Set(Some("boom")));
+        assert_eq!(failed.elsewhere().notice(), super::NoticeUpdate::Keep);
+        // 走査由来の理由は「操作」ではないので、`elsewhere` でも姿が変わらない。
+        for cause in [super::ModelsRefresh::Rescan, super::ModelsRefresh::Poll] {
+            assert_eq!(cause.elsewhere(), cause, "{cause:?} is not an operation");
+        }
+    }
+
     /// 巻き込まれた側は**モーダルを畳むが通知は触らない**。
     ///
     /// 畳まないと、並びが変わったあとのモーダルが別の行を指す（**表示と違うモデルを消す**）。
@@ -1780,10 +1864,9 @@ mod tests {
         );
     }
 
-    /// **素材を作り直す理由はすべてモーダルを畳む**。作り直しと畳みを別々に選べると、片方だけ
-    /// 選んだ瞬間に添字がずれる。
+    /// **ユーザー操作で作り直す理由はモーダルを畳む**。畳まないまま並びが変わると添字がずれる。
     #[test]
-    fn every_reseeding_cause_folds_the_modal() {
+    fn every_operation_cause_folds_the_modal() {
         for cause in [
             super::ModelsRefresh::AfterOperation(None),
             super::ModelsRefresh::AfterOperationElsewhere,

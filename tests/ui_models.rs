@@ -114,7 +114,7 @@ fn row_delete_buttons(window: &TranscriptionWindow) -> Vec<ElementHandle> {
 }
 
 /// 確認モーダルの確定ボタン（ラベルで引く。行の Delete と取り違えないため）。
-const CONFIRM_LABEL: &str = "Delete Model";
+const CONFIRM_LABEL: &str = "Delete model";
 
 fn confirm_button(window: &TranscriptionWindow) -> ElementHandle {
     ElementHandle::find_by_accessible_label(window, CONFIRM_LABEL)

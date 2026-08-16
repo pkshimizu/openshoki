@@ -36,7 +36,7 @@ fn sample_rows() -> Vec<ModelRow> {
             name: CONFIRM_SAMPLE_NAME,
             detail: "About 40 s per hour of audio; needs 6 GB of free memory.",
             // 使用中のジョブがある行（削除できない理由がいちばん長い）。
-            status_text: "Downloaded · selected for notes · a recording is being summarised now, \
+            status_text: "Downloaded · selected for meeting notes · a recording is being summarized now, \
                           so it cannot be deleted until that finishes.",
             size: "2.0 GB",
             status: ModelStatus::Installed,

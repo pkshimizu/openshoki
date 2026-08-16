@@ -715,38 +715,61 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 画面に他人の失敗を出さない／出ていた通知を黙って消さない）。
     let refresh_lists: windows::models::RefreshSlot = Rc::new(RefCell::new(None));
 
-    let transcription_ui = windows::transcription::build(
-        &config,
-        &model_lists,
-        &model_downloader,
-        &transcriber,
-        &summarizer,
-        {
-            let cell = Rc::clone(&refresh_lists);
-            Rc::new(move |cause| {
-                if let Some(refresh) = cell.borrow().clone() {
-                    refresh(cause);
+    let model_workers = windows::models::ModelWorkers {
+        lists: model_lists.clone(),
+        downloader: model_downloader.clone(),
+        transcriber: transcriber.clone(),
+        summarizer: summarizer.clone(),
+    };
+    let transcription_ui = windows::transcription::build(&config, &model_workers, {
+        let cell = Rc::clone(&refresh_lists);
+        Rc::new(move |cause, origin| {
+            if let Some(refresh) = cell.borrow().clone() {
+                refresh(cause, origin);
+            }
+        })
+    });
+    let minutes_ui = windows::minutes::build(&config, &model_workers, {
+        let cell = Rc::clone(&refresh_lists);
+        Rc::new(move |cause, origin| {
+            if let Some(refresh) = cell.borrow().clone() {
+                refresh(cause, origin);
+            }
+        })
+    });
+    // 閉じる（＝隠す）ときに**確認モーダルを畳む**。開いたまま隠すと、その間の作り直しで並びが
+    // 変わっても畳まれず（tick のガードは表示中のウィンドウしか見ない）、再表示したときに
+    // **古い添字を指したモーダル**が出る。
+    for (window, folder) in [
+        (
+            transcription_ui.window(),
+            Box::new({
+                let weak = transcription_ui.as_weak();
+                move || {
+                    if let Some(window) = weak.upgrade() {
+                        window.set_show_delete_confirm(false);
+                        window.set_delete_index(0);
+                    }
                 }
-            })
-        },
-    );
-    let minutes_ui = windows::minutes::build(
-        &config,
-        &model_lists,
-        &model_downloader,
-        &transcriber,
-        &summarizer,
-        {
-            let cell = Rc::clone(&refresh_lists);
-            Rc::new(move |cause| {
-                if let Some(refresh) = cell.borrow().clone() {
-                    refresh(cause);
+            }) as Box<dyn Fn()>,
+        ),
+        (
+            minutes_ui.window(),
+            Box::new({
+                let weak = minutes_ui.as_weak();
+                move || {
+                    if let Some(window) = weak.upgrade() {
+                        window.set_show_delete_confirm(false);
+                        window.set_delete_index(0);
+                    }
                 }
-            })
-        },
-    );
-    for window in [transcription_ui.window(), minutes_ui.window()] {
-        window.on_close_requested(|| slint::CloseRequestResponse::HideWindow);
+            }) as Box<dyn Fn()>,
+        ),
+    ] {
+        window.on_close_requested(move || {
+            folder();
+            slint::CloseRequestResponse::HideWindow
+        });
     }
 
     // 実体を入れる（2 つのウィンドウを作ってからでないと `Weak` が取れないので、後入れにする）。
@@ -754,66 +777,76 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let transcription_weak = transcription_ui.as_weak();
         let minutes_weak = minutes_ui.as_weak();
         let ui_weak = ui.as_weak();
-        let workers = windows::models::ModelWorkers {
-            lists: model_lists.clone(),
-            downloader: model_downloader.clone(),
-            transcriber: transcriber.clone(),
-            summarizer: summarizer.clone(),
-        };
+        let workers = model_workers.clone();
         let config = Rc::clone(&config);
-        Rc::new(move |cause: ModelsRefresh| {
-            let scan_notice = if matches!(cause, ModelsRefresh::Poll) {
-                None
-            } else {
-                // 走査はここだけ。**ビューを見ない**ので、片方のウィンドウが取れなくても
-                // 素材とラッチは揃う（`rescan_model_lists` の doc）。
-                windows::models::rescan_model_lists(
-                    &workers.lists,
-                    &workers.downloader,
-                    &config.borrow(),
-                )
-            };
-            let cause = windows::models::refresh_cause(cause, scan_notice);
-            // 巻き込まれた側は通知を触らない（`AfterOperationElsewhere`）。どちらが操作したかは
-            // ここでは分からないので、**両方に同じ理由を配らない**ために、操作した側の理由は
-            // 呼び出し元が渡し、他方はこの関数が落とす……のではなく、両方へ配ってから通知だけを
-            // 操作元に限る、という形は取れない（どちらが元かを持っていない）。そこで
-            // **通知は「いま前面にあるウィンドウ」ではなく、素材の作り直しと切り離して扱う**:
-            // 操作元のウィンドウは自分で `AfterOperation` を受け取り、他方は
-            // `AfterOperationElsewhere` になるよう、呼び出し元が 2 回に分けて渡す。
-            let elsewhere = match cause {
-                ModelsRefresh::AfterOperation(_) => ModelsRefresh::AfterOperationElsewhere,
-                other => other,
-            };
-            if let Some(window) = transcription_weak.upgrade() {
-                windows::models::apply_rows(
-                    &window,
-                    &workers.lists.transcription,
-                    &workers,
-                    &config.borrow(),
-                    cause,
-                );
-                windows::transcription::apply_settings(&window, &config.borrow());
-            }
-            if let Some(window) = minutes_weak.upgrade() {
-                windows::models::apply_rows(
-                    &window,
-                    &workers.lists.minutes,
-                    &workers,
-                    &config.borrow(),
-                    elsewhere,
-                );
-                windows::minutes::apply_settings(&window, &config.borrow());
-            }
-            // 設定画面の扉も追従させる（選択・ON/OFF が変わると要約行と状態行が変わる）。
-            if let Some(ui) = ui_weak.upgrade() {
-                windows::transcription::apply_door(&ui, &config.borrow(), &workers.downloader);
-                windows::minutes::apply_door(&ui, &config.borrow(), &workers.downloader);
-            }
-        }) as windows::models::RefreshLists
+        Rc::new(
+            move |cause: ModelsRefresh, origin: windows::models::ListOrigin| {
+                let polling = matches!(cause, ModelsRefresh::Poll);
+                let scan_notice = if polling {
+                    None
+                } else {
+                    // 走査はここだけ。**ビューを見ない**ので、片方のウィンドウが取れなくても
+                    // 素材とラッチは揃う（`rescan_model_lists` の doc）。
+                    windows::models::rescan_model_lists(
+                        &workers.lists,
+                        &workers.downloader,
+                        &config.borrow(),
+                    )
+                };
+                let cause = windows::models::refresh_cause(cause, scan_notice);
+                // **操作元だけが通知を差し替える**。巻き込まれた側はモーダルを畳むだけにする
+                // （触っていない画面に他人の失敗を出さない／出ていた通知を黙って消さない）。
+                let (for_transcription, for_minutes) = match origin {
+                    windows::models::ListOrigin::Transcription => (cause, cause.elsewhere()),
+                    windows::models::ListOrigin::Minutes => (cause.elsewhere(), cause),
+                    // tick から来る理由は通知に触らないので、どちらへ配っても同じ。
+                    windows::models::ListOrigin::Tick => (cause, cause),
+                };
+                // **表示していないウィンドウの行は組み直さない**（行ごとにワーカーのロックを取るので、
+                // 100ms tick で 2 画面ぶん回すのは無駄。素材とラッチは上の走査で揃っているから、
+                // 次に開くときの `AfterOperation` で追いつく）。
+                if let Some(window) = transcription_weak.upgrade()
+                    && window.window().is_visible()
+                {
+                    windows::models::apply_rows(
+                        &window,
+                        &workers.lists.transcription,
+                        &workers,
+                        &config.borrow(),
+                        for_transcription,
+                    );
+                    if !polling {
+                        windows::transcription::apply_settings(&window, &config.borrow());
+                    }
+                }
+                if let Some(window) = minutes_weak.upgrade()
+                    && window.window().is_visible()
+                {
+                    windows::models::apply_rows(
+                        &window,
+                        &workers.lists.minutes,
+                        &workers,
+                        &config.borrow(),
+                        for_minutes,
+                    );
+                    if !polling {
+                        windows::minutes::apply_settings(&window, &config.borrow());
+                    }
+                }
+                // 設定画面の扉も追従させる（選択・ON/OFF が変わると要約行と状態行が変わる）。
+                // **tick の `Poll` では触らない**——扉は tick 自身が別経路で追従させているので、
+                // ここで組み直すと 100ms ごとにカタログ全件のロックと文字列生成が二重に走る。
+                if let Some(ui) = ui_weak.upgrade()
+                    && !polling
+                {
+                    windows::transcription::apply_door(&ui, &config.borrow(), &workers.downloader);
+                    windows::minutes::apply_door(&ui, &config.borrow(), &workers.downloader);
+                }
+            },
+        ) as windows::models::RefreshLists
     });
 
-    // 設定画面の扉。開くたびに一覧を作り直す（ディスク走査はここだけ）。
+    // 設定画面の扉。開くたびに一覧を作り直す（走査の入口は `refresh_lists` の 1 つ）。
     {
         let transcription_weak = transcription_ui.as_weak();
         let refresh = Rc::clone(&refresh_lists);
@@ -823,15 +856,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let Some(window) = transcription_weak.upgrade() else {
                 return;
             };
-            if let Some(refresh) = refresh.borrow().clone() {
-                refresh(ModelsRefresh::AfterOperation(None));
-            }
+            // **見せてから作り直す**。作り直しは表示中のウィンドウにしか行を流さないので、
+            // 順番が逆だと開いた直後の一覧が空のままになる（次の tick まで埋まらない）。
             show_window(
                 window.window(),
                 &mut geometry.borrow_mut(),
                 slint::LogicalPosition::new(TRANSCRIPTION_X, TRANSCRIPTION_Y),
                 slint::LogicalSize::new(TRANSCRIPTION_WIDTH, TRANSCRIPTION_HEIGHT),
             );
+            if let Some(refresh) = refresh.borrow().clone() {
+                refresh(
+                    ModelsRefresh::AfterOperation(None),
+                    windows::models::ListOrigin::Transcription,
+                );
+            }
         });
     }
     {
@@ -842,15 +880,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let Some(window) = minutes_weak.upgrade() else {
                 return;
             };
-            if let Some(refresh) = refresh.borrow().clone() {
-                refresh(ModelsRefresh::AfterOperation(None));
-            }
+            // **見せてから作り直す**。作り直しは表示中のウィンドウにしか行を流さないので、
+            // 順番が逆だと開いた直後の一覧が空のままになる（次の tick まで埋まらない）。
             show_window(
                 window.window(),
                 &mut geometry.borrow_mut(),
                 slint::LogicalPosition::new(MINUTES_X, MINUTES_Y),
                 slint::LogicalSize::new(MINUTES_WIDTH, MINUTES_HEIGHT),
             );
+            if let Some(refresh) = refresh.borrow().clone() {
+                refresh(
+                    ModelsRefresh::AfterOperation(None),
+                    windows::models::ListOrigin::Minutes,
+                );
+            }
         });
     }
     // 議事録ウィンドウの注意書きから文字起こしウィンドウへ渡れるようにする（従属の理由を
@@ -1230,33 +1273,35 @@ fn build_menu_event_handler(
         // ので、**記録が増えたときに 1 回だけ**走査し直す（毎 tick 走査しないためのラッチ。
         // 「記録は取得済みだが実体が無い」を条件にすると、外部でファイルを消された場合などに
         // 条件が解消せず走査が止まらない）。
-        let visible: Vec<bool> = [
+        // **確認モーダルのガードは「表示中の」ウィンドウだけで取る**。隠したウィンドウに残った
+        // フラグまで見ると、そのモーダルが走査を恒久的に止めてしまう（隠すときに畳んでいるので
+        // 実際には残らないが、ガードをそれに依存させない）。
+        // 型が違うので個別に畳む（`Some(モーダルが開いているか)` = 表示中、`None` = 隠れている）。
+        let shown_modals = [
             models
                 .transcription
                 .upgrade()
-                .is_some_and(|window| window.window().is_visible()),
+                .filter(|window| window.window().is_visible())
+                .map(|window| window.get_show_delete_confirm()),
             models
                 .minutes
                 .upgrade()
-                .is_some_and(|window| window.window().is_visible()),
-        ]
-        .into();
-        if visible.iter().any(|shown| *shown) {
-            // **確認モーダルのガードは「表示中の」ウィンドウだけで取る**。隠したウィンドウに
-            // 残ったフラグまで見ると、閉じたときのモーダルが走査を恒久的に止めてしまう。
-            let modal_open = models.transcription.upgrade().is_some_and(|window| {
-                window.window().is_visible() && window.get_show_delete_confirm()
-            }) || models.minutes.upgrade().is_some_and(|window| {
-                window.window().is_visible() && window.get_show_delete_confirm()
-            });
+                .filter(|window| window.window().is_visible())
+                .map(|window| window.get_show_delete_confirm()),
+        ];
+        if shown_modals.iter().any(Option::is_some) {
+            let modal_open = shown_modals.iter().flatten().any(|open| *open);
             // ラッチの比較・消費は 1 か所（`ModelLists`）。消費したら両方の素材を同時に作り直す。
             let rescan = models.lists.downloads_changed(&models.downloader) && !modal_open;
             if let Some(refresh) = models.refresh.borrow().clone() {
-                refresh(if rescan {
-                    ModelsRefresh::Rescan
-                } else {
-                    ModelsRefresh::Poll
-                });
+                refresh(
+                    if rescan {
+                        ModelsRefresh::Rescan
+                    } else {
+                        ModelsRefresh::Poll
+                    },
+                    windows::models::ListOrigin::Tick,
+                );
             }
         }
     }
@@ -1942,11 +1987,10 @@ fn model_path_override(
 /// - **要約 OFF**（要約のみ）: 選択だけ保存する。取得は次に要約が走るとき（設定を ON にした後の
 ///   初回要約、または Recordings ウィンドウの「Summarize」による手動生成）に `ensure_model` が行う。
 ///
-/// 文字起こし側に「自動文字起こし OFF なら取得しない」というゲートは**置かない**（既存挙動のまま）。
-/// 設定画面の Select は自動文字起こしが OFF だと無効なのでそこからは選択が起きず、モデル管理
-/// ウィンドウの「Use」で選ぶのは先行取得の意図が明らかなため。要約側に `auto_summarize` のゲートが
-/// あるのは、要約 LLM が whisper より大きく（最大 4.4 GB）、生成時に `ensure_model` が取得する
-/// 経路が別にあるから。
+/// 文字起こし側に「自動文字起こし OFF なら取得しない」というゲートは**置かない**。一覧の「Use」を
+/// 押すのは**先行取得の意思表示**だから（機能を OFF にしたまま準備しておく、という使い方をする）。
+/// 要約側に `auto_summarize` のゲートがあるのは、要約 LLM が whisper より大きく（最大 4.4 GB）、
+/// 生成時に `ensure_model` が取得する経路が別にあるから。
 ///
 /// 上書きの判定は `model_path_override` に任せ、ここは**上書き以外の契機**だけを種別ごとに
 /// 書く（**網羅 match** なので、種別を足したら契機を書くまでコンパイルが通らない）。

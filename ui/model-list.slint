@@ -101,7 +101,7 @@ export component ModelList inherits Rectangle {
     // `in-out` なのは確認用バイナリ（`examples/models_view.rs`）がモーダルの見た目を出すため。
     in-out property <int> delete-index: 0;
 
-    // 「Use」押下。その行のモデルを使う設定にする（設定画面の Select と同じ経路を通る）。
+    // 「Use」押下。その行のモデルを使う設定にする（**選ぶ場所はここだけ**。#141）。
     callback use-model(int);
     // 「Download」押下。その行のモデルの取得を始める（選択は変えない）。
     callback download-model(int);
@@ -357,7 +357,7 @@ export component ModelList inherits Rectangle {
                 spacing: 7px;
 
                 Text {
-                    text: "Delete This Model?";
+                    text: "Delete this model?";
                     font-size: Style.detail-title-size;
                     font-weight: Style.semibold;
                     color: Palette.foreground;
@@ -401,7 +401,7 @@ export component ModelList inherits Rectangle {
                         // 行の Delete と読み上げ・テストの引き当てが衝突しないように分ける
                         // （行側は自作コントロールなのでラベルを持たない）。
                         accessible-role: button;
-                        accessible-label: "Delete Model";
+                        accessible-label: "Delete model";
                         clicked => {
                             root.show-delete-confirm = false;
                             root.delete-model(root.delete-index);

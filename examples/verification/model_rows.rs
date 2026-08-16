@@ -114,7 +114,7 @@ pub fn stray_rows() -> Vec<ModelRow> {
             name: "ggml-medium-q5.bin",
             detail: "",
             size: "539 MB",
-            status_text: "Downloaded · not recognised, so shoki cannot tell which feature it \
+            status_text: "Downloaded · not recognized, so shoki cannot tell which feature it \
                           belongs to. It is never used; deleting it here only removes the file.",
             status: ModelStatus::Installed,
             tone: StatusTone::Caution,

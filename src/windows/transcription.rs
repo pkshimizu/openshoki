@@ -14,12 +14,9 @@ use slint::ComponentHandle as _;
 
 use crate::config::Config;
 use crate::windows::models::{
-    self, ModelLists, ModelsRefresh, RefreshLists, RowAction, set_if_changed,
+    self, ListOrigin, ModelWorkers, ModelsRefresh, RefreshLists, RowAction, set_if_changed,
 };
-use crate::{
-    AppWindow, StatusTone, TranscriptionWindow, config, model_download, summarize, transcribe,
-    whisper_model,
-};
+use crate::{AppWindow, StatusTone, TranscriptionWindow, config, model_download, whisper_model};
 
 /// ウィンドウを作り、設定とコールバックを配線する。
 ///
@@ -27,14 +24,11 @@ use crate::{
 /// **操作したウィンドウと巻き込まれたウィンドウで理由を変える**ため、呼び出し側へ委ねてある。
 pub(crate) fn build(
     config: &Rc<RefCell<Config>>,
-    lists: &ModelLists,
-    downloader: &model_download::ModelDownloader,
-    transcriber: &transcribe::TranscribeWorker,
-    summarizer: &summarize::SummarizeWorker,
+    workers: &ModelWorkers,
     refresh: RefreshLists,
 ) -> TranscriptionWindow {
     let window = TranscriptionWindow::new().expect("creating the transcription window succeeds");
-    window.set_models(lists.transcription.rows.clone().into());
+    window.set_models(workers.lists.transcription.rows.clone().into());
     // 行が 1 つも無いときの縮退表示（カタログの行は必ず並ぶので実際には出ない。走査の失敗は
     // 通知で伝える）。
     window.set_empty_text(models::MODELS_EMPTY_TEXT.into());
@@ -68,7 +62,10 @@ pub(crate) fn build(
                 apply_settings(&window, &config.borrow());
             }
             // 一覧のバッジ（`In use` / `Selected`）が機能の ON/OFF で変わるので作り直す。
-            refresh(ModelsRefresh::AfterOperation(None));
+            refresh(
+                ModelsRefresh::AfterOperation(None),
+                ListOrigin::Transcription,
+            );
         });
     }
 
@@ -94,73 +91,17 @@ pub(crate) fn build(
         });
     }
 
-    wire_list(
-        &window,
+    // 一覧の 3 操作。**マクロを通す**ことで、ウィンドウと一覧の組を取り違えられなくする
+    // （説明は `models::wire_model_list`）。
+    models::wire_model_list!(
+        window,
+        transcription,
+        ListOrigin::Transcription,
         config,
-        lists,
-        downloader,
-        transcriber,
-        summarizer,
-        refresh,
+        workers,
+        refresh
     );
     window
-}
-
-/// 一覧の 3 操作を配線する。**素材を引くのは自分のウィンドウのハンドルだけ**
-/// （`lists.transcription`）。
-fn wire_list(
-    window: &TranscriptionWindow,
-    config: &Rc<RefCell<Config>>,
-    lists: &ModelLists,
-    downloader: &model_download::ModelDownloader,
-    transcriber: &transcribe::TranscribeWorker,
-    summarizer: &summarize::SummarizeWorker,
-    refresh: RefreshLists,
-) {
-    {
-        let handles = lists.transcription.clone();
-        let config = Rc::clone(config);
-        let downloader = downloader.clone();
-        let refresh = Rc::clone(&refresh);
-        window.on_use_model(move |index| {
-            if let RowAction::Done(notice) =
-                models::use_model_at(&handles, index, &config, &downloader)
-            {
-                refresh(ModelsRefresh::AfterOperation(notice));
-            }
-        });
-    }
-    {
-        let handles = lists.transcription.clone();
-        let downloader = downloader.clone();
-        let refresh = Rc::clone(&refresh);
-        window.on_download_model(move |index| {
-            if let RowAction::Done(notice) = models::download_model_at(&handles, index, &downloader)
-            {
-                refresh(ModelsRefresh::AfterOperation(notice));
-            }
-        });
-    }
-    {
-        let lists = lists.clone();
-        let config = Rc::clone(config);
-        let downloader = downloader.clone();
-        let transcriber = transcriber.clone();
-        let summarizer = summarizer.clone();
-        window.on_delete_model(move |index| {
-            if let RowAction::Done(notice) = models::delete_model_at(
-                &lists,
-                &lists.transcription,
-                index,
-                &config,
-                &downloader,
-                &transcriber,
-                &summarizer,
-            ) {
-                refresh(ModelsRefresh::AfterOperation(notice));
-            }
-        });
-    }
 }
 
 /// 設定の値と、見出しの下の 1 行を表示へ入れる（**初期化と更新が同じ経路を通る**）。
