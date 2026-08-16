@@ -1,13 +1,14 @@
 import { ScrollView } from "std-widgets.slint";
 import { Style, StatusTone } from "style.slint";
-import { SectionHeading, Card, CardDivider, CardBlock, StatusLine, Badge, ActionButton, ButtonRole, Toggle, Stepper, Select } from "controls.slint";
+import { SectionHeading, Card, CardDivider, CardBlock, StatusLine, Badge, ActionButton, ButtonRole, Toggle, Stepper, Select, Door } from "controls.slint";
 
 // Recordings ウィンドウは別ファイルで定義し、ここから再エクスポートして 1 つのエントリ
 // （build.rs は app-window.slint のみコンパイル）に含める。Rust 側は include_modules! で
 // RecordingsWindow / SessionRow を得る。
 export { RecordingsWindow, SessionRow } from "recordings-window.slint";
 // モデル一覧ウィンドウ（#117）。同じく再エクスポートするだけで `build.rs` の変更は要らない。
-export { ModelsWindow, ModelRow } from "models-window.slint";
+export { TranscriptionWindow, ModelRow, ModelStatus } from "transcription-window.slint";
+export { MinutesWindow } from "minutes-window.slint";
 // 状態の意味は Rust から渡すので、生成コードに含まれるよう再エクスポートする。
 export { StatusTone } from "style.slint";
 
@@ -85,12 +86,13 @@ component TriggerAppRow inherits Rectangle {
 export component AppWindow inherits Window {
     title: "shoki";
     // 幅・高さは src/main.rs の WINDOW_WIDTH/HEIGHT と一致させること（片方だけ変えない）。
-    // 標準 460x900 / 最小 420x520（#127 のデザインのサイズ表）。最小まで縮めても、本文が
+    // 標準 460x720 / 最小 420x520（#141 のデザインのサイズ表。機能の設定が専用ウィンドウへ
+    // 移ったぶん縮んだ）。最小まで縮めても、本文が
     // スクロールするのですべての設定に届く。
     min-width: 420px;
     min-height: 520px;
     preferred-width: 460px;
-    preferred-height: 900px;
+    preferred-height: 720px;
     background: Style.paper;
 
     // 現在の録音ファイル保存先（表示用）。Rust 側から設定する。
@@ -103,47 +105,20 @@ export component AppWindow inherits Window {
     // 自動停止のデバウンス秒数。起動時に Rust 側が設定値で初期化し、以後は Stepper で編集する（in-out）。
     // 範囲は minimum/maximum（下の Stepper）で制限し、Rust 側の DEBOUNCE_MIN/MAX_SECS と一致させる。
     in-out property <int> auto-stop-debounce-secs;
-    // 「録音停止時に自動文字起こし」の ON/OFF。起動時に Rust 側が設定値で初期化し、以後は
-    // トグル操作で Slint が状態を保持する（in-out。保存失敗時は Rust 側が書き戻す）。
-    in-out property <bool> auto-transcribe;
-    // 文字起こしの言語の表示名一覧（Rust 側の TRANSCRIBE_LANGUAGES を反映。並び順も Rust が決める）。
-    in property <[string]> transcribe-languages;
-    // 選択中の言語のカタログ内インデックス。起動時に Rust 側が設定値で初期化し、以後は
-    // Select で編集する（in-out。保存失敗時は Rust 側が書き戻す）。
-    in-out property <int> transcribe-language-index;
-    // 内蔵 whisper モデルの表示名一覧（Rust 側の whisper_model::CATALOG を反映。名前・サイズ・
-    // 説明を 1 行に整形済み）。選択肢の下に出す説明行もここから導出する。
-    in property <[string]> whisper-models;
-    // 選択中モデルのカタログ内インデックス。起動時に Rust 側が設定値で初期化し、以後は
-    // Select で編集する（in-out。保存失敗時は Rust 側が書き戻す）。
-    in-out property <int> whisper-model-index;
-    // 選択中モデルの取得状況テキスト（Rust 側が定期的に更新する）。
-    in property <string> whisper-model-status;
-    // その状態の意味（色を決める。対応表は Rust 側の網羅 match が正）。
-    in property <StatusTone> whisper-model-tone;
-    // 取得中の進捗（0.0〜1.0）。取得中でなければ負の値で、バーを出さない。
-    in property <float> whisper-model-progress: -1;
-    // config.toml でモデルファイルのパスを上書きしているか（`whisper_model_path`）。上書き中は
-    // カタログの選択が使われないので、選択肢の説明行を出さない（状態行がその旨を示す）。
-    in property <bool> whisper-model-overridden;
-    // 「文字起こしのあと議事録生成を自動生成」の ON/OFF。起動時に Rust 側が設定値で初期化し、
-    // 以後はトグル操作で Slint が状態を保持する（in-out。保存失敗時は Rust 側が書き戻す）。
-    in-out property <bool> auto-summarize;
-    // 要約に使う LLM の表示名一覧（Rust 側の summary_model::CATALOG を反映。whisper と同じく
-    // 名前・サイズ・説明を 1 行に整形済み）。選択肢の下に出す説明行もここから導出する。
-    in property <[string]> summary-models;
-    // 選択中モデルのカタログ内インデックス。起動時に Rust 側が設定値で初期化し、以後は
-    // Select で編集する（in-out。保存失敗時は Rust 側が書き戻す）。
-    in-out property <int> summary-model-index;
-    // 選択中モデルの取得状況（Rust 側が定期的に更新する）。モデル名は Select が出すので
-    // 含めない（`summary_model_status_line`）。
-    in property <string> summary-model-status;
-    // その状態の意味（whisper 側と同じ）。
-    in property <StatusTone> summary-model-tone;
-    // 取得中の進捗（whisper 側と同じ）。
-    in property <float> summary-model-progress: -1;
-    // config.toml でモデルファイルのパスを上書きしているか（`summary_model_path`）。
-    in property <bool> summary-model-overridden;
+    // 文字起こし・議事録の ON/OFF。**扉のバッジに出すためだけに持つ**（設定はそれぞれの
+    // ウィンドウで変える。#141）。起動時と、各ウィンドウで切り替えたときに Rust が更新する。
+    in property <bool> auto-transcribe;
+    in property <bool> auto-summarize;
+    // 扉に出す文言（すべて Rust が組む。対応表は Rust の網羅 match が正）。
+    // `state` は `On` / `Off`、`summary` はいまの構成、`status` は直近の状態。
+    in property <string> transcription-state;
+    in property <string> transcription-summary;
+    in property <string> transcription-status;
+    in property <StatusTone> transcription-tone;
+    in property <string> minutes-state;
+    in property <string> minutes-summary;
+    in property <string> minutes-status;
+    in property <StatusTone> minutes-tone;
     // 設定画面の末尾に出すバージョン表記（例: `shoki v0.1.0`）。組み立てと理由は Rust 側の
     // `app_version_text` を参照。
     in property <string> app-version;
@@ -157,25 +132,14 @@ export component AppWindow inherits Window {
     callback add-app();
     // 登録アプリの削除。一覧のインデックスを渡す。
     callback remove-app(int);
-    // 自動文字起こしトグルの切り替え。新しい ON/OFF を渡し、Rust 側で設定へ永続化する。
-    callback toggle-auto-transcribe(bool);
-    // 文字起こし言語の変更。カタログ内インデックスを渡し、Rust 側でコードへ変換して永続化する。
-    callback change-transcribe-language(int);
-    // 内蔵 whisper モデルの変更。カタログ内インデックスを渡し、Rust 側で ID へ変換して永続化する。
-    // 未取得のモデルの取得を始めるかは設定次第（`model_downloads_on_select`）。
-    callback change-whisper-model(int);
-    // 議事録生成トグルの切り替え。新しい ON/OFF を渡し、Rust 側で設定へ永続化する。
-    callback toggle-auto-summarize(bool);
-    // 要約 LLM の変更。カタログ内インデックスを渡し、Rust 側で ID へ変換して永続化する。
-    // 未取得のモデルの取得を始めるかは設定次第（`model_downloads_on_select`）。
-    callback change-summary-model(int);
-    // 「Manage models…」押下。モデル管理ウィンドウを開く（#117 / #138）。
-    callback open-models-window();
+    // 扉を押した。それぞれの機能ウィンドウを開く（#141）。
+    callback open-transcription-window();
+    callback open-minutes-window();
 
     // 本文のスクロール位置。**確認用バイナリ（`examples/settings_view.rs`）が下端を撮るため**に
     // 外から動かせるようにしてある（本番の Rust 側は触らない）。負の値で下へスクロールする。
     // 画面の高さより本文が長く、1 枚のスナップショットに収まらないので必要になる
-    // （`ui/models-window.slint` の `delete-index` と同じ趣旨）。
+    // （`ui/model-list.slint` の `delete-index` と同じ趣旨）。
     in-out property <length> body-scroll;
 
     ScrollView {
@@ -372,242 +336,57 @@ export component AppWindow inherits Window {
                 }
             }
 
-            // --- Transcription: 録音停止時の自動文字起こし（議事録生成はその従属） ---
+            // --- After a recording: 機能ごとの専用ウィンドウへの扉（#141） ---
+            // 設定と一覧はそれぞれのウィンドウが持つ。ここに置くのは**どこへ行けるか**と
+            // **いまどうなっているか**だけ（文言は Rust が組む）。
             VerticalLayout {
                 spacing: 12px;
                 SectionHeading {
-                    text: "TRANSCRIPTION";
+                    text: "AFTER A RECORDING";
                 }
 
                 Card {
-                    CardBlock {
-                        HorizontalLayout {
-                            spacing: 14px;
-                            VerticalLayout {
-                                spacing: 3px;
-                                horizontal-stretch: 1;
-                                Text {
-                                    text: "Transcribe recordings";
-                                    font-size: Style.body-size;
-                                    font-weight: 500;
-                                    color: Style.ink;
-                                }
-
-                                Text {
-                                    text: "Runs locally after each recording ends. Audio is never uploaded.";
-                                    wrap: word-wrap;
-                                    font-size: Style.caption-size;
-                                    color: Style.ink-muted;
-                                }
-                            }
-
-                            Toggle {
-                                label: "Transcribe recordings";
-                                checked <=> root.auto-transcribe;
-                                toggled(checked) => {
-                                    root.toggle-auto-transcribe(checked);
-                                }
-                            }
+                    Door {
+                        glyph: "文";
+                        title: "Transcription";
+                        state: root.transcription-state;
+                        on: root.auto-transcribe;
+                        summary: root.transcription-summary;
+                        status: root.transcription-status;
+                        status-tone: root.transcription-tone;
+                        clicked => {
+                            root.open-transcription-window();
                         }
                     }
 
-                    // 文字起こしに従属するコントロール群。議事録生成もこの中にある（文字起こしの
-                    // 結果を入力にするので、文字起こし OFF では走らない＝実装と表示を一致させる）。
-                    transcribe-deps := Rectangle {
-                        property <bool> enabled-gate: root.auto-transcribe;
-                        opacity: enabled-gate ? 1.0 : Style.disabled-opacity;
-                        VerticalLayout {
-                            CardDivider { }
+                    CardDivider { }
 
-                            CardBlock {
-                                HorizontalLayout {
-                                    spacing: 14px;
-                                    Text {
-                                        text: "Language";
-                                        font-size: Style.label-size;
-                                        color: Style.ink;
-                                        vertical-alignment: center;
-                                        horizontal-stretch: 1;
-                                    }
-
-                                    Select {
-                                        label: "Language";
-                                        model: root.transcribe-languages;
-                                        current-index <=> root.transcribe-language-index;
-                                        enabled: transcribe-deps.enabled-gate;
-                                        selected(index) => {
-                                            root.change-transcribe-language(index);
-                                        }
-                                    }
-                                }
-                            }
-
-                            CardDivider { }
-
-                            CardBlock {
-                                HorizontalLayout {
-                                    spacing: 14px;
-                                    Text {
-                                        text: "Model";
-                                        font-size: Style.label-size;
-                                        color: Style.ink;
-                                        vertical-alignment: center;
-                                        horizontal-stretch: 1;
-                                    }
-
-                                    Select {
-                                        label: "Transcription model";
-                                        model: root.whisper-models;
-                                        current-index <=> root.whisper-model-index;
-                                        enabled: transcribe-deps.enabled-gate;
-                                        selected(index) => {
-                                            root.change-whisper-model(index);
-                                        }
-                                    }
-                                }
-
-                                if !root.whisper-model-overridden: Text {
-                                    // 選択中の選択肢の全文（名前・サイズ・特徴）。Select の行は箱幅で
-                                    // 省略されるため、選ぶ材料になる目安をここで折り返して読めるようにする。
-                                    // 選択位置から導出するので、選択と説明が食い違わない。
-                                    text: root.whisper-models[root.whisper-model-index];
-                                    wrap: word-wrap;
-                                    font-size: Style.caption-size;
-                                    color: Style.ink-muted;
-                                }
-
-                                StatusLine {
-                                    text: root.whisper-model-status;
-                                    tone: root.whisper-model-tone;
-                                    progress: root.whisper-model-progress;
-                                }
-                            }
-
-                            // --- 議事録生成: 文字起こしの従属 ---
-                            // 別セクションにせず、この面の中に沈めた帯として置く（従属関係を
-                            // 入れ子で示す。#127 のデザイン）。左端の細い縦罫が親子の境目。
-                            Rectangle {
-                                background: Style.sheet-sunken;
-                                VerticalLayout {
-                                    CardDivider { }
-
-                                    HorizontalLayout {
-                                        padding-right: 15px;
-                                        padding-top: 14px;
-                                        padding-bottom: 15px;
-                                        // 縦罫は左の余白の中央に立てる（本文の字下げも兼ねる）。
-                                        Rectangle {
-                                            width: 15px;
-                                            Rectangle {
-                                                width: 2px;
-                                                border-radius: 1px;
-                                                background: Style.seal.transparentize(0.55);
-                                            }
-                                        }
-
-                                        VerticalLayout {
-                                            spacing: 11px;
-                                            horizontal-stretch: 1;
-                                            HorizontalLayout {
-                                                spacing: 14px;
-                                                VerticalLayout {
-                                                    spacing: 3px;
-                                                    horizontal-stretch: 1;
-                                                    HorizontalLayout {
-                                                        spacing: 8px;
-                                                        alignment: start;
-                                                        Text {
-                                                            text: "Generate meeting notes";
-                                                            font-size: Style.body-size;
-                                                            font-weight: 500;
-                                                            color: Style.ink;
-                                                            vertical-alignment: center;
-                                                        }
-
-                                                        Badge {
-                                                            text: "NEEDS TRANSCRIPTION";
-                                                            tone: StatusTone.caution;
-                                                        }
-                                                    }
-
-                                                    Text {
-                                                        text: "Summarizes the transcript into decisions and action items.";
-                                                        wrap: word-wrap;
-                                                        font-size: Style.caption-size;
-                                                        color: Style.ink-muted;
-                                                    }
-                                                }
-
-                                                Toggle {
-                                                    label: "Generate meeting notes";
-                                                    checked <=> root.auto-summarize;
-                                                    enabled: transcribe-deps.enabled-gate;
-                                                    toggled(checked) => {
-                                                        root.toggle-auto-summarize(checked);
-                                                    }
-                                                }
-                                            }
-
-                                            HorizontalLayout {
-                                                spacing: 14px;
-                                                Text {
-                                                    text: "Model";
-                                                    font-size: Style.label-size;
-                                                    color: Style.ink;
-                                                    vertical-alignment: center;
-                                                    horizontal-stretch: 1;
-                                                }
-
-                                                Select {
-                                                    label: "Meeting notes model";
-                                                    model: root.summary-models;
-                                                    current-index <=> root.summary-model-index;
-                                                    enabled: transcribe-deps.enabled-gate;
-                                                    selected(index) => {
-                                                        root.change-summary-model(index);
-                                                    }
-                                                }
-                                            }
-
-                                            if !root.summary-model-overridden: Text {
-                                                text: root.summary-models[root.summary-model-index];
-                                                wrap: word-wrap;
-                                                font-size: Style.caption-size;
-                                                color: Style.ink-muted;
-                                            }
-
-                                            StatusLine {
-                                                text: root.summary-model-status;
-                                                tone: root.summary-model-tone;
-                                                progress: root.summary-model-progress;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                    Door {
+                        glyph: "議";
+                        title: "Meeting notes";
+                        state: root.minutes-state;
+                        on: root.auto-summarize;
+                        summary: root.minutes-summary;
+                        status: root.minutes-status;
+                        status-tone: root.minutes-tone;
+                        clicked => {
+                            root.open-minutes-window();
                         }
                     }
+                }
+
+                Text {
+                    text: "Each window holds that feature's switches and its model files. Recording and auto-record settings stay on this screen.";
+                    wrap: word-wrap;
+                    font-size: Style.caption-size;
+                    color: Style.ink-faint;
                 }
             }
 
-            // --- 末尾: モデル管理への導線・通信の注記・バージョン ---
+            // --- 末尾: 通信の注記・バージョン ---
             // デザインどおり**固定フッタにはしない**（本文と一緒にスクロールする）。
             VerticalLayout {
                 spacing: 12px;
-                HorizontalLayout {
-                    alignment: start;
-                    ActionButton {
-                        // モデルの管理（#117 / #138。取得・削除・使用するモデルの選択）。文字起こしと
-                        // 議事録生成の両方のモデルが対象なので、どちらのセクションにも入れない。
-                        // 自動文字起こしのトグルには従わせない: 取得済みモデルの掃除は、機能を
-                        // OFF にした後こそやりたい操作なので。
-                        text: "Manage models…";
-                        clicked => {
-                            root.open-models-window();
-                        }
-                    }
-                }
-
                 Text {
                     // モデルは内蔵（初回に自動ダウンロード）。これまで通信ゼロだったアプリで唯一の
                     // 外部通信になるため、接続先と「音声は送らない」ことを明示する（透明性）。

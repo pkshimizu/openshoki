@@ -73,12 +73,6 @@ pub fn spec_or_default(id: &str) -> &'static ModelSpec {
     spec_for(id).unwrap_or_else(default_spec)
 }
 
-/// 識別子 → カタログ内インデックス。カタログ外（手編集値）は既定モデルの位置へ
-/// フォールバックする（解決は共有基盤の `catalog_index` が正。whisper 側と同じ挙動になる）。
-pub fn model_index(id: &str) -> usize {
-    crate::model_download::catalog_index(CATALOG, id, DEFAULT_MODEL_ID)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,14 +107,6 @@ mod tests {
                 spec.id
             );
         }
-    }
-
-    #[test]
-    fn model_index_resolves_known_and_falls_back() {
-        assert_eq!(model_index("qwen2.5-3b-instruct-q4-k-m"), 0);
-        assert_eq!(CATALOG[model_index(DEFAULT_MODEL_ID)].id, DEFAULT_MODEL_ID);
-        // カタログ外は既定モデルの位置へ（先頭ではなく既定の位置に落ちることを見る）。
-        assert_eq!(CATALOG[model_index("no-such-model")].id, DEFAULT_MODEL_ID);
     }
 
     #[test]

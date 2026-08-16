@@ -106,12 +106,6 @@ pub fn spec_or_default(id: &str) -> &'static ModelSpec {
     spec_for(id).unwrap_or_else(default_spec)
 }
 
-/// 識別子 → カタログ内インデックス。カタログ外（手編集値）は既定モデルの位置へ
-/// フォールバックする（解決は共有基盤の `catalog_index` が正。要約 LLM 側と同じ挙動になる）。
-pub fn model_index(id: &str) -> usize {
-    crate::model_download::catalog_index(CATALOG, id, DEFAULT_MODEL_ID)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,13 +156,5 @@ mod tests {
             .expect("the model should download and verify");
         assert!(path.is_file());
         assert_eq!(downloader.status_of(spec), DownloadStatus::Downloaded);
-    }
-
-    #[test]
-    fn model_index_resolves_known_and_falls_back() {
-        assert_eq!(model_index("tiny"), 0);
-        assert_eq!(CATALOG[model_index(DEFAULT_MODEL_ID)].id, DEFAULT_MODEL_ID);
-        // カタログ外は既定モデルの位置へ。
-        assert_eq!(CATALOG[model_index("no-such-model")].id, DEFAULT_MODEL_ID);
     }
 }

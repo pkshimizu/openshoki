@@ -1,6 +1,6 @@
 import { Button, Palette, ScrollView } from "std-widgets.slint";
-import { Style } from "style.slint";
-import { DangerButton } from "controls.slint";
+import { Style, StatusTone } from "style.slint";
+import { DangerButton, ActionButton, ButtonRole, Badge, StatusLine, SectionHeading, Card } from "controls.slint";
 
 // モデル 1 件の取得の状態。**取得の軸だけ**を持つ（使用中か・削除できるかは状況（ジョブ・
 // `config.toml` の上書き・カタログの有無）が絡むので、この enum からは導けない。それらは
@@ -31,8 +31,20 @@ export struct ModelRow {
     detail: string,
     // 概数のサイズ（例 `1.5 GB`）。未取得はカタログの値、取得済みは実ファイルの長さ。
     size: string,
-    // 状態の文言。進捗（`Downloading… 42%`）や、使用中・削除できない理由もここに出る。
+    // 状態の文言（`Downloaded · selected for transcription.` など）。削除できない理由もここに出る。
     status-text: string,
+    // 状態の意味（点と文字の色。対応表は `Style.tone-ink` / `tone-mark` の 1 箇所）。
+    tone: StatusTone,
+    // 取得中だけ 0.0〜1.0。それ以外は -1（バーを出さない）。
+    progress: float,
+    // 進捗の内訳（`1.9 / 3.1 GB · 62%`）。取得中だけ入り、**状態の文言とは別の列**に出す
+    // ——文言と混ぜると、桁が増えたときに右のボタンが動く。
+    progress-detail: string,
+    // 使用中・選択中の標（`In use` / `Selected`）。空なら出さない。**状態の文言に畳まない**:
+    // 一覧の中から「いまこれが使われている」を目で探せるようにするため。
+    badge: string,
+    // 名前を等幅で出すか（カタログ外のファイル名。拡張子やハッシュが読み取りやすい）。
+    mono: bool,
     // 確認モーダルに出す説明（解放される容量、完全削除であること、再取得の有無）。
     delete-detail: string,
     status: ModelStatus,
@@ -62,9 +74,12 @@ export component ModelList inherits Rectangle {
 
     // 一覧の全行（見出しを含む。Rust 側が開いたときに作り、tick が状態だけ作り直す）。
     in property <[ModelRow]> models;
-    // 一覧の上に置く説明（この一覧で何ができるか）。**載せるウィンドウごとに変わる**ので
-    // 外から渡す（一覧そのものの見た目ではない）。
-    in property <string> intro;
+    // 一覧の見出しと、その下の 1 行（`Speech models on this Mac` など）。載せるウィンドウごとに
+    // 語が変わるので外から渡す。
+    in property <string> heading;
+    in property <string> heading-note;
+    // 末尾の注記（取得元と、音声がここから出ないこと）。ウィンドウごとに語が変わる。
+    in property <string> footnote;
     // 末尾に出す取得済みの合計（例 `3 models — 5.9 GB`）。行が無いときは空文字。
     in property <string> total-text;
     // 1 行も無いときに一覧の中央へ出す文言。起動時に一度だけ入れる（カタログの行は必ず並ぶので
@@ -75,6 +90,10 @@ export component ModelList inherits Rectangle {
     // 失敗したときは tick 由来でも出す。`windows::models::ModelsRefresh` /
     // `windows::models::refresh_cause`）。
     in property <string> notice;
+    // 操作列の幅。**狭い窓では詰める**（デザイン: 520 未満で 176 → 120px）。列を固定するのは、
+    // 行ごとに出るボタンの数が違っても位置がずれないようにするため。
+    property <length> action-column-width: root.width < 520px ? 120px : 176px;
+
     // 削除の確認モーダルの表示状態。Delete 押下で開き、Cancel / 確定で閉じる（Slint 内で完結。
     // Recordings ウィンドウと同じ作り）。
     in-out property <bool> show-delete-confirm: false;
@@ -89,26 +108,56 @@ export component ModelList inherits Rectangle {
     // 確認モーダルの Delete 押下。その行のモデルファイルを完全削除する（インデックスを渡す）。
     callback delete-model(int);
 
-    VerticalLayout {
+    // 本文はまるごとスクロールする（一覧が伸びても、上の設定へ戻れる）。
+    ScrollView {
+        VerticalLayout {
         padding: 16px;
-        spacing: 12px;
+        spacing: 16px;
+        alignment: start;
 
-        Text {
-            text: root.intro;
-            wrap: word-wrap;
-            font-size: Style.caption-size;
-            color: Palette.foreground.transparentize(Style.muted-alpha);
+        // **ウィンドウ固有の中身はここへ差し込む**（その機能のスイッチ類）。一覧の外に置くと、
+        // 削除の確認モーダルの覆いが一覧の枠内に縮んでしまう（覆いはこの部品が持つ）。
+        @children
+
+        VerticalLayout {
+            spacing: 8px;
+            HorizontalLayout {
+                spacing: 10px;
+                SectionHeading {
+                    text: root.heading;
+                    horizontal-stretch: 1;
+                }
+                // 取得済みの合計使用量（未取得の行は含めない）。
+                Text {
+                    text: root.total-text;
+                    font-size: Style.caption-size;
+                    vertical-alignment: center;
+                    horizontal-alignment: right;
+                    color: Style.ink-faint;
+                }
+            }
+
+            if root.heading-note != "": Text {
+                text: root.heading-note;
+                wrap: word-wrap;
+                font-size: Style.caption-size;
+                color: Style.ink-muted;
+            }
         }
 
         // 行数はカタログ全件（現状 8 件）＋見出し＋カタログ外のファイルで、増えても十数行なので
         // ScrollView + for で足りる（`docs/rules/slint.md` の「固定数行の小さな一覧」）。
+        // 枠の中は**入れ子でスクロールさせない**（外側の 1 つでウィンドウ全体が動く）。入れ子に
+        // すると内側は親から高さをもらえず、高さ 0 になって行がまるごと消える。
         Rectangle {
-            vertical-stretch: 1;
             border-width: 1px;
-            border-color: Palette.border;
+            border-color: Style.rule;
             border-radius: 8px;
-            background: Palette.alternate-background;
+            background: Style.sheet;
 
+            // **枠の中はレイアウトで包む**。`Rectangle` は子の自然な高さを引き継がないので、
+            // `if` を直接ぶら下げると枠の高さが 0 になり、下の注記が一覧の上へ重なる。
+            VerticalLayout {
             if root.models.length == 0: Text {
                 text: root.empty-text;
                 font-size: Style.body-size;
@@ -117,11 +166,10 @@ export component ModelList inherits Rectangle {
                 color: Palette.foreground.transparentize(Style.muted-alpha);
             }
 
-            if root.models.length > 0: ScrollView {
-                VerticalLayout {
-                    alignment: start;
+            if root.models.length > 0: VerticalLayout {
+                alignment: start;
 
-                    for model[index] in root.models: VerticalLayout {
+                for model[index] in root.models: VerticalLayout {
                         if model.is-heading: Rectangle {
                             // 種別の区切り。行の一部なので背景で少し沈める（トーンは共有の
                             // トークン。`ui/style.slint`）。
@@ -140,90 +188,128 @@ export component ModelList inherits Rectangle {
                             }
                         }
 
-                        if !model.is-heading: HorizontalLayout {
-                            padding: 12px;
-                            spacing: 12px;
+                        if !model.is-heading: Rectangle {
+                            background: model.badge != "" ? Style.seal.transparentize(0.94) : transparent;
 
-                            VerticalLayout {
-                                alignment: center;
-                                spacing: 2px;
-                                horizontal-stretch: 1;
-
-                                Text {
-                                    text: model.name;
-                                    font-size: Style.body-size;
-                                    font-weight: Style.semibold;
-                                    color: Palette.foreground;
-                                    overflow: elide;
-                                }
-
-                                // 説明が無い行（カタログ外）では空文字が来るので、行ごと出さない。
-                                if model.detail != "": Text {
-                                    text: model.detail;
-                                    font-size: Style.caption-size;
-                                    color: Palette.foreground.transparentize(Style.muted-alpha);
-                                    overflow: elide;
-                                }
-
-                                Text {
-                                    text: model.status-text;
-                                    font-size: Style.caption-size;
-                                    // 失敗だけ警告色にする（他ウィンドウの状態行と揃える）。
-                                    color: model.status == ModelStatus.failed
-                                        ? Style.danger
-                                        : Palette.foreground.transparentize(Style.muted-alpha);
-                                    // ここには削除できない理由も出るので、省略せず折り返す
-                                    // （名前・説明は elide でよいが、理由が切れると読み手が
-                                    // ボタンの淡色の意味を追えない）。
-                                    wrap: word-wrap;
-                                }
-                            }
-
-                            // サイズは幅を固定して**列として揃える**（行ごとに桁数が違うので、
-                            // 自然幅に任せると数字がばらける）。
-                            Text {
-                                width: 72px;
-                                text: model.size;
-                                font-size: Style.body-size;
-                                vertical-alignment: center;
-                                horizontal-alignment: right;
-                                color: Palette.foreground;
-                            }
-
-                            // ボタンは右端に寄せ、**枠の幅を固定**する（行によって出る数が違うので、
-                            // 固定しないと Use / Delete の位置が行ごとにずれる）。
                             HorizontalLayout {
-                                min-width: 184px;
-                                alignment: end;
-                                spacing: 8px;
+                                padding: 12px;
+                                spacing: 12px;
 
-                                // 「使う」。いま選ばれている行・カタログ外・config 上書き中は
-                                // 出ない（理由は状態の文言に出る）。
-                                if model.can-use: Button {
-                                    text: "Use";
-                                    clicked => {
-                                        root.use-model(index);
+                                // 使用中の行は左端に朱の縦罫を引く（一覧を目で走ったとき、
+                                // どれが動いているかが行頭で分かる）。
+                                Rectangle {
+                                    width: 3px;
+                                    border-radius: 1.5px;
+                                    background: model.badge != "" ? Style.seal : transparent;
+                                }
+
+                                VerticalLayout {
+                                    alignment: center;
+                                    spacing: 4px;
+                                    horizontal-stretch: 1;
+
+                                    HorizontalLayout {
+                                        spacing: 8px;
+                                        alignment: start;
+
+                                        Text {
+                                            text: model.name;
+                                            font-size: Style.body-size;
+                                            font-weight: Style.semibold;
+                                            font-family: model.mono ? "Menlo" : "";
+                                            color: Style.ink;
+                                            overflow: elide;
+                                            vertical-alignment: center;
+                                        }
+
+                                        Text {
+                                            text: model.size;
+                                            font-size: Style.caption-size;
+                                            color: Style.ink-muted;
+                                            vertical-alignment: center;
+                                        }
+
+                                        if model.badge != "": Badge {
+                                            text: model.badge;
+                                            tone: StatusTone.done;
+                                        }
+                                    }
+
+                                    // 説明が無い行（カタログ外）では空文字が来るので、行ごと出さない。
+                                    if model.detail != "": Text {
+                                        text: model.detail;
+                                        font-size: Style.caption-size;
+                                        color: Style.ink-muted;
+                                        wrap: word-wrap;
+                                    }
+
+                                    HorizontalLayout {
+                                        spacing: 10px;
+
+                                        StatusLine {
+                                            text: model.status-text;
+                                            tone: model.tone;
+                                            progress: model.progress;
+                                            horizontal-stretch: 1;
+                                        }
+
+                                        // 進捗の内訳は**固定幅の右端**に置く（桁が増えても
+                                        // 左の文言とボタンの位置が動かない）。
+                                        if model.progress-detail != "": Text {
+                                            text: model.progress-detail;
+                                            width: 116px;
+                                            font-size: Style.caption-size;
+                                            color: Style.ink-muted;
+                                            horizontal-alignment: right;
+                                        }
                                     }
                                 }
 
-                                // 取得できる行だけ（未取得・失敗で、上書き先が別のファイルで
-                                // ないとき。判断は `can-download`）。
-                                if model.can-download: Button {
-                                    text: "Download";
-                                    clicked => {
-                                        root.download-model(index);
-                                    }
-                                }
+                                // 操作は右端に寄せ、**枠の幅を固定**する（行によって出る数が
+                                // 違うので、固定しないと Use / Del の位置が行ごとにずれる）。
+                                VerticalLayout {
+                                    alignment: center;
+                                    HorizontalLayout {
+                                        min-width: root.action-column-width;
+                                        alignment: end;
+                                        spacing: 8px;
 
-                                // 削除はディスクに在る行だけ。押せるかは状況次第（`can-delete`）
-                                // で、押せない理由は状態の文言に出す（ボタンを消すと理由が
-                                // 分からない）。
-                                if model.status == ModelStatus.installed: DangerButton {
-                                    text: "Delete";
-                                    enabled: model.can-delete;
-                                    clicked => {
-                                        root.delete-index = index;
-                                        root.show-delete-confirm = true;
+                                        // 「使う」。いま使われている行・カタログ外・config
+                                        // 上書き中は出ない（理由は状態の文言に出る）。
+                                        if model.can-use: ActionButton {
+                                            text: "Use";
+                                            compact: true;
+                                            clicked => {
+                                                root.use-model(index);
+                                            }
+                                        }
+
+                                        // 取得できる行だけ（未取得・失敗で、上書き先が別の
+                                        // ファイルでないとき。判断は `can-download`）。
+                                        if model.can-download: ActionButton {
+                                            // 失敗からの再取得は同じ操作だが、**押す動機が違う**
+                                            // ので文言を変える（デザインの `Retry`）。
+                                            text: model.status == ModelStatus.failed
+                                                ? "Retry"
+                                                : "Download";
+                                            compact: true;
+                                            clicked => {
+                                                root.download-model(index);
+                                            }
+                                        }
+
+                                        // 削除はディスクに在る行だけ。押せるかは状況次第
+                                        // （`can-delete`）で、押せない理由は状態の文言に出す
+                                        // （ボタンを消すと理由が分からない）。
+                                        if model.status == ModelStatus.installed: DangerButton {
+                                            text: "Del";
+                                            compact: true;
+                                            enabled: model.can-delete;
+                                            clicked => {
+                                                root.delete-index = index;
+                                                root.show-delete-confirm = true;
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -233,26 +319,20 @@ export component ModelList inherits Rectangle {
             }
         }
 
-        HorizontalLayout {
-            spacing: 10px;
+        // 失敗の通知（空なら出ない）。
+        if root.notice != "": Text {
+            text: root.notice;
+            font-size: Style.caption-size;
+            wrap: word-wrap;
+            color: Style.danger;
+        }
 
-            // 失敗の通知（空なら出ない）。合計と同じ行に置き、ウィンドウの高さを変えない。
-            Text {
-                text: root.notice;
-                font-size: Style.caption-size;
-                horizontal-stretch: 1;
-                wrap: word-wrap;
-                color: Style.danger;
-            }
-
-            // 取得済みの合計使用量（未取得の行は含めない）。
-            Text {
-                text: root.total-text;
-                font-size: Style.caption-size;
-                vertical-alignment: center;
-                horizontal-alignment: right;
-                color: Palette.foreground.transparentize(Style.muted-alpha);
-            }
+        Text {
+            text: root.footnote;
+            wrap: word-wrap;
+            font-size: Style.caption-size;
+            color: Style.ink-faint;
+        }
         }
     }
 

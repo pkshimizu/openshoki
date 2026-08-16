@@ -1,0 +1,130 @@
+import { Style, StatusTone } from "style.slint";
+import { SectionHeading, Card, CardBlock, FeatureHeading, Toggle, StatusLine, ActionButton, ButtonRole } from "controls.slint";
+import { ModelList, ModelRow } from "model-list.slint";
+
+// 議事録の設定ウィンドウ。文字起こしウィンドウと**同じ骨格**（説明は
+// `ui/transcription-window.slint`）。違うのは Behaviour の中身と、一覧に出す種別だけ。
+export component MinutesWindow inherits Window {
+    title: "Meeting notes";
+    // 幅・高さは src/main.rs の MINUTES_WIDTH/HEIGHT と一致させること（片方だけ変えない）。
+    // 中身は兄弟より少ないが**同じ幅で開く**（行き来しても画面が動かないように）。
+    min-width: 460px;
+    min-height: 520px;
+    preferred-width: 620px;
+    preferred-height: 700px;
+    background: Style.paper;
+
+    in-out property <bool> auto-summarize;
+    in property <string> feature-note;
+    // 文字起こしが OFF のときだけ出す注意（空なら出さない）。**トグルは無効にしない**——
+    // 手で頼む要約は自動文字起こしと独立に動くので、無効化は実装より強い制約になる。
+    in property <string> depends-note;
+
+    in property <[ModelRow]> models;
+    in property <string> total-text;
+    in property <string> empty-text;
+    in property <string> notice;
+    in-out property <bool> show-delete-confirm: false;
+    in-out property <int> delete-index: 0;
+
+    callback toggle-auto-summarize(bool);
+    callback open-transcription();
+    callback use-model(int);
+    callback download-model(int);
+    callback delete-model(int);
+
+    ModelList {
+        models: root.models;
+        heading: "Writing models on this Mac";
+        heading-note: "These files are large. Only the one marked In use is needed; the other can stay off disk.";
+        footnote: "Models are downloaded from Hugging Face when you choose them or when they are first needed. Transcripts and notes never leave this Mac.";
+        total-text: root.total-text;
+        empty-text: root.empty-text;
+        notice: root.notice;
+        show-delete-confirm <=> root.show-delete-confirm;
+        delete-index <=> root.delete-index;
+
+        use-model(index) => {
+            root.use-model(index);
+        }
+        download-model(index) => {
+            root.download-model(index);
+        }
+        delete-model(index) => {
+            root.delete-model(index);
+        }
+
+        VerticalLayout {
+            spacing: 16px;
+
+            FeatureHeading {
+                glyph: "議";
+                title: "Meeting notes";
+                note: root.feature-note;
+            }
+
+            VerticalLayout {
+                spacing: 12px;
+                SectionHeading {
+                    text: "BEHAVIOUR";
+                }
+
+                Card {
+                    CardBlock {
+                        HorizontalLayout {
+                            spacing: 14px;
+                            VerticalLayout {
+                                spacing: 3px;
+                                horizontal-stretch: 1;
+                                Text {
+                                    text: "Write notes after each transcript";
+                                    font-size: Style.body-size;
+                                    font-weight: Style.semibold;
+                                    color: Style.ink;
+                                }
+                                Text {
+                                    text: "Notes are generated from the transcript, never from the audio.";
+                                    font-size: Style.caption-size;
+                                    color: Style.ink-muted;
+                                    wrap: word-wrap;
+                                }
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                Toggle {
+                                    label: "Write notes after each transcript";
+                                    checked <=> root.auto-summarize;
+                                    toggled(checked) => {
+                                        root.toggle-auto-summarize(checked);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // 文字起こしへの従属は**注意書きで表す**（無効化しない）。別ウィンドウの
+                    // 状態でここのスイッチを殺すと、なぜ押せないのかがその場で分からない。
+                    if root.depends-note != "": CardBlock {
+                        VerticalLayout {
+                            spacing: 10px;
+                            StatusLine {
+                                text: root.depends-note;
+                                tone: StatusTone.caution;
+                            }
+                            HorizontalLayout {
+                                alignment: start;
+                                ActionButton {
+                                    text: "Open Transcription →";
+                                    role: ButtonRole.quiet;
+                                    clicked => {
+                                        root.open-transcription();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

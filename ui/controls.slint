@@ -159,7 +159,7 @@ export component FocusRing inherits Rectangle {
 // Slint の三項連鎖なので**網羅チェックは効かない**。役割を足したら `ActionButton` の
 // `is-filled` / `tint` / `border-color` / `background` / 文字色の 5 つを必ず見直すこと。
 export enum ButtonRole {
-    // 枠つき・面つきの既定（`Change…` / `Manage models…`）。
+    // 枠つき・面つきの既定（`Change…` / 一覧の `Use` / `Download`）。
     plain,
     // 枠も面も持たない控えめな操作（一覧行の `Remove`）。押すと消えるものなので、
     // ポインタを載せたときだけ危険色に寄せる。
@@ -761,5 +761,164 @@ export component Select inherits Rectangle {
     // ガードは `open-options` が持つ（3 経路のどれから来ても同じ口を通る）。
     accessible-action-expand => {
         root.open-options();
+    }
+}
+
+// 機能ウィンドウの見出し（漢字グリフ・機能名・いまの状態を 1 行）。
+//
+// グリフは**フォントを同梱していない**ので OS の日本語フォントに任せる（#127 で同梱を見送った）。
+// 出せない環境では豆腐になるが、右の機能名が本体なので意味は失われない。
+export component FeatureHeading inherits HorizontalLayout {
+    in property <string> glyph;
+    in property <string> title;
+    // いまの状態を 1 行で（`Off — recordings stay as audio only.` など）。Rust が組む。
+    in property <string> note;
+
+    spacing: 14px;
+
+    Rectangle {
+        width: 44px;
+        height: 44px;
+        border-radius: Style.control-radius;
+        background: Style.seal.transparentize(0.9);
+        Text {
+            text: root.glyph;
+            font-size: 24px;
+            color: Style.seal;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            // 見出しは右の Text が読む（同じ意味を 2 回読み上げない）。
+            accessible-role: none;
+        }
+    }
+
+    VerticalLayout {
+        alignment: center;
+        spacing: 3px;
+        horizontal-stretch: 1;
+
+        Text {
+            text: root.title;
+            font-size: Style.detail-title-size;
+            font-weight: Style.semibold;
+            color: Style.ink;
+        }
+
+        Text {
+            text: root.note;
+            font-size: Style.caption-size;
+            color: Style.ink-muted;
+            wrap: word-wrap;
+        }
+    }
+}
+
+// 設定画面から機能ウィンドウへ渡す「扉」。1 行に、その機能の名前・ON/OFF・いまの構成・
+// 直近の状態を出す（デザインの Doors）。
+//
+// 文言はすべて Rust が組む（状態→文言の対応表は Rust の網羅 match が正。`docs/rules/slint.md`）。
+export component Door inherits Rectangle {
+    in property <string> glyph;
+    in property <string> title;
+    // ON/OFF の語（`On` / `Off`）。バッジで出す。
+    in property <string> state;
+    in property <bool> on;
+    // いまの構成（`Japanese · Medium (1.5 GB) · 2 of 6 models downloaded`）。
+    in property <string> summary;
+    // 直近の状態（`Large v3 downloading — 62%` / `Ready`）。
+    in property <string> status;
+    in property <StatusTone> status-tone;
+
+    callback clicked();
+
+    border-radius: Style.control-radius;
+    background: touch.pressed || focus.has-focus
+        ? Style.control-hover
+        : (touch.has-hover ? Style.quiet-hover : transparent);
+
+    FocusRing {
+        shown: focus.has-focus;
+        radius: root.border-radius;
+    }
+
+    focus := FocusScope {
+        key-pressed(event) => {
+            if (event.text == " " || event.text == "\n") {
+                root.clicked();
+                return accept;
+            }
+            return reject;
+        }
+    }
+
+    HorizontalLayout {
+        padding: 12px;
+        spacing: 12px;
+
+        Text {
+            text: root.glyph;
+            font-size: 20px;
+            color: Style.seal;
+            vertical-alignment: center;
+            accessible-role: none;
+        }
+
+        VerticalLayout {
+            spacing: 4px;
+            horizontal-stretch: 1;
+
+            HorizontalLayout {
+                spacing: 8px;
+                alignment: start;
+                Text {
+                    text: root.title;
+                    font-size: Style.body-size;
+                    font-weight: Style.semibold;
+                    color: Style.ink;
+                    vertical-alignment: center;
+                    accessible-role: none;
+                }
+                Badge {
+                    text: root.state;
+                    tone: root.on ? StatusTone.done : StatusTone.neutral;
+                }
+            }
+
+            Text {
+                text: root.summary;
+                font-size: Style.caption-size;
+                color: Style.ink-muted;
+                wrap: word-wrap;
+                accessible-role: none;
+            }
+
+            StatusLine {
+                text: root.status;
+                tone: root.status-tone;
+            }
+        }
+
+        // 「開く」ことを示す記号。押せる範囲は行全体なので、これ自体は飾り。
+        Text {
+            text: "›";
+            font-size: Style.detail-title-size;
+            color: Style.ink-faint;
+            vertical-alignment: center;
+            accessible-role: none;
+        }
+    }
+
+    touch := TouchArea {
+        clicked => {
+            focus.focus();
+            root.clicked();
+        }
+    }
+
+    accessible-role: button;
+    // 読み上げは 1 つにまとめる（行の中の Text は `accessible-role: none`）。
+    accessible-label: root.title + " — " + root.state + ". " + root.summary + " " + root.status;
+    accessible-action-default => {
+        root.clicked();
     }
 }
