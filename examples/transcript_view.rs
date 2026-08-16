@@ -32,11 +32,11 @@ const DEFAULT_SEGMENT_COUNT: usize = 30;
 
 /// 生成中のラベル。状態テキストと縮退ラベルで同じ文言を使うため 1 箇所に置く
 /// （`src/main.rs` の `SUMMARIZING_LABEL` の複製。あちらを変えたらここも合わせること）。
-const SUMMARIZING_LABEL: &str = "Summarizing…";
+const SUMMARIZING_LABEL: &str = "Writing notes…";
 
-/// キュー待ちのラベル（同上。`src/main.rs` の複製。状態行と縮退表示で大小が違う）。
+/// キュー待ちのラベル（同上。`src/main.rs` の複製。状態行と縮退表示で同じ文言）。
 const SUMMARY_QUEUED_LABEL: &str = "Waiting to summarize…";
-const SUMMARY_QUEUED_PLACEHOLDER: &str = "Waiting to Summarize…";
+const SUMMARY_QUEUED_PLACEHOLDER: &str = "Waiting to write notes…";
 
 /// Summary タブの確認用のダミー議事録。見出しの強調・本文の折り返し・段落の間隔を見たいので、
 /// 実際の生成物（`src/summarize.rs` のプロンプトが作る 4 見出し構成）と同じ形にする。
@@ -131,7 +131,7 @@ fn main() {
 
     win.set_has_selection(true);
     win.set_detail_datetime("Aug 10, 2026 · 14:02".into());
-    win.set_detail_sources("Mic + system audio".into());
+    win.set_detail_sources("Mic + system".into());
 
     // 文字起こしと議事録は**実アプリで起こりうる組み合わせ**に揃える（要約は文字起こしを
     // 入力にするので、文字起こしが無いセッションには議事録も無い）。状態の文言は `src/main.rs` の
@@ -149,7 +149,7 @@ fn main() {
     } else {
         "Not transcribed".into()
     });
-    win.set_detail_transcript_placeholder("Not Transcribed Yet".into());
+    win.set_detail_transcript_placeholder("Not transcribed yet".into());
     if has_transcript {
         win.set_segments(ModelRc::from(Rc::new(VecModel::from(rows))));
         win.set_current_segment(2);
@@ -173,7 +173,7 @@ fn main() {
             SummaryStatus::NotSummarized => "Not summarized",
             SummaryStatus::Queued => SUMMARY_QUEUED_LABEL,
             SummaryStatus::Summarizing => SUMMARIZING_LABEL,
-            SummaryStatus::Done => "Summarized",
+            SummaryStatus::Done => "Notes ready",
             SummaryStatus::Failed => "Summarization failed",
         }
         .into(),
@@ -182,8 +182,8 @@ fn main() {
         match summary_status {
             SummaryStatus::Queued => SUMMARY_QUEUED_PLACEHOLDER,
             SummaryStatus::Summarizing => SUMMARIZING_LABEL,
-            SummaryStatus::Failed => "Summarization Failed",
-            SummaryStatus::NotSummarized | SummaryStatus::Done => "Not Summarized Yet",
+            SummaryStatus::Failed => "Notes could not be written",
+            SummaryStatus::NotSummarized | SummaryStatus::Done => "No notes yet",
         }
         .into(),
     );

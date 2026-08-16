@@ -1843,8 +1843,9 @@ fn transcript_status_text(display_status: TranscriptStatus) -> &'static str {
 }
 
 /// 文字起こしの表示状態 → Transcript セクションの縮退表示（セグメントが無いとき）のラベル。
-/// 状態テキスト（`transcript_status_text`）が文形式なのに対し、こちらは他の空状態ラベル
-/// （"No Recordings Yet" 等）と同じ Title Case の見出し形式にする（デザイン準拠）。
+///
+/// 状態テキスト（`transcript_status_text`）が**いまどうなっているか**を言うのに対し、こちらは
+/// **何が無いか**を言う（`Not transcribed yet`）。どちらも sentence case（#128 で揃えた）。
 /// `Done` でセグメントが空になるのは JSON の欠落・破損時で、従来どおり未実施と同じ表示に落とす。
 fn transcript_placeholder_text(display_status: TranscriptStatus) -> &'static str {
     match display_status {
@@ -1899,34 +1900,33 @@ fn summary_display_status(
 
 /// 「要約生成中」の表示ラベル。状態テキストと Summary の縮退表示で同じ文言を使うため 1 箇所で
 /// 管理する（`TRANSCRIBING_LABEL` と同じ理由）。
-const SUMMARIZING_LABEL: &str = "Summarizing…";
+const SUMMARIZING_LABEL: &str = "Writing notes…";
 
 /// 「キュー待ち」の表示ラベル。生成中と区別できる語にする: この間はまだ CPU を使っておらず、
 /// 取り消せる（`SummarizeWorker::cancel`）。
 ///
-/// 状態行（文形式）と縮退表示（Title Case）で大小が違うので、`SUMMARIZING_LABEL` のように
-/// 1 つを共有できない（1 語のラベルは偶然どちらの流儀にも合っていた）。2 つに分ける。
-const SUMMARY_QUEUED_LABEL: &str = "Waiting to summarize…";
-const SUMMARY_QUEUED_PLACEHOLDER: &str = "Waiting to write notes…";
+/// 状態行と縮退表示で**同じ文言**を使う（#128 で語を `notes` に揃えたら一致した）。以前は
+/// 大小の流儀が違って 2 つに分けていた。
+const SUMMARY_QUEUED_LABEL: &str = "Waiting to write notes…";
 
 /// 議事録生成の表示状態 → 詳細ペインの状態テキスト。
 fn summary_status_text(display_status: SummaryStatus) -> &'static str {
     match display_status {
-        SummaryStatus::NotSummarized => "Not summarized",
+        SummaryStatus::NotSummarized => "No notes",
         SummaryStatus::Queued => SUMMARY_QUEUED_LABEL,
         SummaryStatus::Summarizing => SUMMARIZING_LABEL,
-        SummaryStatus::Done => "Summarized",
-        SummaryStatus::Failed => "Summarization failed",
+        SummaryStatus::Done => "Notes ready",
+        SummaryStatus::Failed => "Notes failed",
     }
 }
 
-/// 議事録生成の表示状態 → Summary タブの縮退表示（行が無いとき）のラベル。状態テキストが
-/// 文形式なのに対し、こちらは他の空状態ラベルと同じ Title Case にする
+/// 議事録生成の表示状態 → Notes タブの縮退表示（行が無いとき）のラベル。状態テキストが
+/// **いまどうなっているか**を言うのに対し、こちらは**何が無いか**を言う
 /// （`transcript_placeholder_text` と対称）。`Done` で行が空になるのは `summary.md` の欠落・
 /// 破損・空のときで、未生成と同じ表示に落とす。
 fn summary_placeholder_text(display_status: SummaryStatus) -> &'static str {
     match display_status {
-        SummaryStatus::Queued => SUMMARY_QUEUED_PLACEHOLDER,
+        SummaryStatus::Queued => SUMMARY_QUEUED_LABEL,
         SummaryStatus::Summarizing => SUMMARIZING_LABEL,
         SummaryStatus::Failed => "Notes could not be written",
         SummaryStatus::NotSummarized | SummaryStatus::Done => "No notes yet",
@@ -2521,21 +2521,18 @@ mod tests {
     fn summary_status_text_covers_all_states() {
         assert_eq!(
             summary_status_text(SummaryStatus::NotSummarized),
-            "Not summarized"
+            "No notes"
         );
         assert_eq!(
             summary_status_text(SummaryStatus::Queued),
-            "Waiting to summarize…"
+            "Waiting to write notes…"
         );
         assert_eq!(
             summary_status_text(SummaryStatus::Summarizing),
-            "Summarizing…"
+            "Writing notes…"
         );
-        assert_eq!(summary_status_text(SummaryStatus::Done), "Summarized");
-        assert_eq!(
-            summary_status_text(SummaryStatus::Failed),
-            "Summarization failed"
-        );
+        assert_eq!(summary_status_text(SummaryStatus::Done), "Notes ready");
+        assert_eq!(summary_status_text(SummaryStatus::Failed), "Notes failed");
     }
 
     /// 縮退表示ラベル。Done で行が空になるのは `summary.md` の欠落・破損・空の経路で、
@@ -2552,7 +2549,7 @@ mod tests {
         );
         assert_eq!(
             summary_placeholder_text(SummaryStatus::Summarizing),
-            "Summarizing…"
+            "Writing notes…"
         );
         assert_eq!(
             summary_placeholder_text(SummaryStatus::Done),
