@@ -1,6 +1,6 @@
 import { ListView, ScrollView } from "std-widgets.slint";
 import { Style, StatusTone } from "style.slint";
-import { DangerButton, FocusRing, ActionButton, ButtonRole, Toggle, SectionHeading, Card, CardBlock, StatusLine, Badge } from "controls.slint";
+import { DangerButton, FocusRing, ActionButton, ButtonRole } from "controls.slint";
 
 // 文字起こしの表示状態。Rust 側（main.rs の transcript_display_status）がワーカーの
 // 進行状況と JSON の有無から合成して詰める。
@@ -310,9 +310,6 @@ export component RecordingsWindow inherits Window {
     background: Style.paper;
 
     // セッション一覧（新しい順）。Rust 側が list_sessions の結果で更新する。
-    // 再生位置に合わせて文字起こしの行を追うか。**切れるようにする**のは、読み返しながら聴く
-    // ときに勝手にスクロールされると読んでいる場所を見失うため（デザインの `Follow transcript`）。
-    in-out property <bool> follow-transcript: true;
     // 一覧の下端に出す合計（`148 recordings`）。Rust が組む。
     in property <string> library-summary;
     in property <[SessionRow]> sessions;
@@ -945,24 +942,6 @@ export component RecordingsWindow inherits Window {
                         }
                     }
 
-                    VerticalLayout {
-                        alignment: center;
-                        HorizontalLayout {
-                            spacing: 8px;
-                            Text {
-                                text: "Follow transcript";
-                                font-size: Style.caption-size;
-                                color: Style.ink-muted;
-                                vertical-alignment: center;
-                                // ラベルはトグルが読み上げる（同じ文字列を 2 回出さない）。
-                                accessible-role: none;
-                            }
-                            Toggle {
-                                label: "Follow transcript";
-                                checked <=> root.follow-transcript;
-                            }
-                        }
-                    }
                 }
             }
         }

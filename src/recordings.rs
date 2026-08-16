@@ -91,6 +91,24 @@ pub struct RecordingSession {
 }
 
 impl RecordingSession {
+    /// テスト用に、日時だけを持つセッションを作る（ファイルの有無は呼び出し側で足す）。
+    ///
+    /// **表示の組み立て**（見出し・行の文言）は日時とファイルの有無だけで決まるので、実ディスクを
+    /// 用意せずに検証できる。
+    #[cfg(test)]
+    pub fn for_test(datetime: NaiveDateTime) -> Self {
+        Self {
+            datetime,
+            dir: PathBuf::new(),
+            display_datetime: datetime.format(DISPLAY_DATETIME_FORMAT).to_string(),
+            has_mic: false,
+            has_system: false,
+            has_mix: false,
+            has_transcript: false,
+            has_summary: false,
+        }
+    }
+
     /// 一覧の行に出す時刻（`14:02`）。同じ日の中ではこれで見分けるので、行の中でいちばん大きく出す。
     pub fn display_time(&self) -> String {
         self.datetime.format(DISPLAY_TIME_FORMAT).to_string()

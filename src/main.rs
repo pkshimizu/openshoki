@@ -2270,6 +2270,8 @@ mod tests {
         summary_status_text, transcript_display_status, transcript_placeholder_text,
         transcript_status_text, whisper_model_status_line,
     };
+    use chrono::{Datelike as _, Timelike as _};
+
     use crate::transcribe::TranscribeStatus;
     use std::time::Duration;
 
@@ -2282,6 +2284,72 @@ mod tests {
     /// ハードコードしても両辺が一致して通る（ミューテーションで確認済み）。`Cargo.toml` と
     /// `env!("CARGO_PKG_VERSION")` の紐づきは cargo のコンパイル時保証で、実行時テストの
     /// 守備範囲外。
+    /// 一覧の見出しは**その日の最初の行だけ**が持つ。
+    ///
+    /// 全行に出すと同じ語が並んで、どこで日が変わったのか分からない。逆に別の配列へ分けると、
+    /// 行の添字とセッションの添字がずれて**別の録音を選ぶ**（`SessionRow` の doc）。
+    #[test]
+    fn a_group_heading_marks_only_the_first_row_of_its_day() {
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 8, 10)
+            .expect("a valid date")
+            .and_hms_opt(18, 0, 0)
+            .expect("a valid time");
+        let sessions = [
+            crate::recordings::RecordingSession::for_test(now.with_hour(14).expect("a valid hour")),
+            crate::recordings::RecordingSession::for_test(now.with_hour(9).expect("a valid hour")),
+            crate::recordings::RecordingSession::for_test(
+                now.with_day(9)
+                    .expect("a valid day")
+                    .with_hour(16)
+                    .expect("a valid hour"),
+            ),
+        ];
+
+        assert_eq!(super::session_group_heading(&sessions, 0, now), "Today");
+        assert_eq!(
+            super::session_group_heading(&sessions, 1, now),
+            "",
+            "the second recording of the same day repeats no heading"
+        );
+        assert_eq!(super::session_group_heading(&sessions, 2, now), "Yesterday");
+    }
+
+    /// 行の 3 行目は「音源 · 文字起こしの状態」（**網羅 match**。状態を足したら語を決めるまで
+    /// コンパイルが通らない）。
+    #[test]
+    fn a_row_says_its_sources_and_transcript_state() {
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 8, 10)
+            .expect("a valid date")
+            .and_hms_opt(14, 0, 0)
+            .expect("a valid time");
+        let mut session = crate::recordings::RecordingSession::for_test(now);
+        session.has_mic = true;
+        session.has_system = true;
+        assert_eq!(
+            super::session_detail_text(&session, TranscriptStatus::Transcribing),
+            "Mic + system · transcribing"
+        );
+        session.has_system = false;
+        assert_eq!(
+            super::session_detail_text(&session, TranscriptStatus::Done),
+            "Mic only · transcribed"
+        );
+        session.has_mic = false;
+        assert_eq!(
+            super::session_detail_text(&session, TranscriptStatus::Failed),
+            "No audio · transcription failed",
+            "a session without audio still says what it is"
+        );
+    }
+
+    /// 一覧の合計は**件数だけ**（単数形も出す）。容量は全ファイルを開かないと分からない。
+    #[test]
+    fn the_library_summary_counts_recordings() {
+        assert_eq!(super::library_summary(0), "0 recordings");
+        assert_eq!(super::library_summary(1), "1 recording");
+        assert_eq!(super::library_summary(148), "148 recordings");
+    }
+
     #[test]
     fn app_version_text_shows_the_version_from_cargo_toml() {
         let version = include_str!("../Cargo.toml")
