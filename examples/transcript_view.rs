@@ -86,9 +86,52 @@ fn main() {
             .into(),
         })
         .collect();
+    // 一覧のサンプル（見出しのまとまり・選択の縦罫・状態のドットを目視する）。**行の高さは
+    // 固定**なので、いちばん長い文言でクリップされることも見る。文言は `src/main.rs` の
+    // `session_detail_text` の複製（あちらを変えたらここも合わせること）。
+    win.set_sessions(ModelRc::from(Rc::new(VecModel::from(vec![
+        SessionRow {
+            group_heading: "Today".into(),
+            time_text: "14:02".into(),
+            date_text: "Aug 10, 2026".into(),
+            detail_text: "Mic + system · transcribing".into(),
+            transcript_status: TranscriptStatus::Transcribing,
+        },
+        SessionRow {
+            group_heading: "".into(),
+            time_text: "09:30".into(),
+            date_text: "Aug 10, 2026".into(),
+            detail_text: "Mic only · transcribed".into(),
+            transcript_status: TranscriptStatus::Done,
+        },
+        SessionRow {
+            group_heading: "Yesterday".into(),
+            time_text: "16:45".into(),
+            date_text: "Aug 9, 2026".into(),
+            detail_text: "System only · transcription failed".into(),
+            transcript_status: TranscriptStatus::Failed,
+        },
+        SessionRow {
+            group_heading: "".into(),
+            time_text: "11:00".into(),
+            date_text: "Aug 9, 2026".into(),
+            detail_text: "Mic + system · not transcribed".into(),
+            transcript_status: TranscriptStatus::NotTranscribed,
+        },
+        SessionRow {
+            group_heading: "Aug 5, 2026".into(),
+            time_text: "15:30".into(),
+            date_text: "Aug 5, 2026".into(),
+            detail_text: "Mic + system · transcribed".into(),
+            transcript_status: TranscriptStatus::Done,
+        },
+    ]))));
+    win.set_selected_index(0);
+    win.set_library_summary("5 recordings".into());
+
     win.set_has_selection(true);
-    win.set_detail_datetime("2026-07-21 12:00:00".into());
-    win.set_detail_sources("Mic + System".into());
+    win.set_detail_datetime("Aug 10, 2026 · 14:02".into());
+    win.set_detail_sources("Mic + system audio".into());
 
     // 文字起こしと議事録は**実アプリで起こりうる組み合わせ**に揃える（要約は文字起こしを
     // 入力にするので、文字起こしが無いセッションには議事録も無い）。状態の文言は `src/main.rs` の
@@ -169,7 +212,8 @@ fn main() {
 
     win.window()
         .set_position(slint::LogicalPosition::new(60.0, 60.0));
-    win.window().set_size(slint::LogicalSize::new(720.0, 540.0));
+    win.window()
+        .set_size(slint::LogicalSize::new(1100.0, 720.0));
     win.show()
         .expect("showing the window should succeed in this verification binary");
 

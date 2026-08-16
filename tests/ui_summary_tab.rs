@@ -46,6 +46,23 @@ fn button(window: &RecordingsWindow, label: &str) -> ElementHandle {
         .unwrap_or_else(|| panic!("the detail pane should have a {label} button"))
 }
 
+/// 議事録のボタン。**文言は状態で変わる**（まだ無ければ `Write notes`、あれば
+/// `Regenerate notes`）ので、どちらかを引く——押す動機が違うので語を変えている（#128）。
+fn notes_button(window: &RecordingsWindow) -> ElementHandle {
+    ["Regenerate notes", "Write notes"]
+        .into_iter()
+        .find_map(|label| ElementHandle::find_by_accessible_label(window, label).next())
+        .expect("the detail pane should have a notes button")
+}
+
+/// 文字起こしのボタン（同じ理由で `Transcribe` / `Re-transcribe` のどちらか）。
+fn transcribe_button(window: &RecordingsWindow) -> ElementHandle {
+    ["Re-transcribe", "Transcribe"]
+        .into_iter()
+        .find_map(|label| ElementHandle::find_by_accessible_label(window, label).next())
+        .expect("the detail pane should have a transcribe button")
+}
+
 #[test]
 #[cfg_attr(
     not(slint_debug_info),
@@ -92,7 +109,7 @@ fn summarize_reports_the_index_only_while_it_is_enabled() {
     let recorded = Rc::clone(&calls);
     window.on_summarize_session(move |index| recorded.borrow_mut().push(index));
 
-    let summarize = button(&window, "Summarize");
+    let summarize = notes_button(&window);
     assert_eq!(summarize.accessible_enabled(), Some(true));
     summarize.mock_single_click(PointerEventButton::Left);
     assert_eq!(*calls.borrow(), vec![2], "the selected index is passed");
@@ -132,9 +149,9 @@ fn the_summary_state_decides_which_actions_are_offered() {
         window.set_show_delete_confirm(false);
 
         assert_eq!(
-            button(&window, "Summarize").accessible_enabled(),
+            notes_button(&window).accessible_enabled(),
             Some(summarize_enabled),
-            "Summarize for {status:?}"
+            "the notes button for {status:?}"
         );
         assert_eq!(
             ElementHandle::find_by_accessible_label(&window, "Cancel Summary").count(),
@@ -189,7 +206,7 @@ fn cancelling_a_queued_summary_reports_the_index() {
 )]
 fn summarizing_also_disables_transcribe() {
     let window = open_window();
-    let transcribe = button(&window, "Transcribe");
+    let transcribe = transcribe_button(&window);
     assert_eq!(transcribe.accessible_enabled(), Some(true));
 
     window.set_detail_summary_status(SummaryStatus::Summarizing);

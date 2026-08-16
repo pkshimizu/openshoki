@@ -62,8 +62,8 @@ const WINDOW_Y: f32 = 160.0;
 
 /// Recordings ウィンドウの初期ジオメトリ。幅・高さは `ui/recordings-window.slint` の
 /// min/preferred と一致させること（片方だけ変えない）。設定ウィンドウと重ならない位置に出す。
-const RECORDINGS_WIDTH: f32 = 720.0;
-const RECORDINGS_HEIGHT: f32 = 540.0;
+const RECORDINGS_WIDTH: f32 = 1100.0;
+const RECORDINGS_HEIGHT: f32 = 720.0;
 const RECORDINGS_X: f32 = 200.0;
 const RECORDINGS_Y: f32 = 120.0;
 
@@ -1307,6 +1307,59 @@ fn build_menu_event_handler(
     }
 }
 
+/// 一覧の行に出す見出し（その日の最初の行だけが持つ）。
+///
+/// **直前の行と比べて決める**。見出しを別の配列に分けると、行の添字とセッションの添字がずれて
+/// 別の録音を選ぶことになる（`SessionRow` の doc）。
+fn session_group_heading(
+    sessions: &[recordings::RecordingSession],
+    index: usize,
+    now: chrono::NaiveDateTime,
+) -> String {
+    let Some(session) = sessions.get(index) else {
+        return String::new();
+    };
+    let heading = session.group_heading(now);
+    match index.checked_sub(1).and_then(|prev| sessions.get(prev)) {
+        // 直前と同じまとまりなら出さない（同じ語が並ぶと、どこで日が変わったか分からない）。
+        Some(previous) if previous.group_heading(now) == heading => String::new(),
+        _ => heading,
+    }
+}
+
+/// 一覧の行の 3 行目（`Mic + system · transcribed`）。音源と文字起こしの状態を 1 行にまとめる。
+///
+/// **行の高さを固定してある**ので、ここは 1 行に収める（溢れたらクリップされる）。
+fn session_detail_text(session: &recordings::RecordingSession, status: TranscriptStatus) -> String {
+    let sources = match (session.has_mic, session.has_system) {
+        (true, true) => "Mic + system",
+        (true, false) => "Mic only",
+        (false, true) => "System only",
+        // 音源が無いセッション（録音に失敗した残骸）。再生も文字起こしもできない。
+        (false, false) => "No audio",
+    };
+    format!("{sources} · {}", session_transcript_word(status))
+}
+
+/// 一覧の行に出す文字起こしの状態（**網羅 match**。状態を足したら語を決めるまで通らない）。
+fn session_transcript_word(status: TranscriptStatus) -> &'static str {
+    match status {
+        TranscriptStatus::NotTranscribed => "not transcribed",
+        TranscriptStatus::Transcribing => "transcribing",
+        TranscriptStatus::Done => "transcribed",
+        TranscriptStatus::Failed => "transcription failed",
+    }
+}
+
+/// 一覧の下端に出す合計。**件数だけ**にする——容量を出すには全セッションのファイルを開く必要が
+/// あり、一覧を開くたびに走らせるには重い。
+fn library_summary(count: usize) -> String {
+    match count {
+        1 => "1 recording".to_owned(),
+        count => format!("{count} recordings"),
+    }
+}
+
 /// セッションディレクトリを OS のゴミ箱へ移動する。macOS では `NsFileManager` 方式を明示する:
 /// `trash` の既定（Finder 方式）は osascript の子プロセス経由で Finder を操作するため、
 /// 初回に Automation 権限プロンプトが出て、拒否されると以後の削除が全て失敗するうえ、
@@ -1382,19 +1435,28 @@ fn open_recordings_window(
     // 範囲と時期の判断は `recordings::spawn_session_part_sweep` の doc）。表示には使わない
     // 副作用なので、完了は待たない。
     recordings::spawn_session_part_sweep(&list, SystemTime::now());
+    let now = chrono::Local::now().naive_local();
     let rows: Vec<SessionRow> = list
         .iter()
-        .map(|session| SessionRow {
-            datetime: session.display_datetime.clone().into(),
-            has_mic: session.has_mic,
-            has_system: session.has_system,
-            transcript_status: transcript_display_status(
+        .enumerate()
+        .map(|(index, session)| {
+            let status = transcript_display_status(
                 handles.transcriber.status_of(&session.dir),
                 session.has_transcript,
-            ),
+            );
+            SessionRow {
+                // 見出しは**その日の最初の行だけ**が持つ（直前の行と比べて決める）。行に持たせる
+                // 理由は `SessionRow` の doc。
+                group_heading: session_group_heading(&list, index, now).into(),
+                time_text: session.display_time().into(),
+                date_text: session.display_date().into(),
+                detail_text: session_detail_text(session, status).into(),
+                transcript_status: status,
+            }
         })
         .collect();
     handles.sessions_model.set_vec(rows);
+    rec.set_library_summary(library_summary(list.len()).into());
     // 開くたびに未選択・停止表示へ初期化する。
     clear_recordings_selection(rec, &handles.transcript_segments);
     *handles.sessions.borrow_mut() = list;

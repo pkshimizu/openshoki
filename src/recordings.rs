@@ -64,6 +64,9 @@ const SWEPT_PART_DESTS: &[&str] = &[
 const DIR_DATETIME_FORMAT: &str = "%Y%m%d-%H%M%S";
 /// 一覧に表示する日時フォーマット（カンプに合わせて分まで）。
 const DISPLAY_DATETIME_FORMAT: &str = "%Y-%m-%d %H:%M";
+/// 一覧の行の時刻・日付（`14:02` / `Aug 10, 2026`）。詳細ヘッダもこの組み合わせで出す。
+const DISPLAY_TIME_FORMAT: &str = "%H:%M";
+const DISPLAY_DATE_FORMAT: &str = "%b %-d, %Y";
 
 /// 1 つの録音セッション。ディレクトリと、含まれる音源・文字起こし・議事録要約の有無を持つ。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +91,30 @@ pub struct RecordingSession {
 }
 
 impl RecordingSession {
+    /// 一覧の行に出す時刻（`14:02`）。同じ日の中ではこれで見分けるので、行の中でいちばん大きく出す。
+    pub fn display_time(&self) -> String {
+        self.datetime.format(DISPLAY_TIME_FORMAT).to_string()
+    }
+
+    /// 一覧の行に出す日付（`Aug 10, 2026`）。見出しと重なるが、スクロールで見出しが流れても
+    /// どの日か分かるように行にも残す。
+    pub fn display_date(&self) -> String {
+        self.datetime.format(DISPLAY_DATE_FORMAT).to_string()
+    }
+
+    /// 日付のまとまりの見出し（`Today` / `Yesterday` / `Aug 5, 2026`）。
+    ///
+    /// **相対の語を出すのは今日と昨日だけ**。「先週」のような幅のある語は、境界がいつ変わるのか
+    /// （週の始まりは日曜か月曜か）を読み手が推測することになるので使わない。
+    pub fn group_heading(&self, now: NaiveDateTime) -> String {
+        let days = (now.date() - self.datetime.date()).num_days();
+        match days {
+            0 => "Today".to_owned(),
+            1 => "Yesterday".to_owned(),
+            _ => self.display_date(),
+        }
+    }
+
     /// 再生対象ファイルのパス。両音源のセッションは録音後生成の `mix.mp3`（まだ無ければ再生不可で
     /// `None`）、単一音源のセッションはその音源ファイルそのもの。音源なしは `None`。
     ///
