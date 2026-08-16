@@ -39,11 +39,7 @@ use tray_icon::menu::{IconMenuItem, MenuEvent};
 use crate::config::Config;
 use crate::recorder::Recorder;
 use crate::tray::Tray;
-use crate::windows::models::{
-    DeleteOutcome, MODEL_SELECT_FAILED_NOTICE, MODELS_EMPTY_TEXT, ModelListHandles, ModelRowSource,
-    ModelsRefresh, OverrideFiles, delete_failure_notice, downloaded_ids, models_context,
-    refresh_model_rows, refresh_models_window, row_facts, select_model,
-};
+use crate::windows::models::ModelsRefresh;
 
 slint::include_modules!();
 
@@ -59,7 +55,7 @@ const BLINK_CYCLE_SECS: f32 = 2.0;
 /// 確定されないまま高さ 0 で表示される。初回表示時にこの値を明示してジオメトリを確定させる。
 /// 幅・高さは `ui/app-window.slint` の min/preferred と一致させること（片方だけ変えない）。
 const WINDOW_WIDTH: f32 = 460.0;
-const WINDOW_HEIGHT: f32 = 900.0;
+const WINDOW_HEIGHT: f32 = 720.0;
 /// 初回表示位置（画面左上からの暫定値）。中央寄せ等の調整は後続に回す。
 const WINDOW_X: f32 = 240.0;
 const WINDOW_Y: f32 = 160.0;
@@ -71,12 +67,20 @@ const RECORDINGS_HEIGHT: f32 = 540.0;
 const RECORDINGS_X: f32 = 200.0;
 const RECORDINGS_Y: f32 = 120.0;
 
-/// モデル管理ウィンドウの初期ジオメトリ。幅・高さは `ui/models-window.slint` の min/preferred と
-/// 一致させること（片方だけ変えない）。設定ウィンドウから開くので、それと重ならない位置に出す。
-const MODELS_WIDTH: f32 = 560.0;
-const MODELS_HEIGHT: f32 = 520.0;
-const MODELS_X: f32 = 700.0;
-const MODELS_Y: f32 = 200.0;
+/// 文字起こしウィンドウの初期ジオメトリ。幅・高さは `ui/transcription-window.slint` の
+/// min/preferred と一致させること（片方だけ変えない）。設定ウィンドウの扉から開くので、
+/// それと重ならない位置に出す。
+const TRANSCRIPTION_WIDTH: f32 = 620.0;
+const TRANSCRIPTION_HEIGHT: f32 = 780.0;
+const TRANSCRIPTION_X: f32 = 700.0;
+const TRANSCRIPTION_Y: f32 = 160.0;
+
+/// 議事録ウィンドウ（`ui/minutes-window.slint` と一致させる）。**兄弟と同じ幅で開く**
+/// （行き来しても画面が動かないように）。
+const MINUTES_WIDTH: f32 = 620.0;
+const MINUTES_HEIGHT: f32 = 700.0;
+const MINUTES_X: f32 = 740.0;
+const MINUTES_Y: f32 = 200.0;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 多重起動ガード。取得したロックは _instance_lock でプロセス終了まで保持し続ける
@@ -124,34 +128,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ui.set_auto_record_app(config.borrow().auto_record_on_app_mic);
     // 保存値は load 時に範囲へ正規化済みなので、そのまま表示へ渡す。
     ui.set_auto_stop_debounce_secs(config.borrow().auto_stop_debounce_secs as i32);
-    ui.set_auto_transcribe(config.borrow().auto_transcribe);
-    // 文字起こし言語: 表示名一覧はカタログ（TRANSCRIBE_LANGUAGES）から組み立てる。選択位置は
-    // 設定の言語コードから解決し、カタログ外の手編集値は既定（English）位置に表示される
-    // （値は書き換えず、ユーザーが Select を操作した時点で上書き保存される）。
-    ui.set_transcribe_languages(
-        Rc::new(slint::VecModel::<slint::SharedString>::from(
-            config::TRANSCRIBE_LANGUAGES
-                .iter()
-                .map(|(_, display)| slint::SharedString::from(*display))
-                .collect::<Vec<_>>(),
-        ))
-        .into(),
-    );
-    ui.set_transcribe_language_index(config::transcribe_language_index(
-        &config.borrow().transcribe_language,
-    ) as i32);
-    // 内蔵 whisper モデル: 表示名一覧はカタログから「名前 — サイズ — 説明」を組み立てる。
-    // 選択位置は設定のモデル ID から解決し、カタログ外の手編集値は既定（Small）位置に表示される。
-    ui.set_whisper_models(model_choices(whisper_model::CATALOG));
-    // 議事録生成: トグルと、使う LLM の選択・取得状況。選択肢の組み立て・フォールバックは
-    // whisper と同じ（選択肢には所要時間とメモリの目安を含める。数 GB のダウンロードと
-    // 数十秒・数 GB の実行コストが選択で決まるため）。
-    ui.set_auto_summarize(config.borrow().auto_summarize);
-    ui.set_summary_models(model_choices(summary_model::CATALOG));
-    // 選択位置と状態行は、モデル管理ウィンドウから選び直したときの追従と**同じ関数**で入れる
-    // （両種別ぶんを 1 箇所にまとめ、種別や状態行の導出が増えたときに初期化だけ取り残されない
-    // ようにする）。
-    apply_model_selection_to_settings(&ui, &config.borrow(), &model_downloader);
+    // 扉の文言（機能の ON/OFF・構成・状態）。**初期化と更新が同じ関数を通る**ので、状態の
+    // 導出が増えても初期化だけ取り残されない。
+    windows::transcription::apply_door(&ui, &config.borrow(), &model_downloader);
+    windows::minutes::apply_door(&ui, &config.borrow(), &model_downloader);
     // 登録アプリの一覧を Slint のモデルで持ち、追加/削除で更新する。
     let app_list_model = Rc::new(slint::VecModel::<TriggerApp>::from(
         config
@@ -237,146 +217,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 丸めた値を Stepper へ反映し、表示・メモリ・ディスクを一致させる。
         ui.set_auto_stop_debounce_secs(secs as i32);
         *config_for_debounce.borrow_mut() = candidate;
-    });
-
-    // 「録音停止時に自動文字起こし」トグル: 永続化に成功してから反映する。Slint 側は先に
-    // チェック状態を新値へ更新するため、保存失敗時は表示を保存済みの値へ戻す
-    // （docs/rules/slint.md。自動録音トグルと対称）。モデルは内蔵（初回に自動ダウンロード）
-    // なので、ここではモデルの選択・検証は行わない。
-    let config_for_transcribe = Rc::clone(&config);
-    let ui_for_transcribe = ui.as_weak();
-    ui.on_toggle_auto_transcribe(move |enabled| {
-        let Some(ui) = ui_for_transcribe.upgrade() else {
-            return;
-        };
-        let mut candidate = config_for_transcribe.borrow().clone();
-        candidate.auto_transcribe = enabled;
-        if let Err(err) = candidate.save() {
-            eprintln!(
-                "Not changing the auto-transcribe setting because saving the settings failed: {err}"
-            );
-            ui.set_auto_transcribe(config_for_transcribe.borrow().auto_transcribe);
-            return;
-        }
-        *config_for_transcribe.borrow_mut() = candidate;
-    });
-
-    // 「議事録生成を自動生成」トグル: 永続化に成功してから反映する（自動文字起こしトグルと対称）。
-    // モデルは内蔵だが、ここでは取得を始めない（数 GB あり、ON にしただけで落とし始めると
-    // 帯域とディスクを黙って使う）。取得の契機は `model_downloads_on_select` の
-    // doc コメントを参照。
-    let config_for_summarize = Rc::clone(&config);
-    let ui_for_summarize = ui.as_weak();
-    ui.on_toggle_auto_summarize(move |enabled| {
-        let Some(ui) = ui_for_summarize.upgrade() else {
-            return;
-        };
-        let mut candidate = config_for_summarize.borrow().clone();
-        candidate.auto_summarize = enabled;
-        if let Err(err) = candidate.save() {
-            eprintln!(
-                "Not changing the auto-summarize setting because saving the settings failed: {err}"
-            );
-            ui.set_auto_summarize(config_for_summarize.borrow().auto_summarize);
-            return;
-        }
-        *config_for_summarize.borrow_mut() = candidate;
-    });
-
-    // 文字起こし言語の変更: Select のインデックスをカタログの言語コードへ変換して永続化する。
-    // Slint 側は先に選択位置を新値へ更新するため、保存失敗時は表示を保存済みの値へ戻す
-    // （docs/rules/slint.md）。
-    let config_for_language = Rc::clone(&config);
-    let ui_for_language = ui.as_weak();
-    ui.on_change_transcribe_language(move |index| {
-        let Some(ui) = ui_for_language.upgrade() else {
-            return;
-        };
-        // Select は Rust が渡したカタログの範囲しか返さないが、防御的に既定（先頭）へ丸める。
-        let code = usize::try_from(index)
-            .ok()
-            .and_then(|i| config::TRANSCRIBE_LANGUAGES.get(i))
-            .unwrap_or(&config::TRANSCRIBE_LANGUAGES[0])
-            .0;
-        let mut candidate = config_for_language.borrow().clone();
-        candidate.transcribe_language = code.to_owned();
-        if let Err(err) = candidate.save() {
-            eprintln!(
-                "Not changing the transcription language because saving the settings failed: {err}"
-            );
-            ui.set_transcribe_language_index(config::transcribe_language_index(
-                &config_for_language.borrow().transcribe_language,
-            ) as i32);
-            return;
-        }
-        *config_for_language.borrow_mut() = candidate;
-    });
-
-    // 内蔵 whisper モデルの変更: Select のインデックスをカタログの ID へ変換して永続化し、
-    // 未取得ならバックグラウンドでダウンロードを開始する（進捗はタイマーが状態行へ反映する）。
-    // 取得を始めない場合もある（`whisper_model_path` で上書き中。契機の正は
-    // `model_downloads_on_select`）。永続化と取得開始そのものは `select_model` が持つ
-    // （モデル管理ウィンドウの「Use」と**同じ経路**にして、どちらから選んでも同じ結果になる
-    // ようにする）。
-    // Slint 側は先に選択位置を新値へ更新するため、保存失敗時は表示を保存済みの値へ戻す
-    // （docs/rules/slint.md）。
-    let config_for_model = Rc::clone(&config);
-    let ui_for_model = ui.as_weak();
-    let downloader_for_model = model_downloader.clone();
-    ui.on_change_whisper_model(move |index| {
-        let Some(ui) = ui_for_model.upgrade() else {
-            return;
-        };
-        // Select は Rust が渡したカタログの範囲しか返さないが、防御的に既定へ丸める。
-        let spec = usize::try_from(index)
-            .ok()
-            .and_then(|i| whisper_model::CATALOG.get(i))
-            .unwrap_or_else(|| whisper_model::default_spec());
-        if !select_model(
-            model_download::ModelKind::Speech,
-            spec,
-            &config_for_model,
-            &downloader_for_model,
-        ) {
-            ui.set_whisper_model_index(whisper_model::model_index(
-                &config_for_model.borrow().whisper_model,
-            ) as i32);
-            return;
-        }
-        whisper_model_status_line(&config_for_model.borrow(), &downloader_for_model).apply(&ui);
-    });
-
-    // 要約 LLM の変更: whisper モデルの変更と同じ流儀（インデックス→ID の変換、永続化成功後に
-    // 反映、保存失敗時は表示を保存済みの値へ戻す）。取得を始める条件だけ whisper と違うが、
-    // その分岐も `select_model` が持つ（理由は `model_downloads_on_select` の doc）。
-    let config_for_summary_model = Rc::clone(&config);
-    let ui_for_summary_model = ui.as_weak();
-    let downloader_for_summary_model = model_downloader.clone();
-    ui.on_change_summary_model(move |index| {
-        let Some(ui) = ui_for_summary_model.upgrade() else {
-            return;
-        };
-        // Select は Rust が渡したカタログの範囲しか返さないが、防御的に既定へ丸める。
-        let spec = usize::try_from(index)
-            .ok()
-            .and_then(|i| summary_model::CATALOG.get(i))
-            .unwrap_or_else(|| summary_model::default_spec());
-        if !select_model(
-            model_download::ModelKind::Summary,
-            spec,
-            &config_for_summary_model,
-            &downloader_for_summary_model,
-        ) {
-            ui.set_summary_model_index(summary_model::model_index(
-                &config_for_summary_model.borrow().summary_model,
-            ) as i32);
-            return;
-        }
-        summary_model_status_line(
-            &config_for_summary_model.borrow(),
-            &downloader_for_summary_model,
-        )
-        .apply(&ui);
     });
 
     // 登録アプリの削除: 一覧のインデックスで設定とモデルから取り除く（永続化成功後に反映）。
@@ -862,190 +702,208 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // モデル管理ウィンドウ（#117 で新設し、#138 で取得・選択まで扱うようにした）。設定画面の
-    // ボタンで開く。設定・Recordings と同じく起動時に生成して隠しておき、閉じても常駐を保つ。
-    let models_ui = ModelsWindow::new()?;
-    models_ui
-        .window()
-        .on_close_requested(|| slint::CloseRequestResponse::HideWindow);
-    // 一覧の素材（インデックス→操作対象の解決に使う）と、UI が参照し続けるモデル。
-    // 差し替えずに行単位で更新する（tick で差し替えるとクリックを取りこぼす）。
-    let model_list = ModelListHandles {
-        sources: Rc::new(RefCell::new(Vec::new())),
-        override_files: Rc::new(RefCell::new(OverrideFiles::default())),
-        // モデル管理ウィンドウは全種別を 1 つの一覧に並べる（種別ごとに分けるのは #141）。
-        kinds: windows::models::ALL_MODEL_KINDS,
-        rows: Rc::new(slint::VecModel::default()),
-        downloaded_seen: Rc::new(RefCell::new(Vec::new())),
+    // 機能ごとの設定ウィンドウ（#141）。設定画面の「扉」から開く。設定・Recordings と同じく
+    // 起動時に生成して隠しておき、閉じても常駐を保つ。
+    //
+    // **走査は 2 つで共有する**（`ModelLists`）。両方開いていてもディスクを見るのは 1 回だけで、
+    // 片方での削除・選択は両方の素材へ同時に反映される（カタログ外ファイルは両方に出るため、
+    // 片側だけ作り直すと消えた行が残る）。
+    let model_lists = windows::models::ModelLists::new();
+
+    // 「作り直して、生きているウィンドウへ反映する」処理。**操作した側と巻き込まれた側で理由を
+    // 変える**（巻き込まれた側は並びが変わるのでモーダルは畳むが、通知は触らない——触っていない
+    // 画面に他人の失敗を出さない／出ていた通知を黙って消さない）。
+    let refresh_lists: windows::models::RefreshSlot = Rc::new(RefCell::new(None));
+
+    let model_workers = windows::models::ModelWorkers {
+        lists: model_lists.clone(),
+        downloader: model_downloader.clone(),
+        transcriber: transcriber.clone(),
+        summarizer: summarizer.clone(),
     };
-    models_ui.set_models(model_list.rows.clone().into());
-    // 行が 1 つも無いときの縮退表示。カタログの行は必ず並ぶので実際には出ないが、表示の穴を
-    // 残さないために一度だけ入れておく（走査の失敗は通知で伝える。`MODELS_UNREADABLE_NOTICE`）。
-    models_ui.set_empty_text(MODELS_EMPTY_TEXT.into());
-    {
-        let models_weak = models_ui.as_weak();
-        let ui_weak = ui.as_weak();
-        let list = model_list.clone();
-        let downloader = model_downloader.clone();
-        let transcriber_for_models = transcriber.clone();
-        let summarizer_for_models = summarizer.clone();
-        let config_for_models = Rc::clone(&config);
-        // 3 つのハンドラは「対象の行を引く → 操作する → 一覧を作り直す」が共通なので、
-        // 作り直しだけを共有のクロージャ（`refresh`）にして、操作ごとにハンドラを分ける。
-        let refresh = move |models: &ModelsWindow, notice: Option<&'static str>| {
-            refresh_models_window(
-                models,
-                &list,
-                &downloader,
-                &transcriber_for_models,
-                &summarizer_for_models,
-                &config_for_models.borrow(),
-                ModelsRefresh::AfterOperation(notice),
-            );
-        };
-        let refresh = Rc::new(refresh);
-
-        // 「Use」: 使うモデルを選び直す（設定画面の Select と同じ経路）。
-        {
-            let models_weak = models_weak.clone();
-            let ui_weak = ui_weak.clone();
-            let sources = Rc::clone(&model_list.sources);
-            let downloader = model_downloader.clone();
-            let config = Rc::clone(&config);
-            let refresh = Rc::clone(&refresh);
-            models_ui.on_use_model(move |index| {
-                let Some(models) = models_weak.upgrade() else {
-                    return;
-                };
-                // 境界チェックと要素取得を get(i) で一体にする（他ハンドラと同じパターン）。
-                let Some(ModelRowSource::Catalog { kind, spec, .. }) = usize::try_from(index)
-                    .ok()
-                    .and_then(|i| sources.borrow().get(i).cloned())
-                else {
-                    return; // 見出し・カタログ外の行では Use を出していない。
-                };
-                let saved = select_model(kind, spec, &config, &downloader);
-                if saved && let Some(ui) = ui_weak.upgrade() {
-                    // 設定画面の Select と状態行を追従させる（どちらから選んでも同じ結果）。
-                    apply_model_selection_to_settings(&ui, &config.borrow(), &downloader);
-                }
-                refresh(&models, (!saved).then_some(MODEL_SELECT_FAILED_NOTICE));
-            });
-        }
-
-        // 「Download」: 選択は変えずに取得だけ始める（未取得・失敗の行にだけ出る）。
-        {
-            let models_weak = models_weak.clone();
-            let sources = Rc::clone(&model_list.sources);
-            let downloader = model_downloader.clone();
-            let refresh = Rc::clone(&refresh);
-            models_ui.on_download_model(move |index| {
-                let Some(models) = models_weak.upgrade() else {
-                    return;
-                };
-                let Some(ModelRowSource::Catalog { spec, .. }) = usize::try_from(index)
-                    .ok()
-                    .and_then(|i| sources.borrow().get(i).cloned())
-                else {
-                    return;
-                };
-                // 取得済み・DL 中なら request_download 側が早期 return する。進捗は tick が拾う。
-                downloader.request_download(spec);
-                refresh(&models, None);
-            });
-        }
-
-        // 「Delete」: 確認モーダルの確定から呼ばれる。
-        {
-            let models_weak = models_weak.clone();
-            let list = model_list.clone();
-            let downloader = model_downloader.clone();
-            let transcriber = transcriber.clone();
-            let summarizer = summarizer.clone();
-            let config = Rc::clone(&config);
-            let refresh = Rc::clone(&refresh);
-            models_ui.on_delete_model(move |index| {
-                let Some(models) = models_weak.upgrade() else {
-                    return;
-                };
-                let Some(source) = usize::try_from(index)
-                    .ok()
-                    .and_then(|i| list.sources.borrow().get(i).cloned())
-                else {
-                    return;
-                };
-                let Some(target) = source.installed().cloned() else {
-                    // Delete はディスクに実体がある行にしか出さないので通常は来ないが、
-                    // 「押しても無反応」に見せないため通知とログを残す（#117 の方針）。
-                    eprintln!("Skipping the model deletion because the file is no longer listed");
-                    refresh(&models, delete_failure_notice(DeleteOutcome::Failed));
-                    return;
-                };
-                // **押された時点で使用中を再確認する**。一覧は tick が状態を追うが、tick と
-                // クリックの間にジョブが始まることはありうる（限界は
-                // `refresh_models_window` の doc）。取得中の拒否は基盤側が持つ。
-                //
-                // **判定はブロックに閉じてハンドルの借用を先に返す**。この下の `refresh` は
-                // `reseed_model_sources` まで進んで `override_files` を `borrow_mut` するので、
-                // `Ref` を持ったままだと `BorrowMutError` で**アプリごと落ちる**
-                // （`ModelListHandles` の doc）。
-                let busy = {
-                    let config = config.borrow();
-                    let override_files = list.override_files.borrow();
-                    let context = models_context(
-                        &transcriber,
-                        &summarizer,
-                        &downloader,
-                        &config,
-                        &override_files,
-                    );
-                    row_facts(&source, &context).busy
-                };
-                let outcome = if busy {
-                    DeleteOutcome::InUse
-                } else {
-                    match downloader.delete(&target) {
-                        Ok(()) => DeleteOutcome::Deleted,
-                        Err(err) => {
-                            // 文言にフルパスは含めない（`docs/rules/security.md`）。
-                            eprintln!("Skipping the model deletion because {err}");
-                            DeleteOutcome::Failed
-                        }
+    let transcription_ui = windows::transcription::build(&config, &model_workers, {
+        let cell = Rc::clone(&refresh_lists);
+        Rc::new(move |cause, origin| {
+            if let Some(refresh) = cell.borrow().clone() {
+                refresh(cause, origin);
+            }
+        })
+    });
+    let minutes_ui = windows::minutes::build(&config, &model_workers, {
+        let cell = Rc::clone(&refresh_lists);
+        Rc::new(move |cause, origin| {
+            if let Some(refresh) = cell.borrow().clone() {
+                refresh(cause, origin);
+            }
+        })
+    });
+    // 閉じる（＝隠す）ときに**確認モーダルを畳む**。開いたまま隠すと、その間の作り直しで並びが
+    // 変わっても畳まれず（tick のガードは表示中のウィンドウしか見ない）、再表示したときに
+    // **古い添字を指したモーダル**が出る。
+    for (window, folder) in [
+        (
+            transcription_ui.window(),
+            Box::new({
+                let weak = transcription_ui.as_weak();
+                move || {
+                    if let Some(window) = weak.upgrade() {
+                        window.set_show_delete_confirm(false);
+                        window.set_delete_index(0);
                     }
-                };
-                refresh(&models, delete_failure_notice(outcome));
-            });
-        }
+                }
+            }) as Box<dyn Fn()>,
+        ),
+        (
+            minutes_ui.window(),
+            Box::new({
+                let weak = minutes_ui.as_weak();
+                move || {
+                    if let Some(window) = weak.upgrade() {
+                        window.set_show_delete_confirm(false);
+                        window.set_delete_index(0);
+                    }
+                }
+            }) as Box<dyn Fn()>,
+        ),
+    ] {
+        window.on_close_requested(move || {
+            folder();
+            slint::CloseRequestResponse::HideWindow
+        });
     }
+
+    // 実体を入れる（2 つのウィンドウを作ってからでないと `Weak` が取れないので、後入れにする）。
+    *refresh_lists.borrow_mut() = Some({
+        let transcription_weak = transcription_ui.as_weak();
+        let minutes_weak = minutes_ui.as_weak();
+        let ui_weak = ui.as_weak();
+        let workers = model_workers.clone();
+        let config = Rc::clone(&config);
+        Rc::new(
+            move |cause: ModelsRefresh, origin: windows::models::ListOrigin| {
+                let polling = matches!(cause, ModelsRefresh::Poll);
+                let scan_notice = if polling {
+                    None
+                } else {
+                    // 走査はここだけ。**ビューを見ない**ので、片方のウィンドウが取れなくても
+                    // 素材とラッチは揃う（`rescan_model_lists` の doc）。
+                    windows::models::rescan_model_lists(
+                        &workers.lists,
+                        &workers.downloader,
+                        &config.borrow(),
+                    )
+                };
+                let cause = windows::models::refresh_cause(cause, scan_notice);
+                // **操作元だけが通知を差し替える**。巻き込まれた側はモーダルを畳むだけにする
+                // （触っていない画面に他人の失敗を出さない／出ていた通知を黙って消さない）。
+                let (for_transcription, for_minutes) = match origin {
+                    windows::models::ListOrigin::Transcription => (cause, cause.elsewhere()),
+                    windows::models::ListOrigin::Minutes => (cause.elsewhere(), cause),
+                    // tick から来る理由は通知に触らないので、どちらへ配っても同じ。
+                    windows::models::ListOrigin::Tick => (cause, cause),
+                };
+                // **表示していないウィンドウの行は組み直さない**（行ごとにワーカーのロックを取るので、
+                // 100ms tick で 2 画面ぶん回すのは無駄。素材とラッチは上の走査で揃っているから、
+                // 次に開くときの `AfterOperation` で追いつく）。
+                if let Some(window) = transcription_weak.upgrade()
+                    && window.window().is_visible()
+                {
+                    windows::models::apply_rows(
+                        &window,
+                        &workers.lists.transcription,
+                        &workers,
+                        &config.borrow(),
+                        for_transcription,
+                    );
+                    if !polling {
+                        windows::transcription::apply_settings(&window, &config.borrow());
+                    }
+                }
+                if let Some(window) = minutes_weak.upgrade()
+                    && window.window().is_visible()
+                {
+                    windows::models::apply_rows(
+                        &window,
+                        &workers.lists.minutes,
+                        &workers,
+                        &config.borrow(),
+                        for_minutes,
+                    );
+                    if !polling {
+                        windows::minutes::apply_settings(&window, &config.borrow());
+                    }
+                }
+                // 設定画面の扉も追従させる（選択・ON/OFF が変わると要約行と状態行が変わる）。
+                // **tick の `Poll` では触らない**——扉は tick 自身が別経路で追従させているので、
+                // ここで組み直すと 100ms ごとにカタログ全件のロックと文字列生成が二重に走る。
+                if let Some(ui) = ui_weak.upgrade()
+                    && !polling
+                {
+                    windows::transcription::apply_door(&ui, &config.borrow(), &workers.downloader);
+                    windows::minutes::apply_door(&ui, &config.borrow(), &workers.downloader);
+                }
+            },
+        ) as windows::models::RefreshLists
+    });
+
+    // 設定画面の扉。開くたびに一覧を作り直す（走査の入口は `refresh_lists` の 1 つ）。
     {
-        // 設定画面の「Manage models…」。開くたびに一覧を作り直す（ディスク走査はここだけ）。
-        let models_weak = models_ui.as_weak();
-        let list = model_list.clone();
-        let downloader_for_open = model_downloader.clone();
-        let transcriber_for_open = transcriber.clone();
-        let summarizer_for_open = summarizer.clone();
-        let config_for_open = Rc::clone(&config);
+        let transcription_weak = transcription_ui.as_weak();
+        let refresh = Rc::clone(&refresh_lists);
         // 初回表示でジオメトリを確定させたか（`show_window` が `&mut bool` を取るので RefCell）。
-        let models_geometry = RefCell::new(false);
-        ui.on_open_models_window(move || {
-            let Some(models) = models_weak.upgrade() else {
+        let geometry = RefCell::new(false);
+        ui.on_open_transcription_window(move || {
+            let Some(window) = transcription_weak.upgrade() else {
                 return;
             };
-            refresh_models_window(
-                &models,
-                &list,
-                &downloader_for_open,
-                &transcriber_for_open,
-                &summarizer_for_open,
-                &config_for_open.borrow(),
-                ModelsRefresh::AfterOperation(None),
-            );
+            // **見せてから作り直す**。作り直しは表示中のウィンドウにしか行を流さないので、
+            // 順番が逆だと開いた直後の一覧が空のままになる（次の tick まで埋まらない）。
             show_window(
-                models.window(),
-                &mut models_geometry.borrow_mut(),
-                slint::LogicalPosition::new(MODELS_X, MODELS_Y),
-                slint::LogicalSize::new(MODELS_WIDTH, MODELS_HEIGHT),
+                window.window(),
+                &mut geometry.borrow_mut(),
+                slint::LogicalPosition::new(TRANSCRIPTION_X, TRANSCRIPTION_Y),
+                slint::LogicalSize::new(TRANSCRIPTION_WIDTH, TRANSCRIPTION_HEIGHT),
             );
+            if let Some(refresh) = refresh.borrow().clone() {
+                refresh(
+                    ModelsRefresh::AfterOperation(None),
+                    windows::models::ListOrigin::Transcription,
+                );
+            }
+        });
+    }
+    {
+        let minutes_weak = minutes_ui.as_weak();
+        let refresh = Rc::clone(&refresh_lists);
+        let geometry = RefCell::new(false);
+        ui.on_open_minutes_window(move || {
+            let Some(window) = minutes_weak.upgrade() else {
+                return;
+            };
+            // **見せてから作り直す**。作り直しは表示中のウィンドウにしか行を流さないので、
+            // 順番が逆だと開いた直後の一覧が空のままになる（次の tick まで埋まらない）。
+            show_window(
+                window.window(),
+                &mut geometry.borrow_mut(),
+                slint::LogicalPosition::new(MINUTES_X, MINUTES_Y),
+                slint::LogicalSize::new(MINUTES_WIDTH, MINUTES_HEIGHT),
+            );
+            if let Some(refresh) = refresh.borrow().clone() {
+                refresh(
+                    ModelsRefresh::AfterOperation(None),
+                    windows::models::ListOrigin::Minutes,
+                );
+            }
+        });
+    }
+    // 議事録ウィンドウの注意書きから文字起こしウィンドウへ渡れるようにする（従属の理由を
+    // 読んだその場で直せるように）。
+    {
+        let ui_weak = ui.as_weak();
+        minutes_ui.on_open_transcription(move || {
+            if let Some(ui) = ui_weak.upgrade() {
+                ui.invoke_open_transcription_window();
+            }
         });
     }
 
@@ -1067,10 +925,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 summarizer: summarizer.clone(),
             },
             ModelsHandles {
-                ui: models_ui.as_weak(),
-                list: model_list.clone(),
-                transcriber: transcriber.clone(),
-                summarizer: summarizer.clone(),
+                transcription: transcription_ui.as_weak(),
+                minutes: minutes_ui.as_weak(),
+                lists: model_lists.clone(),
+                refresh: Rc::clone(&refresh_lists),
                 downloader: model_downloader.clone(),
             },
             &tray,
@@ -1113,17 +971,17 @@ struct RecordingsHandles {
     summarizer: summarize::SummarizeWorker,
 }
 
-/// モデル管理ウィンドウを tick で追従させるために必要なハンドル一式（`RecordingsHandles` と
+/// 機能ウィンドウを tick で追従させるために必要なハンドル一式（`RecordingsHandles` と
 /// 同じ理由でまとめる）。
 struct ModelsHandles {
-    ui: slint::Weak<ModelsWindow>,
-    /// 一覧の素材と UI のモデル（組で持つ理由は `ModelListHandles`）。
-    list: ModelListHandles,
-    /// 削除できるかの判定に読む（ジョブがある間は消させない）。
-    transcriber: transcribe::TranscribeWorker,
-    summarizer: summarize::SummarizeWorker,
-    /// モデルの取得状況（一覧の行の状態と、設定画面の状態行が読む）。**設定画面の更新もこの
-    /// ハンドルを使う**（tick が両方を更新するので、引数を 2 つに割らない）。
+    transcription: slint::Weak<TranscriptionWindow>,
+    minutes: slint::Weak<MinutesWindow>,
+    /// 2 つの一覧の素材と、共有する走査の状態（`ModelLists`）。
+    lists: windows::models::ModelLists,
+    /// 「作り直して、生きているウィンドウへ反映する」処理（`main` が組み立てたもの）。
+    /// **走査の入口をこの 1 つに絞る**ため、tick も同じ関数を通す。
+    refresh: windows::models::RefreshSlot,
+    /// モデルの取得状況（扉の状態行と、走査し直す契機の判定が読む）。
     downloader: model_download::ModelDownloader,
 }
 
@@ -1165,8 +1023,6 @@ fn build_menu_event_handler(
     let mut rec_geometry_committed = false;
     // 再生の経過時間テキストを、秒が変わったときだけ更新するための前回値。
     let mut last_play_secs: Option<u64> = None;
-    // 設定画面のモデル状態行の前回値（種別ごと）。UI から読み戻さずここで覚える。
-    let mut status_lines = StatusLineCache::default();
     // 実行中の録音セッション。None=待機中、Some=録音中。
     let mut recorder: Option<Recorder> = None;
     // 録音中の経過時間テキストを、秒が変わったときだけ更新するための前回値。
@@ -1399,64 +1255,52 @@ fn build_menu_event_handler(
             }
         }
 
-        // 設定ウィンドウが開いている間だけ、選択中モデルの取得状況（ダウンロード進捗等）を
-        // 状態行へ反映する（閉じているときは更新しない。変化したときだけ set して無駄な
-        // 再描画を避ける）。
-        if let Some(ui) = ui.upgrade() {
-            if ui.window().is_visible() {
-                // 変わったときだけ流す（判定と流し込みは `StatusLineCache` が持つ）。
-                status_lines.apply_if_changed(
-                    &ui,
-                    whisper_model_status_line(&config.borrow(), &models.downloader),
-                );
-                status_lines.apply_if_changed(
-                    &ui,
-                    summary_model_status_line(&config.borrow(), &models.downloader),
-                );
-            } else {
-                // **見えていない間に覚えた値はあてにならない**: この tick は止まるのに、
-                // モデル管理ウィンドウの「Use」（`apply_model_selection_to_settings`）は
-                // 設定画面が閉じていても状態行を直接書く。覚えたままだと、次に開いたときに
-                // 「導出値＝覚えている値」で一致してスキップし、古い表示が固定される。
-                status_lines.forget();
-            }
+        // 設定ウィンドウが開いている間だけ、扉の文言（構成・状態）を追従させる。
+        //
+        // **前回値を別に覚えない**。扉は機能ウィンドウ側の操作でも書き換わるので、こちらの記憶と
+        // UI が食い違いうる（覚えたままだと「導出値＝記憶」で一致してスキップし、古い表示が
+        // 固定される）。UI の現在値と比べれば、誰が書いた後でも正しく追いつく。
+        if let Some(ui) = ui.upgrade()
+            && ui.window().is_visible()
+        {
+            windows::transcription::apply_door(&ui, &config.borrow(), &models.downloader);
+            windows::minutes::apply_door(&ui, &config.borrow(), &models.downloader);
         }
 
-        // モデル管理ウィンドウが開いている間だけ、行の状態（取得の進捗・完了・失敗、ジョブの
-        // 開始・終了）を追従させる。**ディスクは走査しない**（状態は状態マップだけで分かる。
+        // 機能ウィンドウが開いている間だけ、行の状態（取得の進捗・完了・失敗、ジョブの開始・
+        // 終了）を追従させる。**ディスクは走査しない**（状態は状態マップだけで分かる。
         // `docs/rules/performance.md`）。取得が完了した行だけは実サイズと合計を追いつかせたい
         // ので、**記録が増えたときに 1 回だけ**走査し直す（毎 tick 走査しないためのラッチ。
         // 「記録は取得済みだが実体が無い」を条件にすると、外部でファイルを消された場合などに
         // 条件が解消せず走査が止まらない）。
-        if let Some(models_ui) = models.ui.upgrade()
-            && models_ui.window().is_visible()
-        {
-            let config = config.borrow();
-            let downloaded = downloaded_ids(&models.list.sources.borrow(), &models.downloader);
-            // 確認モーダルが開いている間は素材を作り直さない（行の並びが変わると、モーダルが
-            // 指している行がずれる）。次の tick で拾う。
-            let rescan = downloaded != *models.list.downloaded_seen.borrow()
-                && !models_ui.get_show_delete_confirm();
-            if rescan {
-                // 走査し直すと `downloaded_seen` も更新される（`refresh_models_window`）。
-                refresh_models_window(
-                    &models_ui,
-                    &models.list,
-                    &models.downloader,
-                    &models.transcriber,
-                    &models.summarizer,
-                    &config,
-                    ModelsRefresh::Rescan,
-                );
-            } else {
-                refresh_model_rows(
-                    &models_ui,
-                    &models.list,
-                    &models.downloader,
-                    &models.transcriber,
-                    &models.summarizer,
-                    &config,
-                    ModelsRefresh::Poll,
+        // **確認モーダルのガードは「表示中の」ウィンドウだけで取る**。隠したウィンドウに残った
+        // フラグまで見ると、そのモーダルが走査を恒久的に止めてしまう（隠すときに畳んでいるので
+        // 実際には残らないが、ガードをそれに依存させない）。
+        // 型が違うので個別に畳む（`Some(モーダルが開いているか)` = 表示中、`None` = 隠れている）。
+        let shown_modals = [
+            models
+                .transcription
+                .upgrade()
+                .filter(|window| window.window().is_visible())
+                .map(|window| window.get_show_delete_confirm()),
+            models
+                .minutes
+                .upgrade()
+                .filter(|window| window.window().is_visible())
+                .map(|window| window.get_show_delete_confirm()),
+        ];
+        if shown_modals.iter().any(Option::is_some) {
+            let modal_open = shown_modals.iter().flatten().any(|open| *open);
+            // ラッチの比較・消費は 1 か所（`ModelLists`）。消費したら両方の素材を同時に作り直す。
+            let rescan = models.lists.downloads_changed(&models.downloader) && !modal_open;
+            if let Some(refresh) = models.refresh.borrow().clone() {
+                refresh(
+                    if rescan {
+                        ModelsRefresh::Rescan
+                    } else {
+                        ModelsRefresh::Poll
+                    },
+                    windows::models::ListOrigin::Tick,
                 );
             }
         }
@@ -2116,28 +1960,6 @@ fn trigger_app_row(trigger: &config::AppTrigger) -> TriggerApp {
     }
 }
 
-/// 設定画面の Select に並べる選択肢（`名前 — サイズ — 説明`）。whisper・要約 LLM で共用し、
-/// 並び順はカタログのまま（選択位置はカタログ内インデックスで表す）。
-///
-/// 要約 LLM の説明行はこの文字列を Slint 側で選択位置から引いて出す（Select の行は箱幅で
-/// 省略されるため。`ui/app-window.slint` の `summary-models`）。
-fn model_choices(catalog: &[model_download::ModelSpec]) -> slint::ModelRc<slint::SharedString> {
-    Rc::new(slint::VecModel::<slint::SharedString>::from(
-        catalog
-            .iter()
-            .map(|spec| {
-                slint::SharedString::from(format!(
-                    "{} — {} — {}",
-                    spec.display_name,
-                    model_download::format_size(spec.size_bytes),
-                    spec.description
-                ))
-            })
-            .collect::<Vec<_>>(),
-    ))
-    .into()
-}
-
 /// その種別のモデルファイルを `config.toml` で上書きしているか（上書き先のパス）。上級者向けの
 /// 手編集のみで、UI からは設定できない。
 ///
@@ -2165,11 +1987,10 @@ fn model_path_override(
 /// - **要約 OFF**（要約のみ）: 選択だけ保存する。取得は次に要約が走るとき（設定を ON にした後の
 ///   初回要約、または Recordings ウィンドウの「Summarize」による手動生成）に `ensure_model` が行う。
 ///
-/// 文字起こし側に「自動文字起こし OFF なら取得しない」というゲートは**置かない**（既存挙動のまま）。
-/// 設定画面の Select は自動文字起こしが OFF だと無効なのでそこからは選択が起きず、モデル管理
-/// ウィンドウの「Use」で選ぶのは先行取得の意図が明らかなため。要約側に `auto_summarize` のゲートが
-/// あるのは、要約 LLM が whisper より大きく（最大 4.4 GB）、生成時に `ensure_model` が取得する
-/// 経路が別にあるから。
+/// 文字起こし側に「自動文字起こし OFF なら取得しない」というゲートは**置かない**。一覧の「Use」を
+/// 押すのは**先行取得の意思表示**だから（機能を OFF にしたまま準備しておく、という使い方をする）。
+/// 要約側に `auto_summarize` のゲートがあるのは、要約 LLM が whisper より大きく（最大 4.4 GB）、
+/// 生成時に `ensure_model` が取得する経路が別にあるから。
 ///
 /// 上書きの判定は `model_path_override` に任せ、ここは**上書き以外の契機**だけを種別ごとに
 /// 書く（**網羅 match** なので、種別を足したら契機を書くまでコンパイルが通らない）。
@@ -2192,42 +2013,6 @@ const MODEL_OVERRIDDEN_STATUS: &str = "Using the model file set in config.toml";
 
 /// 設定画面の状態行を、**変わったときだけ**流し込むためのキャッシュ（種別ごとに直前の行を持つ）。
 ///
-/// 100ms tick から呼ぶので、毎回 set すると変化が無くても再描画が走る。どちらのスロットへ
-/// しまうかは `kind` の網羅 match が決める（`ModelStatusLine::apply` と同じ流儀。種別を足したら
-/// スロットを書くまでコンパイルが通らない）。
-///
-/// `build_menu_event_handler` の中へ直書きしないのは、あのクロージャがテストから呼べないため
-/// （`docs/rules/testing.md` の「配線は繋いでいる関数に継ぎ目を入れてテストする」）。
-#[derive(Default)]
-struct StatusLineCache {
-    whisper: Option<ModelStatusLine>,
-    summary: Option<ModelStatusLine>,
-}
-
-impl StatusLineCache {
-    /// 直前の行と**まるごと**比べ、変わったときだけ設定画面へ流す。
-    ///
-    /// 文言だけで比べないこと: 進捗は連続値なので、文言（1% 刻み）が同じまま進捗と色だけ
-    /// 変わる区間があり、そこを飛ばすとバーが飛び飛びに動く。
-    /// 覚えている値を捨てる。**UI を直接書く経路がある間**（設定画面が見えていない間）は、
-    /// こちらの記憶と UI が食い違いうるので、次に流すときは必ず流し直す。
-    fn forget(&mut self) {
-        *self = Self::default();
-    }
-
-    fn apply_if_changed(&mut self, ui: &AppWindow, line: ModelStatusLine) {
-        let slot = match line.kind {
-            model_download::ModelKind::Speech => &mut self.whisper,
-            model_download::ModelKind::Summary => &mut self.summary,
-        };
-        if slot.as_ref() == Some(&line) {
-            return;
-        }
-        line.apply(ui);
-        *slot = Some(line);
-    }
-}
-
 /// 文字起こしに使う whisper モデルの取得状況を、設定画面の状態行（文言・意味・進捗）にする。
 ///
 /// どのモデルかは Select が示すので、ここは状態だけを出す。ただし上書き中は選んでも取得せず
@@ -2336,32 +2121,6 @@ impl ModelStatusLine {
             overridden: false,
         }
     }
-
-    /// 設定画面へ流し込む。**その種別の 4 つを必ずまとめて set する**（片方だけ古い値が
-    /// 残らないように）。どちらの状態行へ流すかは `kind` の網羅 match が決める。
-    ///
-    /// `overridden` は `tone == Caution` から導ける（いまは上書き中だけが caution）が、
-    /// **導出させずに一緒に運ぶ**: caution を他の意味へ広げた瞬間に説明行が黙って消えるため。
-    /// 二重表現の危険（`docs/rules/slint.md`）は、ここで必ず同時に set することで塞いでいる。
-    fn apply(&self, ui: &AppWindow) {
-        let text: slint::SharedString = self.text.as_str().into();
-        // Slint 側の契約: 負なら進捗バーを出さない（`ui/controls.slint` の `StatusLine`）。
-        let progress = self.progress.unwrap_or(-1.0);
-        match self.kind {
-            model_download::ModelKind::Speech => {
-                ui.set_whisper_model_status(text);
-                ui.set_whisper_model_tone(self.tone);
-                ui.set_whisper_model_progress(progress);
-                ui.set_whisper_model_overridden(self.overridden);
-            }
-            model_download::ModelKind::Summary => {
-                ui.set_summary_model_status(text);
-                ui.set_summary_model_tone(self.tone);
-                ui.set_summary_model_progress(progress);
-                ui.set_summary_model_overridden(self.overridden);
-            }
-        }
-    }
 }
 
 /// モデルの取得状況を、設定画面の状態行にする（whisper / 要約 LLM で共用）。
@@ -2405,23 +2164,6 @@ fn model_status_line(
     }
 }
 
-/// 設定画面の Select の選択位置・状態行（文言・意味・進捗）・上書きフラグを、いまの設定に
-/// 合わせて更新する。
-///
-/// 起動時の初期化と、モデル管理ウィンドウから選び直したときの追従が**同じ経路**を通る（状態行の
-/// 導出が種別ごとに増えても、初期化だけ古い経路に取り残されないようにするため）。
-fn apply_model_selection_to_settings(
-    ui: &AppWindow,
-    config: &Config,
-    downloader: &model_download::ModelDownloader,
-) {
-    ui.set_whisper_model_index(whisper_model::model_index(&config.whisper_model) as i32);
-    ui.set_summary_model_index(summary_model::model_index(&config.summary_model) as i32);
-    // 上書きフラグも状態行がまとめて運ぶ（`ModelStatusLine::apply`）ので、ここでは触らない。
-    whisper_model_status_line(config, downloader).apply(ui);
-    summary_model_status_line(config, downloader).apply(ui);
-}
-
 /// macOS で Dock アイコンを隠し、メニューバー常駐アプリとして振る舞わせる。
 ///
 /// activation policy を Accessory にすることで Dock とアプリスイッチャーに出なくなる。
@@ -2440,32 +2182,34 @@ fn hide_dock_icon() {
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 }
 
+/// Slint のテストバックエンドを初期化する（**スレッドごとに 1 回だけ**呼べる仕様）。
+///
+/// `tests/ui_support::init_backend` と同じ趣旨だが、あちらは統合テスト用のモジュールで bin
+/// クレートからは使えないため、ここに持つ。
+#[cfg(test)]
+pub(crate) fn init_test_backend() {
+    use std::cell::Cell;
+    thread_local! {
+        static INITIALIZED: Cell<bool> = const { Cell::new(false) };
+    }
+    INITIALIZED.with(|initialized| {
+        if !initialized.replace(true) {
+            i_slint_backend_testing::init_no_event_loop();
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        AppWindow, ModelStatusLine, StatusLineCache, StatusTone, SummaryStatus, TranscriptStatus,
-        app_version_text, breathing_level, model_choices, model_downloads_on_select,
-        model_status_line, playback_progress, seek_position_from_ratio, summary_display_status,
-        summary_model_status_line, summary_placeholder_text, summary_rows, summary_status_text,
-        transcript_display_status, transcript_placeholder_text, transcript_status_text,
-        whisper_model_status_line,
+        StatusTone, SummaryStatus, TranscriptStatus, app_version_text, breathing_level,
+        model_downloads_on_select, model_status_line, playback_progress, seek_position_from_ratio,
+        summary_display_status, summary_model_status_line, summary_placeholder_text, summary_rows,
+        summary_status_text, transcript_display_status, transcript_placeholder_text,
+        transcript_status_text, whisper_model_status_line,
     };
     use crate::transcribe::TranscribeStatus;
     use std::time::Duration;
-
-    /// Slint のテストバックエンドを初期化する（スレッドごとに 1 回だけ呼べる仕様）。
-    /// `tests/ui_support::init_backend` と同じ趣旨だが、あちらは統合テスト用のモジュールで
-    /// bin クレートからは使えないため、ここに持つ。
-    fn init_test_backend() {
-        thread_local! {
-            static INITIALIZED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-        }
-        INITIALIZED.with(|initialized| {
-            if !initialized.replace(true) {
-                i_slint_backend_testing::init_no_event_loop();
-            }
-        });
-    }
 
     /// バージョン表記が `Cargo.toml` の `version` と一致することを確かめる。
     ///
@@ -2866,115 +2610,6 @@ mod tests {
         assert!(!downloads(&with(false, Some("/tmp/model.gguf"))));
     }
 
-    /// 状態行が**その種別のプロパティだけ**へ、4 つまとめて流し込まれること。
-    ///
-    /// ここが配線の唯一の検査点。`apply` の set を 1 つ消す・whisper と summary を取り違える、
-    /// といったミューテーションは他のテスト（struct の中身しか見ない）では捕まらない
-    /// （`docs/rules/testing.md` の「配線は繋いでいる関数に継ぎ目を入れてテストする」）。
-    #[test]
-    #[cfg_attr(
-        not(slint_debug_info),
-        ignore = "needs Slint debug info (SLINT_EMIT_DEBUG_INFO=1)"
-    )]
-    fn apply_fills_only_its_own_status_line() {
-        init_test_backend();
-        let ui = AppWindow::new().expect("creating the settings window should succeed");
-
-        ModelStatusLine {
-            kind: crate::model_download::ModelKind::Speech,
-            text: "speech line".to_owned(),
-            tone: StatusTone::Active,
-            progress: Some(0.25),
-            overridden: true,
-        }
-        .apply(&ui);
-
-        assert_eq!(ui.get_whisper_model_status(), "speech line");
-        assert_eq!(ui.get_whisper_model_tone(), StatusTone::Active);
-        assert!((ui.get_whisper_model_progress() - 0.25).abs() < f32::EPSILON);
-        assert!(ui.get_whisper_model_overridden());
-        // 要約側は触られていない（取り違えるとここが落ちる）。
-        assert_eq!(ui.get_summary_model_status(), "");
-        assert!(!ui.get_summary_model_overridden());
-
-        ModelStatusLine::plain(
-            crate::model_download::ModelKind::Summary,
-            "summary line".to_owned(),
-            StatusTone::Done,
-        )
-        .apply(&ui);
-
-        assert_eq!(ui.get_summary_model_status(), "summary line");
-        assert_eq!(ui.get_summary_model_tone(), StatusTone::Done);
-        // 進捗なしは負の値へ落として、Slint 側にバーを出させない。
-        assert!(ui.get_summary_model_progress() < 0.0);
-        assert!(!ui.get_summary_model_overridden());
-        // whisper 側は上書きされていない。
-        assert_eq!(ui.get_whisper_model_status(), "speech line");
-    }
-
-    /// 変わったときだけ流す、が種別ごとに効くこと。
-    ///
-    /// tick の配線（1000 行超のクロージャ）はテストから呼べないので、判定と流し込みを持つ
-    /// `StatusLineCache` を継ぎ目にしてここで固定する。文言だけで比べる形へ戻す変異と、
-    /// 前回値の更新忘れが落ちる。
-    #[test]
-    #[cfg_attr(
-        not(slint_debug_info),
-        ignore = "needs Slint debug info (SLINT_EMIT_DEBUG_INFO=1)"
-    )]
-    fn the_status_line_cache_skips_unchanged_lines_per_kind() {
-        init_test_backend();
-        let ui = AppWindow::new().expect("creating the settings window should succeed");
-        let mut cache = StatusLineCache::default();
-        let line = |progress| ModelStatusLine {
-            kind: crate::model_download::ModelKind::Speech,
-            text: "Downloading… 25%".to_owned(),
-            tone: StatusTone::Active,
-            progress: Some(progress),
-            overridden: false,
-        };
-
-        // 1 回目は流れる。
-        cache.apply_if_changed(&ui, line(0.25));
-        assert_eq!(ui.get_whisper_model_status(), "Downloading… 25%");
-
-        // 同じ行は流さない（番兵を置いて、上書きされないことで確かめる）。
-        ui.set_whisper_model_status("sentinel".into());
-        cache.apply_if_changed(&ui, line(0.25));
-        assert_eq!(ui.get_whisper_model_status(), "sentinel");
-
-        // **文言が同じでも進捗が違えば流す**（文言だけで比べる形へ戻すとここが落ちる）。
-        cache.apply_if_changed(&ui, line(0.26));
-        assert_eq!(ui.get_whisper_model_status(), "Downloading… 25%");
-        assert!((ui.get_whisper_model_progress() - 0.26).abs() < f32::EPSILON);
-
-        // 種別ごとに独立している（要約の行を流しても whisper 側は動かない）。
-        ui.set_whisper_model_status("sentinel".into());
-        cache.apply_if_changed(
-            &ui,
-            ModelStatusLine::plain(
-                crate::model_download::ModelKind::Summary,
-                "summary line".to_owned(),
-                StatusTone::Done,
-            ),
-        );
-        assert_eq!(ui.get_summary_model_status(), "summary line");
-        assert_eq!(ui.get_whisper_model_status(), "sentinel");
-
-        // **スロットが種別ごとに分かれている**こと: 間に別種別を挟んでも、変わっていない
-        // whisper の行は依然としてスキップされる（スロットを 1 つにまとめる変異がここで落ちる。
-        // 実際の tick は両種別を交互に流すので、1 つだと差分更新が丸ごと効かなくなる）。
-        cache.apply_if_changed(&ui, line(0.26));
-        assert_eq!(ui.get_whisper_model_status(), "sentinel");
-
-        // 覚えている値を捨てたら、同じ行でも流し直す（設定画面を閉じている間に別経路が
-        // UI を直接書くので、開き直したときは必ず反映する）。
-        cache.forget();
-        cache.apply_if_changed(&ui, line(0.26));
-        assert_eq!(ui.get_whisper_model_status(), "Downloading… 25%");
-    }
-
     /// 状態行の**意味（tone）と進捗**が状態ごとに決まること。色は Slint 側の対応表が引くので、
     /// ここが崩れると「失敗が普通の色で出る」「進捗バーが出ない／出っぱなし」になる。
     #[test]
@@ -3192,32 +2827,6 @@ mod tests {
         // 上書きは「失敗」ではなく「選択が使われない」＝ caution。説明行も出さない。
         assert_eq!(overridden_line.tone, StatusTone::Caution);
         assert!(overridden_line.overridden);
-    }
-
-    /// Select の選択肢は「名前 — サイズ — 説明」で、カタログの順・件数どおりに並ぶ。
-    /// 要約 LLM の説明行はこの文字列を Slint 側で引くので、目安が入っていることもここで固定する。
-    #[test]
-    fn model_choices_follow_the_catalog_order() {
-        use slint::Model;
-
-        let choices = model_choices(crate::summary_model::CATALOG);
-        assert_eq!(choices.row_count(), crate::summary_model::CATALOG.len());
-        assert_eq!(
-            choices
-                .row_data(0)
-                .expect("the catalog has at least one entry"),
-            "Qwen2.5 3B Instruct — 2.0 GB — 25 s and 3.7 GB of memory for a 4-min meeting, but can invent details"
-        );
-        assert_eq!(
-            choices.row_data(1).expect("the catalog has a second entry"),
-            "Qwen2.5 7B Instruct — 4.4 GB — 54 s and 8.2 GB of memory for a 4-min meeting, more faithful"
-        );
-        // whisper でも同じ形（サイズは MB 表記になる）。
-        let whisper = model_choices(crate::whisper_model::CATALOG);
-        assert_eq!(
-            whisper.row_data(0).expect("the catalog has a first entry"),
-            "Tiny — 74 MB — fastest, lowest accuracy"
-        );
     }
 
     /// サイン波の代表的な位相で、期待どおりの明度レベルになることを確認する。

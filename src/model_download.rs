@@ -85,23 +85,6 @@ pub fn format_size(bytes: u64) -> String {
     }
 }
 
-/// 識別子 → カタログ内インデックス。カタログ外（設定の手編集値）は `default_id` の位置へ
-/// フォールバックする（値自体は書き換えず、表示だけ既定位置になる）。
-///
-/// 種別ごとのカタログが同じ解決をするための正（`whisper_model::model_index` /
-/// `summary_model::model_index` から呼ぶ）。設定画面の Select の選択位置に使う。
-pub fn catalog_index(catalog: &[ModelSpec], id: &str, default_id: &str) -> usize {
-    catalog
-        .iter()
-        .position(|spec| spec.id == id)
-        .unwrap_or_else(|| {
-            catalog
-                .iter()
-                .position(|spec| spec.id == default_id)
-                .expect("the default model id is always in the catalog")
-        })
-}
-
 /// モデルの取得状況。設定画面の表示と二重ダウンロード防止に使う。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DownloadStatus {
@@ -264,7 +247,7 @@ impl ModelDownloader {
     /// 避けるため）。文字起こし中なら当該セッションのジョブが失敗し、次のジョブ・設定画面での
     /// 再選択で再試行される（自動リトライは無い）。
     ///
-    /// **入口は 3 つ**（設定画面の選択・ワーカーの `ensure_model`・モデル管理ウィンドウの
+    /// **入口は 3 つ**（一覧の「Use」・ワーカーの `ensure_model`・一覧の
     /// 「Download」。#138 で 3 つ目が増えた）。管理ウィンドウからはカタログ全件を個別に始められる
     /// ので、続けて押せば同時に何本でも走る——上限を持たない判断は変えていないが、まとめて始めると
     /// **空き容量の事前確認で全部が落ちる**ことがある（各スレッドが他の在庫の残量を必要量へ

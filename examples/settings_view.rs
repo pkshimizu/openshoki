@@ -64,32 +64,19 @@ fn main() {
     } else {
         sample_apps()
     }))));
-    // Transcription セクションは従属コントロールが多く、下端の余白を食い潰しやすい。
+    // 扉（#141）。文言は `src/windows/transcription.rs` / `minutes.rs` の複製で、**いちばん
+    // 長くなる形**で見る: 構成行は言語・モデル名・件数の 3 つ、状態行は取得中と「待っている
+    // 理由」（いずれも折り返しやすい）。
     win.set_auto_transcribe(true);
-    win.set_transcribe_languages(ModelRc::from(Rc::new(VecModel::from(vec![
-        slint::SharedString::from("Japanese"),
-    ]))));
-    win.set_whisper_models(ModelRc::from(Rc::new(VecModel::from(vec![
-        slint::SharedString::from("Small — 465 MB — balanced speed and accuracy"),
-    ]))));
-    // 状態行は「取得中」で見る（ドット・注意色・進捗バーが同時に出る、いちばん背の高い形）。
-    win.set_whisper_model_status("Downloading… 62%".into());
-    win.set_whisper_model_tone(StatusTone::Active);
-    win.set_whisper_model_progress(0.62);
-    // 要約 LLM は選択肢・説明行（選択中の選択肢の全文）・状態行の 3 段。いちばん背が高くなる
-    // 組み合わせで見る: 議事録生成は OFF（状態行が取得の契機を説明する長い文言になる）＋
-    // 説明が最長の 3B を選択中（`src/summary_model.rs` の description の複製。あちらを
-    // 変えたらここも合わせること）。
-    win.set_auto_summarize(false);
-    win.set_summary_models(ModelRc::from(Rc::new(VecModel::from(vec![
-        slint::SharedString::from(
-            "Qwen2.5 3B Instruct — 2.0 GB — 25 s and 3.7 GB of memory for a 4-min meeting, but can invent details",
-        ),
-    ]))));
-    win.set_summary_model_status(
-        "Not downloaded — downloads when notes are generated (2.0 GB)".into(),
-    );
-    win.set_summary_model_tone(StatusTone::Neutral);
+    win.set_transcription_state("On".into());
+    win.set_transcription_summary("Japanese · Medium (1.5 GB) · 2 of 6 models downloaded".into());
+    win.set_transcription_status("Large v3 downloading — 62%".into());
+    win.set_transcription_tone(StatusTone::Active);
+    win.set_auto_summarize(true);
+    win.set_minutes_state("On".into());
+    win.set_minutes_summary("Qwen2.5 7B Instruct (4.4 GB) · 1 of 2 models downloaded".into());
+    win.set_minutes_status("Waits for a transcript — automatic transcription is off".into());
+    win.set_minutes_tone(StatusTone::Caution);
 
     win.window()
         .set_position(slint::LogicalPosition::new(60.0, 60.0));

@@ -1,4 +1,7 @@
-//! モデル管理ウィンドウの操作（選択・取得・削除）のテスト（#117 / #138）。
+//! モデル一覧の操作（選択・取得・削除）のテスト（#117 / #138。#141 で機能ウィンドウへ移設）。
+//!
+//! 一覧は文字起こし・議事録の 2 ウィンドウが**同じ部品**（`ModelList`）で持つので、代表として
+//! 文字起こし側で検証する（行の見た目と操作はどちらも同じ部品が出す）。
 //!
 //! 見た目は `examples/models_view.rs` で目視するが、**クリックが配線されているか**は
 //! ビルドでも目視でも分からない（Delete は自作の `DangerButton`＝`TouchArea` を重ねる構造で、
@@ -21,10 +24,10 @@ use slint::platform::PointerEventButton;
 
 slint::include_modules!();
 
-/// ウィンドウ寸法（実アプリと同じ。`src/main.rs` の MODELS_WIDTH/HEIGHT）。要素の座標を出すために
+/// ウィンドウ寸法（実アプリと同じ。`src/main.rs` の TRANSCRIPTION_WIDTH/HEIGHT）。要素の座標を出すために
 /// 必要で、この値自体はアサートに使わない。
-const WINDOW_WIDTH: f32 = 560.0;
-const WINDOW_HEIGHT: f32 = 520.0;
+const WINDOW_WIDTH: f32 = 620.0;
+const WINDOW_HEIGHT: f32 = 780.0;
 
 /// テスト用の行の指定（表示の中身ではなく、**操作の可否を決める軸**だけを置く）。
 #[derive(Clone, Copy)]
@@ -58,7 +61,7 @@ impl Row {
 }
 
 /// 取得済み・未取得・取得中の 3 行を並べたウィンドウ。
-fn open_window() -> ModelsWindow {
+fn open_window() -> TranscriptionWindow {
     open_window_with(&[
         Row::installed(),
         Row::with_status(ModelStatus::NotDownloaded),
@@ -66,9 +69,9 @@ fn open_window() -> ModelsWindow {
     ])
 }
 
-fn open_window_with(rows: &[Row]) -> ModelsWindow {
+fn open_window_with(rows: &[Row]) -> TranscriptionWindow {
     ui_support::init_backend();
-    let window = ModelsWindow::new().expect("create the models window");
+    let window = TranscriptionWindow::new().expect("create the models window");
     window
         .window()
         .set_size(slint::LogicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT));
@@ -76,7 +79,7 @@ fn open_window_with(rows: &[Row]) -> ModelsWindow {
     window
 }
 
-fn set_rows(window: &ModelsWindow, rows: &[Row]) {
+fn set_rows(window: &TranscriptionWindow, rows: &[Row]) {
     let rows: Vec<ModelRow> = rows
         .iter()
         .enumerate()
@@ -86,6 +89,11 @@ fn set_rows(window: &ModelsWindow, rows: &[Row]) {
             detail: "balanced speed and accuracy".into(),
             size: "1.5 GB".into(),
             status_text: "status".into(),
+            tone: StatusTone::Neutral,
+            progress: -1.0,
+            progress_detail: "".into(),
+            badge: "".into(),
+            mono: false,
             delete_detail: "detail".into(),
             status: row.status,
             can_use: row.can_use,
@@ -99,16 +107,16 @@ fn set_rows(window: &ModelsWindow, rows: &[Row]) {
 /// 行の Delete ボタン（宣言順＝行の順）。自作の `DangerButton` は accessible-label を持たないので
 /// 型名で引く。確認モーダルの確定ボタンだけはラベル（`Delete Model`）を持たせてあるので、
 /// 位置ではなくラベルで引ける（下の `confirm_button`）。
-fn row_delete_buttons(window: &ModelsWindow) -> Vec<ElementHandle> {
+fn row_delete_buttons(window: &TranscriptionWindow) -> Vec<ElementHandle> {
     ElementHandle::find_by_element_type_name(window, "DangerButton")
         .filter(|handle| handle.accessible_label().as_deref() != Some(CONFIRM_LABEL))
         .collect()
 }
 
 /// 確認モーダルの確定ボタン（ラベルで引く。行の Delete と取り違えないため）。
-const CONFIRM_LABEL: &str = "Delete Model";
+const CONFIRM_LABEL: &str = "Delete model";
 
-fn confirm_button(window: &ModelsWindow) -> ElementHandle {
+fn confirm_button(window: &TranscriptionWindow) -> ElementHandle {
     ElementHandle::find_by_accessible_label(window, CONFIRM_LABEL)
         .next()
         .expect("the confirmation should have a Delete Model button")
@@ -117,19 +125,26 @@ fn confirm_button(window: &ModelsWindow) -> ElementHandle {
 /// 状態ごとに、行に出るはずのボタン（**網羅 match**。Slint 側は `can-download` と
 /// `status == installed` で出し分けているので、状態を足したときにここがコンパイルエラーになって
 /// 更新漏れに気づけるようにする）。`Row::with_status` が渡す可否と対で読む。
-fn expected_buttons(status: ModelStatus) -> (bool /* Download */, bool /* Delete */) {
+fn expected_buttons(
+    status: ModelStatus,
+) -> (
+    Option<&'static str>, /* 取得 */
+    bool,                 /* Delete */
+) {
     match status {
         // ディスクに無い＝取得できる／消すものが無い。
-        ModelStatus::NotDownloaded | ModelStatus::Failed => (true, false),
+        ModelStatus::NotDownloaded => (Some("Download"), false),
+        // 失敗からの再取得は**同じ操作だが押す動機が違う**ので、文言を変える（#141 のデザイン）。
+        ModelStatus::Failed => (Some("Retry"), false),
         // 受信中は一時ファイルなので、取得も削除も出さない。
-        ModelStatus::Downloading => (false, false),
+        ModelStatus::Downloading => (None, false),
         // 在るものは消せる（押せるかは can-delete）。
-        ModelStatus::Installed => (false, true),
+        ModelStatus::Installed => (None, true),
     }
 }
 
-/// ラベルで std-widgets の `Button` を引く（`Use` / `Download`。行の順に返る）。
-fn buttons_labelled(window: &ModelsWindow, label: &str) -> Vec<ElementHandle> {
+/// ラベルでボタンを引く（`Use` / `Download` / `Retry`。行の順に返る）。
+fn buttons_labelled(window: &TranscriptionWindow, label: &str) -> Vec<ElementHandle> {
     ElementHandle::find_by_accessible_label(window, label).collect()
 }
 
@@ -226,12 +241,14 @@ fn the_status_decides_which_buttons_appear() {
     ] {
         set_rows(&window, &[Row::with_status(status)]);
         window.set_show_delete_confirm(false);
-        let (download, delete) = expected_buttons(status);
-        assert_eq!(
-            buttons_labelled(&window, "Download").len(),
-            usize::from(download),
-            "Download for {status:?}"
-        );
+        let (fetch, delete) = expected_buttons(status);
+        for label in ["Download", "Retry"] {
+            assert_eq!(
+                buttons_labelled(&window, label).len(),
+                usize::from(fetch == Some(label)),
+                "{label} for {status:?}"
+            );
+        }
         assert_eq!(
             row_delete_buttons(&window).len(),
             usize::from(delete),

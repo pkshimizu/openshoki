@@ -1,0 +1,150 @@
+import { Style, StatusTone } from "style.slint";
+import { SectionHeading, Card, CardBlock, FeatureHeading, Toggle, Select } from "controls.slint";
+import { ModelList, ModelRow, ModelStatus } from "model-list.slint";
+
+// 一覧の型はここを経由して外へ出す（`ui/app-window.slint` の再エクスポート先を 1 つに保つ）。
+export { ModelRow, ModelStatus }
+
+// 文字起こしの設定ウィンドウ。設定画面の「扉」から開く（#141）。
+//
+// **1 つの機能を端から端まで持つ**: その機能のスイッチ（Behaviour）と、その機能が使うモデル
+// ファイル（一覧）。**使うモデルを選ぶ場所はこの一覧だけ**——設定画面から選択 UI を無くした
+// のは、同じ設定を 2 つの UI が持っていたため。
+//
+// 中身は `ModelList` が持ち、その上のスロット（`@children`）へこのウィンドウ固有の設定を
+// 差し込む。削除の確認モーダルは `ModelList` の中にあるので、覆いはウィンドウ全体に掛かる。
+export component TranscriptionWindow inherits Window {
+    title: "Transcription";
+    // 幅・高さは src/main.rs の TRANSCRIPTION_WIDTH/HEIGHT と一致させること（片方だけ変えない）。
+    // 議事録ウィンドウと**同じ幅**で開く（行き来しても画面が動かないように）。
+    min-width: 460px;
+    min-height: 560px;
+    preferred-width: 620px;
+    preferred-height: 780px;
+    background: Style.paper;
+
+    // --- 機能の設定（Rust の Config と `<=>` で束ねる。保存失敗時は Rust が書き戻す） ---
+    in-out property <bool> auto-transcribe;
+    in property <[string]> languages;
+    in-out property <int> language-index;
+    // 見出しの下に出す 1 行（`Off — recordings stay as audio only.`）。Rust が組む。
+    in property <string> feature-note;
+
+    // --- 一覧（`ModelList` へそのまま渡す。説明は `ui/model-list.slint`） ---
+    in property <[ModelRow]> models;
+    in property <string> total-text;
+    in property <string> empty-text;
+    in property <string> notice;
+    in-out property <bool> show-delete-confirm: false;
+    in-out property <int> delete-index: 0;
+
+    callback toggle-auto-transcribe(bool);
+    callback change-language(int);
+    callback use-model(int);
+    callback download-model(int);
+    callback delete-model(int);
+
+    ModelList {
+        models: root.models;
+        heading: "Transcription models on this Mac";
+        heading-note: "The one marked In use is what transcription runs. This list is the only place that choice is made.";
+        footnote: "Models are downloaded from Hugging Face when you choose them or when they are first needed. Audio and transcripts never leave this Mac.";
+        total-text: root.total-text;
+        empty-text: root.empty-text;
+        notice: root.notice;
+        show-delete-confirm <=> root.show-delete-confirm;
+        delete-index <=> root.delete-index;
+
+        use-model(index) => {
+            root.use-model(index);
+        }
+        download-model(index) => {
+            root.download-model(index);
+        }
+        delete-model(index) => {
+            root.delete-model(index);
+        }
+
+        VerticalLayout {
+            spacing: 16px;
+
+            FeatureHeading {
+                glyph: "文";
+                title: "Transcription";
+                note: root.feature-note;
+            }
+
+            VerticalLayout {
+                spacing: 12px;
+                SectionHeading {
+                    text: "BEHAVIOR";
+                }
+
+                Card {
+                    CardBlock {
+                        HorizontalLayout {
+                            spacing: 14px;
+                            VerticalLayout {
+                                spacing: 3px;
+                                horizontal-stretch: 1;
+                                Text {
+                                    text: "Transcribe when a recording stops";
+                                    font-size: Style.body-size;
+                                    font-weight: Style.semibold;
+                                    color: Style.ink;
+                                }
+                                Text {
+                                    // 自動が OFF でも手で頼めることを言う（できないと誤解させない）。
+                                    text: "You can also transcribe a recording by hand from the Recordings window.";
+                                    font-size: Style.caption-size;
+                                    color: Style.ink-muted;
+                                    wrap: word-wrap;
+                                }
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                Toggle {
+                                    label: "Transcribe when a recording stops";
+                                    checked <=> root.auto-transcribe;
+                                    toggled(checked) => {
+                                        root.toggle-auto-transcribe(checked);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    CardBlock {
+                        VerticalLayout {
+                            spacing: 8px;
+                            HorizontalLayout {
+                                spacing: 14px;
+                                Text {
+                                    text: "Spoken language";
+                                    font-size: Style.body-size;
+                                    color: Style.ink;
+                                    vertical-alignment: center;
+                                    horizontal-stretch: 1;
+                                }
+                                Select {
+                                    label: "Spoken language";
+                                    model: root.languages;
+                                    current-index <=> root.language-index;
+                                    selected(index) => {
+                                        root.change-language(index);
+                                    }
+                                }
+                            }
+                            Text {
+                                text: "Auto-detect is slower and less exact than naming the language.";
+                                font-size: Style.caption-size;
+                                color: Style.ink-muted;
+                                wrap: word-wrap;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

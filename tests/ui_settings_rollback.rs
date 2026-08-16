@@ -1,5 +1,8 @@
-//! 設定画面の入力ウィジェットが、Rust 側からの書き戻し（保存失敗時の巻き戻し）を
-//! **ユーザー操作のあとでも**反映することのテスト。
+//! 入力ウィジェットが、Rust 側からの書き戻し（保存失敗時の巻き戻し）を**ユーザー操作の
+//! あとでも**反映することのテスト。
+//!
+//! #141 で機能の設定が専用ウィンドウへ移ったので、対象も移設先で見る（設定画面に残るのは
+//! 録音・自動録音と、機能ウィンドウへの扉だけ）。
 //!
 //! `docs/rules/slint.md` の「in-out プロパティの操作は、保存失敗時に表示を旧値へ戻す」は、
 //! ウィジェット側が `checked: root.x` のような**片方向バインディング**だと成立しない
@@ -15,17 +18,9 @@ use i_slint_backend_testing::ElementHandle;
 
 slint::include_modules!();
 
-/// 設定画面のトグルはラベルを隣の Text に持たせているため、要素型で探して
-/// 並び順（宣言順 = 上から。Record automatically → Transcribe recordings →
-/// Generate meeting notes）で選ぶ。
+/// トグルはラベルを隣の Text に持たせているため、要素型で探して並び順（宣言順 = 上から）で選ぶ。
 fn toggles(window: &AppWindow) -> Vec<ElementHandle> {
     ElementHandle::find_by_element_type_name(window, "Toggle").collect()
-}
-
-/// 同じく Select を上から順に集める（Language → Model（whisper）→
-/// Model（議事録ブロックの中）。後ろ 2 つはラベルが同名なので、所属で見分ける）。
-fn selects(window: &AppWindow) -> Vec<ElementHandle> {
-    ElementHandle::find_by_element_type_name(window, "Select").collect()
 }
 
 /// 同じく Stepper（「Stop recording after the mic is released for」の 1 つだけ）。
@@ -98,56 +93,51 @@ fn rust_can_write_back_a_delay_after_the_user_edited_it() {
     );
 }
 
-/// 要約 LLM の Select も同じ契約を持つ（#119 で足した選択 UI。whisper・言語の Select も
-/// 同じ束縛にしてあるので、代表として一番下のものを見る）。
+/// 認識言語の `Select` も同じ契約を持つ（#141 で文字起こしウィンドウへ移設）。
 ///
-/// 選択の変更はキー操作で行う（ポップアップの項目をクリックする経路はヘッドレスでは不安定）。
-/// クリックでフォーカスが `Select` へ移り、続く矢印キーを `Select` 自身の FocusScope が受けて
-/// 選択を 1 つ動かす（`Select` は一覧を開かなくても上下キーで選べる）。
+/// **モデルの選択 UI はもう無い**——選ぶ場所は一覧の `Use` だけになったので、書き戻しの契約が
+/// 要るのは言語だけになった。選択の変更はキー操作で行う（ポップアップの項目をクリックする
+/// 経路はヘッドレスでは不安定）。クリックでフォーカスが `Select` へ移り、続く矢印キーを
+/// `Select` 自身の FocusScope が受けて選択を 1 つ動かす。
 #[test]
 #[cfg_attr(
     not(slint_debug_info),
     ignore = "needs Slint debug info (SLINT_EMIT_DEBUG_INFO=1)"
 )]
-fn rust_can_roll_back_a_model_choice_after_the_user_changed_it() {
-    const LIGHT: &str = "Light — 2.0 GB — fast";
-    const HEAVY: &str = "Heavy — 4.4 GB — slow";
-
+fn rust_can_roll_back_a_language_choice_after_the_user_changed_it() {
     ui_support::init_backend();
-    let window = AppWindow::new().expect("create the settings window");
-    ui_support::fit_settings_content(&window);
-    // Select は自動文字起こし ON のときだけ操作できる（`transcribe-deps` のゲート）。
-    window.set_auto_transcribe(true);
-    window.set_summary_models(
+    let window = TranscriptionWindow::new().expect("create the transcription window");
+    window
+        .window()
+        .set_size(slint::LogicalSize::new(620.0, 780.0));
+    window.set_languages(
         std::rc::Rc::new(slint::VecModel::from(vec![
-            slint::SharedString::from(LIGHT),
-            slint::SharedString::from(HEAVY),
+            slint::SharedString::from("English"),
+            slint::SharedString::from("Japanese"),
         ]))
         .into(),
     );
-    window.set_summary_model_index(1);
+    window.set_language_index(1);
 
-    let select = selects(&window)
-        .pop()
-        .expect("the settings window has a summary model select");
-    assert_eq!(select.accessible_value().as_deref(), Some(HEAVY));
+    let select = ElementHandle::find_by_element_type_name(&window, "Select")
+        .next()
+        .expect("the transcription window has a language select");
+    assert_eq!(select.accessible_value().as_deref(), Some("Japanese"));
 
-    // ユーザー操作で軽い方へ移す（クリックでフォーカスを与え、↑ で 1 つ上の選択肢へ）。
+    // ユーザー操作で 1 つ上へ（クリックでフォーカスを与え、↑ で English へ）。
     select.mock_single_click(slint::platform::PointerEventButton::Left);
     window
         .window()
         .dispatch_event(slint::platform::WindowEvent::KeyPressed {
             text: slint::platform::Key::UpArrow.into(),
         });
-    assert_eq!(window.get_summary_model_index(), 0);
+    assert_eq!(window.get_language_index(), 0);
 
-    // 保存に失敗した Rust 側が、保存済みの選択（Heavy）へ書き戻す。`Select` の表示は
-    // `model[current-index]` の直接束縛なので、set した時点で追従する（`ComboBox` のときに
-    // 要った `mock_elapsed_time` は不要になった）。
-    window.set_summary_model_index(1);
+    // 保存に失敗した Rust 側が、保存済みの選択（Japanese）へ書き戻す。
+    window.set_language_index(1);
     assert_eq!(
         select.accessible_value().as_deref(),
-        Some(HEAVY),
+        Some("Japanese"),
         "the select should follow the index Rust wrote back"
     );
 }
