@@ -2182,6 +2182,23 @@ fn hide_dock_icon() {
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 }
 
+/// Slint のテストバックエンドを初期化する（**スレッドごとに 1 回だけ**呼べる仕様）。
+///
+/// `tests/ui_support::init_backend` と同じ趣旨だが、あちらは統合テスト用のモジュールで bin
+/// クレートからは使えないため、ここに持つ。
+#[cfg(test)]
+pub(crate) fn init_test_backend() {
+    use std::cell::Cell;
+    thread_local! {
+        static INITIALIZED: Cell<bool> = const { Cell::new(false) };
+    }
+    INITIALIZED.with(|initialized| {
+        if !initialized.replace(true) {
+            i_slint_backend_testing::init_no_event_loop();
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

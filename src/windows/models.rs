@@ -340,6 +340,11 @@ pub(crate) struct ModelWorkers {
 /// 一覧を載せているウィンドウ。**表示の更新だけ**を受け持つ（素材には触らせない——
 /// ビューとハンドルの取り違えで「別の一覧の添字で素材を引く」事故を型で防ぐ）。
 pub(crate) trait ModelListView {
+    /// このビューが出す一覧。**ウィンドウの型が決める**ので、呼び出し側が選べない
+    /// （選べると、議事録のウィンドウに文字起こしの一覧を渡しても通ってしまう）。
+    fn handles<'a>(&self, lists: &'a ModelLists) -> &'a ModelListHandles;
+    /// このビューで操作したときの出どころ（通知の宛先を決める）。同じ理由でビューが答える。
+    fn origin(&self) -> ListOrigin;
     fn total_text(&self) -> slint::SharedString;
     fn set_total_text(&self, text: slint::SharedString);
     fn notice(&self) -> slint::SharedString;
@@ -348,16 +353,24 @@ pub(crate) trait ModelListView {
     fn set_delete_index(&self, value: i32);
 }
 
-/// 一覧の 3 操作（Use / Download / Delete）を、そのウィンドウのハンドルへ配線する。
+/// 一覧の 3 操作（Use / Download / Delete）を、そのウィンドウの一覧へ配線する。
 ///
-/// **マクロにするのは、2 つのウィンドウで取り違えないため**。手で 2 回書くと、議事録ウィンドウに
-/// 文字起こしのハンドルを渡してもコンパイルが通り、**添字は正しいのに別のモデルを消す**
-/// （行数が同じなら例外も出ない）。ここを通せば、ウィンドウと一覧の組は呼び出し 1 か所でしか
-/// 決まらない。Slint の生成型に共通のコールバック登録トレイトが無いので、ジェネリクスにはできない。
+/// **どの一覧を触るかはウィンドウの型が答える**（`ModelListView::handles` / `origin`）。呼び出し側は
+/// ウィンドウを渡すだけで一覧も通知の宛先も選べないので、**組を間違えられるのは
+/// `impl_model_list_view!` の 1 行だけ**になる。型では防げない（`ModelListHandles` はどちらの
+/// 一覧も同じ型）ので、そこは `each_window_owns_its_own_list` が検査する。
+///
+/// 間違えたときに起きるのは、**添字は正しいのに別のモデルを消す**こと——カタログ外の行は両方の
+/// 一覧の末尾に出るので、行数が同じなら例外も出ない。
+///
+/// マクロなのは、Slint の生成型に共通のコールバック登録トレイトが無いため（`on_use_model` などは
+/// 型ごとの固有メソッドで、ジェネリクスからは呼べない）。
 macro_rules! wire_model_list {
-    ($window:expr, $field:ident, $origin:expr, $config:expr, $workers:expr, $refresh:expr) => {{
+    ($window:expr, $config:expr, $workers:expr, $refresh:expr) => {{
+        let handles = models::ModelListView::handles(&$window, &$workers.lists).clone();
+        let origin = models::ModelListView::origin(&$window);
         {
-            let handles = $workers.lists.$field.clone();
+            let handles = handles.clone();
             let config = std::rc::Rc::clone($config);
             let downloader = $workers.downloader.clone();
             let refresh = std::rc::Rc::clone(&$refresh);
@@ -365,19 +378,19 @@ macro_rules! wire_model_list {
                 if let RowAction::Done(notice) =
                     models::use_model_at(&handles, index, &config, &downloader)
                 {
-                    refresh(ModelsRefresh::AfterOperation(notice), $origin);
+                    refresh(ModelsRefresh::AfterOperation(notice), origin);
                 }
             });
         }
         {
-            let handles = $workers.lists.$field.clone();
+            let handles = handles.clone();
             let downloader = $workers.downloader.clone();
             let refresh = std::rc::Rc::clone(&$refresh);
             $window.on_download_model(move |index| {
                 if let RowAction::Done(notice) =
                     models::download_model_at(&handles, index, &downloader)
                 {
-                    refresh(ModelsRefresh::AfterOperation(notice), $origin);
+                    refresh(ModelsRefresh::AfterOperation(notice), origin);
                 }
             });
         }
@@ -387,9 +400,9 @@ macro_rules! wire_model_list {
             let refresh = std::rc::Rc::clone(&$refresh);
             $window.on_delete_model(move |index| {
                 if let RowAction::Done(notice) =
-                    models::delete_model_at(&workers, &workers.lists.$field, index, &config)
+                    models::delete_model_at(&workers, &handles, index, &config)
                 {
-                    refresh(ModelsRefresh::AfterOperation(notice), $origin);
+                    refresh(ModelsRefresh::AfterOperation(notice), origin);
                 }
             });
         }
@@ -399,8 +412,17 @@ pub(crate) use wire_model_list;
 
 /// Slint が生成したウィンドウ型へ `ModelListView` を実装する（委譲するだけ）。
 macro_rules! impl_model_list_view {
-    ($window:ty) => {
+    ($window:ty, $field:ident, $origin:ident) => {
         impl $crate::windows::models::ModelListView for $window {
+            fn handles<'a>(
+                &self,
+                lists: &'a $crate::windows::models::ModelLists,
+            ) -> &'a $crate::windows::models::ModelListHandles {
+                &lists.$field
+            }
+            fn origin(&self) -> $crate::windows::models::ListOrigin {
+                $crate::windows::models::ListOrigin::$origin
+            }
             fn total_text(&self) -> slint::SharedString {
                 <$window>::get_total_text(self)
             }
@@ -423,8 +445,8 @@ macro_rules! impl_model_list_view {
     };
 }
 
-impl_model_list_view!(crate::TranscriptionWindow);
-impl_model_list_view!(crate::MinutesWindow);
+impl_model_list_view!(crate::TranscriptionWindow, transcription, Transcription);
+impl_model_list_view!(crate::MinutesWindow, minutes, Minutes);
 
 /// 一覧の 1 行の素材。**カタログ全件**（未取得を含む）と、`models/` にあるカタログ外のファイルを
 /// 種別ごとに並べたもの（#138。#117 の「ディスクにあるものだけ」から広げた）。
@@ -1825,6 +1847,38 @@ mod tests {
             };
             assert_eq!(row.name, expected, "row {index} must match its source");
         }
+    }
+
+    /// **ウィンドウと一覧の組**（`impl_model_list_view!` の 1 行）が入れ違っていないか。
+    ///
+    /// 型では防げない（`ModelListHandles` はどちらの一覧も同じ型）。入れ違うと、文字起こしの
+    /// 一覧で Del を押したときに要約 LLM が消える——添字は正しいので例外も出ない。
+    #[test]
+    #[cfg_attr(
+        not(slint_debug_info),
+        ignore = "needs Slint debug info (SLINT_EMIT_DEBUG_INFO=1)"
+    )]
+    fn each_window_owns_its_own_list() {
+        use super::ModelListView as _;
+        crate::init_test_backend();
+        let lists = super::ModelLists::new();
+
+        let transcription =
+            crate::TranscriptionWindow::new().expect("create the transcription window");
+        assert_eq!(
+            transcription.handles(&lists).kinds,
+            super::SPEECH_KINDS,
+            "the transcription window must own the speech list"
+        );
+        assert_eq!(transcription.origin(), super::ListOrigin::Transcription);
+
+        let minutes = crate::MinutesWindow::new().expect("create the meeting notes window");
+        assert_eq!(
+            minutes.handles(&lists).kinds,
+            super::SUMMARY_KINDS,
+            "the meeting notes window must own the summary list"
+        );
+        assert_eq!(minutes.origin(), super::ListOrigin::Minutes);
     }
 
     /// 通知の宛先は**操作元だけ**。議事録側で失敗した通知が文字起こし側に出てはいけないし、

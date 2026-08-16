@@ -93,14 +93,7 @@ pub(crate) fn build(
 
     // 一覧の 3 操作。**マクロを通す**ことで、ウィンドウと一覧の組を取り違えられなくする
     // （説明は `models::wire_model_list`）。
-    models::wire_model_list!(
-        window,
-        transcription,
-        ListOrigin::Transcription,
-        config,
-        workers,
-        refresh
-    );
+    models::wire_model_list!(window, config, workers, refresh);
     window
 }
 
