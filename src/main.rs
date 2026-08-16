@@ -360,7 +360,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return;
             };
             rec.set_has_selection(true);
-            rec.set_detail_datetime(session.display_datetime.clone().into());
+            // 一覧の行と**同じ組み立て**にする（`Aug 10, 2026 · 14:02`）。左右で日時の形が
+            // 違うと、同じ録音を見ていることが読み取りにくい。
+            rec.set_detail_datetime(
+                format!("{} · {}", session.display_date(), session.display_time()).into(),
+            );
             rec.set_detail_sources(session.source_summary().into());
             rec.set_has_transcript(session.has_transcript);
             // 文字起こしの状態テキストと Transcribe ボタンの活性を、ワーカーの進行状況＋
@@ -695,6 +699,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             sessions.borrow_mut().remove(i);
             sessions_model.remove(i);
+            // 削除で**隣接行の見出しと合計が変わる**。見出しは直前の行との比較で決まるので、
+            // その日の先頭を消すと繰り上がった行が見出しを引き継ぐ必要がある。
+            {
+                let sessions = sessions.borrow();
+                rec.set_library_summary(library_summary(sessions.len()).into());
+                if let Some(mut row) = sessions_model.row_data(i) {
+                    row.group_heading =
+                        session_group_heading(&sessions, i, chrono::Local::now().naive_local())
+                            .into();
+                    sessions_model.set_row_data(i, row);
+                }
+            }
             // 進行状況マップに残ったエントリを掃除する（削除済みセッションの記録を残さない）。
             transcriber.forget(&dir);
             summarizer.forget(&dir);
@@ -1188,6 +1204,9 @@ fn build_menu_event_handler(
                     }
                     let previous = row.transcript_status;
                     row.transcript_status = status;
+                    // **文言も一緒に組み直す**。行は状態を enum と文字列の 2 つで持っているので、
+                    // 片方だけ更新すると「完了したのに `transcribing` のまま」が残る。
+                    row.detail_text = session_detail_text(session, status).into();
                     recordings.sessions_model.set_row_data(i, row);
                     if previous == TranscriptStatus::Transcribing
                         && status == TranscriptStatus::Done
@@ -1319,26 +1338,29 @@ fn session_group_heading(
     let Some(session) = sessions.get(index) else {
         return String::new();
     };
-    let heading = session.group_heading(now);
-    match index.checked_sub(1).and_then(|prev| sessions.get(prev)) {
-        // 直前と同じまとまりなら出さない（同じ語が並ぶと、どこで日が変わったか分からない）。
-        Some(previous) if previous.group_heading(now) == heading => String::new(),
-        _ => heading,
+    // 直前と同じ日なら出さない（同じ語が並ぶと、どこで日が変わったか分からない）。**日付で
+    // 比べる**——文言で比べると、比較のためだけに全行ぶんの文字列を作って捨てることになる。
+    let same_day = index
+        .checked_sub(1)
+        .and_then(|prev| sessions.get(prev))
+        .is_some_and(|previous| previous.date() == session.date());
+    if same_day {
+        return String::new();
     }
+    session.group_heading(now)
 }
 
 /// 一覧の行の 3 行目（`Mic + system · transcribed`）。音源と文字起こしの状態を 1 行にまとめる。
 ///
 /// **行の高さを固定してある**ので、ここは 1 行に収める（溢れたらクリップされる）。
 fn session_detail_text(session: &recordings::RecordingSession, status: TranscriptStatus) -> String {
-    let sources = match (session.has_mic, session.has_system) {
-        (true, true) => "Mic + system",
-        (true, false) => "Mic only",
-        (false, true) => "System only",
-        // 音源が無いセッション（録音に失敗した残骸）。再生も文字起こしもできない。
-        (false, false) => "No audio",
-    };
-    format!("{sources} · {}", session_transcript_word(status))
+    // 音源の語は `source_summary` の 1 箇所に持つ（詳細ヘッダと削除の確認も同じ語を使うので、
+    // ここで別の表を持つと片方だけ直って表記が割れる）。
+    format!(
+        "{} · {}",
+        session.source_summary(),
+        session_transcript_word(status)
+    )
 }
 
 /// 一覧の行に出す文字起こしの状態（**網羅 match**。状態を足したら語を決めるまで通らない）。
@@ -1827,8 +1849,8 @@ fn transcript_status_text(display_status: TranscriptStatus) -> &'static str {
 fn transcript_placeholder_text(display_status: TranscriptStatus) -> &'static str {
     match display_status {
         TranscriptStatus::Transcribing => TRANSCRIBING_LABEL,
-        TranscriptStatus::Failed => "Transcription Failed",
-        TranscriptStatus::NotTranscribed | TranscriptStatus::Done => "Not Transcribed Yet",
+        TranscriptStatus::Failed => "Transcription failed",
+        TranscriptStatus::NotTranscribed | TranscriptStatus::Done => "Not transcribed yet",
     }
 }
 
@@ -1885,7 +1907,7 @@ const SUMMARIZING_LABEL: &str = "Summarizing…";
 /// 状態行（文形式）と縮退表示（Title Case）で大小が違うので、`SUMMARIZING_LABEL` のように
 /// 1 つを共有できない（1 語のラベルは偶然どちらの流儀にも合っていた）。2 つに分ける。
 const SUMMARY_QUEUED_LABEL: &str = "Waiting to summarize…";
-const SUMMARY_QUEUED_PLACEHOLDER: &str = "Waiting to Summarize…";
+const SUMMARY_QUEUED_PLACEHOLDER: &str = "Waiting to write notes…";
 
 /// 議事録生成の表示状態 → 詳細ペインの状態テキスト。
 fn summary_status_text(display_status: SummaryStatus) -> &'static str {
@@ -1906,8 +1928,8 @@ fn summary_placeholder_text(display_status: SummaryStatus) -> &'static str {
     match display_status {
         SummaryStatus::Queued => SUMMARY_QUEUED_PLACEHOLDER,
         SummaryStatus::Summarizing => SUMMARIZING_LABEL,
-        SummaryStatus::Failed => "Summarization Failed",
-        SummaryStatus::NotSummarized | SummaryStatus::Done => "Not Summarized Yet",
+        SummaryStatus::Failed => "Notes could not be written",
+        SummaryStatus::NotSummarized | SummaryStatus::Done => "No notes yet",
     }
 }
 
@@ -2275,15 +2297,6 @@ mod tests {
     use crate::transcribe::TranscribeStatus;
     use std::time::Duration;
 
-    /// バージョン表記が `Cargo.toml` の `version` と一致することを確かめる。
-    ///
-    /// 期待値を `env!("CARGO_PKG_VERSION")` で組むと実装と同じ式になるので、**別の出所**として
-    /// `Cargo.toml` を直接読む。これで「バンプしたのに表示が追随しない」形の崩れは捕まる。
-    ///
-    /// ただし「実装が `env!` を使っている」ことまでは検証できない。実装を現在の値のまま
-    /// ハードコードしても両辺が一致して通る（ミューテーションで確認済み）。`Cargo.toml` と
-    /// `env!("CARGO_PKG_VERSION")` の紐づきは cargo のコンパイル時保証で、実行時テストの
-    /// 守備範囲外。
     /// 一覧の見出しは**その日の最初の行だけ**が持つ。
     ///
     /// 全行に出すと同じ語が並んで、どこで日が変わったのか分からない。逆に別の配列へ分けると、
@@ -2349,6 +2362,16 @@ mod tests {
         assert_eq!(super::library_summary(1), "1 recording");
         assert_eq!(super::library_summary(148), "148 recordings");
     }
+
+    /// バージョン表記が `Cargo.toml` の `version` と一致することを確かめる。
+    ///
+    /// 期待値を `env!("CARGO_PKG_VERSION")` で組むと実装と同じ式になるので、**別の出所**として
+    /// `Cargo.toml` を直接読む。これで「バンプしたのに表示が追随しない」形の崩れは捕まる。
+    ///
+    /// ただし「実装が `env!` を使っている」ことまでは検証できない。実装を現在の値のまま
+    /// ハードコードしても両辺が一致して通る（ミューテーションで確認済み）。`Cargo.toml` と
+    /// `env!("CARGO_PKG_VERSION")` の紐づきは cargo のコンパイル時保証で、実行時テストの
+    /// 守備範囲外。
 
     #[test]
     fn app_version_text_shows_the_version_from_cargo_toml() {
@@ -2445,7 +2468,7 @@ mod tests {
     fn transcript_placeholder_text_covers_all_states() {
         assert_eq!(
             transcript_placeholder_text(TranscriptStatus::NotTranscribed),
-            "Not Transcribed Yet"
+            "Not transcribed yet"
         );
         assert_eq!(
             transcript_placeholder_text(TranscriptStatus::Transcribing),
@@ -2453,11 +2476,11 @@ mod tests {
         );
         assert_eq!(
             transcript_placeholder_text(TranscriptStatus::Done),
-            "Not Transcribed Yet"
+            "Not transcribed yet"
         );
         assert_eq!(
             transcript_placeholder_text(TranscriptStatus::Failed),
-            "Transcription Failed"
+            "Transcription failed"
         );
     }
 
@@ -2521,11 +2544,11 @@ mod tests {
     fn summary_placeholder_text_covers_all_states() {
         assert_eq!(
             summary_placeholder_text(SummaryStatus::NotSummarized),
-            "Not Summarized Yet"
+            "No notes yet"
         );
         assert_eq!(
             summary_placeholder_text(SummaryStatus::Queued),
-            "Waiting to Summarize…"
+            "Waiting to write notes…"
         );
         assert_eq!(
             summary_placeholder_text(SummaryStatus::Summarizing),
@@ -2533,11 +2556,11 @@ mod tests {
         );
         assert_eq!(
             summary_placeholder_text(SummaryStatus::Done),
-            "Not Summarized Yet"
+            "No notes yet"
         );
         assert_eq!(
             summary_placeholder_text(SummaryStatus::Failed),
-            "Summarization Failed"
+            "Notes could not be written"
         );
     }
 

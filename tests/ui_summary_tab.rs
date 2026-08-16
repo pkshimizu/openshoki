@@ -154,7 +154,7 @@ fn the_summary_state_decides_which_actions_are_offered() {
             "the notes button for {status:?}"
         );
         assert_eq!(
-            ElementHandle::find_by_accessible_label(&window, "Cancel Summary").count(),
+            ElementHandle::find_by_accessible_label(&window, "Cancel notes").count(),
             usize::from(cancel_shown),
             "the Cancel button should only exist while queued ({status:?})"
         );
@@ -192,7 +192,7 @@ fn cancelling_a_queued_summary_reports_the_index() {
     window.on_summarize_session(|_| panic!("a queued summary must not be re-submitted"));
 
     window.set_detail_summary_status(SummaryStatus::Queued);
-    button(&window, "Cancel Summary").mock_single_click(PointerEventButton::Left);
+    button(&window, "Cancel notes").mock_single_click(PointerEventButton::Left);
     assert_eq!(*calls.borrow(), vec![1], "the selected index is passed");
 }
 

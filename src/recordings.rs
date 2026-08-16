@@ -109,6 +109,11 @@ impl RecordingSession {
         }
     }
 
+    /// 録音した日（見出しのまとまりの判定に使う。**文言ではなく日付で比べる**ため）。
+    pub fn date(&self) -> chrono::NaiveDate {
+        self.datetime.date()
+    }
+
     /// 一覧の行に出す時刻（`14:02`）。同じ日の中ではこれで見分けるので、行の中でいちばん大きく出す。
     pub fn display_time(&self) -> String {
         self.datetime.format(DISPLAY_TIME_FORMAT).to_string()
@@ -168,7 +173,7 @@ impl RecordingSession {
     /// 含まれる音源を表す英語サマリー（右ペインのヘッダ表示用）。
     pub fn source_summary(&self) -> &'static str {
         match (self.has_mic, self.has_system) {
-            (true, true) => "Mic + System",
+            (true, true) => "Mic + system",
             (true, false) => "Mic only",
             (false, true) => "System only",
             // 音源なしのセッションは一覧に含めない（`list_sessions` がスキップ）ため通常起きない。
@@ -532,7 +537,7 @@ mod tests {
         // 音源・文字起こし・議事録要約の判定とサマリー。
         assert!(sessions[0].has_mic && sessions[0].has_system && sessions[0].has_transcript);
         assert!(sessions[0].has_summary);
-        assert_eq!(sessions[0].source_summary(), "Mic + System");
+        assert_eq!(sessions[0].source_summary(), "Mic + system");
         assert_eq!(sessions[1].source_summary(), "Mic only");
         assert!(!sessions[1].has_transcript);
         // 文字起こしも要約も無いセッション（要約の有無は独立に判定される）。
