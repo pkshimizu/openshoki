@@ -62,8 +62,8 @@ const WINDOW_Y: f32 = 160.0;
 
 /// Recordings ウィンドウの初期ジオメトリ。幅・高さは `ui/recordings-window.slint` の
 /// min/preferred と一致させること（片方だけ変えない）。設定ウィンドウと重ならない位置に出す。
-const RECORDINGS_WIDTH: f32 = 720.0;
-const RECORDINGS_HEIGHT: f32 = 540.0;
+const RECORDINGS_WIDTH: f32 = 1100.0;
+const RECORDINGS_HEIGHT: f32 = 720.0;
 const RECORDINGS_X: f32 = 200.0;
 const RECORDINGS_Y: f32 = 120.0;
 
@@ -360,7 +360,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return;
             };
             rec.set_has_selection(true);
-            rec.set_detail_datetime(session.display_datetime.clone().into());
+            // 一覧の行と**同じ組み立て**にする（`Aug 10, 2026 · 14:02`）。左右で日時の形が
+            // 違うと、同じ録音を見ていることが読み取りにくい。
+            rec.set_detail_datetime(
+                format!("{} · {}", session.display_date(), session.display_time()).into(),
+            );
             rec.set_detail_sources(session.source_summary().into());
             rec.set_has_transcript(session.has_transcript);
             // 文字起こしの状態テキストと Transcribe ボタンの活性を、ワーカーの進行状況＋
@@ -695,6 +699,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             sessions.borrow_mut().remove(i);
             sessions_model.remove(i);
+            // 削除で**隣接行の見出しと合計が変わる**。見出しは直前の行との比較で決まるので、
+            // その日の先頭を消すと繰り上がった行が見出しを引き継ぐ必要がある。
+            {
+                let sessions = sessions.borrow();
+                rec.set_library_summary(library_summary(sessions.len()).into());
+                if let Some(mut row) = sessions_model.row_data(i) {
+                    row.group_heading =
+                        session_group_heading(&sessions, i, chrono::Local::now().naive_local())
+                            .into();
+                    sessions_model.set_row_data(i, row);
+                }
+            }
             // 進行状況マップに残ったエントリを掃除する（削除済みセッションの記録を残さない）。
             transcriber.forget(&dir);
             summarizer.forget(&dir);
@@ -1188,6 +1204,9 @@ fn build_menu_event_handler(
                     }
                     let previous = row.transcript_status;
                     row.transcript_status = status;
+                    // **文言も一緒に組み直す**。行は状態を enum と文字列の 2 つで持っているので、
+                    // 片方だけ更新すると「完了したのに `transcribing` のまま」が残る。
+                    row.detail_text = session_detail_text(session, status).into();
                     recordings.sessions_model.set_row_data(i, row);
                     if previous == TranscriptStatus::Transcribing
                         && status == TranscriptStatus::Done
@@ -1307,6 +1326,62 @@ fn build_menu_event_handler(
     }
 }
 
+/// 一覧の行に出す見出し（その日の最初の行だけが持つ）。
+///
+/// **直前の行と比べて決める**。見出しを別の配列に分けると、行の添字とセッションの添字がずれて
+/// 別の録音を選ぶことになる（`SessionRow` の doc）。
+fn session_group_heading(
+    sessions: &[recordings::RecordingSession],
+    index: usize,
+    now: chrono::NaiveDateTime,
+) -> String {
+    let Some(session) = sessions.get(index) else {
+        return String::new();
+    };
+    // 直前と同じ日なら出さない（同じ語が並ぶと、どこで日が変わったか分からない）。**日付で
+    // 比べる**——文言で比べると、比較のためだけに全行ぶんの文字列を作って捨てることになる。
+    let same_day = index
+        .checked_sub(1)
+        .and_then(|prev| sessions.get(prev))
+        .is_some_and(|previous| previous.date() == session.date());
+    if same_day {
+        return String::new();
+    }
+    session.group_heading(now)
+}
+
+/// 一覧の行の 3 行目（`Mic + system · transcribed`）。音源と文字起こしの状態を 1 行にまとめる。
+///
+/// **行の高さを固定してある**ので、ここは 1 行に収める（溢れたらクリップされる）。
+fn session_detail_text(session: &recordings::RecordingSession, status: TranscriptStatus) -> String {
+    // 音源の語は `source_summary` の 1 箇所に持つ（詳細ヘッダと削除の確認も同じ語を使うので、
+    // ここで別の表を持つと片方だけ直って表記が割れる）。
+    format!(
+        "{} · {}",
+        session.source_summary(),
+        session_transcript_word(status)
+    )
+}
+
+/// 一覧の行に出す文字起こしの状態（**網羅 match**。状態を足したら語を決めるまで通らない）。
+fn session_transcript_word(status: TranscriptStatus) -> &'static str {
+    match status {
+        TranscriptStatus::NotTranscribed => "not transcribed",
+        TranscriptStatus::Transcribing => "transcribing",
+        TranscriptStatus::Done => "transcribed",
+        TranscriptStatus::Failed => "transcription failed",
+    }
+}
+
+/// 一覧の下端に出す合計。**件数だけ**にする——容量を出すには全セッションのファイルを開く必要が
+/// あり、一覧を開くたびに走らせるには重い。
+fn library_summary(count: usize) -> String {
+    match count {
+        1 => "1 recording".to_owned(),
+        count => format!("{count} recordings"),
+    }
+}
+
 /// セッションディレクトリを OS のゴミ箱へ移動する。macOS では `NsFileManager` 方式を明示する:
 /// `trash` の既定（Finder 方式）は osascript の子プロセス経由で Finder を操作するため、
 /// 初回に Automation 権限プロンプトが出て、拒否されると以後の削除が全て失敗するうえ、
@@ -1382,19 +1457,28 @@ fn open_recordings_window(
     // 範囲と時期の判断は `recordings::spawn_session_part_sweep` の doc）。表示には使わない
     // 副作用なので、完了は待たない。
     recordings::spawn_session_part_sweep(&list, SystemTime::now());
+    let now = chrono::Local::now().naive_local();
     let rows: Vec<SessionRow> = list
         .iter()
-        .map(|session| SessionRow {
-            datetime: session.display_datetime.clone().into(),
-            has_mic: session.has_mic,
-            has_system: session.has_system,
-            transcript_status: transcript_display_status(
+        .enumerate()
+        .map(|(index, session)| {
+            let status = transcript_display_status(
                 handles.transcriber.status_of(&session.dir),
                 session.has_transcript,
-            ),
+            );
+            SessionRow {
+                // 見出しは**その日の最初の行だけ**が持つ（直前の行と比べて決める）。行に持たせる
+                // 理由は `SessionRow` の doc。
+                group_heading: session_group_heading(&list, index, now).into(),
+                time_text: session.display_time().into(),
+                date_text: session.display_date().into(),
+                detail_text: session_detail_text(session, status).into(),
+                transcript_status: status,
+            }
         })
         .collect();
     handles.sessions_model.set_vec(rows);
+    rec.set_library_summary(library_summary(list.len()).into());
     // 開くたびに未選択・停止表示へ初期化する。
     clear_recordings_selection(rec, &handles.transcript_segments);
     *handles.sessions.borrow_mut() = list;
@@ -1759,14 +1843,15 @@ fn transcript_status_text(display_status: TranscriptStatus) -> &'static str {
 }
 
 /// 文字起こしの表示状態 → Transcript セクションの縮退表示（セグメントが無いとき）のラベル。
-/// 状態テキスト（`transcript_status_text`）が文形式なのに対し、こちらは他の空状態ラベル
-/// （"No Recordings Yet" 等）と同じ Title Case の見出し形式にする（デザイン準拠）。
+///
+/// 状態テキスト（`transcript_status_text`）が**いまどうなっているか**を言うのに対し、こちらは
+/// **何が無いか**を言う（`Not transcribed yet`）。どちらも sentence case（#128 で揃えた）。
 /// `Done` でセグメントが空になるのは JSON の欠落・破損時で、従来どおり未実施と同じ表示に落とす。
 fn transcript_placeholder_text(display_status: TranscriptStatus) -> &'static str {
     match display_status {
         TranscriptStatus::Transcribing => TRANSCRIBING_LABEL,
-        TranscriptStatus::Failed => "Transcription Failed",
-        TranscriptStatus::NotTranscribed | TranscriptStatus::Done => "Not Transcribed Yet",
+        TranscriptStatus::Failed => "Transcription failed",
+        TranscriptStatus::NotTranscribed | TranscriptStatus::Done => "Not transcribed yet",
     }
 }
 
@@ -1815,37 +1900,36 @@ fn summary_display_status(
 
 /// 「要約生成中」の表示ラベル。状態テキストと Summary の縮退表示で同じ文言を使うため 1 箇所で
 /// 管理する（`TRANSCRIBING_LABEL` と同じ理由）。
-const SUMMARIZING_LABEL: &str = "Summarizing…";
+const SUMMARIZING_LABEL: &str = "Writing notes…";
 
 /// 「キュー待ち」の表示ラベル。生成中と区別できる語にする: この間はまだ CPU を使っておらず、
 /// 取り消せる（`SummarizeWorker::cancel`）。
 ///
-/// 状態行（文形式）と縮退表示（Title Case）で大小が違うので、`SUMMARIZING_LABEL` のように
-/// 1 つを共有できない（1 語のラベルは偶然どちらの流儀にも合っていた）。2 つに分ける。
-const SUMMARY_QUEUED_LABEL: &str = "Waiting to summarize…";
-const SUMMARY_QUEUED_PLACEHOLDER: &str = "Waiting to Summarize…";
+/// 状態行と縮退表示で**同じ文言**を使う（#128 で語を `notes` に揃えたら一致した）。以前は
+/// 大小の流儀が違って 2 つに分けていた。
+const SUMMARY_QUEUED_LABEL: &str = "Waiting to write notes…";
 
 /// 議事録生成の表示状態 → 詳細ペインの状態テキスト。
 fn summary_status_text(display_status: SummaryStatus) -> &'static str {
     match display_status {
-        SummaryStatus::NotSummarized => "Not summarized",
+        SummaryStatus::NotSummarized => "No notes",
         SummaryStatus::Queued => SUMMARY_QUEUED_LABEL,
         SummaryStatus::Summarizing => SUMMARIZING_LABEL,
-        SummaryStatus::Done => "Summarized",
-        SummaryStatus::Failed => "Summarization failed",
+        SummaryStatus::Done => "Notes ready",
+        SummaryStatus::Failed => "Notes failed",
     }
 }
 
-/// 議事録生成の表示状態 → Summary タブの縮退表示（行が無いとき）のラベル。状態テキストが
-/// 文形式なのに対し、こちらは他の空状態ラベルと同じ Title Case にする
+/// 議事録生成の表示状態 → Notes タブの縮退表示（行が無いとき）のラベル。状態テキストが
+/// **いまどうなっているか**を言うのに対し、こちらは**何が無いか**を言う
 /// （`transcript_placeholder_text` と対称）。`Done` で行が空になるのは `summary.md` の欠落・
 /// 破損・空のときで、未生成と同じ表示に落とす。
 fn summary_placeholder_text(display_status: SummaryStatus) -> &'static str {
     match display_status {
-        SummaryStatus::Queued => SUMMARY_QUEUED_PLACEHOLDER,
+        SummaryStatus::Queued => SUMMARY_QUEUED_LABEL,
         SummaryStatus::Summarizing => SUMMARIZING_LABEL,
-        SummaryStatus::Failed => "Summarization Failed",
-        SummaryStatus::NotSummarized | SummaryStatus::Done => "Not Summarized Yet",
+        SummaryStatus::Failed => "Notes could not be written",
+        SummaryStatus::NotSummarized | SummaryStatus::Done => "No notes yet",
     }
 }
 
@@ -2208,8 +2292,76 @@ mod tests {
         summary_status_text, transcript_display_status, transcript_placeholder_text,
         transcript_status_text, whisper_model_status_line,
     };
+    use chrono::{Datelike as _, Timelike as _};
+
     use crate::transcribe::TranscribeStatus;
     use std::time::Duration;
+
+    /// 一覧の見出しは**その日の最初の行だけ**が持つ。
+    ///
+    /// 全行に出すと同じ語が並んで、どこで日が変わったのか分からない。逆に別の配列へ分けると、
+    /// 行の添字とセッションの添字がずれて**別の録音を選ぶ**（`SessionRow` の doc）。
+    #[test]
+    fn a_group_heading_marks_only_the_first_row_of_its_day() {
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 8, 10)
+            .expect("a valid date")
+            .and_hms_opt(18, 0, 0)
+            .expect("a valid time");
+        let sessions = [
+            crate::recordings::RecordingSession::for_test(now.with_hour(14).expect("a valid hour")),
+            crate::recordings::RecordingSession::for_test(now.with_hour(9).expect("a valid hour")),
+            crate::recordings::RecordingSession::for_test(
+                now.with_day(9)
+                    .expect("a valid day")
+                    .with_hour(16)
+                    .expect("a valid hour"),
+            ),
+        ];
+
+        assert_eq!(super::session_group_heading(&sessions, 0, now), "Today");
+        assert_eq!(
+            super::session_group_heading(&sessions, 1, now),
+            "",
+            "the second recording of the same day repeats no heading"
+        );
+        assert_eq!(super::session_group_heading(&sessions, 2, now), "Yesterday");
+    }
+
+    /// 行の 3 行目は「音源 · 文字起こしの状態」（**網羅 match**。状態を足したら語を決めるまで
+    /// コンパイルが通らない）。
+    #[test]
+    fn a_row_says_its_sources_and_transcript_state() {
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 8, 10)
+            .expect("a valid date")
+            .and_hms_opt(14, 0, 0)
+            .expect("a valid time");
+        let mut session = crate::recordings::RecordingSession::for_test(now);
+        session.has_mic = true;
+        session.has_system = true;
+        assert_eq!(
+            super::session_detail_text(&session, TranscriptStatus::Transcribing),
+            "Mic + system · transcribing"
+        );
+        session.has_system = false;
+        assert_eq!(
+            super::session_detail_text(&session, TranscriptStatus::Done),
+            "Mic only · transcribed"
+        );
+        session.has_mic = false;
+        assert_eq!(
+            super::session_detail_text(&session, TranscriptStatus::Failed),
+            "No audio · transcription failed",
+            "a session without audio still says what it is"
+        );
+    }
+
+    /// 一覧の合計は**件数だけ**（単数形も出す）。容量は全ファイルを開かないと分からない。
+    #[test]
+    fn the_library_summary_counts_recordings() {
+        assert_eq!(super::library_summary(0), "0 recordings");
+        assert_eq!(super::library_summary(1), "1 recording");
+        assert_eq!(super::library_summary(148), "148 recordings");
+    }
 
     /// バージョン表記が `Cargo.toml` の `version` と一致することを確かめる。
     ///
@@ -2220,6 +2372,7 @@ mod tests {
     /// ハードコードしても両辺が一致して通る（ミューテーションで確認済み）。`Cargo.toml` と
     /// `env!("CARGO_PKG_VERSION")` の紐づきは cargo のコンパイル時保証で、実行時テストの
     /// 守備範囲外。
+
     #[test]
     fn app_version_text_shows_the_version_from_cargo_toml() {
         let version = include_str!("../Cargo.toml")
@@ -2315,7 +2468,7 @@ mod tests {
     fn transcript_placeholder_text_covers_all_states() {
         assert_eq!(
             transcript_placeholder_text(TranscriptStatus::NotTranscribed),
-            "Not Transcribed Yet"
+            "Not transcribed yet"
         );
         assert_eq!(
             transcript_placeholder_text(TranscriptStatus::Transcribing),
@@ -2323,11 +2476,11 @@ mod tests {
         );
         assert_eq!(
             transcript_placeholder_text(TranscriptStatus::Done),
-            "Not Transcribed Yet"
+            "Not transcribed yet"
         );
         assert_eq!(
             transcript_placeholder_text(TranscriptStatus::Failed),
-            "Transcription Failed"
+            "Transcription failed"
         );
     }
 
@@ -2368,21 +2521,18 @@ mod tests {
     fn summary_status_text_covers_all_states() {
         assert_eq!(
             summary_status_text(SummaryStatus::NotSummarized),
-            "Not summarized"
+            "No notes"
         );
         assert_eq!(
             summary_status_text(SummaryStatus::Queued),
-            "Waiting to summarize…"
+            "Waiting to write notes…"
         );
         assert_eq!(
             summary_status_text(SummaryStatus::Summarizing),
-            "Summarizing…"
+            "Writing notes…"
         );
-        assert_eq!(summary_status_text(SummaryStatus::Done), "Summarized");
-        assert_eq!(
-            summary_status_text(SummaryStatus::Failed),
-            "Summarization failed"
-        );
+        assert_eq!(summary_status_text(SummaryStatus::Done), "Notes ready");
+        assert_eq!(summary_status_text(SummaryStatus::Failed), "Notes failed");
     }
 
     /// 縮退表示ラベル。Done で行が空になるのは `summary.md` の欠落・破損・空の経路で、
@@ -2391,23 +2541,23 @@ mod tests {
     fn summary_placeholder_text_covers_all_states() {
         assert_eq!(
             summary_placeholder_text(SummaryStatus::NotSummarized),
-            "Not Summarized Yet"
+            "No notes yet"
         );
         assert_eq!(
             summary_placeholder_text(SummaryStatus::Queued),
-            "Waiting to Summarize…"
+            "Waiting to write notes…"
         );
         assert_eq!(
             summary_placeholder_text(SummaryStatus::Summarizing),
-            "Summarizing…"
+            "Writing notes…"
         );
         assert_eq!(
             summary_placeholder_text(SummaryStatus::Done),
-            "Not Summarized Yet"
+            "No notes yet"
         );
         assert_eq!(
             summary_placeholder_text(SummaryStatus::Failed),
-            "Summarization Failed"
+            "Notes could not be written"
         );
     }
 

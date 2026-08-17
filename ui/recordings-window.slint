@@ -1,6 +1,6 @@
-import { Button, ListView, ScrollView, Palette } from "std-widgets.slint";
-import { Style } from "style.slint";
-import { DangerButton, FocusRing } from "controls.slint";
+import { ListView, ScrollView } from "std-widgets.slint";
+import { Style, StatusTone } from "style.slint";
+import { DangerButton, FocusRing, ActionButton, ButtonRole } from "controls.slint";
 
 // 文字起こしの表示状態。Rust 側（main.rs の transcript_display_status）がワーカーの
 // 進行状況と JSON の有無から合成して詰める。
@@ -25,9 +25,17 @@ export enum SummaryStatus {
 
 // 一覧の 1 行分。Rust の recordings::RecordingSession から詰める。
 export struct SessionRow {
-    datetime: string,
-    has-mic: bool,
-    has-system: bool,
+    // 日付のまとまりの見出し（`Today` / `Yesterday` / `Aug 5, 2026`）。空なら見出しを出さない。
+    // **行に持たせる**のは、一覧が可視範囲だけを描くため——別の配列に分けると、行の添字と
+    // セッションの添字が合わなくなる（添字は操作対象の解決に使う。`docs/rules/slint.md`）。
+    group-heading: string,
+    // 時刻（`14:02`）。行の中でいちばん大きく出す——同じ日の中では時刻で見分けるため。
+    time-text: string,
+    // 日付（`Aug 10, 2026`）。見出しと重なるが、スクロールで見出しが流れても分かるように残す。
+    date-text: string,
+    // 音源と状態を 1 行にしたもの（`Mic + system · transcribing 48%`）。**Rust が組む**
+    // （状態→文言の対応表は Rust の網羅 match が正。`docs/rules/slint.md`）。
+    detail-text: string,
     transcript-status: TranscriptStatus,
 }
 
@@ -49,34 +57,13 @@ export struct TranscriptRow {
     text: string,
 }
 
-// 音源バッジ（`Mic` / `System`）。選択行では白アウトライン、非選択では補助色アウトライン。
-component SourceBadge inherits Rectangle {
-    in property <string> label;
-    in property <bool> selected;
-    border-radius: 4px;
-    border-width: 1px;
-    border-color: selected ? Style.on-accent-foreground : Palette.border;
-    background: transparent;
-    HorizontalLayout {
-        padding-left: 6px;
-        padding-right: 6px;
-        padding-top: 2px;
-        padding-bottom: 2px;
-        Text {
-            text: root.label;
-            font-size: Style.badge-size;
-            font-weight: Style.semibold;
-            color: root.selected ? Style.on-accent-foreground : Palette.foreground.transparentize(Style.muted-alpha);
-        }
-    }
-}
 
 // トランスクリプトの話者バッジ。Mic はアクセント色背景＋白文字、System はニュートラル背景。
 component SpeakerBadge inherits Rectangle {
     in property <string> label;
     in property <bool> accent;
     border-radius: 4px;
-    background: accent ? Palette.accent-background : Palette.border;
+    background: root.accent ? Style.seal : Style.sheet-sunken;
     HorizontalLayout {
         padding-left: 6px;
         padding-right: 6px;
@@ -86,14 +73,14 @@ component SpeakerBadge inherits Rectangle {
             text: root.label;
             font-size: Style.badge-size;
             font-weight: Style.semibold;
-            color: root.accent ? Style.on-accent-foreground : Palette.foreground;
+            color: root.accent ? Style.on-accent-foreground : Style.ink;
         }
     }
 }
 
-// 右ペイン下段の表示切替タブ（Transcript / Summary）。選択中は前景色＋下線、非選択は muted。
+// 右ペイン下段の表示切替タブ（Transcript / Notes）。選択中は前景色＋下線、非選択は muted。
 // std-widgets の TabWidget は枠と余白の見た目がこの画面（角丸 1px 枠のセクション）と合わないため、
-// 見出し行に並べられる軽いタブを自作する（`SourceBadge` / `DangerButton` と同じ流儀）。
+// 見出し行に並べられる軽いタブを自作する（`SpeakerBadge` / `DangerButton` と同じ流儀）。
 component ViewTab inherits Rectangle {
     in property <string> text;
     in property <bool> selected;
@@ -109,8 +96,8 @@ component ViewTab inherits Rectangle {
             font-size: Style.heading-size;
             font-weight: root.selected ? Style.semibold : Style.regular;
             color: root.selected
-                ? Palette.foreground
-                : Palette.foreground.transparentize(Style.muted-alpha);
+                ? Style.ink
+                : Style.ink-muted;
             // ラベルを読み上げるのはタブ自身（`accessible-label`）。
             accessible-role: none;
         }
@@ -118,7 +105,7 @@ component ViewTab inherits Rectangle {
         // 選択中だけ下線を出す（高さは常に確保して、切替でタブの高さが動かないようにする）。
         Rectangle {
             height: 2px;
-            background: root.selected ? Palette.accent-background : transparent;
+            background: root.selected ? Style.seal : transparent;
         }
     }
 
@@ -196,14 +183,14 @@ component SeekBar inherits Rectangle {
         y: (parent.height - self.height) / 2;
         height: 5px;
         border-radius: 3px;
-        background: Palette.border;
+        background: Style.hairline;
         clip: true;
         Rectangle {
             x: 0;
             width: parent.width * root.ratio;
             height: parent.height;
             border-radius: 3px;
-            background: Palette.accent-background;
+            background: Style.seal;
         }
     }
 
@@ -214,7 +201,7 @@ component SeekBar inherits Rectangle {
         border-radius: self.width / 2;
         x: min(max(root.width * root.ratio - self.width / 2, 0px), root.width - self.width);
         y: (root.height - self.height) / 2;
-        background: Palette.accent-background;
+        background: Style.seal;
     }
 
     // キーボードでもシークできるようにする（#146。左右キーで 5% ずつ、Home / End で端へ）。
@@ -307,19 +294,25 @@ component SeekBar inherits Rectangle {
     }
 }
 
-// トレイの「Recordings…」から開く録音一覧ウィンドウ。左＝セッション一覧、右＝再生と文字起こし。
-// 配色は Palette でライト/ダークに追従し、サイズ・淡色は共有の Style トークンを使う
+// トレイの「Recordings…」から開く録音一覧ウィンドウ。**3 つの領域**に分かれる（#128）:
+// 左＝探す（300px 固定）、右＝読む（measure 640px）、下辺＝聴く（72px の常設帯）。
+// 配色・サイズ・淡色はすべて共有の Style トークンから引く（#128 で Palette 依存を外した）
 // （選択行の白文字はアクセント固定背景のため Style.on-accent-foreground）。
 export component RecordingsWindow inherits Window {
     title: "Recordings";
     // 幅・高さは src/main.rs の RECORDINGS_WIDTH/HEIGHT と一致させること（片方だけ変えない）。
-    min-width: 720px;
-    min-height: 540px;
-    preferred-width: 720px;
-    preferred-height: 540px;
+    // **読むことが主な仕事**なので広くする（#128 のデザイン）。720 幅では文字起こしが 1 行
+    // 40 字ほどにしかならず、長い会議を読み返すのがつらい。
+    min-width: 840px;
+    min-height: 520px;
+    preferred-width: 1100px;
+    preferred-height: 720px;
+    background: Style.paper;
 
     // セッション一覧（新しい順）。Rust 側が list_sessions の結果で更新する。
     in property <[SessionRow]> sessions;
+    // 一覧の下端に出す合計（`148 recordings`）。Rust が組む。
+    in property <string> library-summary;
     // 選択中セッションの一覧インデックス。未選択は -1。行クリックで更新し select-session を呼ぶ。
     in-out property <int> selected-index: -1;
     // 選択セッションの詳細（Rust 側が選択時に更新する）。
@@ -344,7 +337,7 @@ export component RecordingsWindow inherits Window {
     // 議事録要約の状態。状態テキストの失敗色の分岐と、生成中判定の導出に使う
     // （Rust 側が detail-summary-status-text と同時に更新する）。
     in property <SummaryStatus> detail-summary-status;
-    // Summary タブの縮退表示（行が無いとき）のラベル。状態→文言の対応表は Rust 側
+    // Notes タブの縮退表示（行が無いとき）のラベル。状態→文言の対応表は Rust 側
     // （summary_placeholder_text）に集約し、ここでは表示するだけ。
     in property <string> detail-summary-placeholder;
     // 選択中セッションの議事録要約（`summary.md` を行単位に分けたもの）。空なら状態依存の
@@ -386,10 +379,10 @@ export component RecordingsWindow inherits Window {
     out property <bool> scrubbing;
     // 削除の確認モーダルの表示状態。Delete 押下で開き、Cancel / 確定で閉じる（Slint 内で完結）。
     in-out property <bool> show-delete-confirm: false;
-    // 右ペイン下段が Summary タブを表示しているか。タブの選択は UI が所有し、セッションを
-    // 選び直しても保つ（アプリ側の Rust は Transcript / Summary の中身を常に最新へ更新するので、
+    // 右ペイン下段が Notes タブを表示しているか（内部名が `summary` なのは `summary.md` が正だから。`docs/CONTEXT.md`）。タブの選択は UI が所有し、セッションを
+    // 選び直しても保つ（アプリ側の Rust は Transcript / Notes の中身を常に最新へ更新するので、
     // どちらを見せているかを知る必要が無い＝set しない）。`in-out` なのは、確認用バイナリ
-    // （`examples/transcript_view.rs`）が Summary タブの見た目を出すために選ぶため。
+    // （`examples/transcript_view.rs`）が Notes タブの見た目を出すために選ぶため。
     in-out property <bool> showing-summary: false;
 
     // 行クリックでの選択通知。Rust 側で詳細更新・再生対象のロードを行う。
@@ -413,251 +406,497 @@ export component RecordingsWindow inherits Window {
     // 確認モーダルの Delete 押下。選択中セッションをゴミ箱へ移動する（インデックスを渡す）。
     callback delete-session(int);
 
-    HorizontalLayout {
-        padding: 16px;
-        spacing: 14px;
+    VerticalLayout {
+        // 「探す・読む」を上に、「聴く」を下の常設帯に置く（デザインの 3 領域）。
+        HorizontalLayout {
+            padding: 16px;
+            spacing: 14px;
+            vertical-stretch: 1;
 
-        // --- 左ペイン: セッション一覧 ---
-        Rectangle {
-            width: 236px;
-            border-width: 1px;
-            border-color: Palette.border;
-            border-radius: 8px;
-            background: Palette.control-background;
-            clip: true;
+            // --- 探す: 左の固定幅の列（デザインの「find」） ---
+            // **幅を固定する**のは、読む領域を可変にするため（ウィンドウを広げたぶんは本文が受け取る）。
+            Rectangle {
+                width: 300px;
+                border-width: 1px;
+                border-color: Style.rule;
+                border-radius: 8px;
+                background: Style.sheet;
+                clip: true;
 
-            if root.sessions.length == 0: VerticalLayout {
-                alignment: center;
-                padding: 24px;
-                spacing: 6px;
-                Text {
-                    text: "No Recordings Yet";
-                    font-size: Style.body-size;
-                    font-weight: Style.semibold;
-                    horizontal-alignment: center;
-                    color: Palette.foreground;
+                if root.sessions.length == 0: VerticalLayout {
+                    alignment: center;
+                    padding: 24px;
+                    spacing: 8px;
+                    Text {
+                        text: "No recordings yet";
+                        font-size: Style.body-size;
+                        font-weight: Style.semibold;
+                        horizontal-alignment: center;
+                        color: Style.ink;
+                    }
+
+                    Text {
+                        text: "Start one from the shoki icon in the menu bar, or turn on Record automatically in Settings so meetings are captured for you.";
+                        font-size: Style.caption-size;
+                        wrap: word-wrap;
+                        horizontal-alignment: center;
+                        color: Style.ink-muted;
+                    }
                 }
 
-                Text {
-                    text: "Recordings you make will appear here.";
-                    font-size: Style.caption-size;
-                    wrap: word-wrap;
-                    horizontal-alignment: center;
-                    color: Palette.foreground.transparentize(Style.muted-alpha);
-                }
-            }
-            if root.sessions.length > 0: ScrollView {
-                VerticalLayout {
-                    alignment: start;
-                    for row[i] in root.sessions: Rectangle {
-                        // 行間の区切り罫線（先頭行は出さない）。
-                        VerticalLayout {
-                            Rectangle {
-                                height: i > 0 ? 1px : 0px;
-                                background: Palette.border;
+                if root.sessions.length > 0: VerticalLayout {
+                    // **一覧は仮想化する**（`ListView`。`docs/rules/slint.md`）。
+                    //
+                    // ただし行の高さは 2 種類ある（見出しを持つ行だけ 28px 高い）。`ListView` は
+                    // **平均の行高から総スクロール量を推定する**ので、見出しが可視範囲を出入りすると
+                    // スクロールバーのつまみがわずかに揺れる。表示そのものは崩れない（要素の生成・
+                    // 破棄は正しく行われる）ので、日付のまとまりが見える利点を取ってこの形にした。
+                    ListView {
+                        vertical-stretch: 1;
+                        for row[i] in root.sessions: VerticalLayout {
+                            // 日付のまとまりの見出し（`Today` など）。**行に持たせてある**ので、
+                            // 仮想化しても添字がずれない（`SessionRow` の doc）。
+                            if row.group-heading != "": Rectangle {
+                                height: 28px;
+                                background: Style.sheet-sunken;
+                                HorizontalLayout {
+                                    padding-left: 12px;
+                                    padding-right: 12px;
+                                    Text {
+                                        text: row.group-heading;
+                                        font-size: Style.caption-size;
+                                        font-weight: Style.semibold;
+                                        letter-spacing: Style.badge-tracking;
+                                        color: Style.ink-faint;
+                                        vertical-alignment: center;
+                                    }
+                                }
                             }
 
                             rowbg := Rectangle {
+                                // **高さを固定する**（デザイン: 62px）。各項目は 1 行でクリップし、
+                                // 長い文言で行が伸びないようにする——行ごとに高さが変わると、上の
+                                // 平均高の推定がさらに荒くなる。
+                                height: 62px;
                                 // 選択状態は id で参照する（レイアウトを跨ぐ parent 参照は Slint で
                                 // 使えないため）。
                                 property <bool> selected: i == root.selected-index;
-                                background: rowbg.selected ? Palette.accent-background : transparent;
+                                background: rowbg.selected ? Style.seal.transparentize(0.9) : transparent;
+
+                                HorizontalLayout {
+                                    // 選択中の行は左端に朱の縦罫（一覧を目で走ったときに行頭で分かる）。
+                                    Rectangle {
+                                        width: 3px;
+                                        background: rowbg.selected ? Style.seal : transparent;
+                                    }
+
+                                    VerticalLayout {
+                                        padding-left: 11px;
+                                        padding-right: 11px;
+                                        spacing: 2px;
+                                        alignment: center;
+
+                                        HorizontalLayout {
+                                            spacing: 8px;
+                                            Text {
+                                                text: row.time-text;
+                                                font-size: Style.body-size;
+                                                font-weight: Style.semibold;
+                                                color: Style.ink;
+                                                overflow: clip;
+                                                horizontal-stretch: 1;
+                                            }
+                                            // 文字起こしの状態を表すドット（前=透明で場所だけ確保 /
+                                            // 中=進行中 / 完了 / 失敗）。
+                                            Rectangle {
+                                                width: 6px;
+                                                height: 6px;
+                                                y: 6px;
+                                                border-radius: 3px;
+                                                background: row.transcript-status == TranscriptStatus.done
+                                                    ? Style.done-mark
+                                                    : row.transcript-status == TranscriptStatus.transcribing
+                                                        ? Style.caution-mark
+                                                        : row.transcript-status == TranscriptStatus.failed
+                                                            ? Style.danger
+                                                            : transparent;
+                                            }
+                                        }
+
+                                        Text {
+                                            text: row.date-text;
+                                            font-size: Style.caption-size;
+                                            color: Style.ink-muted;
+                                            overflow: clip;
+                                        }
+
+                                        Text {
+                                            text: row.detail-text;
+                                            font-size: Style.caption-size;
+                                            color: row.transcript-status == TranscriptStatus.failed
+                                                ? Style.danger
+                                                : Style.ink-faint;
+                                            overflow: clip;
+                                        }
+                                    }
+                                }
+
                                 TouchArea {
                                     clicked => {
                                         root.selected-index = i;
                                         root.select-session(i);
                                     }
                                 }
+                            }
+                        }
+                    }
 
-                                VerticalLayout {
-                                    padding-left: 11px;
-                                    padding-right: 11px;
-                                    padding-top: 8px;
-                                    padding-bottom: 8px;
-                                    spacing: 5px;
-                                    HorizontalLayout {
-                                        spacing: 8px;
-                                        Text {
-                                            text: row.datetime;
-                                            font-size: Style.body-size;
-                                            font-weight: Style.semibold;
-                                            color: rowbg.selected ? Style.on-accent-foreground : Palette.foreground;
-                                            vertical-alignment: center;
-                                            horizontal-stretch: 1;
+                    // 一覧の合計（何件あるか）。**下端に固定**して、スクロールしても件数が分かるように。
+                    Rectangle {
+                        height: 1px;
+                        background: Style.hairline;
+                    }
+                    HorizontalLayout {
+                        padding: 10px;
+                        Text {
+                            text: root.library-summary;
+                            font-size: Style.caption-size;
+                            color: Style.ink-faint;
+                            overflow: elide;
+                        }
+                    }
+                }
+            }
+
+            // --- 読む: 残り全部を使い、本文だけ measure で止める（デザインの「read」） ---
+            Rectangle {
+                horizontal-stretch: 1;
+
+                if !root.has-selection: VerticalLayout {
+                    alignment: center;
+                    spacing: 8px;
+                    Text {
+                        text: "Nothing selected";
+                        font-size: Style.body-size;
+                        font-weight: Style.semibold;
+                        horizontal-alignment: center;
+                        color: Style.ink;
+                    }
+                    Text {
+                        text: "Pick a recording on the left to listen to it and read its transcript.";
+                        font-size: Style.caption-size;
+                        wrap: word-wrap;
+                        horizontal-alignment: center;
+                        color: Style.ink-muted;
+                    }
+                }
+
+                // alignment は既定（stretch）にし、余った高さを Transcript セクション
+                // （vertical-stretch: 1）へ与える。alignment: start だと全子要素が推奨サイズに
+                // 縮み、中身が可変の Transcript の箱が見出しだけに潰れる。
+                // **本文は 640px で止める**（デザインの measure）。ウィンドウを広げたぶんは余白になる
+                // ——1 行が長くなるほど、次の行の頭を探すのが難しくなる。
+                if root.has-selection: HorizontalLayout {
+                    alignment: center;
+                    VerticalLayout {
+                        max-width: 640px;
+                        spacing: 12px;
+
+                        // ヘッダ: 日時・音源の内訳と、文字起こし／議事録要約の状態＋
+                        // Transcribe / Summarize / Delete。
+                        HorizontalLayout {
+                            vertical-stretch: 0;
+                            spacing: 12px;
+                            VerticalLayout {
+                                spacing: 3px;
+                                horizontal-stretch: 1;
+                                Text {
+                                    text: root.detail-datetime;
+                                    font-size: Style.detail-title-size;
+                                    font-weight: Style.semibold;
+                                    color: Style.ink;
+                                }
+
+                                Text {
+                                    text: root.detail-sources;
+                                    font-size: Style.caption-size;
+                                    color: Style.ink-muted;
+                                }
+
+                                // 文字起こしと議事録の状態を**同じ行に並べる**。2 行に分けると、どちらの
+                                // 話をしているのかを目で追い直すことになる。キュー待ちの間だけ、その場に
+                                // 取り消しを出す——**ボタン列と差し替えない**（同じ位置で「積む」と
+                                // 「やめる」が入れ替わると、投入直後の 2 度押しが取り消しになる）。
+                                HorizontalLayout {
+                                    alignment: start;
+                                    spacing: 8px;
+                                    Text {
+                                        text: root.detail-transcript-text;
+                                        font-size: Style.caption-size;
+                                        vertical-alignment: center;
+                                        // 失敗だけ警告色にして muted に埋もれさせず一目で分かるようにする。
+                                        color: root.detail-transcript-status == TranscriptStatus.failed
+                                            ? Style.danger
+                                            : Style.ink-muted;
+                                    }
+
+                                    Text {
+                                        text: "·";
+                                        font-size: Style.caption-size;
+                                        vertical-alignment: center;
+                                        color: Style.ink-faint;
+                                        accessible-role: none;
+                                    }
+
+                                    Text {
+                                        text: root.detail-summary-status-text;
+                                        font-size: Style.caption-size;
+                                        vertical-alignment: center;
+                                        // 失敗の扱いは文字起こしの状態行と揃える。
+                                        color: root.detail-summary-status == SummaryStatus.failed
+                                            ? Style.danger
+                                            : Style.ink-muted;
+                                    }
+
+                                    if root.detail-summary-queued: ActionButton {
+                                        text: "Cancel";
+                                        compact: true;
+                                        // 削除確認モーダルの「Cancel」と読み上げが衝突するので、
+                                        // 支援技術向けには何を取り消すのかを明示する。
+                                        accessible-label: "Cancel notes";
+                                        clicked => {
+                                            root.cancel-summary(root.selected-index);
                                         }
-                                        // 文字起こしの状態を表すドット（前=透明で場所だけ確保 /
-                                        // 中=淡色 / 完了=アクセント / 失敗=警告色）。
-                                        Rectangle {
-                                            width: 6px;
-                                            height: 6px;
-                                            border-radius: 3px;
-                                            background: row.transcript-status == TranscriptStatus.done
-                                                ? (rowbg.selected ? Style.on-accent-foreground : Palette.accent-background)
-                                                : row.transcript-status == TranscriptStatus.transcribing
-                                                    ? (rowbg.selected ? Style.on-accent-foreground : Palette.foreground).transparentize(Style.muted-alpha)
-                                                    : row.transcript-status == TranscriptStatus.failed ? Style.danger : transparent;
+                                    }
+                                }
+                            }
+
+                            VerticalLayout {
+                                alignment: start;
+                                horizontal-stretch: 0;
+                                HorizontalLayout {
+                                spacing: 8px;
+                                ActionButton {
+                                    // 「やり直す」ことが分かる語にする——1 回目も再実行も同じボタンだが、
+                                    // 押す動機は「言語やモデルを変えたのでもう一度」が主。
+                                    text: root.has-transcript ? "Re-transcribe" : "Transcribe";
+                                    // 完了済み・失敗・未実施のいずれからも（再）実行できる
+                                    // （言語・モデル変更後のやり直し用途）。無効化の理由は
+                                    // detail-jobs-pending。
+                                    enabled: !root.detail-jobs-pending;
+                                    clicked => {
+                                        root.transcribe-session(root.selected-index);
+                                    }
+                                }
+
+                                ActionButton {
+                                    text: root.detail-summary-status == SummaryStatus.done
+                                        ? "Regenerate notes"
+                                        : "Write notes";
+                                    // 要約は文字起こしを入力にするので、無いセッションでは押させない
+                                    // （生成済み・失敗からは押し直せる。モデル変更後のやり直し用途）。
+                                    // 取り消しはこのボタンを差し替えず、状態行の隣に出す（理由は
+                                    // 状態行のコメント）。
+                                    enabled: root.has-transcript && !root.detail-jobs-pending;
+                                    clicked => {
+                                        root.summarize-session(root.selected-index);
+                                    }
+                                }
+
+                                DangerButton {
+                                    // 押すと確認が出ることを「…」で示す（押した瞬間に消えない）。
+                                    text: "Delete…";
+                                    // キュー待ちなら消せる（Rust 側が取り消してから削除する）。
+                                    enabled: !root.detail-files-in-use;
+                                    clicked => {
+                                        root.show-delete-confirm = true;
+                                    }
+                                }
+                                }
+                            }
+                        }
+
+                        // Transcript / Notes セクション。タブで表示を切り替える。Transcript は
+                        // セグメントを時刻順に表示し、現在再生位置をハイライト、クリックでその開始秒へ
+                        // シークする。Summary は `summary.md` を行単位に表示する（クリック連動は無い。
+                        // #81 のスコープ外）。どちらも中身が無いときは状態依存のラベルに縮退。
+                        Rectangle {
+                            vertical-stretch: 1;
+                            border-width: 1px;
+                            border-color: Style.rule;
+                            border-radius: 8px;
+                            VerticalLayout {
+                                padding-left: 14px;
+                                padding-right: 14px;
+                                padding-top: 12px;
+                                padding-bottom: 12px;
+                                spacing: 10px;
+                                HorizontalLayout {
+                                    vertical-stretch: 0;
+                                    alignment: start;
+                                    spacing: 18px;
+                                    ViewTab {
+                                        text: "Transcript";
+                                        selected: !root.showing-summary;
+                                        clicked => {
+                                            root.showing-summary = false;
                                         }
                                     }
 
-                                    HorizontalLayout {
-                                        alignment: start;
-                                        spacing: 5px;
-                                        if row.has-mic: SourceBadge {
-                                            label: "Mic";
-                                            selected: rowbg.selected;
+                                    ViewTab {
+                                        text: "Notes";
+                                        selected: root.showing-summary;
+                                        clicked => {
+                                            root.showing-summary = true;
                                         }
-                                        if row.has-system: SourceBadge {
-                                            label: "System";
-                                            selected: rowbg.selected;
+                                    }
+                                }
+
+                                Rectangle {
+                                    vertical-stretch: 1;
+                                    clip: true;
+
+                                    if !root.showing-summary: Rectangle {
+                                        // 文字起こしがあればセグメント一覧、無ければ縮退表示。長時間録音では
+                                        // セグメントが数千件になり得るため、可視範囲だけ生成する ListView を使う
+                                        // （ScrollView + for は全行を即時生成し、選択時のヒッチにつながる）。
+                                        if root.segments.length > 0: ListView {
+                                            for seg[i] in root.segments: Rectangle {
+                                                // 現在再生位置のセグメントをハイライト（淡色背景＋左 3px 罫線）。
+                                                property <bool> active: i == root.current-segment;
+                                                background: active ? Style.segment-highlight : transparent;
+                                                // ListView の行は自身の高さを明示する（word-wrap する本文の
+                                                // 実高さに追従させる）。
+                                                height: row-content.preferred-height;
+                                                TouchArea {
+                                                    clicked => {
+                                                        root.seek-to-segment(i);
+                                                    }
+                                                }
+
+                                                row-content := HorizontalLayout {
+                                                    // 左端のアクセント罫線（active のときだけ幅を持つ）。
+                                                    Rectangle {
+                                                        width: active ? 3px : 0px;
+                                                        background: Style.seal;
+                                                    }
+
+                                                    VerticalLayout {
+                                                        padding-left: 8px;
+                                                        padding-right: 6px;
+                                                        padding-top: 6px;
+                                                        padding-bottom: 6px;
+                                                        spacing: 3px;
+                                                        HorizontalLayout {
+                                                            alignment: start;
+                                                            spacing: 7px;
+                                                            SpeakerBadge {
+                                                                label: seg.speaker;
+                                                                accent: seg.is-mic;
+                                                            }
+
+                                                            Text {
+                                                                text: seg.time;
+                                                                font-size: Style.caption-size;
+                                                                vertical-alignment: center;
+                                                                color: Style.ink-muted;
+                                                            }
+                                                        }
+
+                                                        Text {
+                                                            text: seg.text;
+                                                            wrap: word-wrap;
+                                                            font-size: Style.body-size;
+                                                            color: Style.ink;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if root.segments.length == 0: Text {
+                                            // 縮退表示は実際の状態を語る（ラベルの対応は Rust 側の
+                                            // transcript_placeholder_text 参照。JSON の欠落・破損は状態 Done の
+                                            // ままセグメントが空になり、未実施と同じ表示に落ちる）。完了済みの
+                                            // 再実行中は旧トランスクリプトが残るため上の一覧表示が維持される。
+                                            text: root.detail-transcript-placeholder;
+                                            font-size: Style.body-size;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                            color: Style.ink-muted;
+                                        }
+                                    }
+
+                                    if root.showing-summary: Rectangle {
+                                        // 議事録があれば行一覧、無ければ縮退表示。長い議事録でも可視範囲
+                                        // だけ生成する（Transcript 側と同じ理由で ListView）。
+                                        if root.summary-rows.length > 0: ListView {
+                                            for row in root.summary-rows: Rectangle {
+                                                // ListView の行は自身の高さを明示する（word-wrap する
+                                                // 本文の実高さに追従させる）。
+                                                height: summary-row-content.preferred-height;
+                                                summary-row-content := VerticalLayout {
+                                                    padding-left: 2px;
+                                                    padding-right: 6px;
+                                                    // 見出しは上に余白を置いて段落の切れ目を作る
+                                                    // （記号を落としているぶん、間隔で構造を見せる）。
+                                                    padding-top: row.is-heading ? 8px : 2px;
+                                                    padding-bottom: 2px;
+                                                    Text {
+                                                        text: row.text;
+                                                        wrap: word-wrap;
+                                                        // 見出しはサイズを上げず太さだけで差を付ける
+                                                        // （`heading-size` は本文より小さいので、
+                                                        // 使うと見出しと本文のサイズが逆転する）。
+                                                        font-size: Style.body-size;
+                                                        font-weight: row.is-heading
+                                                            ? Style.semibold
+                                                            : Style.regular;
+                                                        color: Style.ink;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if root.summary-rows.length == 0: Text {
+                                            // ラベルの対応は Rust 側の summary_placeholder_text 参照
+                                            // （`summary.md` の欠落・破損・空はいずれも未生成と同じ表示に
+                                            // 落ちる）。再生成中は旧議事録が残るため一覧表示が維持される。
+                                            text: root.detail-summary-placeholder;
+                                            font-size: Style.body-size;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                            color: Style.ink-muted;
                                         }
                                     }
                                 }
                             }
                         }
-                    }
+                        }
                 }
             }
         }
 
-        // --- 右ペイン: 詳細（再生・文字起こし） ---
+        // --- 聴く: 下辺の常設プレイヤー帯（デザインの「listen」） ---
+        // **高さを固定して常に置く**。100ms の時計で高さが変わると、そのたびに上の本文が
+        // 流れ直す。選択が無いときも帯は残し、ウィンドウの形を変えない。
         Rectangle {
-            horizontal-stretch: 1;
-            // 未選択（録音ゼロ含む）のときは淡色化して非活性にする。
-            opacity: root.has-selection ? 1.0 : Style.disabled-opacity;
-
-            if !root.has-selection: Text {
-                text: "No Recording Selected";
-                font-size: Style.body-size;
-                horizontal-alignment: center;
-                vertical-alignment: center;
-                color: Palette.foreground.transparentize(Style.muted-alpha);
-            }
-
-            // alignment は既定（stretch）にし、余った高さを Transcript セクション
-            // （vertical-stretch: 1）へ与える。alignment: start だと全子要素が推奨サイズに
-            // 縮み、中身が可変の Transcript の箱が見出しだけに潰れる。
-            if root.has-selection: VerticalLayout {
-                spacing: 12px;
-
-                // ヘッダ: 日時・音源の内訳と、文字起こし／議事録要約の状態＋
-                // Transcribe / Summarize / Delete。
-                HorizontalLayout {
-                    vertical-stretch: 0;
-                    spacing: 12px;
-                    VerticalLayout {
-                        spacing: 3px;
-                        horizontal-stretch: 1;
-                        Text {
-                            text: root.detail-datetime;
-                            font-size: Style.detail-title-size;
-                            font-weight: Style.semibold;
-                            color: Palette.foreground;
-                        }
-
-                        Text {
-                            text: root.detail-sources;
-                            font-size: Style.caption-size;
-                            color: Palette.foreground.transparentize(Style.muted-alpha);
-                        }
-
-                        Text {
-                            text: root.detail-transcript-text;
-                            font-size: Style.caption-size;
-                            // 失敗だけ警告色にして muted に埋もれさせず一目で分かるようにする。
-                            color: root.detail-transcript-status == TranscriptStatus.failed
-                                ? Style.danger
-                                : Palette.foreground.transparentize(Style.muted-alpha);
-                        }
-
-                        // 要約の状態行。キュー待ちの間だけ、その場に取り消しを出す。
-                        // **Summarize ボタンと差し替えない**: 同じ位置で「積む」と「やめる」が
-                        // 入れ替わると、投入直後の 2 度押しが取り消しになってしまう。ここに置けば
-                        // ボタン列も動かないので、Summarize / Delete の位置が変わらない。
-                        HorizontalLayout {
-                            alignment: start;
-                            spacing: 10px;
-                            Text {
-                                text: root.detail-summary-status-text;
-                                font-size: Style.caption-size;
-                                vertical-alignment: center;
-                                // 失敗の扱いは文字起こしの状態行と揃える。
-                                color: root.detail-summary-status == SummaryStatus.failed
-                                    ? Style.danger
-                                    : Palette.foreground.transparentize(Style.muted-alpha);
-                            }
-
-                            if root.detail-summary-queued: Button {
-                                text: "Cancel";
-                                // 削除確認モーダルの「Cancel」と読み上げが衝突するので、
-                                // 支援技術向けには何を取り消すのかを明示する。
-                                accessible-label: "Cancel Summary";
-                                clicked => {
-                                    root.cancel-summary(root.selected-index);
-                                }
-                            }
-                        }
-                    }
-
-                    VerticalLayout {
-                        alignment: start;
-                        horizontal-stretch: 0;
-                        spacing: 8px;
-                        Button {
-                            text: "Transcribe";
-                            // 完了済み・失敗・未実施のいずれからも（再）実行できる
-                            // （言語・モデル変更後のやり直し用途）。無効化の理由は
-                            // detail-jobs-pending。
-                            enabled: !root.detail-jobs-pending;
-                            clicked => {
-                                root.transcribe-session(root.selected-index);
-                            }
-                        }
-
-                        Button {
-                            text: "Summarize";
-                            // 要約は文字起こしを入力にするので、無いセッションでは押させない
-                            // （生成済み・失敗からは押し直せる。モデル変更後のやり直し用途）。
-                            // 取り消しはこのボタンを差し替えず、状態行の隣に出す（理由は
-                            // 状態行のコメント）。
-                            enabled: root.has-transcript && !root.detail-jobs-pending;
-                            clicked => {
-                                root.summarize-session(root.selected-index);
-                            }
-                        }
-
-                        DangerButton {
-                            text: "Delete";
-                            // キュー待ちなら消せる（Rust 側が取り消してから削除する）。
-                            enabled: !root.detail-files-in-use;
-                            clicked => {
-                                root.show-delete-confirm = true;
-                            }
-                        }
-                    }
+            height: 72px;
+            background: Style.sheet;
+            VerticalLayout {
+                Rectangle {
+                    height: 1px;
+                    background: Style.rule;
                 }
 
-                // Playback セクション。
-                Rectangle {
-                    vertical-stretch: 0;
-                    border-width: 1px;
-                    border-color: Palette.border;
-                    border-radius: 8px;
-                    VerticalLayout {
-                        padding-left: 14px;
-                        padding-right: 14px;
-                        padding-top: 12px;
-                        padding-bottom: 14px;
-                        spacing: 11px;
-                        Text {
-                            text: "Playback";
-                            font-size: Style.heading-size;
-                            font-weight: Style.semibold;
-                            color: Palette.foreground;
-                        }
+                HorizontalLayout {
+                    padding-left: 16px;
+                    padding-right: 16px;
+                    spacing: 14px;
 
+                    VerticalLayout {
+                        alignment: center;
                         HorizontalLayout {
                             spacing: 8px;
-                            Button {
+                            ActionButton {
                                 text: root.playing ? "Pause" : "Play";
                                 enabled: root.playable;
                                 clicked => {
@@ -665,25 +904,21 @@ export component RecordingsWindow inherits Window {
                                 }
                             }
 
-                            Button {
+                            ActionButton {
                                 text: "Stop";
+                                role: ButtonRole.quiet;
                                 enabled: root.playable;
                                 clicked => {
                                     root.stop();
                                 }
                             }
-
-                            Rectangle {
-                                horizontal-stretch: 1;
-                            }
-
-                            Text {
-                                text: root.time-text;
-                                font-size: Style.caption-size;
-                                vertical-alignment: center;
-                                color: Palette.foreground.transparentize(Style.muted-alpha);
-                            }
                         }
+                    }
+
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 6px;
+                        horizontal-stretch: 1;
 
                         // 再生位置のシークバー（分担・仕様は SeekBar の doc コメント参照）。
                         SeekBar {
@@ -698,161 +933,19 @@ export component RecordingsWindow inherits Window {
                             }
                         }
                     }
-                }
 
-                // Transcript / Summary セクション。タブで表示を切り替える。Transcript は
-                // セグメントを時刻順に表示し、現在再生位置をハイライト、クリックでその開始秒へ
-                // シークする。Summary は `summary.md` を行単位に表示する（クリック連動は無い。
-                // #81 のスコープ外）。どちらも中身が無いときは状態依存のラベルに縮退。
-                Rectangle {
-                    vertical-stretch: 1;
-                    border-width: 1px;
-                    border-color: Palette.border;
-                    border-radius: 8px;
                     VerticalLayout {
-                        padding-left: 14px;
-                        padding-right: 14px;
-                        padding-top: 12px;
-                        padding-bottom: 12px;
-                        spacing: 10px;
-                        HorizontalLayout {
-                            vertical-stretch: 0;
-                            alignment: start;
-                            spacing: 18px;
-                            ViewTab {
-                                text: "Transcript";
-                                selected: !root.showing-summary;
-                                clicked => {
-                                    root.showing-summary = false;
-                                }
-                            }
-
-                            ViewTab {
-                                text: "Summary";
-                                selected: root.showing-summary;
-                                clicked => {
-                                    root.showing-summary = true;
-                                }
-                            }
-                        }
-
-                        Rectangle {
-                            vertical-stretch: 1;
-                            clip: true;
-
-                            if !root.showing-summary: Rectangle {
-                                // 文字起こしがあればセグメント一覧、無ければ縮退表示。長時間録音では
-                                // セグメントが数千件になり得るため、可視範囲だけ生成する ListView を使う
-                                // （ScrollView + for は全行を即時生成し、選択時のヒッチにつながる）。
-                                if root.segments.length > 0: ListView {
-                                    for seg[i] in root.segments: Rectangle {
-                                        // 現在再生位置のセグメントをハイライト（淡色背景＋左 3px 罫線）。
-                                        property <bool> active: i == root.current-segment;
-                                        background: active ? Style.segment-highlight : transparent;
-                                        // ListView の行は自身の高さを明示する（word-wrap する本文の
-                                        // 実高さに追従させる）。
-                                        height: row-content.preferred-height;
-                                        TouchArea {
-                                            clicked => {
-                                                root.seek-to-segment(i);
-                                            }
-                                        }
-
-                                        row-content := HorizontalLayout {
-                                            // 左端のアクセント罫線（active のときだけ幅を持つ）。
-                                            Rectangle {
-                                                width: active ? 3px : 0px;
-                                                background: Palette.accent-background;
-                                            }
-
-                                            VerticalLayout {
-                                                padding-left: 8px;
-                                                padding-right: 6px;
-                                                padding-top: 6px;
-                                                padding-bottom: 6px;
-                                                spacing: 3px;
-                                                HorizontalLayout {
-                                                    alignment: start;
-                                                    spacing: 7px;
-                                                    SpeakerBadge {
-                                                        label: seg.speaker;
-                                                        accent: seg.is-mic;
-                                                    }
-
-                                                    Text {
-                                                        text: seg.time;
-                                                        font-size: Style.caption-size;
-                                                        vertical-alignment: center;
-                                                        color: Palette.foreground.transparentize(Style.muted-alpha);
-                                                    }
-                                                }
-
-                                                Text {
-                                                    text: seg.text;
-                                                    wrap: word-wrap;
-                                                    font-size: Style.body-size;
-                                                    color: Palette.foreground;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                if root.segments.length == 0: Text {
-                                    // 縮退表示は実際の状態を語る（ラベルの対応は Rust 側の
-                                    // transcript_placeholder_text 参照。JSON の欠落・破損は状態 Done の
-                                    // ままセグメントが空になり、未実施と同じ表示に落ちる）。完了済みの
-                                    // 再実行中は旧トランスクリプトが残るため上の一覧表示が維持される。
-                                    text: root.detail-transcript-placeholder;
-                                    font-size: Style.body-size;
-                                    horizontal-alignment: center;
-                                    vertical-alignment: center;
-                                    color: Palette.foreground.transparentize(Style.muted-alpha);
-                                }
-                            }
-
-                            if root.showing-summary: Rectangle {
-                                // 議事録があれば行一覧、無ければ縮退表示。長い議事録でも可視範囲
-                                // だけ生成する（Transcript 側と同じ理由で ListView）。
-                                if root.summary-rows.length > 0: ListView {
-                                    for row in root.summary-rows: Rectangle {
-                                        // ListView の行は自身の高さを明示する（word-wrap する
-                                        // 本文の実高さに追従させる）。
-                                        height: summary-row-content.preferred-height;
-                                        summary-row-content := VerticalLayout {
-                                            padding-left: 2px;
-                                            padding-right: 6px;
-                                            // 見出しは上に余白を置いて段落の切れ目を作る
-                                            // （記号を落としているぶん、間隔で構造を見せる）。
-                                            padding-top: row.is-heading ? 8px : 2px;
-                                            padding-bottom: 2px;
-                                            Text {
-                                                text: row.text;
-                                                wrap: word-wrap;
-                                                // 見出しはサイズを上げず太さだけで差を付ける
-                                                // （`heading-size` は本文より小さいので、
-                                                // 使うと見出しと本文のサイズが逆転する）。
-                                                font-size: Style.body-size;
-                                                font-weight: row.is-heading
-                                                    ? Style.semibold
-                                                    : Style.regular;
-                                                color: Palette.foreground;
-                                            }
-                                        }
-                                    }
-                                }
-                                if root.summary-rows.length == 0: Text {
-                                    // ラベルの対応は Rust 側の summary_placeholder_text 参照
-                                    // （`summary.md` の欠落・破損・空はいずれも未生成と同じ表示に
-                                    // 落ちる）。再生成中は旧議事録が残るため一覧表示が維持される。
-                                    text: root.detail-summary-placeholder;
-                                    font-size: Style.body-size;
-                                    horizontal-alignment: center;
-                                    vertical-alignment: center;
-                                    color: Palette.foreground.transparentize(Style.muted-alpha);
-                                }
-                            }
+                        alignment: center;
+                        Text {
+                            // 時刻は**等幅**で出す（桁が変わるたびに左右が動かないように）。
+                            text: root.time-text;
+                            font-family: "Menlo";
+                            font-size: Style.caption-size;
+                            color: Style.ink-muted;
+                            vertical-alignment: center;
                         }
                     }
+
                 }
             }
         }
@@ -869,9 +962,9 @@ export component RecordingsWindow inherits Window {
         Rectangle {
             width: 320px;
             height: dialog-layout.preferred-height;
-            background: Palette.alternate-background;
+            background: Style.sheet;
             border-width: 1px;
-            border-color: Palette.border;
+            border-color: Style.rule;
             border-radius: 12px;
 
             dialog-layout := VerticalLayout {
@@ -880,17 +973,27 @@ export component RecordingsWindow inherits Window {
                 spacing: 7px;
 
                 Text {
-                    text: "Delete This Recording?";
+                    text: "Move this recording to the Trash?";
                     font-size: Style.detail-title-size;
                     font-weight: Style.semibold;
-                    color: Palette.foreground;
+                    color: Style.ink;
                     horizontal-alignment: center;
                 }
 
                 Text {
-                    text: "The recording will be moved to the Trash.";
+                    // **何が一緒に消えるか**を言う（音声だけだと思って押させない）。
+                    text: root.detail-datetime + " · " + root.detail-sources;
                     font-size: Style.caption-size;
-                    color: Palette.foreground.transparentize(Style.muted-alpha);
+                    color: Style.ink-muted;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+
+                Text {
+                    // 戻せることも言う（ゴミ箱を空にするまでは元に戻せる）。
+                    text: "The audio, its transcript and its notes go to the Trash together. You can put them back from the Trash until you empty it.";
+                    font-size: Style.caption-size;
+                    color: Style.ink-muted;
                     horizontal-alignment: center;
                     wrap: word-wrap;
                 }
@@ -899,8 +1002,9 @@ export component RecordingsWindow inherits Window {
                     padding-top: 11px;
                     spacing: 10px;
 
-                    Button {
-                        text: "Cancel";
+                    ActionButton {
+                        // 「消さずに戻る」ことが分かる語にする（デザインの `Keep`）。
+                        text: "Keep";
                         horizontal-stretch: 1;
                         clicked => {
                             root.show-delete-confirm = false;
@@ -908,7 +1012,8 @@ export component RecordingsWindow inherits Window {
                     }
 
                     DangerButton {
-                        text: "Delete";
+                        // ゴミ箱へ入るだけで消えないことを語で示す（戻せる操作だと分かる）。
+                        text: "Move to Trash";
                         filled: true;
                         horizontal-stretch: 1;
                         clicked => {

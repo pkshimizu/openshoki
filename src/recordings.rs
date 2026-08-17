@@ -63,17 +63,19 @@ const SWEPT_PART_DESTS: &[&str] = &[
 /// セッションディレクトリ名の日時フォーマット（`main.rs` の録音開始時の命名と一致させること）。
 const DIR_DATETIME_FORMAT: &str = "%Y%m%d-%H%M%S";
 /// 一覧に表示する日時フォーマット（カンプに合わせて分まで）。
-const DISPLAY_DATETIME_FORMAT: &str = "%Y-%m-%d %H:%M";
+/// 一覧の行と詳細ヘッダの時刻・日付（`14:02` / `Aug 10, 2026`）。**同じ組み合わせを両方で
+/// 使う**——左右で日時の形が違うと、同じ録音を見ていることが読み取りにくい。
+const DISPLAY_TIME_FORMAT: &str = "%H:%M";
+const DISPLAY_DATE_FORMAT: &str = "%b %-d, %Y";
 
 /// 1 つの録音セッション。ディレクトリと、含まれる音源・文字起こし・議事録要約の有無を持つ。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordingSession {
-    /// ソート用の日時（ディレクトリ名からパース）。表示には `display_datetime` を使う。
+    /// 日時（ディレクトリ名からパース）。並び順と、表示用の組み立て（`display_time` /
+    /// `display_date` / `group_heading`）の両方がここから決まる。
     datetime: NaiveDateTime,
     /// セッションディレクトリの絶対/相対パス。
     pub dir: PathBuf,
-    /// 一覧表示用の日時文字列（例 `2026-06-28 14:30`）。
-    pub display_datetime: String,
     /// `mic.mp3` があるか。
     pub has_mic: bool,
     /// `system.mp3` があるか。
@@ -88,6 +90,52 @@ pub struct RecordingSession {
 }
 
 impl RecordingSession {
+    /// テスト用に、日時だけを持つセッションを作る（ファイルの有無は呼び出し側で足す）。
+    ///
+    /// **表示の組み立て**（見出し・行の文言）は日時とファイルの有無だけで決まるので、実ディスクを
+    /// 用意せずに検証できる。
+    #[cfg(test)]
+    pub fn for_test(datetime: NaiveDateTime) -> Self {
+        Self {
+            datetime,
+            dir: PathBuf::new(),
+            has_mic: false,
+            has_system: false,
+            has_mix: false,
+            has_transcript: false,
+            has_summary: false,
+        }
+    }
+
+    /// 録音した日（見出しのまとまりの判定に使う。**文言ではなく日付で比べる**ため）。
+    pub fn date(&self) -> chrono::NaiveDate {
+        self.datetime.date()
+    }
+
+    /// 一覧の行に出す時刻（`14:02`）。同じ日の中ではこれで見分けるので、行の中でいちばん大きく出す。
+    pub fn display_time(&self) -> String {
+        self.datetime.format(DISPLAY_TIME_FORMAT).to_string()
+    }
+
+    /// 一覧の行に出す日付（`Aug 10, 2026`）。見出しと重なるが、スクロールで見出しが流れても
+    /// どの日か分かるように行にも残す。
+    pub fn display_date(&self) -> String {
+        self.datetime.format(DISPLAY_DATE_FORMAT).to_string()
+    }
+
+    /// 日付のまとまりの見出し（`Today` / `Yesterday` / `Aug 5, 2026`）。
+    ///
+    /// **相対の語を出すのは今日と昨日だけ**。「先週」のような幅のある語は、境界がいつ変わるのか
+    /// （週の始まりは日曜か月曜か）を読み手が推測することになるので使わない。
+    pub fn group_heading(&self, now: NaiveDateTime) -> String {
+        let days = (now.date() - self.datetime.date()).num_days();
+        match days {
+            0 => "Today".to_owned(),
+            1 => "Yesterday".to_owned(),
+            _ => self.display_date(),
+        }
+    }
+
     /// 再生対象ファイルのパス。両音源のセッションは録音後生成の `mix.mp3`（まだ無ければ再生不可で
     /// `None`）、単一音源のセッションはその音源ファイルそのもの。音源なしは `None`。
     ///
@@ -123,7 +171,7 @@ impl RecordingSession {
     /// 含まれる音源を表す英語サマリー（右ペインのヘッダ表示用）。
     pub fn source_summary(&self) -> &'static str {
         match (self.has_mic, self.has_system) {
-            (true, true) => "Mic + System",
+            (true, true) => "Mic + system",
             (true, false) => "Mic only",
             (false, true) => "System only",
             // 音源なしのセッションは一覧に含めない（`list_sessions` がスキップ）ため通常起きない。
@@ -172,7 +220,6 @@ pub fn list_sessions(recording_dir: &Path) -> Vec<RecordingSession> {
 
         sessions.push(RecordingSession {
             datetime,
-            display_datetime: datetime.format(DISPLAY_DATETIME_FORMAT).to_string(),
             dir,
             has_mic,
             has_system,
@@ -481,13 +528,14 @@ mod tests {
         let sessions = list_sessions(&root);
         assert_eq!(sessions.len(), 3);
         // 新しい順。
-        assert_eq!(sessions[0].display_datetime, "2026-06-28 14:30");
-        assert_eq!(sessions[1].display_datetime, "2026-06-28 11:05");
-        assert_eq!(sessions[2].display_datetime, "2026-06-27 16:42");
+        assert_eq!(sessions[0].display_date(), "Jun 28, 2026");
+        assert_eq!(sessions[0].display_time(), "14:30");
+        assert_eq!(sessions[1].display_time(), "11:05");
+        assert_eq!(sessions[2].display_date(), "Jun 27, 2026");
         // 音源・文字起こし・議事録要約の判定とサマリー。
         assert!(sessions[0].has_mic && sessions[0].has_system && sessions[0].has_transcript);
         assert!(sessions[0].has_summary);
-        assert_eq!(sessions[0].source_summary(), "Mic + System");
+        assert_eq!(sessions[0].source_summary(), "Mic + system");
         assert_eq!(sessions[1].source_summary(), "Mic only");
         assert!(!sessions[1].has_transcript);
         // 文字起こしも要約も無いセッション（要約の有無は独立に判定される）。
@@ -509,7 +557,8 @@ mod tests {
 
         let sessions = list_sessions(&root);
         assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].display_datetime, "2026-06-28 14:30");
+        assert_eq!(sessions[0].display_date(), "Jun 28, 2026");
+        assert_eq!(sessions[0].display_time(), "14:30");
 
         let _ = fs::remove_dir_all(&root);
     }

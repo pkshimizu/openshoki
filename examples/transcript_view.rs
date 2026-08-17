@@ -32,11 +32,11 @@ const DEFAULT_SEGMENT_COUNT: usize = 30;
 
 /// 生成中のラベル。状態テキストと縮退ラベルで同じ文言を使うため 1 箇所に置く
 /// （`src/main.rs` の `SUMMARIZING_LABEL` の複製。あちらを変えたらここも合わせること）。
-const SUMMARIZING_LABEL: &str = "Summarizing…";
+const SUMMARIZING_LABEL: &str = "Writing notes…";
 
-/// キュー待ちのラベル（同上。`src/main.rs` の複製。状態行と縮退表示で大小が違う）。
+/// キュー待ちのラベル（同上。`src/main.rs` の複製。状態行と縮退表示で同じ文言）。
 const SUMMARY_QUEUED_LABEL: &str = "Waiting to summarize…";
-const SUMMARY_QUEUED_PLACEHOLDER: &str = "Waiting to Summarize…";
+const SUMMARY_QUEUED_PLACEHOLDER: &str = "Waiting to write notes…";
 
 /// Summary タブの確認用のダミー議事録。見出しの強調・本文の折り返し・段落の間隔を見たいので、
 /// 実際の生成物（`src/summarize.rs` のプロンプトが作る 4 見出し構成）と同じ形にする。
@@ -86,9 +86,52 @@ fn main() {
             .into(),
         })
         .collect();
+    // 一覧のサンプル（見出しのまとまり・選択の縦罫・状態のドットを目視する）。**行の高さは
+    // 固定**なので、いちばん長い文言でクリップされることも見る。文言は `src/main.rs` の
+    // `session_detail_text` の複製（あちらを変えたらここも合わせること）。
+    win.set_sessions(ModelRc::from(Rc::new(VecModel::from(vec![
+        SessionRow {
+            group_heading: "Today".into(),
+            time_text: "14:02".into(),
+            date_text: "Aug 10, 2026".into(),
+            detail_text: "Mic + system · transcribing".into(),
+            transcript_status: TranscriptStatus::Transcribing,
+        },
+        SessionRow {
+            group_heading: "".into(),
+            time_text: "09:30".into(),
+            date_text: "Aug 10, 2026".into(),
+            detail_text: "Mic only · transcribed".into(),
+            transcript_status: TranscriptStatus::Done,
+        },
+        SessionRow {
+            group_heading: "Yesterday".into(),
+            time_text: "16:45".into(),
+            date_text: "Aug 9, 2026".into(),
+            detail_text: "System only · transcription failed".into(),
+            transcript_status: TranscriptStatus::Failed,
+        },
+        SessionRow {
+            group_heading: "".into(),
+            time_text: "11:00".into(),
+            date_text: "Aug 9, 2026".into(),
+            detail_text: "Mic + system · not transcribed".into(),
+            transcript_status: TranscriptStatus::NotTranscribed,
+        },
+        SessionRow {
+            group_heading: "Aug 5, 2026".into(),
+            time_text: "15:30".into(),
+            date_text: "Aug 5, 2026".into(),
+            detail_text: "Mic + system · transcribed".into(),
+            transcript_status: TranscriptStatus::Done,
+        },
+    ]))));
+    win.set_selected_index(0);
+    win.set_library_summary("5 recordings".into());
+
     win.set_has_selection(true);
-    win.set_detail_datetime("2026-07-21 12:00:00".into());
-    win.set_detail_sources("Mic + System".into());
+    win.set_detail_datetime("Aug 10, 2026 · 14:02".into());
+    win.set_detail_sources("Mic + system".into());
 
     // 文字起こしと議事録は**実アプリで起こりうる組み合わせ**に揃える（要約は文字起こしを
     // 入力にするので、文字起こしが無いセッションには議事録も無い）。状態の文言は `src/main.rs` の
@@ -106,7 +149,7 @@ fn main() {
     } else {
         "Not transcribed".into()
     });
-    win.set_detail_transcript_placeholder("Not Transcribed Yet".into());
+    win.set_detail_transcript_placeholder("Not transcribed yet".into());
     if has_transcript {
         win.set_segments(ModelRc::from(Rc::new(VecModel::from(rows))));
         win.set_current_segment(2);
@@ -130,7 +173,7 @@ fn main() {
             SummaryStatus::NotSummarized => "Not summarized",
             SummaryStatus::Queued => SUMMARY_QUEUED_LABEL,
             SummaryStatus::Summarizing => SUMMARIZING_LABEL,
-            SummaryStatus::Done => "Summarized",
+            SummaryStatus::Done => "Notes ready",
             SummaryStatus::Failed => "Summarization failed",
         }
         .into(),
@@ -139,8 +182,8 @@ fn main() {
         match summary_status {
             SummaryStatus::Queued => SUMMARY_QUEUED_PLACEHOLDER,
             SummaryStatus::Summarizing => SUMMARIZING_LABEL,
-            SummaryStatus::Failed => "Summarization Failed",
-            SummaryStatus::NotSummarized | SummaryStatus::Done => "Not Summarized Yet",
+            SummaryStatus::Failed => "Notes could not be written",
+            SummaryStatus::NotSummarized | SummaryStatus::Done => "No notes yet",
         }
         .into(),
     );
@@ -169,7 +212,8 @@ fn main() {
 
     win.window()
         .set_position(slint::LogicalPosition::new(60.0, 60.0));
-    win.window().set_size(slint::LogicalSize::new(720.0, 540.0));
+    win.window()
+        .set_size(slint::LogicalSize::new(1100.0, 720.0));
     win.show()
         .expect("showing the window should succeed in this verification binary");
 
