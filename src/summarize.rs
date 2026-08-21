@@ -358,10 +358,9 @@ impl SummarizeWorker {
         let seq = {
             let mut queue = lock_queue(&self.queue);
             let seq = queue.next_seq();
-            // 生成中のセッションへ積み直したときは、**走っているジョブの表示をそのまま引き継ぐ**
-            // （下げない理由は上の doc）。開始時刻も引き継がないと経過が 0 に戻る。
-            // 走っているジョブの表示は**まるごと**引き継ぐ。モデル名だけ新しいジョブのものに
-            // すると、「動いていないモデルが、動いているジョブの経過つきで」出る。
+            // 生成中のセッションへ積み直したときは、走っているジョブの表示を**まるごと**
+            // 引き継ぐ（下げない理由は上の doc）。フィールドを選んで写すと、モデル名だけ新しい
+            // ジョブのものになって「動いていないモデルが、動いているジョブの経過つきで」出る。
             let running = match queue.status.get(&job.session_dir) {
                 Some((_, entry)) if entry.status == SummarizeStatus::Summarizing => {
                     Some(entry.clone())

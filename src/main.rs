@@ -2418,7 +2418,6 @@ fn transcript_pane_of(
     }
 }
 
-/// セッションの現在の文字起こし状態を合成して詳細ペインへ反映する（選択時・手動投入直後用。
 /// 選択中セッションの読む領域（両タブ）を組み直す。
 ///
 /// **選択時・手動投入直後・tick 追従の全経路がここを通る**。進捗の割合と経過は状態が変わらない
@@ -2688,8 +2687,6 @@ fn apply_detail_summary_status(rec: &RecordingsWindow, pane: &SummaryPane, jobs_
     rec.set_detail_summary_status(status);
 }
 
-/// セッションの現在の要約状態を合成して詳細ペインへ反映する（選択時・手動投入直後用。
-/// tick は状態を計算済みなので `apply_detail_summary_status` を直接使う）。
 /// ワーカーの状態と設定から、読む領域に出す議事録の状態を組み立てる
 /// （`transcript_pane` と対称）。
 fn summary_pane(
