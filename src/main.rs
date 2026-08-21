@@ -29,6 +29,8 @@ mod windows;
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 // VecModel の row_data / set_row_data（tick の行単位更新）に必要。
@@ -315,9 +317,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Recordings ウィンドウ（録音一覧＋再生）。設定ウィンドウと同じく起動時に生成して隠しておき、
     // トレイの「Recordings…」で表示する。閉じても常駐を保つ。
     let recordings_ui = RecordingsWindow::new()?;
-    recordings_ui
-        .window()
-        .on_close_requested(|| slint::CloseRequestResponse::HideWindow);
+    // 選んだ録音の読み込み結果を UI スレッドへ返す道（#152）。**tick が受け取る**——Slint の
+    // プロパティも `Rc` の共有状態も UI スレッド専有なので、読み込みスレッドからは触れない。
+    let (load_sender, load_receiver) = std::sync::mpsc::channel::<LoadedSession>();
+    // 選択の世代。**遅れて届いた結果で新しい選択を上書きしない**ための番号で、選ぶたびに増やす
+    // （速く切り替えると、前の読み込みがあとから返ってくる）。
+    let load_generation = Rc::new(Cell::new(0u64));
+
+    {
+        // 隠すときも**世代を進める**（#152）。進めないと、閉じたあとに届いた読み込み結果が
+        // 誰も見ていない画面へ適用され、音声のハンドルと文字起こし本文を次に開くまで抱え続ける。
+        let generation = Rc::clone(&load_generation);
+        recordings_ui.window().on_close_requested(move || {
+            generation.set(generation.get().wrapping_add(1));
+            slint::CloseRequestResponse::HideWindow
+        });
+    }
 
     // 音声再生ハンドル。出力デバイスを開けない環境では再生機能なしで続行する（一覧・常駐は動く）。
     let player: Rc<RefCell<Option<player::AudioPlayer>>> = Rc::new(RefCell::new(
@@ -342,13 +357,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 算出に使う）。選択のたびに読み直す。
     let transcript_segments: Rc<RefCell<Vec<transcript::TranscriptSegment>>> =
         Rc::new(RefCell::new(Vec::new()));
-
-    // 選んだ録音の読み込み結果を UI スレッドへ返す道（#152）。**tick が受け取る**——Slint の
-    // プロパティも `Rc` の共有状態も UI スレッド専有なので、読み込みスレッドからは触れない。
-    let (load_sender, load_receiver) = std::sync::mpsc::channel::<LoadedSession>();
-    // 選択の世代。**遅れて届いた結果で新しい選択を上書きしない**ための番号で、選ぶたびに増やす
-    // （速く切り替えると、前の読み込みがあとから返ってくる）。
-    let load_generation = Rc::new(Cell::new(0u64));
 
     // セッション選択: 詳細を更新し、その音源を再生準備する。
     //
@@ -414,32 +422,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // --- ここからが別スレッド。届いたら世代を確かめて反映する ---
-            let dir = session.dir.clone();
-            let playback_path = session.playback_path();
-            let sender = load_sender.clone();
-            std::thread::spawn(move || {
-                let loaded = LoadedSession {
-                    generation: generation_id,
-                    segments: transcript::load_transcript(&dir),
-                    summary: summarize::load_summary(&dir),
-                    // 失敗はここでログして `None` に畳む（UI へ運ぶのは結果だけにする）。
-                    playback: playback_path.and_then(|path| {
-                        match player::AudioPlayer::prepare(&path) {
-                            Ok(prepared) => Some(prepared),
-                            Err(err) => {
-                                eprintln!("Failed to load the recording for playback: {err}");
-                                None
-                            }
-                        }
-                    }),
-                };
-                // **結果は送るだけ**。Slint のプロパティも `Rc` の共有状態も UI スレッド専有なので、
-                // ここからは触れない（受け取って反映するのは tick）。
-                if sender.send(loaded).is_err() {
-                    // 受け手が畳まれている（アプリ終了時）。表示は捨ててよい。
-                    eprintln!("Skipping the loaded recording because the window is gone");
-                }
-            });
+            spawn_session_load(session, generation_id, &generation, &load_sender);
         });
     }
 
@@ -711,6 +694,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 // 事前に手放した再生対象を積み直し、「選択中なのに再生が沈黙する」不整合を
                 // 残さない（ベストエフォート。失敗はログのみで選択し直せば回復する）。
+                //
+                // **ここは同期の `load` を使う**（#152 の非同期経路に載せていない）。削除の失敗は
+                // まれで、そのときだけ数秒待たせるほうが、失敗処理を非同期にして順序を増やすより
+                // 読みやすい。長い録音では体感できる待ちになる、という限界は承知のうえ。
                 let reloaded = match (&playback_path, player.borrow_mut().as_mut()) {
                     (Some(path), Some(p)) => match p.load(path) {
                         Ok(()) => true,
@@ -968,6 +955,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ui: recordings_ui.as_weak(),
                 player: Rc::clone(&player),
                 load_receiver,
+                load_sender: load_sender.clone(),
                 load_generation: Rc::clone(&load_generation),
                 sessions: Rc::clone(&sessions),
                 sessions_model: Rc::clone(&sessions_model),
@@ -1017,6 +1005,9 @@ struct RecordingsHandles {
     /// 選んだ録音の読み込み結果の受け口（#152）。**tick が拾って反映する**——読み込みスレッドは
     /// UI スレッド専有のものに触れないので、送るだけにしてある。
     load_receiver: std::sync::mpsc::Receiver<LoadedSession>,
+    /// 読み込みをやり直すための送り口。tick は**表示を直接書かず**、中身が変わったら読み直す
+    /// （理由は `spawn_session_load` の doc）。
+    load_sender: std::sync::mpsc::Sender<LoadedSession>,
     /// いま表示している選択の世代。届いた結果がこれと違えば**捨てる**（速く切り替えたときに、
     /// 前の読み込みがあとから返って新しい選択を上書きするのを防ぐ）。
     load_generation: Rc<Cell<u64>>,
@@ -1219,9 +1210,7 @@ fn build_menu_event_handler(
         // 読み込みが終わった録音を表示へ入れる（#152）。**ウィンドウが閉じていても受け取る**——
         // 受け口に溜めたままにすると、次に開いたときに古い結果がまとめて流れ込む。
         while let Ok(loaded) = recordings.load_receiver.try_recv() {
-            // **遅れて届いた結果は捨てる**。速く切り替えると前の読み込みがあとから返り、
-            // いま選んでいる録音を別の録音の中身で上書きしてしまう。
-            if recordings.load_generation.get() != loaded.generation {
+            if !load_is_current(recordings.load_generation.get(), loaded.generation) {
                 continue;
             }
             if let Some(rec) = recordings.ui.upgrade() {
@@ -1248,6 +1237,8 @@ fn build_menu_event_handler(
             let mut transcribed: Vec<usize> = Vec::new();
             // 要約の追従は選択中セッションだけを見るので、書き戻す対象も高々 1 件。
             let mut summarized: Option<usize> = None;
+            // 選択中セッションの中身がディスク上で変わったか（変わったら読み直す。理由は下）。
+            let mut reload_selected = false;
             {
                 let sessions_ref = recordings.sessions.borrow();
                 for (i, session) in sessions_ref.iter().enumerate() {
@@ -1277,12 +1268,11 @@ fn build_menu_event_handler(
                         if previous == TranscriptStatus::Transcribing
                             && status == TranscriptStatus::Done
                         {
-                            let segments = transcript::load_transcript(&session.dir);
-                            rec.set_segments(
-                                Rc::new(slint::VecModel::from(transcript_rows(&segments))).into(),
-                            );
-                            rec.set_current_segment(-1);
-                            *recordings.transcript_segments.borrow_mut() = segments;
+                            // **表示は書かず、読み込みをやり直す**（#152）。ここで直接
+                            // 差し替えると、少し前に始まった読み込みの古いスナップショット
+                            // （まだ何も無かった頃の内容）があとから届いて上書きし、
+                            // **完成した文字起こしが消える**。世代を進めれば古い結果は捨てられる。
+                            reload_selected = true;
                         }
                     }
                 }
@@ -1308,7 +1298,8 @@ fn build_menu_event_handler(
                         if matches!(previous, SummaryStatus::Queued | SummaryStatus::Summarizing)
                             && status == SummaryStatus::Done
                         {
-                            refresh_detail_summary_rows(&rec, &session.dir);
+                            // 文字起こしと同じ理由で、読み込みをやり直す（上のコメント）。
+                            reload_selected = true;
                             summarized = Some(i);
                         }
                     }
@@ -1325,10 +1316,26 @@ fn build_menu_event_handler(
                 if let Some(session) = summarized.and_then(|i| sessions_mut.get_mut(i)) {
                     session.has_summary = true;
                 }
-                // 選択中セッションのボタン活性（Summarize は文字起こしの有無で決まる）を、
-                // 書き戻した値から更新する。
+                // 選択中セッションのボタン活性（議事録は文字起こしの有無で決まる）を、書き戻した
+                // 値から更新する。
                 if let Some(session) = selected.and_then(|i| sessions_mut.get(i)) {
                     rec.set_has_transcript(session.has_transcript);
+                }
+            }
+
+            // 中身が変わったので読み直す。**世代を進めてから**起こすので、走っている古い読み込みの
+            // 結果は届いても捨てられる（`spawn_session_load` の doc）。
+            if reload_selected {
+                let sessions = recordings.sessions.borrow();
+                if let Some(session) = selected.and_then(|i| sessions.get(i)) {
+                    let generation_id = recordings.load_generation.get().wrapping_add(1);
+                    recordings.load_generation.set(generation_id);
+                    spawn_session_load(
+                        session,
+                        generation_id,
+                        &recordings.load_generation,
+                        &recordings.load_sender,
+                    );
                 }
             }
         }
@@ -1441,6 +1448,100 @@ fn library_summary(count: usize) -> String {
     }
 }
 
+/// 届いた読み込み結果を表示へ入れてよいか（**遅れて届いた結果を捨てる**判定）。
+///
+/// 捨てる理由は 2 つ。(1) 速く切り替えると前の読み込みがあとから返り、いま選んでいる録音を
+/// 別の録音の中身で上書きする。(2) 読み込み中に文字起こしや議事録が完成すると、tick が世代を
+/// 進めて読み直すので、**その前に始まった読み込みの古いスナップショット**（まだ何も無かった頃の
+/// 内容）で完成した中身を消してしまう。
+fn load_is_current(current: u64, loaded: u64) -> bool {
+    current == loaded
+}
+
+/// 選んだ録音の重い読み込みを別スレッドで始める。
+///
+/// **`set_segments` を書く経路をここ 1 本に絞る**ための入口（#152）。読み込み中に文字起こしや
+/// 議事録が完成することがあり、そのとき tick が直接表示を差し替えると、少し前に始まった読み込みの
+/// **古いスナップショット**（まだ何も無かった頃の内容）があとから届いて上書きし、
+/// **完成した文字起こしが消える**。tick も表示を書かずにこれを呼び、世代を進めて読み直す。
+fn spawn_session_load(
+    session: &recordings::RecordingSession,
+    generation_id: u64,
+    generation: &Rc<Cell<u64>>,
+    sender: &std::sync::mpsc::Sender<LoadedSession>,
+) {
+    let dir = session.dir.clone();
+    let playback_path = session.playback_path();
+    // スレッドへ渡す口と、失敗したときにこのスレッドから送る口を分けて持つ。
+    let thread_sender = sender.clone();
+    let fallback_sender = sender.clone();
+    // 読み込みスレッドからも見える世代（`Rc` は渡せないので値を写す）。**重い処理に入る前に
+    // 確かめて、すでに古ければ何も読まない**——連打したぶんだけ数百 MB を読み切るのは、
+    // いま見たい録音の読み込みを自分で遅くする。
+    let live = Arc::new(AtomicU64::new(generation_id));
+    let watcher = Arc::clone(&live);
+    let generation = Rc::clone(generation);
+    // 世代が進んだことをスレッドへ伝える手（UI スレッドから書き、スレッドが読む）。
+    LOAD_WATCHERS.with(|watchers| {
+        let mut watchers = watchers.borrow_mut();
+        watchers.retain(|w| Arc::strong_count(w) > 1);
+        watchers.push(watcher);
+        // 進んだ世代を全員へ知らせる（古い読み込みは自分で降りる）。
+        let current = generation.get();
+        for w in watchers.iter() {
+            w.store(current, Ordering::Relaxed);
+        }
+    });
+
+    let spawned = std::thread::Builder::new()
+        .name("session-load".to_owned())
+        .spawn(move || {
+            // **重い処理の前に降りられるか見る**（軽い読み込みは先に済ませてしまう）。
+            let segments = transcript::load_transcript(&dir);
+            let summary = summarize::load_summary(&dir);
+            let playback = if live.load(Ordering::Relaxed) != generation_id {
+                // すでに別の録音が選ばれている。数百 MB を読む意味はない。
+                None
+            } else {
+                playback_path.and_then(|path| match player::AudioPlayer::prepare(&path) {
+                    Ok(prepared) => Some(prepared),
+                    Err(err) => {
+                        eprintln!("Failed to load the recording for playback: {err}");
+                        None
+                    }
+                })
+            };
+            // **結果は送るだけ**。Slint のプロパティも `Rc` の共有状態も UI スレッド専有なので、
+            // ここからは触れない（受け取って反映するのは tick）。
+            let loaded = LoadedSession {
+                generation: generation_id,
+                segments,
+                summary,
+                playback,
+            };
+            if thread_sender.send(loaded).is_err() {
+                // 受け手が畳まれている（アプリ終了中）。表示は捨ててよい。
+                eprintln!("Skipping the loaded recording because the app is shutting down");
+            }
+        });
+    if let Err(err) = spawned {
+        // スレッドを作れない（資源の枯渇）。**`loading` を残さない**ため、空の結果を自分で送る。
+        eprintln!("Loading the recording on this thread because spawning failed: {err}");
+        let _ = fallback_sender.send(LoadedSession {
+            generation: generation_id,
+            segments: Vec::new(),
+            summary: None,
+            playback: None,
+        });
+    }
+}
+
+thread_local! {
+    /// いま走っている読み込みへ「世代が進んだ」ことを伝える手（`spawn_session_load` の doc）。
+    /// UI スレッド専有なので `thread_local` で足りる。
+    static LOAD_WATCHERS: RefCell<Vec<Arc<AtomicU64>>> = const { RefCell::new(Vec::new()) };
+}
+
 /// 選んだ録音の**重い読み込みの結果**（別スレッドで作り、UI スレッドへ渡す）。
 ///
 /// Slint の型を持たせないのは、生成をイベントループの外で行うため。UI へ入れる形への変換は
@@ -1473,6 +1574,9 @@ fn apply_loaded_session(
     } = loaded;
 
     rec.set_segments(Rc::new(slint::VecModel::from(transcript_rows(&segments))).into());
+    // **ハイライトも戻す**。読み込み中に付いた行番号を引き継ぐと、差し替わった別の内容の
+    // 同じ行番号が光る（選択時にも -1 にしてあるのと対）。
+    rec.set_current_segment(-1);
     *segments_cell.borrow_mut() = segments;
     let summary_rows = summary.map(|text| summary_rows(&text)).unwrap_or_default();
     rec.set_summary_rows(Rc::new(slint::VecModel::from(summary_rows)).into());
@@ -2416,6 +2520,24 @@ mod tests {
 
     use crate::transcribe::TranscribeStatus;
     use std::time::Duration;
+
+    /// 届いた読み込み結果は**世代が一致するときだけ**表示へ入れる。
+    ///
+    /// これが緩むと 2 通りに壊れる: 速く切り替えたときに別の録音の中身が入る／読み込み中に
+    /// 文字起こしが完成したとき、それを古いスナップショット（空）が消す。後者は
+    /// 「文字起こし済みなのに『まだありません』」という形で残り、選び直すまで直らない。
+    #[test]
+    fn only_the_current_load_reaches_the_screen() {
+        assert!(super::load_is_current(7, 7), "the current load is applied");
+        assert!(
+            !super::load_is_current(8, 7),
+            "a load started before the newest selection must be dropped"
+        );
+        assert!(
+            !super::load_is_current(7, 8),
+            "a generation from the future is not ours either"
+        );
+    }
 
     /// 一覧の見出しは**その日の最初の行だけ**が持つ。
     ///
