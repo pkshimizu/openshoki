@@ -21,9 +21,9 @@
 # 固定した以上、放っておいて CI が落ちることはない。上げるのは**必要になったとき**——使いたい
 # 言語機能があるとき、依存が新しい版を要求するとき、取り込みたい lint があるとき。
 [toolchain]
-# `.github/workflows/ci.yml` が実際の `rustc --version` と突き合わせるので、`stable` のような
-# チャンネル名ではなく**具体的な版**で書くこと。下限は 1.85（edition 2024 を使っているため。
-# `docs/` はリポジトリに含まれないので、この線はここに残す）。
+# 書き方の制約が 2 つある。`.github/workflows/ci.yml` が実際の `rustc --version` と突き合わせる
+# ので、`stable` のようなチャンネル名ではなく**具体的な版**にすること。そして edition 2024 を
+# 使っているので、**1.85 未満にはできない**。
 channel = "1.98.0"
 # 手元でも CI でも `cargo fmt --check` / `cargo clippy` を通す（`docs/rules/coding-conventions.md`
 # の検証コマンド）。ここに書いておけば、ワークフロー側で `components:` を指定しなくてよい。
