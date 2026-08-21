@@ -252,16 +252,14 @@ pub struct PreparedSource {
     duration: Option<Duration>,
 }
 
-impl PreparedSource {
-    /// **別スレッドで作って UI スレッドへ送れる**ことを型で確かめる（`Send` でなくなったら
-    /// コンパイルが通らない）。`#152` の分離はこれが前提。
-    #[cfg(test)]
-    fn assert_send()
-    where
-        Self: Send,
-    {
-    }
+/// **別スレッドで作って UI スレッドへ送れる**ことを型で確かめる（`Send` でなくなったらコンパイルが
+/// 通らない）。#152 の分離はこれが前提。
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<PreparedSource>();
+};
 
+impl PreparedSource {
     /// 全体長（`AudioPlayer` へ渡す前に、呼び出し側が表示の判断に使う）。
     pub fn duration(&self) -> Option<Duration> {
         self.duration

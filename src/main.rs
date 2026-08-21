@@ -421,7 +421,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // --- ここからが別スレッド。届いたら世代を確かめて反映する ---
-            spawn_session_load(session, generation_id, &generation, &load_sender);
+            // 選択が変わったので**音声も差し替える**。
+            spawn_session_load(
+                session,
+                generation_id,
+                &generation,
+                &load_sender,
+                load_replaces_playback(true),
+            );
         });
     }
 
@@ -1328,11 +1335,14 @@ fn build_menu_event_handler(
                 let sessions = recordings.sessions.borrow();
                 if let Some(session) = selected.and_then(|i| sessions.get(i)) {
                     let generation_id = advance_load_generation(&recordings.load_generation);
+                    // **音声は読み直さない**。変わったのは文字起こし・議事録だけで、ここで
+                    // 差し替えると再生中の音が止まって先頭へ戻る（`PlaybackLoad`）。
                     spawn_session_load(
                         session,
                         generation_id,
                         &recordings.load_generation,
                         &recordings.load_sender,
+                        load_replaces_playback(false),
                     );
                 }
             }
@@ -1446,6 +1456,16 @@ fn library_summary(count: usize) -> String {
     }
 }
 
+/// その読み込みで再生を差し替えるか（`PlaybackLoad` の判断を 1 か所に置く）。
+///
+/// **選択が変わったときだけ true**。中身が変わって読み直しただけのときに差し替えると、
+/// `AudioPlayer::adopt` が前の対象を手放すので**再生中の音が止まって先頭へ巻き戻る**——
+/// 文字起こしの完成は再生しながら待つ場面なので、そこで止まるのは痛い。あわせて、変わって
+/// いない音声を開き直す重い走査も避けられる。
+fn load_replaces_playback(selection_changed: bool) -> bool {
+    selection_changed
+}
+
 /// 届いた読み込み結果を表示へ入れてよいか（**遅れて届いた結果を捨てる**判定）。
 ///
 /// 捨てる理由は 2 つ。(1) 速く切り替えると前の読み込みがあとから返り、いま選んでいる録音を
@@ -1488,6 +1508,8 @@ fn spawn_session_load(
     generation_id: u64,
     generation: &Rc<Cell<u64>>,
     sender: &std::sync::mpsc::Sender<LoadedSession>,
+    // 音声も読み直すか。**中身だけ変わった読み直しでは false**（理由は `PlaybackLoad`）。
+    load_playback: bool,
 ) {
     let dir = session.dir.clone();
     let playback_path = session.playback_path();
@@ -1513,17 +1535,22 @@ fn spawn_session_load(
             // **重い処理の前に降りられるか見る**（軽い読み込みは先に済ませてしまう）。
             let segments = transcript::load_transcript(&dir);
             let summary = summarize::load_summary(&dir);
-            let playback = if live.load(Ordering::Relaxed) != generation_id {
+            let playback = if !load_playback {
+                // 音声は変わっていない（中身だけ読み直した）。鳴っているものをそのまま使う。
+                PlaybackLoad::Keep
+            } else if live.load(Ordering::Relaxed) != generation_id {
                 // すでに別の録音が選ばれている。数百 MB を読む意味はない。
-                None
+                PlaybackLoad::Replace(None)
             } else {
-                playback_path.and_then(|path| match player::AudioPlayer::prepare(&path) {
-                    Ok(prepared) => Some(prepared),
-                    Err(err) => {
-                        eprintln!("Failed to load the recording for playback: {err}");
-                        None
+                PlaybackLoad::Replace(playback_path.and_then(|path| {
+                    match player::AudioPlayer::prepare(&path) {
+                        Ok(prepared) => Some(prepared),
+                        Err(err) => {
+                            eprintln!("Failed to load the recording for playback: {err}");
+                            None
+                        }
                     }
-                })
+                }))
             };
             // **結果は送るだけ**。Slint のプロパティも `Rc` の共有状態も UI スレッド専有なので、
             // ここからは触れない（受け取って反映するのは tick）。
@@ -1545,7 +1572,7 @@ fn spawn_session_load(
             generation: generation_id,
             segments: Vec::new(),
             summary: None,
-            playback: None,
+            playback: PlaybackLoad::Replace(None),
         });
     }
 }
@@ -1565,8 +1592,20 @@ struct LoadedSession {
     generation: u64,
     segments: Vec<transcript::TranscriptSegment>,
     summary: Option<String>,
-    /// 再生の準備（対象が無い・開けなかったときは `None`）。
-    playback: Option<player::PreparedSource>,
+    /// 再生の準備。**中身だけ読み直したときは触らない**（`Keep`）。
+    playback: PlaybackLoad,
+}
+
+/// 読み込み結果のうち、再生をどう扱うか。
+///
+/// **音声を差し替えてよいのは選択が変わったときだけ**。中身（文字起こし・議事録）が変わって
+/// 読み直しただけのときに差し替えると、`adopt` が前の対象を手放すので**再生中の音が止まって
+/// 先頭へ巻き戻る**。文字起こしの完成は再生しながら待つ場面なので、そこで止まるのは痛い。
+enum PlaybackLoad {
+    /// いま鳴らしているものをそのまま使う（音声ファイルは変わっていない）。
+    Keep,
+    /// 差し替える（`None` は対象が無い・開けなかった）。
+    Replace(Option<player::PreparedSource>),
 }
 
 /// 読み込みの結果を表示へ入れる（**イベントループ上でだけ呼ぶ**）。
@@ -1588,28 +1627,37 @@ fn apply_loaded_session(
     } = loaded;
 
     rec.set_segments(Rc::new(slint::VecModel::from(transcript_rows(&segments))).into());
-    // **ハイライトも戻す**。読み込み中に付いた行番号を引き継ぐと、差し替わった別の内容の
-    // 同じ行番号が光る（選択時にも -1 にしてあるのと対）。
-    rec.set_current_segment(-1);
+    // **選択が変わったときだけハイライトを戻す**。読み込み中に付いた行番号を引き継ぐと、
+    // 差し替わった別の内容の同じ行番号が光る。中身だけ読み直したときは、次の tick が再生位置
+    // から付け直すので触らない（触ると再生中の印が一瞬消える）。
+    if matches!(playback, PlaybackLoad::Replace(_)) {
+        rec.set_current_segment(-1);
+    }
     *segments_cell.borrow_mut() = segments;
     let summary_rows = summary.map(|text| summary_rows(&text)).unwrap_or_default();
     rec.set_summary_rows(Rc::new(slint::VecModel::from(summary_rows)).into());
 
-    let duration = playback.as_ref().and_then(player::PreparedSource::duration);
-    // **開けたかどうかが「再生できる」の答え**。両音源で mix.mp3 が未生成のセッションや、
-    // ファイルを開けなかったセッションはここで `None` になる（選択時にその場でミックスして
-    // UI を固めることはしない）。
-    let playable = playback.is_some();
-    if let Some(prepared) = playback
-        && let Some(p) = player.borrow_mut().as_mut()
-    {
-        p.adopt(prepared);
+    match playback {
+        // 中身だけ読み直した。**再生には触れない**（触ると鳴っている音が止まる。`PlaybackLoad`）。
+        PlaybackLoad::Keep => {}
+        PlaybackLoad::Replace(prepared) => {
+            let duration = prepared.as_ref().and_then(player::PreparedSource::duration);
+            // **開けたかどうかが「再生できる」の答え**。両音源で mix.mp3 が未生成のセッションや、
+            // ファイルを開けなかったセッションはここで `None` になる（選択時にその場でミックス
+            // して UI を固めることはしない）。
+            let playable = prepared.is_some();
+            if let Some(prepared) = prepared
+                && let Some(p) = player.borrow_mut().as_mut()
+            {
+                p.adopt(prepared);
+            }
+            rec.set_playable(playable);
+            apply_playback_position(rec, Duration::ZERO, duration);
+            // 全体長が分からないと比率→秒の換算ができないため、その場合はシークバーを表示専用に
+            // 縮退させる。
+            rec.set_seekable(playable && duration.is_some());
+        }
     }
-    rec.set_playable(playable);
-    apply_playback_position(rec, Duration::ZERO, duration);
-    // 全体長が分からないと比率→秒の換算ができないため、その場合はシークバーを表示専用に
-    // 縮退させる。
-    rec.set_seekable(playable && duration.is_some());
     rec.set_loading(false);
 }
 
@@ -2245,13 +2293,6 @@ fn refresh_detail_summary_status(
 }
 
 /// 選択中セッションの `summary.md` を読み直して Summary タブへ反映する（選択時・生成完了時）。
-/// 欠落・破損・空はいずれも行なしになり、Slint 側が状態依存のラベルへ縮退させる。
-fn refresh_detail_summary_rows(rec: &RecordingsWindow, session_dir: &std::path::Path) {
-    let rows = summarize::load_summary(session_dir)
-        .map(|text| summary_rows(&text))
-        .unwrap_or_default();
-    rec.set_summary_rows(Rc::new(slint::VecModel::from(rows)).into());
-}
 
 /// 保存先パスを画面表示用の文字列に変換する。
 fn recording_dir_text(dir: &std::path::Path) -> slint::SharedString {
@@ -2534,6 +2575,22 @@ mod tests {
 
     use crate::transcribe::TranscribeStatus;
     use std::time::Duration;
+
+    /// 中身を読み直しただけのときは**再生を差し替えない**。
+    ///
+    /// 差し替えると `adopt` が前の対象を手放し、再生中の音が止まって先頭へ巻き戻る。文字起こしの
+    /// 完成は再生しながら待つ場面なので、そこで止まるのは痛い。
+    #[test]
+    fn only_a_new_selection_replaces_playback() {
+        assert!(
+            super::load_replaces_playback(true),
+            "picking another recording swaps the audio"
+        );
+        assert!(
+            !super::load_replaces_playback(false),
+            "a reload after the transcript finished must not stop playback"
+        );
+    }
 
     /// 届いた読み込み結果は**世代が一致するときだけ**表示へ入れる。
     ///
