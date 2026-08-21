@@ -318,10 +318,6 @@ component SeekBar inherits Rectangle {
     }
 }
 
-// トレイの「Recordings…」から開く録音一覧ウィンドウ。**3 つの領域**に分かれる（#128）:
-// 左＝探す（300px 固定）、右＝読む（measure 640px）、下辺＝聴く（72px の常設帯）。
-// 配色・サイズ・淡色はすべて共有の Style トークンから引く（#128 で Palette 依存を外した）
-// （選択行の白文字はアクセント固定背景のため Style.on-accent-foreground）。
 // 読む領域の空表示（#154）。**見出し・理由・次の操作**の 3 段で出す。
 //
 // 短いラベル 1 行に縮退させると「なぜ無いのか・どうすれば出るのか」が画面から分からない。
@@ -363,6 +359,7 @@ component EmptyState inherits Rectangle {
             spacing: 10px;
             for item in root.actions: ActionButton {
                 text: item.label;
+                // 主操作は枠つきの既定、補助は控えめ（役割の意味は `ui/controls.slint`）。
                 role: item.primary ? ButtonRole.plain : ButtonRole.quiet;
                 clicked => {
                     root.action(item.kind);
@@ -499,6 +496,10 @@ component TranscriptList inherits Rectangle {
     }
 }
 
+// トレイの「Recordings…」から開く録音一覧ウィンドウ。**3 つの領域**に分かれる（#128）:
+// 左＝探す（300px 固定）、右＝読む（measure 640px）、下辺＝聴く（72px の常設帯）。
+// 配色・サイズ・淡色はすべて共有の Style トークンから引く（#128 で Palette 依存を外した）
+// （選択行の白文字はアクセント固定背景のため Style.on-accent-foreground）。
 export component RecordingsWindow inherits Window {
     title: "Recordings";
     // 幅・高さは src/main.rs の RECORDINGS_WIDTH/HEIGHT と一致させること（片方だけ変えない）。
@@ -529,10 +530,8 @@ export component RecordingsWindow inherits Window {
     // 選択中セッションの文字起こし状態。状態テキストの失敗色の分岐と、実行中判定の導出に
     // 使う（Rust 側が detail-transcript-text と同時に更新する）。
     in property <TranscriptStatus> detail-transcript-status;
-    // Transcript セクションの縮退表示（セグメントが無いとき）のラベル。状態→文言の対応表は
-    // Rust 側（transcript_placeholder_text）に集約し、ここでは表示するだけ。
-    // 読む領域（Transcript タブ）の空表示（#154）。見出し・理由・次の操作を Rust が
-    // 状態から組み立てて渡す（`main::transcript_pane`）。
+    // 読む領域（Transcript タブ）の空表示（#154。セグメントが無いときに出す）。見出し・理由・
+    // 次の操作を Rust が状態から組み立てて渡す（`main::transcript_pane`）。
     in property <string> detail-transcript-heading;
     in property <string> detail-transcript-body;
     in property <[PaneAction]> detail-transcript-actions;
@@ -545,9 +544,7 @@ export component RecordingsWindow inherits Window {
     // 議事録要約の状態。状態テキストの失敗色の分岐と、生成中判定の導出に使う
     // （Rust 側が detail-summary-status-text と同時に更新する）。
     in property <SummaryStatus> detail-summary-status;
-    // Notes タブの縮退表示（行が無いとき）のラベル。状態→文言の対応表は Rust 側
-    // （summary_placeholder_text）に集約し、ここでは表示するだけ。
-    // 読む領域（Notes タブ）の空表示（#154。`main::summary_pane`）。
+    // 読む領域（Notes タブ）の空表示（#154。行が無いときに出す。`main::summary_pane`）。
     in property <string> detail-summary-heading;
     in property <string> detail-summary-body;
     in property <[PaneAction]> detail-summary-actions;
@@ -576,7 +573,7 @@ export component RecordingsWindow inherits Window {
     // 現在の再生位置に対応するセグメントの index（ハイライト対象。-1 は該当なし）。
     in property <int> current-segment: -1;
     // 再生位置をスクロールで追うか（#154）。**UI が持つ表示の好み**なので設定には保存しない。
-    // 既定は ON。印は追従と無関係に常に付く（切り替えるのは「追うかどうか」だけ）。
+    // 既定は ON。切り替えが何に効くかは `TranscriptList.follow` の doc が正。
     in-out property <bool> follow-transcript: true;
     // 選択セッションが再生可能か（両音源は mix.mp3 生成済み、単一音源は常に可）。false なら
     // 再生ボタンを無効化する。
@@ -620,10 +617,10 @@ export component RecordingsWindow inherits Window {
     // 「Cancel」押下（キュー待ちの間だけ出る）。積んだ要約ジョブを取り消す。
     callback cancel-summary(int);
     // 確認モーダルの Delete 押下。選択中セッションをゴミ箱へ移動する（インデックスを渡す）。
+    callback delete-session(int);
     // 読む領域の空表示から起こす操作（#154）。どれを出すかは Rust が状態から決めるので、
     // ここは押されたものを返すだけ。
     callback pane-action(PaneActionKind);
-    callback delete-session(int);
 
     VerticalLayout {
         // 「探す・読む」を上に、「聴く」を下の常設帯に置く（デザインの 3 領域）。
@@ -1011,32 +1008,32 @@ export component RecordingsWindow inherits Window {
                                         if root.summary-rows.length > 0: VerticalLayout {
                                             spacing: 8px;
                                             ListView {
-                                            vertical-stretch: 1;
-                                            for row in root.summary-rows: Rectangle {
-                                                // ListView の行は自身の高さを明示する（word-wrap する
-                                                // 本文の実高さに追従させる）。
-                                                height: summary-row-content.preferred-height;
-                                                summary-row-content := VerticalLayout {
-                                                    padding-left: 2px;
-                                                    padding-right: 6px;
-                                                    // 見出しは上に余白を置いて段落の切れ目を作る
-                                                    // （記号を落としているぶん、間隔で構造を見せる）。
-                                                    padding-top: row.is-heading ? 8px : 2px;
-                                                    padding-bottom: 2px;
-                                                    Text {
-                                                        text: row.text;
-                                                        wrap: word-wrap;
-                                                        // 見出しはサイズを上げず太さだけで差を付ける
-                                                        // （`heading-size` は本文より小さいので、
-                                                        // 使うと見出しと本文のサイズが逆転する）。
-                                                        font-size: Style.body-size;
-                                                        font-weight: row.is-heading
-                                                            ? Style.semibold
-                                                            : Style.regular;
-                                                        color: Style.ink;
+                                                vertical-stretch: 1;
+                                                for row in root.summary-rows: Rectangle {
+                                                    // ListView の行は自身の高さを明示する（word-wrap する
+                                                    // 本文の実高さに追従させる）。
+                                                    height: summary-row-content.preferred-height;
+                                                    summary-row-content := VerticalLayout {
+                                                        padding-left: 2px;
+                                                        padding-right: 6px;
+                                                        // 見出しは上に余白を置いて段落の切れ目を作る
+                                                        // （記号を落としているぶん、間隔で構造を見せる）。
+                                                        padding-top: row.is-heading ? 8px : 2px;
+                                                        padding-bottom: 2px;
+                                                        Text {
+                                                            text: row.text;
+                                                            wrap: word-wrap;
+                                                            // 見出しはサイズを上げず太さだけで差を付ける
+                                                            // （`heading-size` は本文より小さいので、
+                                                            // 使うと見出しと本文のサイズが逆転する）。
+                                                            font-size: Style.body-size;
+                                                            font-weight: row.is-heading
+                                                                ? Style.semibold
+                                                                : Style.regular;
+                                                            color: Style.ink;
+                                                        }
                                                     }
                                                 }
-                                            }
                                             }
 
                                             if root.detail-summary-footer != "": Text {

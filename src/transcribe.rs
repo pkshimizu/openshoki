@@ -148,6 +148,11 @@ impl ProgressSink {
     ///
     /// **進行中のエントリにしか書かない**。完了・失敗が先に書かれた後で遅れて届いた進捗が
     /// 状態を巻き戻さないようにする（whisper のコールバックは推論スレッドから来る）。
+    ///
+    /// **ここでパニックしない**こと。呼び出し元は whisper.cpp の C フレームで、whisper-rs の
+    /// トランポリンは `catch_unwind` を挟まない——巻き戻しが FFI 境界を越えると未定義動作に
+    /// なる。いま安全なのは、ロックが poison を吸収し、`total == 0` を先に弾き、`as` が
+    /// 飽和キャストだから。`expect` や添字アクセスを足さないこと（`docs/rules/ffi.md`）。
     fn report(&self, file_percent: i32) {
         if self.total == 0 {
             return;
@@ -311,7 +316,12 @@ impl TranscribeWorker {
     /// セッションの進行状況。マップに載っていなければ `None`（表示側が JSON の有無で
     /// 「文字起こし前/完了」を解決する）。
     pub fn status_of(&self, session_dir: &Path) -> Option<TranscribeStatus> {
-        self.state_of(session_dir).map(|state| state.status)
+        // **`state_of` へ委譲しない**。これは一覧の全行が毎 tick 呼ぶ経路で、状態 1 つを読むのに
+        // `model_label` と `reason` の確保を払うことになる。同じ 1 エントリを読むので、
+        // 委譲しなくても状態と説明は食い違わない。
+        lock_status(&self.status)
+            .get(session_dir)
+            .map(|state| state.status)
     }
 
     /// セッションの進行状況と、読む領域に出す中身（モデル名・進捗・失敗の理由）。
@@ -500,6 +510,10 @@ fn transcribe_file(
     params.set_translate(false);
     // 読む領域に割合を出すため、whisper の進捗を状態マップへ流す（#154）。コールバックは推論
     // スレッドから来るので、`ProgressSink` 側で「進行中のエントリにだけ書く」ことを守る。
+    //
+    // **このクロージャは解放されない**（whisper-rs 0.16 は `Box::into_raw` で C 側へ預けたきり、
+    // 落とす持ち主を持たない）。音源 1 本につき数十バイトずつ積むので、重いものや機微なものを
+    // 捕まえないこと。クレートを上げるときに直っているか確かめる。
     params.set_progress_callback_safe(move |percent| progress.report(percent));
     // 言語は設定 TOML（手編集されうる信頼境界外）由来。whisper-rs の set_language は NUL バイトを
     // 含む文字列で panic するため（内部の CString::new が expect）、ここで弾いて whisper の既定

@@ -360,24 +360,16 @@ impl SummarizeWorker {
             let seq = queue.next_seq();
             // 生成中のセッションへ積み直したときは、**走っているジョブの表示をそのまま引き継ぐ**
             // （下げない理由は上の doc）。開始時刻も引き継がないと経過が 0 に戻る。
+            // 走っているジョブの表示は**まるごと**引き継ぐ。モデル名だけ新しいジョブのものに
+            // すると、「動いていないモデルが、動いているジョブの経過つきで」出る。
             let running = match queue.status.get(&job.session_dir) {
-                Some((
-                    _,
-                    SummarizeEntry {
-                        status: SummarizeStatus::Summarizing,
-                        started,
-                        ..
-                    },
-                )) => Some(*started),
+                Some((_, entry)) if entry.status == SummarizeStatus::Summarizing => {
+                    Some(entry.clone())
+                }
                 _ => None,
             };
             let shown = match running {
-                Some(started) => SummarizeEntry {
-                    status: SummarizeStatus::Summarizing,
-                    model_label: job_model_label(&job),
-                    started,
-                    reason: None,
-                },
+                Some(entry) => entry,
                 None => SummarizeEntry {
                     status: SummarizeStatus::Queued,
                     model_label: job_model_label(&job),
@@ -404,7 +396,12 @@ impl SummarizeWorker {
     /// （表示側が `summary.md` の有無で「未生成/生成済み」を解決する。
     /// `main::summary_display_status`）。
     pub fn status_of(&self, session_dir: &Path) -> Option<SummarizeStatus> {
-        self.state_of(session_dir).map(|state| state.status)
+        // **`state_of` へ委譲しない**（理由は `TranscribeWorker::status_of`）。こちらは
+        // 委譲すると、状態 1 つを読むのに `queued_position` のマップ全走査まで付いてくる。
+        lock_queue(&self.queue)
+            .status
+            .get(session_dir)
+            .map(|(_, entry)| entry.status)
     }
 
     /// セッションの進行状況と、読む領域に出す中身（モデル名・順番・経過・失敗の理由）。
@@ -572,10 +569,10 @@ fn lock_queue(queue: &Mutex<QueueState>) -> MutexGuard<'_, QueueState> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// 1 ジョブの処理結果（状態マップへの反映用）。
 /// ワーカースレッドがパニックしたときに読む領域へ出す理由（`crate::transcribe` と同じ流儀）。
 const PANIC_REASON: &str = "Writing notes stopped unexpectedly.";
 
+/// 1 ジョブの処理結果（状態マップへの反映用）。
 enum JobOutcome {
     /// `summary.md` を保存した。
     Done,

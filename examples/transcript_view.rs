@@ -3,16 +3,18 @@
 //! 実行: `cargo run --example transcript_view [引数...]` → screencapture で目視確認。
 //!
 //! 引数（順不同・組み合わせ可）:
-//! - 数値: セグメント件数（0 で Transcript の縮退表示。既定は `DEFAULT_SEGMENT_COUNT`）
+//! - 数値: セグメント件数（0 で Transcript の空表示。既定は `DEFAULT_SEGMENT_COUNT`）
 //! - `modal`: 削除確認モーダルを重ねた状態
 //! - `no-seek`: シークバーを表示専用へ縮退させた状態（再生不可・全体長不明のセッション相当）
 //! - `summary`: Summary タブを開いた状態（議事録の見出し強調・折り返しの確認）
 //! - `queued` / `summarizing` / `summary-failed`: Summary タブを開き、キュー待ち／生成中／
-//!   失敗の状態にした状態（状態行の色・縮退ラベル・状態行の隣に出る取り消しの確認）
-//! - `no-transcript`: 文字起こしも議事録も無いセッション（両タブの縮退表示・Summarize の無効化）。
+//!   失敗の状態にした状態（状態行の色・空表示の 3 段・状態行の隣に出る取り消しの確認）
+//! - `no-transcript`: 文字起こしも議事録も無いセッション（両タブの空表示・Summarize の無効化）。
 //!   要約は入力が無いので、上の要約状態の指定より優先される
-//! - `transcribing` / `transcript-failed`: Transcript タブの空表示を実行中／失敗にする
-//!   （見出し・理由・操作の 3 段と、最長の理由の折り返しの確認。件数 0 と組み合わせる）
+//! - `transcribing` / `transcript-failed` / `transcript-unreadable`: Transcript タブの空表示を
+//!   実行中／失敗／JSON が読めなかった状態にする（見出し・理由・操作の 3 段と、最長の理由の
+//!   折り返しの確認。件数 0 と組み合わせる）
+//! - `auto-on`: 未実施の理由を「自動は ON だがまだ回っていない」にする（両タブ）
 //! - `no-follow`: 再生位置の追従を OFF にした状態（プレイヤー帯のスイッチの確認）
 //! - `far`: 再生位置を一覧の末尾寄りに置く（追従でその行が見えているかの確認。`no-follow`
 //!   と組み合わせると先頭のままになる）。**スナップショットは表示後の更新を反映しない**ので、
@@ -36,12 +38,12 @@ fn flag(name: &str) -> bool {
 /// 引数で件数を指定しなかったときのセグメント件数。
 const DEFAULT_SEGMENT_COUNT: usize = 30;
 
-/// 生成中のラベル。状態テキストと縮退ラベルで同じ文言を使うため 1 箇所に置く
+/// 生成中のラベル。状態テキストと空表示の見出しで同じ文言を使うため 1 箇所に置く
 /// （`src/main.rs` の `SUMMARIZING_LABEL` の複製。あちらを変えたらここも合わせること）。
 const SUMMARIZING_LABEL: &str = "Writing notes…";
 
 /// キュー待ちのラベル（同上。`src/main.rs` の複製。状態行と空表示で同じ文言）。
-const SUMMARY_QUEUED_LABEL: &str = "Waiting to summarize…";
+const SUMMARY_QUEUED_LABEL: &str = "Waiting to write notes…";
 
 /// 空表示のボタン列を Slint のモデルにする。
 fn pane_actions(actions: Vec<(&str, PaneActionKind, bool)>) -> ModelRc<PaneAction> {
@@ -69,6 +71,22 @@ fn transcript_empty_state() -> (
             "Transcribing — 48%",
             "Medium is running on this Mac. Finished lines appear here as they are recognized.",
             Vec::new(),
+        );
+    }
+    if flag("transcript-unreadable") {
+        // JSON が読めなかった経路（状態は Done のままセグメントだけ空になる）。
+        return (
+            "No transcript to show",
+            "The transcript file is missing or could not be read. Transcribing again will \
+             rebuild it.",
+            vec![("Transcribe again", PaneActionKind::Transcribe, true)],
+        );
+    }
+    if flag("auto-on") {
+        return (
+            "No transcript yet",
+            "Automatic transcription is on, but this recording has not been through it.",
+            vec![("Transcribe now", PaneActionKind::Transcribe, true)],
         );
     }
     if flag("transcript-failed") {
@@ -130,10 +148,21 @@ fn summary_empty_state(
              now — closing other apps, or choosing a smaller model, can let it run.",
             vec![
                 ("Try again", PaneActionKind::WriteNotes, true),
-                ("Open Meeting notes", PaneActionKind::OpenNotes, false),
+                ("Open meeting notes", PaneActionKind::OpenNotes, false),
             ],
         ),
-        SummaryStatus::NotSummarized | SummaryStatus::Done => (
+        // `summary.md` が読めなかった経路（状態は Done のまま行だけ空になる）。
+        SummaryStatus::Done => (
+            "No notes to show",
+            "The notes file is missing or could not be read. Writing them again will rebuild it.",
+            vec![("Write notes again", PaneActionKind::WriteNotes, true)],
+        ),
+        SummaryStatus::NotSummarized if flag("auto-on") => (
+            "No notes yet",
+            "Automatic notes are on, but this recording has not been through them.",
+            vec![("Write notes", PaneActionKind::WriteNotes, true)],
+        ),
+        SummaryStatus::NotSummarized => (
             "No notes yet",
             "Notes are not written automatically, so this recording does not have any.",
             vec![("Write notes", PaneActionKind::WriteNotes, true)],
@@ -273,7 +302,7 @@ fn main() {
         });
     }
 
-    // 議事録の状態を引数で選べるようにする（状態行の色・縮退ラベル・取り消しの確認用）。
+    // 議事録の状態を引数で選べるようにする（状態行の色・空表示・取り消しの確認用）。
     let summary_status = if !has_transcript {
         SummaryStatus::NotSummarized
     } else if flag("queued") {
@@ -301,7 +330,7 @@ fn main() {
     win.set_detail_summary_body(body.into());
     win.set_detail_summary_actions(pane_actions(actions));
     win.set_detail_summary_footer("Written from the transcript · Aug 9, 2026 · 09:14".into());
-    // 生成済みのときだけ行を入れる（生成中・失敗は旧議事録が無い状態＝縮退表示を見る）。
+    // 生成済みのときだけ行を入れる（生成中・失敗は旧議事録が無い状態＝空表示を見る）。
     if summary_status == SummaryStatus::Done {
         win.set_summary_rows(ModelRc::from(Rc::new(
             VecModel::from(sample_summary_rows()),
