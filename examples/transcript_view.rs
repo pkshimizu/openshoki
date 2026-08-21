@@ -137,6 +137,10 @@ fn main() {
     // 入力にするので、文字起こしが無いセッションには議事録も無い）。状態の文言は `src/main.rs` の
     // transcript_* / summary_* の対応表の複製（bin クレートなので import できない。あちらを
     // 変えたらここも合わせること）。
+    // 読み込み中の表示（#152）。選んだ直後は中身が空で、その間もウィンドウは操作できる。
+    if flag("loading") {
+        win.set_loading(true);
+    }
     let has_transcript = !flag("no-transcript");
     win.set_has_transcript(has_transcript);
     win.set_detail_transcript_status(if has_transcript {

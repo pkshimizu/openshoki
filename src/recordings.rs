@@ -150,11 +150,6 @@ impl RecordingSession {
         }
     }
 
-    /// 再生できるか（再生対象ファイルが定まるか）。両音源で `mix.mp3` 未生成のときは false。
-    pub fn is_playable(&self) -> bool {
-        self.playback_path().is_some()
-    }
-
     /// 文字起こしの対象となる音源ファイル（存在する `mic.mp3` / `system.mp3`）。
     /// 手動再実行（Recordings ウィンドウの Transcribe ボタン）の投入対象に使う。
     pub fn audio_source_paths(&self) -> Vec<PathBuf> {
@@ -585,16 +580,16 @@ mod tests {
             sessions[0].playback_path(),
             Some(root.join("20260628-143025").join("mix.mp3"))
         );
-        assert!(sessions[0].is_playable());
+        assert!(sessions[0].playback_path().is_some());
         // 両音源で mix が無ければ再生不可（選択時にその場ミックスはしない）。
         assert_eq!(sessions[1].playback_path(), None);
-        assert!(!sessions[1].is_playable());
+        assert!(sessions[1].playback_path().is_none());
         // 単一音源はその音源ファイルを直接再生する。
         assert_eq!(
             sessions[2].playback_path(),
             Some(root.join("20260627-164200").join("mic.mp3"))
         );
-        assert!(sessions[2].is_playable());
+        assert!(sessions[2].playback_path().is_some());
 
         let _ = fs::remove_dir_all(&root);
     }
