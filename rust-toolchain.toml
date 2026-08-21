@@ -9,16 +9,22 @@
 #
 # ## 上げ方
 #
-# 1. `rustup check` で最新の安定版を確認する
+# 1. 最新の安定版を調べる。`rustup update stable`（未導入なら `rustup toolchain install stable`）
+#    してから `rustup run stable rustc --version`。ここで固定しているのは具体的な版なので、
+#    `rustup check` の一覧には出てこない
 # 2. 下の `channel` をその版へ書き換える
-# 3. `cargo clippy --all-targets -- -D warnings` を通す（新しい lint が出ることがある。
-#    差分ビルドでは見逃すので、`touch src/*.rs src/windows/*.rs` してから回す。
-#    `docs/rules/testing.md`）
+# 3. `docs/rules/coding-conventions.md` の検証コマンド一式を通す。新しい lint や rustfmt の
+#    出力変化で落ちることがあり、CI は fmt から順に回るので clippy だけでは足りない。
+#    バージョンが変われば全体が解析し直されるので、そのまま流せばよい
 # 4. 上げたこと自体を 1 コミットにする（他の変更と混ぜると、lint 対応の差分が読めなくなる）
 #
-# 上げる頻度は決めていない。落ちてから上げるのではなく、**新機能や lint が要るときに上げる**。
+# 固定した以上、放っておいて CI が落ちることはない。上げるのは**必要になったとき**——使いたい
+# 言語機能があるとき、依存が新しい版を要求するとき、取り込みたい lint があるとき。
 [toolchain]
+# `.github/workflows/ci.yml` が実際の `rustc --version` と突き合わせるので、`stable` のような
+# チャンネル名ではなく**具体的な版**で書くこと。下限は 1.85（edition 2024 を使っているため。
+# `docs/` はリポジトリに含まれないので、この線はここに残す）。
 channel = "1.98.0"
-# CI がこの 2 つを使う（`cargo fmt --check` / `cargo clippy`）。ここに書いておけば、
-# ワークフロー側で `components:` を指定しなくてよい。
+# 手元でも CI でも `cargo fmt --check` / `cargo clippy` を通す（`docs/rules/coding-conventions.md`
+# の検証コマンド）。ここに書いておけば、ワークフロー側で `components:` を指定しなくてよい。
 components = ["rustfmt", "clippy"]
