@@ -23,6 +23,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Instant;
 
 use crate::transcript::TranscriptSegment;
 
@@ -139,16 +140,57 @@ struct QueuedJob {
 /// 別々のカウンタにするとその制約がコメントでしか守られないので、型で 1 つにしている。
 struct QueueState {
     /// セッションディレクトリ → そのセッションで**最後に投入したジョブ**の通番と進行状況。
-    status: HashMap<PathBuf, (u64, SummarizeStatus)>,
+    status: HashMap<PathBuf, (u64, SummarizeEntry)>,
     /// 次に配る投入通番。**セッションではなくジョブを識別する**ので、同じセッションを
     /// 積み直しても別の値になり、取り消しが他のジョブを巻き添えにしない。
     next_seq: u64,
+}
+
+/// キューに載っている 1 ジョブの状態と、**読む領域に出す中身**（#154）。
+///
+/// 状態と説明を 1 つの値にまとめる理由は `crate::transcribe::TranscribeState` と同じ
+/// （別々に持つと、片方だけ更新した瞬間にありえない組み合わせができる）。
+#[derive(Debug, Clone)]
+struct SummarizeEntry {
+    status: SummarizeStatus,
+    /// 使う LLM の表示名（**ジョブ投入時のスナップショット**）。
+    model_label: String,
+    /// 生成を始めた時刻（`Summarizing` のときだけ）。読む領域に経過を出すのに使う。
+    started: Option<Instant>,
+    /// 失敗した理由（`Failed` のときだけ）。**パスを含めない**（`docs/rules/security.md`）。
+    reason: Option<String>,
+}
+
+/// 読む領域が読む、セッション 1 件分の要約の状態。`SummarizeEntry` から組み立てる
+/// （順番・経過はマップ全体を見ないと出せないので、読み出しのたびに計算する）。
+#[derive(Debug, Clone)]
+pub struct SummarizeState {
+    pub status: SummarizeStatus,
+    pub model_label: String,
+    /// キュー待ちの順番（1 始まり。`Queued` のときだけ）。**保存せず読み出し時に数える**——
+    /// 前のジョブが終われば順番は繰り上がるので、投入時に固定すると嘘になる。
+    pub queue_position: Option<usize>,
+    /// 生成を始めてからの経過（`Summarizing` のときだけ）。
+    pub elapsed: Option<std::time::Duration>,
+    pub reason: Option<String>,
 }
 
 impl QueueState {
     /// この通番のジョブが、そのセッションの「いま有効なジョブ」か。
     fn is_current(&self, session_dir: &Path, seq: u64) -> bool {
         self.status.get(session_dir).map(|(latest, _)| *latest) == Some(seq)
+    }
+
+    /// この通番のキュー待ちジョブが、キュー待ちの中で何番目か（1 始まり）。
+    ///
+    /// **走り出しているジョブは数えない**。数えると「1 番目なのに始まらない」になる
+    /// （先頭は既に生成中で、待っている側から見た順番ではない）。
+    fn queued_position(&self, seq: u64) -> usize {
+        self.status
+            .values()
+            .filter(|(other, entry)| entry.status == SummarizeStatus::Queued && *other < seq)
+            .count()
+            + 1
     }
 
     /// 通番を 1 つ配る（ロックの中でしか呼べないので、採番順とマップの登録順がずれない）。
@@ -204,6 +246,7 @@ impl SummarizeWorker {
             .spawn(move || {
                 // 送信側（アプリ本体）が落ちてチャネルが閉じたら自然に終了する。
                 while let Ok(QueuedJob { seq, job }) = rx.recv() {
+                    let model_label = job_model_label(&job);
                     // **走らせてよいかの判定と「生成中」への遷移は 1 つのクリティカル
                     // セクションで行う**（別々にすると、その隙間に入った `cancel` が
                     // 「取り消せた」と答えたあとでジョブが走り出す）。マップに自分の通番が
@@ -213,7 +256,15 @@ impl SummarizeWorker {
                         if queue.is_current(&job.session_dir, seq) {
                             queue.status.insert(
                                 job.session_dir.clone(),
-                                (seq, SummarizeStatus::Summarizing),
+                                (
+                                    seq,
+                                    SummarizeEntry {
+                                        status: SummarizeStatus::Summarizing,
+                                        model_label: model_label.clone(),
+                                        started: Some(Instant::now()),
+                                        reason: None,
+                                    },
+                                ),
                             );
                             true
                         } else {
@@ -240,7 +291,7 @@ impl SummarizeWorker {
                                 );
                                 // 古い議事録の後始末は `run_job` の失敗経路と同じにする
                                 // （パニックでも「古い議事録を残さない」を守る）。
-                                failed(&job, &job.session_dir.join(SUMMARY_FILENAME))
+                                failed(&job, &job.session_dir.join(SUMMARY_FILENAME), PANIC_REASON)
                             }
                         };
                     let mut queue = lock_queue(&queue_for_worker);
@@ -250,16 +301,30 @@ impl SummarizeWorker {
                         demote_superseded(&mut queue, &job.session_dir);
                         continue;
                     }
+                    let finished = |status, reason| SummarizeEntry {
+                        status,
+                        model_label,
+                        started: None,
+                        reason,
+                    };
                     match outcome {
                         // 対象なしで何もしなかった場合は「投入済み」の痕跡を消す。
-                        JobOutcome::Skipped => queue.status.remove(&job.session_dir),
-                        JobOutcome::Done => queue
-                            .status
-                            .insert(job.session_dir, (seq, SummarizeStatus::Done)),
-                        JobOutcome::Failed => queue
-                            .status
-                            .insert(job.session_dir, (seq, SummarizeStatus::Failed)),
-                    };
+                        JobOutcome::Skipped => {
+                            queue.status.remove(&job.session_dir);
+                        }
+                        JobOutcome::Done => {
+                            queue.status.insert(
+                                job.session_dir,
+                                (seq, finished(SummarizeStatus::Done, None)),
+                            );
+                        }
+                        JobOutcome::Failed(reason) => {
+                            queue.status.insert(
+                                job.session_dir,
+                                (seq, finished(SummarizeStatus::Failed, Some(reason))),
+                            );
+                        }
+                    }
                 }
             });
         // 差分はワーカーが立ったか（= 送信口を持つか）だけ。`Self { .. }` を 2 回書くと、
@@ -293,14 +358,32 @@ impl SummarizeWorker {
         let seq = {
             let mut queue = lock_queue(&self.queue);
             let seq = queue.next_seq();
-            let running = matches!(
-                queue.status.get(&job.session_dir),
-                Some((_, SummarizeStatus::Summarizing))
-            );
-            let shown = if running {
-                SummarizeStatus::Summarizing
-            } else {
-                SummarizeStatus::Queued
+            // 生成中のセッションへ積み直したときは、**走っているジョブの表示をそのまま引き継ぐ**
+            // （下げない理由は上の doc）。開始時刻も引き継がないと経過が 0 に戻る。
+            let running = match queue.status.get(&job.session_dir) {
+                Some((
+                    _,
+                    SummarizeEntry {
+                        status: SummarizeStatus::Summarizing,
+                        started,
+                        ..
+                    },
+                )) => Some(*started),
+                _ => None,
+            };
+            let shown = match running {
+                Some(started) => SummarizeEntry {
+                    status: SummarizeStatus::Summarizing,
+                    model_label: job_model_label(&job),
+                    started,
+                    reason: None,
+                },
+                None => SummarizeEntry {
+                    status: SummarizeStatus::Queued,
+                    model_label: job_model_label(&job),
+                    started: None,
+                    reason: None,
+                },
             };
             queue.status.insert(job.session_dir.clone(), (seq, shown));
             seq
@@ -321,10 +404,22 @@ impl SummarizeWorker {
     /// （表示側が `summary.md` の有無で「未生成/生成済み」を解決する。
     /// `main::summary_display_status`）。
     pub fn status_of(&self, session_dir: &Path) -> Option<SummarizeStatus> {
-        lock_queue(&self.queue)
-            .status
-            .get(session_dir)
-            .map(|(_, status)| *status)
+        self.state_of(session_dir).map(|state| state.status)
+    }
+
+    /// セッションの進行状況と、読む領域に出す中身（モデル名・順番・経過・失敗の理由）。
+    /// **`status_of` はこれの一部**なので、状態と説明が食い違わない。
+    pub fn state_of(&self, session_dir: &Path) -> Option<SummarizeState> {
+        let queue = lock_queue(&self.queue);
+        let (seq, entry) = queue.status.get(session_dir)?;
+        Some(SummarizeState {
+            status: entry.status,
+            model_label: entry.model_label.clone(),
+            queue_position: (entry.status == SummarizeStatus::Queued)
+                .then(|| queue.queued_position(*seq)),
+            elapsed: entry.started.map(|started| started.elapsed()),
+            reason: entry.reason.clone(),
+        })
     }
 
     /// キュー待ちのジョブを取り消す（取り消せたら `true`）。
@@ -353,9 +448,9 @@ impl SummarizeWorker {
     #[must_use]
     pub fn cancel_queued(&self, session_dir: &Path) -> CancelOutcome {
         let mut queue = lock_queue(&self.queue);
-        match queue.status.get(session_dir) {
-            Some((_, SummarizeStatus::Summarizing)) => CancelOutcome::Running,
-            Some((_, SummarizeStatus::Queued)) => {
+        match queue.status.get(session_dir).map(|(_, entry)| entry.status) {
+            Some(SummarizeStatus::Summarizing) => CancelOutcome::Running,
+            Some(SummarizeStatus::Queued) => {
                 queue.status.remove(session_dir);
                 CancelOutcome::Cancelled
             }
@@ -373,7 +468,7 @@ impl SummarizeWorker {
         lock_queue(&self.queue)
             .status
             .values()
-            .any(|(_, status)| counts_as_pending(*status))
+            .any(|(_, entry)| counts_as_pending(entry.status))
     }
 
     /// セッションの進行状況の記録を破棄する（セッション削除時の掃除）。未登録なら何もしない。
@@ -461,8 +556,11 @@ fn load_summary_limited(session_dir: &Path, max_bytes: u64) -> Option<String> {
 ///
 /// 取り消し済み・削除済み（エントリが無い）セッションを復活させないよう、在るときだけ触る。
 fn demote_superseded(queue: &mut QueueState, session_dir: &Path) {
-    if let Some((_, status @ SummarizeStatus::Summarizing)) = queue.status.get_mut(session_dir) {
-        *status = SummarizeStatus::Queued;
+    if let Some((_, entry)) = queue.status.get_mut(session_dir)
+        && entry.status == SummarizeStatus::Summarizing
+    {
+        entry.status = SummarizeStatus::Queued;
+        entry.started = None;
     }
 }
 
@@ -475,11 +573,15 @@ fn lock_queue(queue: &Mutex<QueueState>) -> MutexGuard<'_, QueueState> {
 }
 
 /// 1 ジョブの処理結果（状態マップへの反映用）。
+/// ワーカースレッドがパニックしたときに読む領域へ出す理由（`crate::transcribe` と同じ流儀）。
+const PANIC_REASON: &str = "Writing notes stopped unexpectedly.";
+
 enum JobOutcome {
     /// `summary.md` を保存した。
     Done,
-    /// 生成・保存に失敗した（モデル準備の失敗を含む）。
-    Failed,
+    /// 生成・保存に失敗した（モデル準備の失敗を含む）。**理由は読む領域にそのまま出る**ので、
+    /// パスを含めず 1 文で書く（`docs/rules/messages.md` / `docs/rules/security.md`）。
+    Failed(String),
     /// 対象なしで何もしなかった（文字起こしが無い・空）。
     Skipped,
 }
@@ -507,7 +609,7 @@ fn run_job(
     let generated = match job.engine {
         SummaryEngine::OnDevice => {
             let Some(model_path) = resolve_model(job, downloader) else {
-                return failed(job, &path);
+                return failed(job, &path, "The meeting notes model could not be prepared.");
             };
             // ここから先が重い区間。文字起こしと同時に走らせない（`crate::inference_slot`）。
             // モデルの準備（ダウンロード）はスロットの外で済ませてある。
@@ -519,7 +621,14 @@ fn run_job(
         Ok(text) => text,
         Err(err) => {
             eprintln!("Skipping summarization because generating the summary failed: {err}");
-            return failed(job, &path);
+            // **なぜ落ちたかは分からない**（llama.cpp の失敗は理由を返さないことが多い）ので、
+            // 断定せずに「いちばんよくある原因」と、そこから取れる手を添える。
+            return failed(
+                job,
+                &path,
+                "The model could not finish. It may need more free memory than this Mac has \
+                 right now — closing other apps, or choosing a smaller model, can let it run.",
+            );
         }
     };
     // 空（または空白だけ）の生成結果は失敗として扱う。空ファイルを置くと、表示側が
@@ -527,7 +636,7 @@ fn run_job(
     let generated = generated.trim();
     if generated.is_empty() {
         eprintln!("Skipping summarization because the model produced no text");
-        return failed(job, &path);
+        return failed(job, &path, "The model returned nothing to write.");
     }
 
     match write_summary(&path, generated) {
@@ -539,7 +648,7 @@ fn run_job(
         }
         Err(err) => {
             eprintln!("Skipping summarization because writing the summary failed: {err}");
-            failed(job, &path)
+            failed(job, &path, "The notes could not be saved.")
         }
     }
 }
@@ -549,11 +658,11 @@ fn run_job(
 /// `write_summary` が原子的に置き換えるので、失敗した時点で既にある `summary.md` は手つかず。
 /// **それが古いと分かっているジョブ（`existing_is_stale`）だけ消す**（判断の理由はその
 /// フィールドの doc）。
-fn failed(job: &SummarizeJob, path: &Path) -> JobOutcome {
+fn failed(job: &SummarizeJob, path: &Path, reason: &str) -> JobOutcome {
     if job.existing_is_stale {
         remove_stale_summary(path);
     }
-    JobOutcome::Failed
+    JobOutcome::Failed(reason.to_owned())
 }
 
 /// 古い（＝ひとつ前の文字起こしから作った）議事録を消す。無ければ何もしない。
@@ -563,6 +672,20 @@ fn remove_stale_summary(path: &Path) {
         && err.kind() != std::io::ErrorKind::NotFound
     {
         eprintln!("Could not remove the stale meeting summary after a failed run: {err}");
+    }
+}
+
+/// ジョブが使う LLM の表示名。上書き指定は**ファイル名だけ**にする（読む領域にそのまま出るので、
+/// パスを漏らさない。`docs/rules/security.md`）。
+fn job_model_label(job: &SummarizeJob) -> String {
+    match &job.model_override {
+        Some(path) => path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Custom model".to_owned()),
+        None => crate::summary_model::spec_or_default(&job.model_id)
+            .display_name
+            .to_owned(),
     }
 }
 
@@ -1576,9 +1699,18 @@ mod tests {
         // 「生成中に積み直された」状態を作る（`submit` が走行中に行うのと同じ書き込み）。
         // チャネルには流さないので、この通番のジョブは永遠に取り出されず、書き戻し後の
         // 表示が固定される。
-        lock_queue(&worker.queue)
-            .status
-            .insert(superseded.clone(), (u64::MAX, SummarizeStatus::Summarizing));
+        lock_queue(&worker.queue).status.insert(
+            superseded.clone(),
+            (
+                u64::MAX,
+                SummarizeEntry {
+                    status: SummarizeStatus::Summarizing,
+                    model_label: "Qwen2.5 3B Instruct".to_owned(),
+                    started: Some(Instant::now()),
+                    reason: None,
+                },
+            ),
+        );
 
         worker.submit(job(&sentinel, false));
         drop(held);
@@ -1608,29 +1740,39 @@ mod tests {
     #[test]
     fn demote_superseded_only_touches_a_session_that_still_shows_running() {
         let dir = std::path::PathBuf::from("/tmp/shoki-demote");
+        let entry = |status| SummarizeEntry {
+            status,
+            model_label: "Qwen2.5 3B Instruct".to_owned(),
+            started: (status == SummarizeStatus::Summarizing).then(Instant::now),
+            reason: None,
+        };
         let state = |status: Option<SummarizeStatus>| {
             let mut queue = QueueState {
                 status: HashMap::new(),
                 next_seq: 0,
             };
             if let Some(status) = status {
-                queue.status.insert(dir.clone(), (7, status));
+                queue.status.insert(dir.clone(), (7, entry(status)));
             }
             queue
         };
 
-        // 走行中の表示 → 実態（後続がキュー待ち）へ戻す。
+        // 走行中の表示 → 実態（後続がキュー待ち）へ戻す。あわせて開始時刻も落とす
+        // （走っていないものに経過を出さない）。
         let mut queue = state(Some(SummarizeStatus::Summarizing));
         demote_superseded(&mut queue, &dir);
-        assert_eq!(
-            queue.status.get(&dir).map(|(_, s)| *s),
-            Some(SummarizeStatus::Queued)
-        );
+        let demoted = queue
+            .status
+            .get(&dir)
+            .map(|(_, entry)| entry.clone())
+            .expect("the entry should stay");
+        assert_eq!(demoted.status, SummarizeStatus::Queued);
+        assert_eq!(demoted.started, None);
 
         // 取り消し・削除でエントリが消えていたら復活させない。
         let mut queue = state(None);
         demote_superseded(&mut queue, &dir);
-        assert_eq!(queue.status.get(&dir), None);
+        assert!(!queue.status.contains_key(&dir));
 
         // 終わった表示は上書きしない（後続が完了を書いた後に届いた先行ジョブ）。
         for status in [
@@ -1641,7 +1783,7 @@ mod tests {
             let mut queue = state(Some(status));
             demote_superseded(&mut queue, &dir);
             assert_eq!(
-                queue.status.get(&dir).map(|(_, s)| *s),
+                queue.status.get(&dir).map(|(_, entry)| entry.status),
                 Some(status),
                 "{status:?} must be left alone"
             );
@@ -1659,6 +1801,41 @@ mod tests {
         assert!(!counts_as_pending(SummarizeStatus::Failed));
     }
 
+    /// キュー待ちの順番は**読み出しのたびに数え直す**（前が終われば繰り上がる）。走っている
+    /// ジョブは数えない——数えると「1 番目なのに始まらない」になる。
+    #[test]
+    fn queued_position_counts_only_the_jobs_still_waiting() {
+        let mut queue = QueueState {
+            status: HashMap::new(),
+            next_seq: 0,
+        };
+        let mut put = |name: &str, seq: u64, status| {
+            queue.status.insert(
+                std::path::PathBuf::from(name),
+                (
+                    seq,
+                    SummarizeEntry {
+                        status,
+                        model_label: "Qwen2.5 3B Instruct".to_owned(),
+                        started: None,
+                        reason: None,
+                    },
+                ),
+            );
+        };
+        put("/tmp/a", 1, SummarizeStatus::Summarizing);
+        put("/tmp/b", 2, SummarizeStatus::Queued);
+        put("/tmp/c", 3, SummarizeStatus::Queued);
+        put("/tmp/d", 4, SummarizeStatus::Done);
+
+        assert_eq!(queue.queued_position(2), 1, "走っている分は数えない");
+        assert_eq!(queue.queued_position(3), 2);
+
+        // 前のキュー待ちが取り消されたら繰り上がる。
+        queue.status.remove(std::path::Path::new("/tmp/b"));
+        assert_eq!(queue.queued_position(3), 1);
+    }
+
     /// ワーカー越しでも同じ判定が効くこと（状態マップを直接組んで、ジョブを走らせずに見る）。
     #[test]
     fn has_pending_jobs_reads_the_status_map() {
@@ -1668,11 +1845,17 @@ mod tests {
         );
         let dir = std::path::PathBuf::from("/tmp/shoki-pending");
         assert!(!worker.has_pending_jobs(), "an empty queue is not pending");
+        let entry = |status| SummarizeEntry {
+            status,
+            model_label: "Qwen2.5 3B Instruct".to_owned(),
+            started: None,
+            reason: None,
+        };
 
         for status in [SummarizeStatus::Queued, SummarizeStatus::Summarizing] {
             lock_queue(&worker.queue)
                 .status
-                .insert(dir.clone(), (1, status));
+                .insert(dir.clone(), (1, entry(status)));
             assert!(
                 worker.has_pending_jobs(),
                 "{status:?} must count as a pending job"
@@ -1682,7 +1865,7 @@ mod tests {
         for status in [SummarizeStatus::Done, SummarizeStatus::Failed] {
             lock_queue(&worker.queue)
                 .status
-                .insert(dir.clone(), (1, status));
+                .insert(dir.clone(), (1, entry(status)));
             assert!(
                 !worker.has_pending_jobs(),
                 "{status:?} must not count as a pending job"

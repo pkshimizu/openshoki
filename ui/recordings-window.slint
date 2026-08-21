@@ -1,6 +1,6 @@
 import { ListView, ScrollView } from "std-widgets.slint";
 import { Style, StatusTone } from "style.slint";
-import { DangerButton, FocusRing, ActionButton, ButtonRole } from "controls.slint";
+import { DangerButton, FocusRing, ActionButton, ButtonRole, Toggle } from "controls.slint";
 
 // 文字起こしの表示状態。Rust 側（main.rs の transcript_display_status）がワーカーの
 // 進行状況と JSON の有無から合成して詰める。
@@ -21,6 +21,30 @@ export enum SummaryStatus {
     summarizing,
     done,
     failed,
+}
+
+// 読む領域の空表示から起こせる操作（#154）。**enum で渡す**——ラベルの文字列で分岐すると、
+// 文言を直した日に操作が静かに壊れる。どれを出すかは Rust の網羅 match が決める。
+export enum PaneActionKind {
+    // 文字起こしを始める / やり直す。
+    transcribe,
+    // 議事録を書く / やり直す。
+    write-notes,
+    // キュー待ちの議事録を取り消す。
+    cancel-notes,
+    // 文字起こしの設定ウィンドウを開く。
+    open-transcription,
+    // 議事録の設定ウィンドウを開く。
+    open-notes,
+}
+
+// 空表示に並べるボタン 1 つ分。**ラベルも Rust が組む**（状態→文言の対応表は Rust の
+// 網羅 match が正。`docs/rules/slint.md`）。
+export struct PaneAction {
+    label: string,
+    kind: PaneActionKind,
+    // 主操作か。並ぶのは最大 2 つで、主は 1 つだけ（Rust 側が保証する）。
+    primary: bool,
 }
 
 // 一覧の 1 行分。Rust の recordings::RecordingSession から詰める。
@@ -298,6 +322,183 @@ component SeekBar inherits Rectangle {
 // 左＝探す（300px 固定）、右＝読む（measure 640px）、下辺＝聴く（72px の常設帯）。
 // 配色・サイズ・淡色はすべて共有の Style トークンから引く（#128 で Palette 依存を外した）
 // （選択行の白文字はアクセント固定背景のため Style.on-accent-foreground）。
+// 読む領域の空表示（#154）。**見出し・理由・次の操作**の 3 段で出す。
+//
+// 短いラベル 1 行に縮退させると「なぜ無いのか・どうすれば出るのか」が画面から分からない。
+// 文言も操作も Rust が状態から組み立てて渡す（ここは並べるだけ）。
+component EmptyState inherits Rectangle {
+    in property <string> heading;
+    // 見出しの下の 1〜2 文。空なら段ごと出さない。
+    in property <string> body;
+    in property <[PaneAction]> actions;
+
+    callback action(PaneActionKind);
+
+    VerticalLayout {
+        alignment: center;
+        spacing: 10px;
+        // 読む列いっぱいに広げない（1 行が長くなりすぎると読みにくい）。
+        padding-left: 40px;
+        padding-right: 40px;
+
+        Text {
+            text: root.heading;
+            font-size: Style.body-size;
+            font-weight: Style.semibold;
+            horizontal-alignment: center;
+            wrap: word-wrap;
+            color: Style.ink;
+        }
+
+        if root.body != "": Text {
+            text: root.body;
+            font-size: Style.caption-size;
+            horizontal-alignment: center;
+            wrap: word-wrap;
+            color: Style.ink-muted;
+        }
+
+        if root.actions.length > 0: HorizontalLayout {
+            alignment: center;
+            spacing: 10px;
+            for item in root.actions: ActionButton {
+                text: item.label;
+                role: item.primary ? ButtonRole.plain : ButtonRole.quiet;
+                clicked => {
+                    root.action(item.kind);
+                }
+            }
+        }
+    }
+}
+
+// 文字起こしのセグメント一覧と、再生位置への追従（#154）。
+//
+// **追従を部品に閉じる**のは、`if` の内側で宣言した id を外から参照できないため
+// （`docs/rules/slint.md`）。ウィンドウ側に関数を置くと ListView を掴めない。
+component TranscriptList inherits Rectangle {
+    in property <[TranscriptRow]> segments;
+    in property <int> current-segment;
+    // 再生位置をスクロールで追うか。**印は追従と無関係に常に付く**（読み返している場所を
+    // 見失わせないため、追うかどうかだけを切り替える）。
+    in property <bool> follow;
+
+    callback seek-to-segment(int);
+
+    // 平均行高での見当。**行が生成されていないときの粗い送り**にだけ使う——ListView は
+    // 可視範囲しか作らないので、遠くへ飛んだ直後は行そのものが無く、正確な位置を訊けない。
+    // 行の高さはまちまちなので、これは「近くまで運ぶ」以上のことはしない。
+    private property <length> row-guess: root.segments.length > 0
+        ? list.viewport-height / root.segments.length
+        : 0px;
+    private property <length> guess-y: root.current-segment * root.row-guess;
+
+    // 行が生成されているときの**正確な**寄せ。`row-y` は viewport 内の位置。
+    function scroll-into-view(row-y: length, row-height: length) {
+        if (!root.follow) {
+            return;
+        }
+        if (row-y + list.viewport-y < 0px) {
+            root.set-viewport-y(-row-y);
+        } else if (row-y + row-height + list.viewport-y > list.visible-height) {
+            root.set-viewport-y(list.visible-height - row-y - row-height);
+        }
+    }
+
+    // 粗い送り。**見当で画面内に入っているなら何もしない**——動かすと、行が生成されている
+    // 場合に正確な位置から見当の位置へずらしてしまう（そのあと戻す口が無い）。
+    function follow-current() {
+        if (!root.follow || root.current-segment < 0 || root.segments.length == 0) {
+            return;
+        }
+        if (root.guess-y + list.viewport-y >= 0px
+            && root.guess-y + root.row-guess + list.viewport-y <= list.visible-height) {
+            return;
+        }
+        root.set-viewport-y(-root.guess-y);
+    }
+
+    // 端を超えて送らない（`viewport-y` は「上へ隠れた量の負値」で、下端は本文の余りぶん）。
+    function set-viewport-y(target: length) {
+        list.viewport-y = max(min(target, 0px), min(0px, list.visible-height - list.viewport-height));
+    }
+
+    // 生成された時点でも寄せる（選んだ録音の再生位置が最初から先にある場合。`changed` は
+    // 生成時には走らない——初期値は「変化」ではない）。
+    init => {
+        root.follow-current();
+    }
+    changed current-segment => {
+        root.follow-current();
+    }
+    changed follow => {
+        root.follow-current();
+    }
+
+    list := ListView {
+        for seg[i] in root.segments: Rectangle {
+            // 現在再生位置のセグメントをハイライト（淡色背景＋左 3px 罫線）。
+            property <bool> active: i == root.current-segment;
+            background: active ? Style.segment-highlight : transparent;
+            // ListView の行は自身の高さを明示する（word-wrap する本文の実高さに追従させる）。
+            height: row-content.preferred-height;
+            TouchArea {
+                clicked => {
+                    root.seek-to-segment(i);
+                }
+            }
+
+            // 再生中の行が生成された時点で、正確な位置へ寄せる。`init` を使うのは、行が
+            // 作られた直後は `changed` が走らないため（生成時の値は「変化」ではない）。
+            if active && root.follow: Rectangle {
+                width: 0px;
+                height: 0px;
+                init => {
+                    root.scroll-into-view(parent.y, parent.height);
+                }
+            }
+
+            row-content := HorizontalLayout {
+                // 左端のアクセント罫線（active のときだけ幅を持つ）。
+                Rectangle {
+                    width: active ? 3px : 0px;
+                    background: Style.seal;
+                }
+
+                VerticalLayout {
+                    padding-left: 8px;
+                    padding-right: 6px;
+                    padding-top: 6px;
+                    padding-bottom: 6px;
+                    spacing: 3px;
+                    HorizontalLayout {
+                        alignment: start;
+                        spacing: 7px;
+                        SpeakerBadge {
+                            label: seg.speaker;
+                            accent: seg.is-mic;
+                        }
+
+                        Text {
+                            text: seg.time;
+                            font-size: Style.caption-size;
+                            vertical-alignment: center;
+                            color: Style.ink-muted;
+                        }
+                    }
+
+                    Text {
+                        text: seg.text;
+                        wrap: word-wrap;
+                        font-size: Style.body-size;
+                        color: Style.ink;
+                    }
+                }
+            }
+        }
+    }
+}
+
 export component RecordingsWindow inherits Window {
     title: "Recordings";
     // 幅・高さは src/main.rs の RECORDINGS_WIDTH/HEIGHT と一致させること（片方だけ変えない）。
@@ -330,7 +531,11 @@ export component RecordingsWindow inherits Window {
     in property <TranscriptStatus> detail-transcript-status;
     // Transcript セクションの縮退表示（セグメントが無いとき）のラベル。状態→文言の対応表は
     // Rust 側（transcript_placeholder_text）に集約し、ここでは表示するだけ。
-    in property <string> detail-transcript-placeholder;
+    // 読む領域（Transcript タブ）の空表示（#154）。見出し・理由・次の操作を Rust が
+    // 状態から組み立てて渡す（`main::transcript_pane`）。
+    in property <string> detail-transcript-heading;
+    in property <string> detail-transcript-body;
+    in property <[PaneAction]> detail-transcript-actions;
     // 選択中セッションが文字起こし中か。状態 enum から導出し、Rust から個別に set しない
     // （bool と enum の食い違いを作らない）。
     property <bool> detail-transcribing: root.detail-transcript-status == TranscriptStatus.transcribing;
@@ -342,7 +547,12 @@ export component RecordingsWindow inherits Window {
     in property <SummaryStatus> detail-summary-status;
     // Notes タブの縮退表示（行が無いとき）のラベル。状態→文言の対応表は Rust 側
     // （summary_placeholder_text）に集約し、ここでは表示するだけ。
-    in property <string> detail-summary-placeholder;
+    // 読む領域（Notes タブ）の空表示（#154。`main::summary_pane`）。
+    in property <string> detail-summary-heading;
+    in property <string> detail-summary-body;
+    in property <[PaneAction]> detail-summary-actions;
+    // 議事録が出来上がっているときに一覧の下へ出す出典。空なら出さない。
+    in property <string> detail-summary-footer;
     // 選択中セッションの議事録要約（`summary.md` を行単位に分けたもの）。空なら状態依存の
     // ラベルに縮退表示する。
     in property <[SummaryRow]> summary-rows;
@@ -365,6 +575,9 @@ export component RecordingsWindow inherits Window {
     in property <[TranscriptRow]> segments;
     // 現在の再生位置に対応するセグメントの index（ハイライト対象。-1 は該当なし）。
     in property <int> current-segment: -1;
+    // 再生位置をスクロールで追うか（#154）。**UI が持つ表示の好み**なので設定には保存しない。
+    // 既定は ON。印は追従と無関係に常に付く（切り替えるのは「追うかどうか」だけ）。
+    in-out property <bool> follow-transcript: true;
     // 選択セッションが再生可能か（両音源は mix.mp3 生成済み、単一音源は常に可）。false なら
     // 再生ボタンを無効化する。
     in property <bool> playable;
@@ -407,6 +620,9 @@ export component RecordingsWindow inherits Window {
     // 「Cancel」押下（キュー待ちの間だけ出る）。積んだ要約ジョブを取り消す。
     callback cancel-summary(int);
     // 確認モーダルの Delete 押下。選択中セッションをゴミ箱へ移動する（インデックスを渡す）。
+    // 読む領域の空表示から起こす操作（#154）。どれを出すかは Rust が状態から決めるので、
+    // ここは押されたものを返すだけ。
+    callback pane-action(PaneActionKind);
     callback delete-session(int);
 
     VerticalLayout {
@@ -760,84 +976,42 @@ export component RecordingsWindow inherits Window {
                                     clip: true;
 
                                     if !root.showing-summary: Rectangle {
-                                        // 文字起こしがあればセグメント一覧、無ければ縮退表示。長時間録音では
-                                        // セグメントが数千件になり得るため、可視範囲だけ生成する ListView を使う
-                                        // （ScrollView + for は全行を即時生成し、選択時のヒッチにつながる）。
-                                        if root.segments.length > 0: ListView {
-                                            for seg[i] in root.segments: Rectangle {
-                                                // 現在再生位置のセグメントをハイライト（淡色背景＋左 3px 罫線）。
-                                                property <bool> active: i == root.current-segment;
-                                                background: active ? Style.segment-highlight : transparent;
-                                                // ListView の行は自身の高さを明示する（word-wrap する本文の
-                                                // 実高さに追従させる）。
-                                                height: row-content.preferred-height;
-                                                TouchArea {
-                                                    clicked => {
-                                                        root.seek-to-segment(i);
-                                                    }
-                                                }
-
-                                                row-content := HorizontalLayout {
-                                                    // 左端のアクセント罫線（active のときだけ幅を持つ）。
-                                                    Rectangle {
-                                                        width: active ? 3px : 0px;
-                                                        background: Style.seal;
-                                                    }
-
-                                                    VerticalLayout {
-                                                        padding-left: 8px;
-                                                        padding-right: 6px;
-                                                        padding-top: 6px;
-                                                        padding-bottom: 6px;
-                                                        spacing: 3px;
-                                                        HorizontalLayout {
-                                                            alignment: start;
-                                                            spacing: 7px;
-                                                            SpeakerBadge {
-                                                                label: seg.speaker;
-                                                                accent: seg.is-mic;
-                                                            }
-
-                                                            Text {
-                                                                text: seg.time;
-                                                                font-size: Style.caption-size;
-                                                                vertical-alignment: center;
-                                                                color: Style.ink-muted;
-                                                            }
-                                                        }
-
-                                                        Text {
-                                                            text: seg.text;
-                                                            wrap: word-wrap;
-                                                            font-size: Style.body-size;
-                                                            color: Style.ink;
-                                                        }
-                                                    }
-                                                }
+                                        // 文字起こしがあればセグメント一覧、無ければ状態ごとの
+                                        // 空表示（#154）。JSON の欠落・破損は状態 `Done` のまま
+                                        // セグメントが空になり、未実施と同じ空表示に落ちる。
+                                        // 完了済みの再実行中は旧トランスクリプトが残るため、
+                                        // 一覧表示が維持される。
+                                        if root.segments.length > 0: TranscriptList {
+                                            segments: root.segments;
+                                            current-segment: root.current-segment;
+                                            follow: root.follow-transcript;
+                                            seek-to-segment(index) => {
+                                                root.seek-to-segment(index);
                                             }
                                         }
-                                        if root.segments.length == 0: Text {
-                                            // 縮退表示は実際の状態を語る（ラベルの対応は Rust 側の
-                                            // transcript_placeholder_text 参照。JSON の欠落・破損は状態 Done の
-                                            // ままセグメントが空になり、未実施と同じ表示に落ちる）。完了済みの
-                                            // 再実行中は旧トランスクリプトが残るため上の一覧表示が維持される。
-                                            //
-                                            // **読み込み中はそう言う**（#152）。空白のまま待たせると、
-                                            // 「文字起こしが無い」のか「まだ読んでいる」のか分からない。
-                                            text: root.loading
+                                        // **読み込み中はそう言う**（#152）。空白のまま待たせると、
+                                        // 「文字起こしが無い」のか「まだ読んでいる」のか分からない。
+                                        if root.segments.length == 0: EmptyState {
+                                            heading: root.loading
                                                 ? "Loading…"
-                                                : root.detail-transcript-placeholder;
-                                            font-size: Style.body-size;
-                                            horizontal-alignment: center;
-                                            vertical-alignment: center;
-                                            color: Style.ink-muted;
+                                                : root.detail-transcript-heading;
+                                            body: root.loading ? "" : root.detail-transcript-body;
+                                            actions: root.loading ? [] : root.detail-transcript-actions;
+                                            action(kind) => {
+                                                root.pane-action(kind);
+                                            }
                                         }
                                     }
 
                                     if root.showing-summary: Rectangle {
-                                        // 議事録があれば行一覧、無ければ縮退表示。長い議事録でも可視範囲
+                                        // 議事録があれば行一覧、無ければ空表示。長い議事録でも可視範囲
                                         // だけ生成する（Transcript 側と同じ理由で ListView）。
-                                        if root.summary-rows.length > 0: ListView {
+                                        // 出典（誰がいつ書いたか）は**一覧の下**に置く——上に置くと
+                                        // 本文より先に読ませることになる。空なら段ごと出さない。
+                                        if root.summary-rows.length > 0: VerticalLayout {
+                                            spacing: 8px;
+                                            ListView {
+                                            vertical-stretch: 1;
                                             for row in root.summary-rows: Rectangle {
                                                 // ListView の行は自身の高さを明示する（word-wrap する
                                                 // 本文の実高さに追従させる）。
@@ -863,16 +1037,29 @@ export component RecordingsWindow inherits Window {
                                                     }
                                                 }
                                             }
+                                            }
+
+                                            if root.detail-summary-footer != "": Text {
+                                                text: root.detail-summary-footer;
+                                                font-size: Style.caption-size;
+                                                color: Style.ink-muted;
+                                                wrap: word-wrap;
+                                                vertical-stretch: 0;
+                                            }
                                         }
-                                        if root.summary-rows.length == 0: Text {
-                                            // ラベルの対応は Rust 側の summary_placeholder_text 参照
-                                            // （`summary.md` の欠落・破損・空はいずれも未生成と同じ表示に
-                                            // 落ちる）。再生成中は旧議事録が残るため一覧表示が維持される。
-                                            text: root.loading ? "Loading…" : root.detail-summary-placeholder;
-                                            font-size: Style.body-size;
-                                            horizontal-alignment: center;
-                                            vertical-alignment: center;
-                                            color: Style.ink-muted;
+                                        if root.summary-rows.length == 0: EmptyState {
+                                            // 文言の対応は Rust 側の `summary_pane` 参照
+                                            // （`summary.md` の欠落・破損・空はいずれも未生成と
+                                            // 同じ空表示に落ちる）。再生成中は旧議事録が残るため
+                                            // 一覧表示が維持される。
+                                            heading: root.loading
+                                                ? "Loading…"
+                                                : root.detail-summary-heading;
+                                            body: root.loading ? "" : root.detail-summary-body;
+                                            actions: root.loading ? [] : root.detail-summary-actions;
+                                            action(kind) => {
+                                                root.pane-action(kind);
+                                            }
                                         }
                                     }
                                 }
@@ -938,6 +1125,33 @@ export component RecordingsWindow inherits Window {
                             }
                             seek-to-ratio(ratio) => {
                                 root.seek-to-ratio(ratio);
+                            }
+                        }
+                    }
+
+                    // 再生位置の追従スイッチ。**プレイヤー帯に置く**のは、追うかどうかが
+                    // 再生の話だから（読む領域のタブを跨いでも同じ設定が効く）。
+                    VerticalLayout {
+                        alignment: center;
+                        // 余りはシークバーへ渡す（ここが伸びると、ラベルとスイッチの間が開く）。
+                        horizontal-stretch: 0;
+                        HorizontalLayout {
+                            alignment: end;
+                            spacing: 8px;
+                            Text {
+                                text: "Follow transcript";
+                                font-size: Style.caption-size;
+                                color: Style.ink-muted;
+                                vertical-alignment: center;
+                                // スイッチが同じ文字列を `accessible-label` に持つので、
+                                // ここは読み上げ対象から外す（付けないと 2 回読まれる。
+                                // `docs/rules/slint.md`）。
+                                accessible-role: none;
+                            }
+
+                            Toggle {
+                                label: "Follow transcript";
+                                checked <=> root.follow-transcript;
                             }
                         }
                     }
