@@ -401,11 +401,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             rec.set_summary_rows(Rc::new(slint::VecModel::default()).into());
             rec.set_loading(true);
             transcript_segments.borrow_mut().clear();
-            // 再生対象は事前生成の mix.mp3（両音源）か単一音源ファイル。両音源で mix.mp3 が
-            // まだ無ければ再生不可（選択時にその場でミックスして UI を固めない）。
-            let playable = session.is_playable();
-            rec.set_playable(playable);
-            // 読み込みが終わるまでは長さが分からないので、シークバーは表示専用に縮退させる。
+            // **読み込みが終わるまでは再生できない**（音源をまだ開いていない）。押しても無反応、
+            // にしないため、ここでは押せない状態にしておく——鳴らせるかどうかは開いてみて
+            // 初めて分かるので、`apply_loaded_session` が実際の結果で入れ直す。
+            rec.set_playable(false);
+            // 長さも分からないので、シークバーは表示専用に縮退させる。
             rec.set_seekable(false);
             apply_playback_position(&rec, Duration::ZERO, None);
             // 前の録音の音声は**すぐ手放す**（読み込みを待つ間に前の音が鳴らないように）。
@@ -1478,15 +1478,20 @@ fn apply_loaded_session(
     rec.set_summary_rows(Rc::new(slint::VecModel::from(summary_rows)).into());
 
     let duration = playback.as_ref().and_then(player::PreparedSource::duration);
+    // **開けたかどうかが「再生できる」の答え**。両音源で mix.mp3 が未生成のセッションや、
+    // ファイルを開けなかったセッションはここで `None` になる（選択時にその場でミックスして
+    // UI を固めることはしない）。
+    let playable = playback.is_some();
     if let Some(prepared) = playback
         && let Some(p) = player.borrow_mut().as_mut()
     {
         p.adopt(prepared);
     }
+    rec.set_playable(playable);
     apply_playback_position(rec, Duration::ZERO, duration);
     // 全体長が分からないと比率→秒の換算ができないため、その場合はシークバーを表示専用に
     // 縮退させる。
-    rec.set_seekable(rec.get_playable() && duration.is_some());
+    rec.set_seekable(playable && duration.is_some());
     rec.set_loading(false);
 }
 
