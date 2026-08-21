@@ -7,8 +7,9 @@
 //! 区別する。追加フィールド（`language` 等）は無視して読める（`deny_unknown_fields` を付けない）。
 //!
 //! 文字起こしが未生成・欠落・破損のセッションは空のトランスクリプトとして扱い、落とさない
-//! （`docs/rules/error-handling.md`）。呼び出し側は空なら状態依存のラベルに縮退表示する
-//! （未生成・欠落・破損は `transcript_placeholder_text` により「Not transcribed yet」になる）。
+//! （`docs/rules/error-handling.md`）。呼び出し側は空なら状態依存の空表示に落とす
+//! （見出し・理由・次の操作の対応表は `main::TranscriptPane::message` が正。欠落・破損は状態
+//! `Done` のままセグメントだけ空になるので、未実施とは違う文が出る）。
 
 use std::path::Path;
 use std::time::Duration;

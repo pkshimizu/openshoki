@@ -68,6 +68,9 @@ const DIR_DATETIME_FORMAT: &str = "%Y%m%d-%H%M%S";
 const DISPLAY_TIME_FORMAT: &str = "%H:%M";
 const DISPLAY_DATE_FORMAT: &str = "%b %-d, %Y";
 
+/// 日付と時刻を 1 行に並べる形（`Aug 10, 2026 · 14:02`）。詳細ヘッダと議事録の出典が使う。
+pub const DISPLAY_DATETIME_FORMAT: &str = "%b %-d, %Y · %H:%M";
+
 /// 1 つの録音セッション。ディレクトリと、含まれる音源・文字起こし・議事録要約の有無を持つ。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordingSession {

@@ -370,6 +370,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let transcript_segments = Rc::clone(&transcript_segments);
         let transcriber = transcriber.clone();
         let summarizer = summarizer.clone();
+        let config = Rc::clone(&config);
         let rec_weak = recordings_ui.as_weak();
         let generation = Rc::clone(&load_generation);
         let load_sender = load_sender.clone();
@@ -397,9 +398,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             rec.set_has_transcript(session.has_transcript);
             // 文字起こしの状態テキストと Transcribe ボタンの活性を、ワーカーの進行状況＋
             // JSON の有無から設定する（以後の変化は tick が追従させる）。
-            refresh_detail_transcript_status(&rec, &transcriber, session);
-            // 議事録生成も同じ流儀で状態を設定する（中身の読み込みは下のスレッドで行う）。
-            refresh_detail_summary_status(&rec, &summarizer, session);
+            // 議事録側も同じ流儀で状態を設定する（中身の読み込みは下のスレッドで行う）。
+            refresh_detail_panes(&rec, &transcriber, &summarizer, session, &config);
             rec.set_playing(false);
             rec.set_current_segment(-1);
             // **前の録音の中身を残さない**。読み込みが終わるまで空にし、読み込み中であることを
@@ -550,6 +550,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let sessions = Rc::clone(&sessions);
         let config = Rc::clone(&config);
         let transcriber = transcriber.clone();
+        // 読む領域は両タブまとめて組み直すので、相手のワーカーも要る（`refresh_detail_panes`）。
+        let summarizer = summarizer.clone();
         let rec_weak = recordings_ui.as_weak();
         recordings_ui.on_transcribe_session(move |index| {
             let sessions = sessions.borrow();
@@ -574,7 +576,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // 投入結果（通常は「文字起こし中」）を詳細ペインへ即反映し、次の tick を待つ間の
             // 2 連クリックによる多重投入を防ぐ。一覧行のドットは tick の差分更新に任せる。
             if let Some(rec) = rec_weak.upgrade() {
-                refresh_detail_transcript_status(&rec, &transcriber, session);
+                refresh_detail_panes(&rec, &transcriber, &summarizer, session, &config);
             }
         });
     }
@@ -586,6 +588,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let sessions = Rc::clone(&sessions);
         let config = Rc::clone(&config);
         let summarizer = summarizer.clone();
+        let transcriber = transcriber.clone();
         let rec_weak = recordings_ui.as_weak();
         recordings_ui.on_summarize_session(move |index| {
             let sessions = sessions.borrow();
@@ -603,7 +606,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             summarizer.submit(manual_summarize_job(&config.borrow(), &session.dir));
             // 投入結果（通常は「生成中」）を即反映し、2 連クリックの多重投入を防ぐ。
             if let Some(rec) = rec_weak.upgrade() {
-                refresh_detail_summary_status(&rec, &summarizer, session);
+                refresh_detail_panes(&rec, &transcriber, &summarizer, session, &config);
             }
         });
     }
@@ -613,6 +616,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let sessions = Rc::clone(&sessions);
         let summarizer = summarizer.clone();
+        let transcriber = transcriber.clone();
+        let config = Rc::clone(&config);
         let rec_weak = recordings_ui.as_weak();
         recordings_ui.on_cancel_summary(move |index| {
             let sessions = sessions.borrow();
@@ -626,7 +631,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             // 取り消し結果（通常は未生成／生成済みへ戻る）を即反映する。
             if let Some(rec) = rec_weak.upgrade() {
-                refresh_detail_summary_status(&rec, &summarizer, session);
+                refresh_detail_panes(&rec, &transcriber, &summarizer, session, &config);
+            }
+        });
+    }
+
+    // 読む領域の空表示から起こす操作（#154）。**振り分けはここ 1 箇所の網羅 match**——
+    // Slint 側で分岐させると、操作を足したときに漏れても静かに何も起きないだけになる。
+    // 行き先は既存のコールバックと同じで、押す場所が増えただけ。
+    {
+        let rec_weak = recordings_ui.as_weak();
+        let app_weak = ui.as_weak();
+        recordings_ui.on_pane_action(move |kind| {
+            let Some(rec) = rec_weak.upgrade() else {
+                return;
+            };
+            // 対象は常に選択中のセッション（空表示は選択中のものしか出ない）。
+            let index = rec.get_selected_index();
+            match kind {
+                PaneActionKind::Transcribe => rec.invoke_transcribe_session(index),
+                PaneActionKind::WriteNotes => rec.invoke_summarize_session(index),
+                PaneActionKind::CancelNotes => rec.invoke_cancel_summary(index),
+                PaneActionKind::OpenTranscription => {
+                    if let Some(ui) = app_weak.upgrade() {
+                        ui.invoke_open_transcription_window();
+                    }
+                }
+                PaneActionKind::OpenNotes => {
+                    if let Some(ui) = app_weak.upgrade() {
+                        ui.invoke_open_minutes_window();
+                    }
+                }
             }
         });
     }
@@ -667,7 +702,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // `cancel_queued` が 1 回のロックでまとめて行う）。
             // 要約だけを見るのは、要約が**ワーカー経由でも投入される**（文字起こしの完了から
             // 自動生成）ため。文字起こしは投入が UI スレッドで、直後に
-            // `refresh_detail_transcript_status` がゲートを閉じるので、この窓が開かない。
+            // `refresh_detail_panes` がゲートを閉じるので、この窓が開かない。
             // なお、このチェックの**後**に自動投入が届く窓は残る。その場合はワーカーが
             // 取り出したときに文字起こしが無く `Skipped` で消える（`summary.md` を書く前に
             // 返るので、消えたディレクトリへは書きに行かない）。
@@ -968,6 +1003,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 transcript_segments: Rc::clone(&transcript_segments),
                 transcriber: transcriber.clone(),
                 summarizer: summarizer.clone(),
+                config: Rc::clone(&config),
             },
             ModelsHandles {
                 transcription: transcription_ui.as_weak(),
@@ -1023,6 +1059,9 @@ struct RecordingsHandles {
     transcriber: transcribe::TranscribeWorker,
     /// 詳細ペインの要約状態を tick で追従させるために読む（#81）。
     summarizer: summarize::SummarizeWorker,
+    /// 読む領域の空表示が「なぜ無いのか」を言うために読む（#154。自動が OFF なのか、
+    /// ON だがまだ回っていないのかで文が変わる）。
+    config: Rc<RefCell<Config>>,
 }
 
 /// 機能ウィンドウを tick で追従させるために必要なハンドル一式（`RecordingsHandles` と
@@ -1269,17 +1308,15 @@ fn build_menu_event_handler(
                     {
                         transcribed.push(i);
                     }
-                    if selected == Some(i) {
-                        apply_detail_transcript_status(&rec, status);
-                        if previous == TranscriptStatus::Transcribing
-                            && status == TranscriptStatus::Done
-                        {
-                            // **表示は書かず、読み込みをやり直す**（#152）。ここで直接
-                            // 差し替えると、少し前に始まった読み込みの古いスナップショット
-                            // （まだ何も無かった頃の内容）があとから届いて上書きし、
-                            // **完成した文字起こしが消える**。世代を進めれば古い結果は捨てられる。
-                            reload_selected = true;
-                        }
+                    if selected == Some(i)
+                        && previous == TranscriptStatus::Transcribing
+                        && status == TranscriptStatus::Done
+                    {
+                        // **表示は書かず、読み込みをやり直す**（#152）。ここで直接差し替えると、
+                        // 少し前に始まった読み込みの古いスナップショット（まだ何も無かった頃の
+                        // 内容）があとから届いて上書きし、**完成した文字起こしが消える**。
+                        // 世代を進めれば古い結果は捨てられる。
+                        reload_selected = true;
                     }
                 }
 
@@ -1297,7 +1334,6 @@ fn build_menu_event_handler(
                     );
                     let previous = rec.get_detail_summary_status();
                     if previous != status {
-                        apply_detail_summary_status(&rec, status);
                         // 生成が終わった瞬間に表示を差し替える（失敗時は前の議事録を残す）。
                         // 通常は生成中を経るが、tick の間隔より短い経路もありうるので
                         // キュー待ちからの完了も拾う。
@@ -1309,6 +1345,17 @@ fn build_menu_event_handler(
                             summarized = Some(i);
                         }
                     }
+
+                    // **読む領域は毎回組み直す**（#154）。進捗の割合と経過は状態が変わらない
+                    // まま動くので、状態の差分だけで更新すると数字が止まって見える
+                    // （`docs/rules/slint.md` の「差分更新は表示に使う値ぜんぶで比べる」）。
+                    refresh_detail_panes(
+                        &rec,
+                        &recordings.transcriber,
+                        &recordings.summarizer,
+                        session,
+                        &recordings.config,
+                    );
                 }
             }
 
@@ -1535,6 +1582,11 @@ fn spawn_session_load(
             // **重い処理の前に降りられるか見る**（軽い読み込みは先に済ませてしまう）。
             let segments = transcript::load_transcript(&dir);
             let summary = summarize::load_summary(&dir);
+            let summary_written = summary.is_some().then(|| {
+                std::fs::metadata(dir.join(summarize::SUMMARY_FILENAME))
+                    .and_then(|meta| meta.modified())
+                    .ok()
+            });
             let playback = if !load_playback {
                 // 音声は変わっていない（中身だけ読み直した）。鳴っているものをそのまま使う。
                 PlaybackLoad::Keep
@@ -1558,6 +1610,7 @@ fn spawn_session_load(
                 generation: generation_id,
                 segments,
                 summary,
+                summary_written: summary_written.flatten(),
                 playback,
             };
             if thread_sender.send(loaded).is_err() {
@@ -1572,6 +1625,7 @@ fn spawn_session_load(
             generation: generation_id,
             segments: Vec::new(),
             summary: None,
+            summary_written: None,
             playback: PlaybackLoad::Replace(None),
         });
     }
@@ -1592,6 +1646,10 @@ struct LoadedSession {
     generation: u64,
     segments: Vec<transcript::TranscriptSegment>,
     summary: Option<String>,
+    /// 議事録を書いた時刻（`summary.md` の更新時刻）。**読み込みスレッドで取る**——UI スレッドの
+    /// tick から毎回 stat すると、保存先がネットワーク越しのときに引っかかる。無ければ出典を
+    /// 出さない。
+    summary_written: Option<SystemTime>,
     /// 再生の準備。**中身だけ読み直したときは触らない**（`Keep`）。
     playback: PlaybackLoad,
 }
@@ -1622,6 +1680,7 @@ fn apply_loaded_session(
     let LoadedSession {
         segments,
         summary,
+        summary_written,
         playback,
         ..
     } = loaded;
@@ -1636,6 +1695,9 @@ fn apply_loaded_session(
     *segments_cell.borrow_mut() = segments;
     let summary_rows = summary.map(|text| summary_rows(&text)).unwrap_or_default();
     rec.set_summary_rows(Rc::new(slint::VecModel::from(summary_rows)).into());
+    // 出典は**議事録の中身と一緒に**入れる。行を書くのはここだけなので、両者がずれない
+    // （tick から組み直すと、書き換わったときにしか変わらない値のために毎回 stat することになる）。
+    rec.set_detail_summary_footer(summary_footer_text(summary_written).into());
 
     match playback {
         // 中身だけ読み直した。**再生には触れない**（触ると鳴っている音が止まる。`PlaybackLoad`）。
@@ -1724,8 +1786,15 @@ fn clear_recordings_selection(
     // 状態も未実施へ畳む（次の選択で必ず上書きされるが、`detail-files-in-use` /
     // `detail-jobs-pending` の入力なので前の
     // セッションの「実行中」を持ち越さない）。文字起こし・要約で対称にする。
-    apply_detail_transcript_status(rec, TranscriptStatus::NotTranscribed);
-    apply_detail_summary_status(rec, SummaryStatus::NotSummarized);
+    // ここは「選択が無い」ときの畳み方なので、設定の状態は関係しない（次の選択で必ず
+    // 上書きされる）。自動の有無は false で組む。
+    apply_detail_transcript_status(
+        rec,
+        &TranscriptPane::NotTranscribed { auto_on: false },
+        false,
+    );
+    apply_detail_summary_status(rec, &SummaryPane::NotSummarized { auto_on: false }, false);
+    rec.set_detail_summary_footer(slint::SharedString::new());
     apply_playback_position(rec, Duration::ZERO, None);
 }
 
@@ -2114,9 +2183,127 @@ fn transcript_display_status(
     }
 }
 
-/// 「文字起こし中」の表示ラベル。状態テキストと Transcript の縮退表示の両方で同じ文言を
+/// 「文字起こし中」の表示ラベル。状態テキストと Transcript の空表示の両方で同じ文言を
 /// 使うため、1 箇所で管理する（片方だけ変えて食い違うのを防ぐ）。
 const TRANSCRIBING_LABEL: &str = "Transcribing…";
+
+/// 読む領域に出す 1 タブ分の中身（#154）。見出し・理由・次の操作の 3 つで 1 組。
+///
+/// **3 つをまとめて返す**のは、状態ごとに別々の関数で組み立てると「見出しは失敗なのに
+/// ボタンは Transcribe now」のような食い違いを作れてしまうため。
+struct PaneMessage {
+    heading: String,
+    /// 見出しの下の 1〜2 文。空なら段ごと出さない。
+    body: String,
+    /// 並べるボタン（最大 2 つ。主操作は 1 つだけ）。
+    actions: Vec<PaneAction>,
+}
+
+impl PaneMessage {
+    /// 見出しと理由だけの土台。操作は `with_primary` / `with_secondary` で足す。
+    fn new(heading: impl Into<String>, body: impl Into<String>) -> Self {
+        Self {
+            heading: heading.into(),
+            body: body.into(),
+            actions: Vec::new(),
+        }
+    }
+
+    /// 主操作を 1 つ添える（並ぶのは最大 2 つで、主はこれ 1 つだけ）。
+    fn with_primary(mut self, label: &str, kind: PaneActionKind) -> Self {
+        self.actions.push(PaneAction {
+            label: label.into(),
+            kind,
+            primary: true,
+        });
+        self
+    }
+
+    /// 補助の操作を添える（`with_action` の後ろに並ぶ）。
+    fn with_secondary(mut self, label: &str, kind: PaneActionKind) -> Self {
+        self.actions.push(PaneAction {
+            label: label.into(),
+            kind,
+            primary: false,
+        });
+        self
+    }
+}
+
+/// 読む領域が出す文字起こしの状態と、そこに出す中身（#154）。
+///
+/// **`TranscriptStatus` はここから導出する**（`status`）。状態 enum と説明を別々に組み立てて
+/// 渡すと、片方だけ更新した瞬間にありえない組み合わせができる（`docs/rules/slint.md`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TranscriptPane {
+    /// まだ走らせていない。`auto_on` は設定の自動文字起こし（なぜ無いのかの説明が変わる）。
+    NotTranscribed {
+        auto_on: bool,
+    },
+    Transcribing {
+        model: String,
+        /// whisper が返した進捗（返し始めるまでは `None`）。
+        percent: Option<u8>,
+    },
+    /// 走り終わっている。**この空表示が出るのは JSON が読めなかったときだけ**
+    /// （セグメントがあれば一覧が出るので、ここへは来ない）。
+    Done,
+    Failed {
+        reason: Option<String>,
+    },
+}
+
+impl TranscriptPane {
+    /// Slint へ渡す状態 enum。文言と同じ値から作るので、両者が食い違わない。
+    fn status(&self) -> TranscriptStatus {
+        match self {
+            Self::NotTranscribed { .. } => TranscriptStatus::NotTranscribed,
+            Self::Transcribing { .. } => TranscriptStatus::Transcribing,
+            Self::Done => TranscriptStatus::Done,
+            Self::Failed { .. } => TranscriptStatus::Failed,
+        }
+    }
+
+    /// 状態 → 読む領域の見出し・理由・次の操作。**ワイルドカードを置かない**（状態を足したら
+    /// ここが割れて気づく。`docs/rules/slint.md`）。
+    fn message(&self) -> PaneMessage {
+        match self {
+            Self::NotTranscribed { auto_on: false } => PaneMessage::new(
+                "No transcript yet",
+                "Automatic transcription is off, so this recording was kept as audio only.",
+            )
+            .with_primary("Transcribe now", PaneActionKind::Transcribe),
+            Self::NotTranscribed { auto_on: true } => PaneMessage::new(
+                "No transcript yet",
+                "Automatic transcription is on, but this recording has not been through it.",
+            )
+            .with_primary("Transcribe now", PaneActionKind::Transcribe),
+            Self::Transcribing { model, percent } => PaneMessage::new(
+                match percent {
+                    Some(percent) => format!("Transcribing — {percent}%"),
+                    None => TRANSCRIBING_LABEL.to_owned(),
+                },
+                format!(
+                    "{model} is running on this Mac. Finished lines appear here as they are \
+                     recognized."
+                ),
+            ),
+            Self::Done => PaneMessage::new(
+                "No transcript to show",
+                "The transcript file is missing or could not be read. Transcribing again will \
+                 rebuild it.",
+            )
+            .with_primary("Transcribe again", PaneActionKind::Transcribe),
+            Self::Failed { reason } => PaneMessage::new(
+                "Transcription failed",
+                reason.clone().unwrap_or_else(|| {
+                    "Something went wrong while transcribing this recording.".to_owned()
+                }),
+            )
+            .with_primary("Try again", PaneActionKind::Transcribe),
+        }
+    }
+}
 
 /// 文字起こしの表示状態 → 詳細ペインの状態テキスト。
 fn transcript_status_text(display_status: TranscriptStatus) -> &'static str {
@@ -2128,19 +2315,6 @@ fn transcript_status_text(display_status: TranscriptStatus) -> &'static str {
     }
 }
 
-/// 文字起こしの表示状態 → Transcript セクションの縮退表示（セグメントが無いとき）のラベル。
-///
-/// 状態テキスト（`transcript_status_text`）が**いまどうなっているか**を言うのに対し、こちらは
-/// **何が無いか**を言う（`Not transcribed yet`）。どちらも sentence case（#128 で揃えた）。
-/// `Done` でセグメントが空になるのは JSON の欠落・破損時で、従来どおり未実施と同じ表示に落とす。
-fn transcript_placeholder_text(display_status: TranscriptStatus) -> &'static str {
-    match display_status {
-        TranscriptStatus::Transcribing => TRANSCRIBING_LABEL,
-        TranscriptStatus::Failed => "Transcription failed",
-        TranscriptStatus::NotTranscribed | TranscriptStatus::Done => "Not transcribed yet",
-    }
-}
-
 /// 詳細ペインの文字起こし表示（状態テキスト・状態依存の配色・縮退ラベル）を反映する。
 /// 選択時・手動投入直後・tick 追従の全経路でここを通し、表示ロジックを 1 箇所にする。
 ///
@@ -2148,23 +2322,143 @@ fn transcript_placeholder_text(display_status: TranscriptStatus) -> &'static str
 /// 決める（bool を別途渡して enum と食い違う余地を作らないため。`docs/rules/slint.md`）:
 /// `detail-files-in-use`（文字起こし中・要約生成中＝ワーカーがファイルを読み書き中）が Delete を、
 /// `detail-jobs-pending`（それ＋要約のキュー待ち）が Transcribe / Summarize を止める。
-fn apply_detail_transcript_status(rec: &RecordingsWindow, status: TranscriptStatus) {
+fn apply_detail_transcript_status(
+    rec: &RecordingsWindow,
+    pane: &TranscriptPane,
+    jobs_pending: bool,
+) {
+    let status = pane.status();
+    let message = pane.message();
     rec.set_detail_transcript_text(transcript_status_text(status).into());
-    rec.set_detail_transcript_placeholder(transcript_placeholder_text(status).into());
+    rec.set_detail_transcript_heading(message.heading.into());
+    rec.set_detail_transcript_body(message.body.into());
+    set_pane_actions(
+        rec.get_detail_transcript_actions(),
+        actions_allowed_while_busy(message.actions, jobs_pending),
+        |actions| rec.set_detail_transcript_actions(actions),
+    );
     rec.set_detail_transcript_status(status);
 }
 
-/// セッションの現在の文字起こし状態を合成して詳細ペインへ反映する（選択時・手動投入直後用。
-/// tick は行の差分更新で status を計算済みのため `apply_detail_transcript_status` を直接使う）。
-fn refresh_detail_transcript_status(
-    rec: &RecordingsWindow,
+/// 空表示のボタン列を**変わったときだけ**差し替える（0〜2 件）。
+///
+/// `ModelRc` の比較はポインタなので、同じ中身でも毎回入れ直すと Slint はリピータを畳んで
+/// ボタンを作り直す。tick は 100ms ごとにここを通るので、入れっぱなしにすると押している最中に
+/// ボタンが消える（文字列や enum のプロパティは Slint が値で比べるため、この心配は無い）。
+fn set_pane_actions(
+    current: slint::ModelRc<PaneAction>,
+    actions: Vec<PaneAction>,
+    set: impl FnOnce(slint::ModelRc<PaneAction>),
+) {
+    use slint::Model as _;
+    if current.iter().eq(actions.iter().cloned()) {
+        return;
+    }
+    set(slint::ModelRc::from(Rc::new(slint::VecModel::from(
+        actions,
+    ))));
+}
+
+/// 走っているジョブがある間、**中身を作り直す操作を出さない**。
+///
+/// ワーカーがこのセッションの JSON / `summary.md` を読み書きしている最中に別のジョブを重ねると、
+/// 書き換え途中の内容を読ませてしまう。詳細ヘッダの Transcribe / Summarize が同じ理由で無効に
+/// なるので、押す場所が増えた空表示にも同じゲートを掛ける（取り消しと窓を開くのは残す）。
+fn actions_allowed_while_busy(actions: Vec<PaneAction>, jobs_pending: bool) -> Vec<PaneAction> {
+    if !jobs_pending {
+        return actions;
+    }
+    actions
+        .into_iter()
+        .filter(|action| match action.kind {
+            PaneActionKind::Transcribe | PaneActionKind::WriteNotes => false,
+            PaneActionKind::CancelNotes
+            | PaneActionKind::OpenTranscription
+            | PaneActionKind::OpenNotes => true,
+        })
+        .collect()
+}
+
+/// ワーカーの状態と設定から、読む領域に出す文字起こしの状態を組み立てる。
+///
+/// **状態の解決はここ 1 箇所**（`transcript_display_status` は一覧行が使う軽い版）。ワーカーの
+/// 進行状況（メモリ）があればそれを優先し、無ければ JSON の有無で解決する。
+fn transcript_pane(
     transcriber: &transcribe::TranscribeWorker,
     session: &recordings::RecordingSession,
+    auto_on: bool,
+) -> TranscriptPane {
+    transcript_pane_of(
+        transcriber.state_of(&session.dir),
+        session.has_transcript,
+        auto_on,
+    )
+}
+
+/// どの状態に落とすかを決める純関数（`transcript_pane` はワーカーから値を取ってくるだけ）。
+/// **ここを割ってあるのは、優先順位をテストで固定するため**（ワーカーを立てずに検査できる）。
+fn transcript_pane_of(
+    state: Option<transcribe::TranscribeState>,
+    has_transcript: bool,
+    auto_on: bool,
+) -> TranscriptPane {
+    match state {
+        Some(state) => match state.status {
+            transcribe::TranscribeStatus::Transcribing => TranscriptPane::Transcribing {
+                model: state.model_label,
+                percent: state.percent,
+            },
+            transcribe::TranscribeStatus::Done => TranscriptPane::Done,
+            transcribe::TranscribeStatus::Failed => TranscriptPane::Failed {
+                reason: state.reason,
+            },
+        },
+        None if has_transcript => TranscriptPane::Done,
+        None => TranscriptPane::NotTranscribed { auto_on },
+    }
+}
+
+/// 選択中セッションの読む領域（両タブ）を組み直す。
+///
+/// **選択時・手動投入直後・tick 追従の全経路がここを通る**。進捗の割合と経過は状態が変わらない
+/// まま動くので、状態の差分だけで更新すると数字が止まって見える（`docs/rules/slint.md`）。
+/// ボタン列だけは値が同じなら差し替えない（`set_pane_actions`）。
+///
+/// **ボタンの活性は Rust から set しない**。Slint 側が状態 enum から導出する 2 つのゲートで
+/// 決める（bool を別途渡して enum と食い違う余地を作らないため。`docs/rules/slint.md`）:
+/// `detail-files-in-use`（文字起こし中・要約生成中＝ワーカーがファイルを読み書き中）が Delete を、
+/// `detail-jobs-pending`（それ＋要約のキュー待ち）が Transcribe / Summarize を止める。空表示の
+/// ボタンは Slint に `enabled` を持たないので、同じ条件で**出すかどうか**を Rust が決める。
+fn refresh_detail_panes(
+    rec: &RecordingsWindow,
+    transcriber: &transcribe::TranscribeWorker,
+    summarizer: &summarize::SummarizeWorker,
+    session: &recordings::RecordingSession,
+    config: &RefCell<Config>,
 ) {
-    apply_detail_transcript_status(
-        rec,
-        transcript_display_status(transcriber.status_of(&session.dir), session.has_transcript),
-    );
+    let (auto_transcribe, auto_summarize) = {
+        let config = config.borrow();
+        (config.auto_transcribe, config.auto_summarize)
+    };
+    let transcript = transcript_pane(transcriber, session, auto_transcribe);
+    let summary = summary_pane(summarizer, session, auto_summarize);
+    // **両方を見てからボタンを決める**。走っているジョブは片方の状態にしか出ないので、
+    // タブごとに判断すると、もう一方で走っているジョブを見落としたボタンが出る。
+    let jobs_pending = jobs_pending(&transcript, &summary);
+    apply_detail_transcript_status(rec, &transcript, jobs_pending);
+    apply_detail_summary_status(rec, &summary, jobs_pending);
+}
+
+/// ワーカーがこのセッションのファイルを読み書き中か、順番待ちのジョブがあるか。
+///
+/// 詳細ヘッダの `detail-jobs-pending`（Slint 側が状態 enum から導出する）と**同じ条件**にする。
+/// 片方だけ変えると、同じ操作がヘッダからは押せないのに空表示からは押せる、という穴になる。
+fn jobs_pending(transcript: &TranscriptPane, summary: &SummaryPane) -> bool {
+    matches!(transcript.status(), TranscriptStatus::Transcribing)
+        || matches!(
+            summary.status(),
+            SummaryStatus::Queued | SummaryStatus::Summarizing
+        )
 }
 
 /// 議事録生成の表示状態（`ui/recordings-window.slint` の `SummaryStatus`）を合成する。
@@ -2184,15 +2478,15 @@ fn summary_display_status(
     }
 }
 
-/// 「要約生成中」の表示ラベル。状態テキストと Summary の縮退表示で同じ文言を使うため 1 箇所で
+/// 「要約生成中」の表示ラベル。状態テキストと Notes の空表示で同じ文言を使うため 1 箇所で
 /// 管理する（`TRANSCRIBING_LABEL` と同じ理由）。
 const SUMMARIZING_LABEL: &str = "Writing notes…";
 
 /// 「キュー待ち」の表示ラベル。生成中と区別できる語にする: この間はまだ CPU を使っておらず、
 /// 取り消せる（`SummarizeWorker::cancel`）。
 ///
-/// 状態行と縮退表示で**同じ文言**を使う（#128 で語を `notes` に揃えたら一致した）。以前は
-/// 大小の流儀が違って 2 つに分けていた。
+/// 状態行と、**順番が取れていないときの**空表示の見出しで同じ文言を使う（#128 で語を `notes` に
+/// 揃えたら一致した）。順番が取れているときの見出しは番号まで出す（`SummaryPane::message`）。
 const SUMMARY_QUEUED_LABEL: &str = "Waiting to write notes…";
 
 /// 議事録生成の表示状態 → 詳細ペインの状態テキスト。
@@ -2206,16 +2500,122 @@ fn summary_status_text(display_status: SummaryStatus) -> &'static str {
     }
 }
 
-/// 議事録生成の表示状態 → Notes タブの縮退表示（行が無いとき）のラベル。状態テキストが
-/// **いまどうなっているか**を言うのに対し、こちらは**何が無いか**を言う
-/// （`transcript_placeholder_text` と対称）。`Done` で行が空になるのは `summary.md` の欠落・
-/// 破損・空のときで、未生成と同じ表示に落とす。
-fn summary_placeholder_text(display_status: SummaryStatus) -> &'static str {
-    match display_status {
-        SummaryStatus::Queued => SUMMARY_QUEUED_LABEL,
-        SummaryStatus::Summarizing => SUMMARIZING_LABEL,
-        SummaryStatus::Failed => "Notes could not be written",
-        SummaryStatus::NotSummarized | SummaryStatus::Done => "No notes yet",
+/// 読む領域が出す議事録の状態と、そこに出す中身（#154。`TranscriptPane` と対称）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SummaryPane {
+    /// **文字起こしが無いので動けない**。議事録は文字起こしを入力にするので、ここだけは
+    /// 「まだ書いていない」ではなく「まだ書けない」。
+    Blocked,
+    /// 文字起こしはあるが、まだ書いていない。
+    NotSummarized {
+        auto_on: bool,
+    },
+    Queued {
+        /// キュー待ちの中で何番目か（1 始まり）。
+        position: Option<usize>,
+    },
+    Summarizing {
+        model: String,
+        /// 始めてからの経過（読める粒度に丸めた文字列。無ければ経過を出さない）。
+        started_ago: Option<String>,
+    },
+    /// 書き終わっている。**この空表示が出るのは `summary.md` が読めなかったときだけ**。
+    Done,
+    Failed {
+        reason: Option<String>,
+    },
+}
+
+impl SummaryPane {
+    /// Slint へ渡す状態 enum。`Blocked` と `NotSummarized` はどちらも「未生成」に落ちる
+    /// （読む領域の説明は違うが、ボタンの活性や一覧の見え方は同じ）。
+    fn status(&self) -> SummaryStatus {
+        match self {
+            Self::Blocked | Self::NotSummarized { .. } => SummaryStatus::NotSummarized,
+            Self::Queued { .. } => SummaryStatus::Queued,
+            Self::Summarizing { .. } => SummaryStatus::Summarizing,
+            Self::Done => SummaryStatus::Done,
+            Self::Failed { .. } => SummaryStatus::Failed,
+        }
+    }
+
+    /// 状態 → 読む領域の見出し・理由・次の操作（`TranscriptPane::message` と同じ流儀）。
+    fn message(&self) -> PaneMessage {
+        match self {
+            Self::Blocked => PaneMessage::new(
+                "No notes yet",
+                "Notes are written from the transcript, and this recording has none. \
+                 Transcribing it first will let notes run.",
+            )
+            .with_primary("Transcribe now", PaneActionKind::Transcribe)
+            .with_secondary("Open transcription", PaneActionKind::OpenTranscription),
+            Self::NotSummarized { auto_on: false } => PaneMessage::new(
+                "No notes yet",
+                "Notes are not written automatically, so this recording does not have any.",
+            )
+            .with_primary("Write notes", PaneActionKind::WriteNotes),
+            Self::NotSummarized { auto_on: true } => PaneMessage::new(
+                "No notes yet",
+                "Automatic notes are on, but this recording has not been through them.",
+            )
+            .with_primary("Write notes", PaneActionKind::WriteNotes),
+            Self::Queued { position } => PaneMessage::new(
+                match position {
+                    Some(position) => format!("Waiting to start — number {position} in the queue"),
+                    None => SUMMARY_QUEUED_LABEL.to_owned(),
+                },
+                "Notes start once the work ahead of this recording finishes. Nothing is running \
+                 for it yet, so it can still be canceled.",
+            )
+            .with_secondary("Cancel", PaneActionKind::CancelNotes),
+            Self::Summarizing { model, started_ago } => PaneMessage::new(
+                SUMMARIZING_LABEL,
+                match started_ago {
+                    Some(ago) => format!(
+                        "{model} is running on this Mac, started {ago} ago. Re-transcribing is \
+                         unavailable until this finishes, because it would change the input."
+                    ),
+                    None => format!(
+                        "{model} is running on this Mac. Re-transcribing is unavailable until \
+                         this finishes, because it would change the input."
+                    ),
+                },
+            ),
+            Self::Done => PaneMessage::new(
+                "No notes to show",
+                "The notes file is missing or could not be read. Writing them again will \
+                 rebuild it.",
+            )
+            .with_primary("Write notes again", PaneActionKind::WriteNotes),
+            Self::Failed { reason } => PaneMessage::new(
+                "Notes could not be written",
+                reason.clone().unwrap_or_else(|| {
+                    "Something went wrong while writing notes for this recording.".to_owned()
+                }),
+            )
+            .with_primary("Try again", PaneActionKind::WriteNotes)
+            .with_secondary("Open meeting notes", PaneActionKind::OpenNotes),
+        }
+    }
+}
+
+/// 経過を読める粒度へ丸める（`40 seconds` / `3 minutes`）。**秒まで出すのは 1 分未満だけ**——
+/// 分オーダーの処理で秒を刻んでも読めないうえ、100ms の tick で数字が動き続ける。
+fn elapsed_text(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    if seconds < 60 {
+        return plural(seconds, "second");
+    }
+    plural(seconds / 60, "minute")
+}
+
+/// 数と単位を英語として揃える（`1 minute` / `3 minutes`）。**そのまま画面に出る**文なので、
+/// 単複が崩れると読みにくい（`docs/rules/messages.md`）。
+fn plural(count: u64, unit: &str) -> String {
+    if count == 1 {
+        format!("1 {unit}")
+    } else {
+        format!("{count} {unit}s")
     }
 }
 
@@ -2273,23 +2673,93 @@ fn heading_text(line: &str) -> Option<&str> {
 
 /// 詳細ペインの議事録生成の表示（状態テキスト・状態依存の配色・縮退ラベル）を反映する
 /// （`apply_detail_transcript_status` と対称。ボタンの活性の扱いもそちらの doc 参照）。
-fn apply_detail_summary_status(rec: &RecordingsWindow, status: SummaryStatus) {
+fn apply_detail_summary_status(rec: &RecordingsWindow, pane: &SummaryPane, jobs_pending: bool) {
+    let status = pane.status();
+    let message = pane.message();
     rec.set_detail_summary_status_text(summary_status_text(status).into());
-    rec.set_detail_summary_placeholder(summary_placeholder_text(status).into());
+    rec.set_detail_summary_heading(message.heading.into());
+    rec.set_detail_summary_body(message.body.into());
+    set_pane_actions(
+        rec.get_detail_summary_actions(),
+        actions_allowed_while_busy(message.actions, jobs_pending),
+        |actions| rec.set_detail_summary_actions(actions),
+    );
     rec.set_detail_summary_status(status);
 }
 
-/// セッションの現在の要約状態を合成して詳細ペインへ反映する（選択時・手動投入直後用。
-/// tick は状態を計算済みなので `apply_detail_summary_status` を直接使う）。
-fn refresh_detail_summary_status(
-    rec: &RecordingsWindow,
+/// ワーカーの状態と設定から、読む領域に出す議事録の状態を組み立てる
+/// （`transcript_pane` と対称）。
+fn summary_pane(
     summarizer: &summarize::SummarizeWorker,
     session: &recordings::RecordingSession,
-) {
-    apply_detail_summary_status(
-        rec,
-        summary_display_status(summarizer.status_of(&session.dir), session.has_summary),
-    );
+    auto_on: bool,
+) -> SummaryPane {
+    summary_pane_of(
+        summarizer.state_of(&session.dir),
+        session.has_summary,
+        session.has_transcript,
+        auto_on,
+    )
+}
+
+/// どの状態に落とすかを決める純関数（`transcript_pane_of` と対称。理由もあちらと同じ）。
+fn summary_pane_of(
+    state: Option<summarize::SummarizeState>,
+    has_summary: bool,
+    has_transcript: bool,
+    auto_on: bool,
+) -> SummaryPane {
+    match state {
+        Some(state) => match state.status {
+            summarize::SummarizeStatus::Queued => SummaryPane::Queued {
+                position: state.queue_position,
+            },
+            summarize::SummarizeStatus::Summarizing => SummaryPane::Summarizing {
+                model: state.model_label,
+                started_ago: state.elapsed.map(elapsed_text),
+            },
+            summarize::SummarizeStatus::Done => SummaryPane::Done,
+            summarize::SummarizeStatus::Failed => SummaryPane::Failed {
+                reason: state.reason,
+            },
+        },
+        None if has_summary => SummaryPane::Done,
+        // 文字起こしが無いと議事録は動かせない。**「まだ書いていない」ではなく「まだ書けない」**
+        // と言い分けるのは、押しても何も起きないボタンを出さないため。
+        None if !has_transcript => SummaryPane::Blocked,
+        None => SummaryPane::NotSummarized { auto_on },
+    }
+}
+
+/// 議事録が出来上がっているときに一覧の下へ出す出典（誰がいつ書いたか）。
+///
+/// **どのモデルが書いたかはファイルに残っていない**（`summary.md` は本文だけ）ので、ここでは
+/// 書かれた時刻だけを言う。時刻はファイルの更新時刻から取る——生成のたびに置き換わるので、
+/// 「この議事録がいつのものか」と一致する。読めなければ段ごと出さない。
+fn summary_footer_text(written: Option<SystemTime>) -> String {
+    let Some(written) = written else {
+        return String::new();
+    };
+    // **`DateTime::from(SystemTime)` を使わない**。chrono の実装は範囲外の時刻で `unwrap` する
+    // ので、外（ファイルシステム・同期ツール・手編集）から来た更新時刻でアプリごと落ちる。
+    // 読めなければ段ごと出さない。
+    let Ok(since_epoch) = written.duration_since(std::time::UNIX_EPOCH) else {
+        return String::new();
+    };
+    let Ok(seconds) = i64::try_from(since_epoch.as_secs()) else {
+        return String::new();
+    };
+    let Some(written) = chrono::DateTime::from_timestamp(seconds, since_epoch.subsec_nanos())
+    else {
+        return String::new();
+    };
+    // 日時の形は一覧・詳細ヘッダと揃える（左右で違うと同じ録音を見ていることが読み取りにくい）。
+    format!(
+        "Written from the transcript · {}",
+        written
+            .with_timezone(&chrono::Local)
+            .format(recordings::DISPLAY_DATETIME_FORMAT)
+    )
 }
 
 /// 保存先パスを画面表示用の文字列に変換する。
@@ -2563,12 +3033,14 @@ pub(crate) fn init_test_backend() {
 #[cfg(test)]
 mod tests {
     use super::{
-        StatusTone, SummaryStatus, TranscriptStatus, app_version_text, breathing_level,
-        model_downloads_on_select, model_status_line, playback_progress, seek_position_from_ratio,
-        summary_display_status, summary_model_status_line, summary_placeholder_text, summary_rows,
-        summary_status_text, transcript_display_status, transcript_placeholder_text,
-        transcript_status_text, whisper_model_status_line,
+        PaneAction, PaneActionKind, StatusTone, SummaryPane, SummaryStatus, TranscriptPane,
+        TranscriptStatus, actions_allowed_while_busy, app_version_text, breathing_level,
+        jobs_pending, model_downloads_on_select, model_status_line, playback_progress,
+        seek_position_from_ratio, summary_display_status, summary_model_status_line,
+        summary_pane_of, summary_rows, summary_status_text, transcript_display_status,
+        transcript_pane_of, transcript_status_text, whisper_model_status_line,
     };
+    use super::{elapsed_text, summarize, transcribe};
     use chrono::{Datelike as _, Timelike as _};
 
     use crate::transcribe::TranscribeStatus;
@@ -2773,25 +3245,255 @@ mod tests {
         );
     }
 
-    /// 縮退表示ラベル。Done は「セグメントが空＝JSON の欠落・破損」の経路でのみ表示され、
-    /// 未実施と同じラベルに落とす。
+    /// 読む領域の空表示（#154）。**全状態で見出し・理由・次の操作が揃う**ことを固定する。
+    /// `Done` は「セグメントが空＝JSON の欠落・破損」の経路でだけ表示される。
     #[test]
-    fn transcript_placeholder_text_covers_all_states() {
+    fn transcript_pane_message_covers_all_states() {
+        let panes = [
+            TranscriptPane::NotTranscribed { auto_on: false },
+            TranscriptPane::NotTranscribed { auto_on: true },
+            TranscriptPane::Transcribing {
+                model: "Medium".to_owned(),
+                percent: Some(48),
+            },
+            TranscriptPane::Transcribing {
+                model: "Medium".to_owned(),
+                percent: None,
+            },
+            TranscriptPane::Done,
+            TranscriptPane::Failed { reason: None },
+        ];
+        for pane in &panes {
+            let message = pane.message();
+            assert!(!message.heading.is_empty(), "{pane:?} needs a heading");
+            assert!(!message.body.is_empty(), "{pane:?} needs a reason");
+            assert!(
+                message.actions.iter().filter(|a| a.primary).count() <= 1,
+                "{pane:?} must not offer two primary actions"
+            );
+        }
+
+        // 見出しは状態をそのまま言う。走っている間は割合まで出す。
         assert_eq!(
-            transcript_placeholder_text(TranscriptStatus::NotTranscribed),
-            "Not transcribed yet"
+            TranscriptPane::NotTranscribed { auto_on: false }
+                .message()
+                .heading,
+            "No transcript yet"
         );
         assert_eq!(
-            transcript_placeholder_text(TranscriptStatus::Transcribing),
+            TranscriptPane::Transcribing {
+                model: "Medium".to_owned(),
+                percent: Some(48),
+            }
+            .message()
+            .heading,
+            "Transcribing — 48%"
+        );
+        // 割合が来ていない間は数字を出さない（0% と出すと止まって見える）。
+        assert_eq!(
+            TranscriptPane::Transcribing {
+                model: "Medium".to_owned(),
+                percent: None,
+            }
+            .message()
+            .heading,
             "Transcribing…"
         );
+        // 走っている状態には操作を出さない（Stop はまだ無い。#128）。
+        assert!(
+            TranscriptPane::Transcribing {
+                model: "Medium".to_owned(),
+                percent: None,
+            }
+            .message()
+            .actions
+            .is_empty()
+        );
+        // 使っているモデルは理由の中に出る。
+        assert!(
+            TranscriptPane::Transcribing {
+                model: "Large v3".to_owned(),
+                percent: None,
+            }
+            .message()
+            .body
+            .contains("Large v3")
+        );
+        // 失敗はワーカーが持つ理由をそのまま出し、無ければ言い切らない文へ落とす。
         assert_eq!(
-            transcript_placeholder_text(TranscriptStatus::Done),
-            "Not transcribed yet"
+            TranscriptPane::Failed {
+                reason: Some("mic.mp3 could not be transcribed.".to_owned()),
+            }
+            .message()
+            .body,
+            "mic.mp3 could not be transcribed."
         );
         assert_eq!(
-            transcript_placeholder_text(TranscriptStatus::Failed),
-            "Transcription failed"
+            TranscriptPane::Failed { reason: None }.message().body,
+            "Something went wrong while transcribing this recording."
+        );
+    }
+
+    /// **どの状態に落とすか**を固定する。文言のテストは変種を手で作って呼ぶだけなので、
+    /// この選び方（ワーカー優先・JSON の有無での解決）が壊れても気づけない。
+    #[test]
+    fn transcript_pane_of_prefers_the_worker_over_the_transcript_file() {
+        let state = |status, percent, reason| {
+            Some(transcribe::TranscribeState {
+                status,
+                model_label: "Medium".to_owned(),
+                percent,
+                reason,
+            })
+        };
+
+        // ワーカーの状態があれば、JSON の有無より優先する。
+        assert_eq!(
+            transcript_pane_of(
+                state(transcribe::TranscribeStatus::Transcribing, Some(48), None),
+                true,
+                false,
+            ),
+            TranscriptPane::Transcribing {
+                model: "Medium".to_owned(),
+                percent: Some(48),
+            }
+        );
+        assert_eq!(
+            transcript_pane_of(
+                state(
+                    transcribe::TranscribeStatus::Failed,
+                    None,
+                    Some("mic.mp3 could not be transcribed.".to_owned()),
+                ),
+                true,
+                false,
+            ),
+            TranscriptPane::Failed {
+                reason: Some("mic.mp3 could not be transcribed.".to_owned()),
+            }
+        );
+
+        // ワーカーに記録が無ければ JSON の有無で解決する。
+        assert_eq!(transcript_pane_of(None, true, false), TranscriptPane::Done);
+        // 自動文字起こしの状態は、なぜ無いのかの説明を変えるので pane まで届く。
+        assert_eq!(
+            transcript_pane_of(None, false, true),
+            TranscriptPane::NotTranscribed { auto_on: true }
+        );
+        assert_eq!(
+            transcript_pane_of(None, false, false),
+            TranscriptPane::NotTranscribed { auto_on: false }
+        );
+    }
+
+    /// 議事録側の選び方。**`Blocked` に落ちる条件はここでしか決まらない**。
+    #[test]
+    fn summary_pane_of_blocks_only_when_there_is_no_transcript() {
+        let queued = Some(summarize::SummarizeState {
+            status: summarize::SummarizeStatus::Queued,
+            model_label: "Qwen2.5 3B Instruct".to_owned(),
+            queue_position: Some(2),
+            elapsed: None,
+            reason: None,
+        });
+
+        // ワーカーの状態があれば、`summary.md` の有無より優先する。
+        assert_eq!(
+            summary_pane_of(queued, true, true, false),
+            SummaryPane::Queued { position: Some(2) }
+        );
+
+        // 文字起こしが無ければ「まだ書けない」。ただし**既にある議事録は読ませる**ので、
+        // 有無の判定はそちらが先。
+        assert_eq!(
+            summary_pane_of(None, false, false, false),
+            SummaryPane::Blocked
+        );
+        assert_eq!(summary_pane_of(None, true, false, false), SummaryPane::Done);
+        // 文字起こしがあれば「まだ書いていない」。自動の状態が pane まで届く。
+        assert_eq!(
+            summary_pane_of(None, false, true, true),
+            SummaryPane::NotSummarized { auto_on: true }
+        );
+    }
+
+    /// 走っているジョブがある間は、中身を作り直す操作を出さない（取り消しと窓は残す）。
+    #[test]
+    fn actions_are_dropped_while_a_job_is_running() {
+        let all = vec![
+            PaneAction {
+                label: "Try again".into(),
+                kind: PaneActionKind::WriteNotes,
+                primary: true,
+            },
+            PaneAction {
+                label: "Cancel".into(),
+                kind: PaneActionKind::CancelNotes,
+                primary: false,
+            },
+            PaneAction {
+                label: "Open meeting notes".into(),
+                kind: PaneActionKind::OpenNotes,
+                primary: false,
+            },
+        ];
+        assert_eq!(actions_allowed_while_busy(all.clone(), false), all);
+        assert_eq!(
+            actions_allowed_while_busy(all, true)
+                .iter()
+                .map(|action| action.kind)
+                .collect::<Vec<_>>(),
+            vec![PaneActionKind::CancelNotes, PaneActionKind::OpenNotes]
+        );
+    }
+
+    /// ゲートは**両タブの状態を合わせて**決める（片方だけ見ると走っているジョブを見落とす）。
+    #[test]
+    fn jobs_pending_looks_at_both_tabs() {
+        let idle_transcript = TranscriptPane::NotTranscribed { auto_on: false };
+        let idle_summary = SummaryPane::NotSummarized { auto_on: false };
+        assert!(!jobs_pending(&idle_transcript, &idle_summary));
+        assert!(jobs_pending(
+            &TranscriptPane::Transcribing {
+                model: "Medium".to_owned(),
+                percent: None,
+            },
+            &idle_summary
+        ));
+        // キュー待ちも数える（走り出す前に文字起こしを重ねさせない）。
+        assert!(jobs_pending(
+            &idle_transcript,
+            &SummaryPane::Queued { position: None }
+        ));
+        assert!(jobs_pending(
+            &idle_transcript,
+            &SummaryPane::Summarizing {
+                model: "Llama 8B".to_owned(),
+                started_ago: None,
+            }
+        ));
+    }
+
+    /// 状態 enum は文言と**同じ値から**作る（別々に渡すと食い違う。`docs/rules/slint.md`）。
+    #[test]
+    fn transcript_pane_status_matches_the_variant() {
+        assert_eq!(
+            TranscriptPane::NotTranscribed { auto_on: true }.status(),
+            TranscriptStatus::NotTranscribed
+        );
+        assert_eq!(
+            TranscriptPane::Transcribing {
+                model: "Medium".to_owned(),
+                percent: None,
+            }
+            .status(),
+            TranscriptStatus::Transcribing
+        );
+        assert_eq!(TranscriptPane::Done.status(), TranscriptStatus::Done);
+        assert_eq!(
+            TranscriptPane::Failed { reason: None }.status(),
+            TranscriptStatus::Failed
         );
     }
 
@@ -2846,30 +3548,129 @@ mod tests {
         assert_eq!(summary_status_text(SummaryStatus::Failed), "Notes failed");
     }
 
-    /// 縮退表示ラベル。Done で行が空になるのは `summary.md` の欠落・破損・空の経路で、
-    /// 未生成と同じラベルに落とす。
+    /// 議事録側の空表示（#154）。`Done` で行が空になるのは `summary.md` の欠落・破損・空の経路。
     #[test]
-    fn summary_placeholder_text_covers_all_states() {
+    fn summary_pane_message_covers_all_states() {
+        let panes = [
+            SummaryPane::Blocked,
+            SummaryPane::NotSummarized { auto_on: false },
+            SummaryPane::NotSummarized { auto_on: true },
+            SummaryPane::Queued { position: Some(2) },
+            SummaryPane::Queued { position: None },
+            SummaryPane::Summarizing {
+                model: "Qwen2.5 3B Instruct".to_owned(),
+                started_ago: Some("40 seconds".to_owned()),
+            },
+            SummaryPane::Summarizing {
+                model: "Qwen2.5 3B Instruct".to_owned(),
+                started_ago: None,
+            },
+            SummaryPane::Done,
+            SummaryPane::Failed { reason: None },
+        ];
+        for pane in &panes {
+            let message = pane.message();
+            assert!(!message.heading.is_empty(), "{pane:?} needs a heading");
+            assert!(!message.body.is_empty(), "{pane:?} needs a reason");
+            assert!(
+                message.actions.iter().filter(|a| a.primary).count() <= 1,
+                "{pane:?} must not offer two primary actions"
+            );
+        }
+
+        // **入力待ちは「書けない理由」を言う**。ここを「まだ書いていない」と同じ文にすると、
+        // なぜ押せないのかが画面から分からなくなる。
+        let blocked = SummaryPane::Blocked.message();
+        assert!(blocked.body.contains("transcript"));
         assert_eq!(
-            summary_placeholder_text(SummaryStatus::NotSummarized),
-            "No notes yet"
+            blocked
+                .actions
+                .iter()
+                .map(|action| action.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                PaneActionKind::Transcribe,
+                PaneActionKind::OpenTranscription
+            ]
+        );
+
+        // キュー待ちは順番まで出し、取り消しを添える。
+        assert_eq!(
+            SummaryPane::Queued { position: Some(2) }.message().heading,
+            "Waiting to start — number 2 in the queue"
         );
         assert_eq!(
-            summary_placeholder_text(SummaryStatus::Queued),
+            SummaryPane::Queued { position: None }.message().heading,
             "Waiting to write notes…"
         );
         assert_eq!(
-            summary_placeholder_text(SummaryStatus::Summarizing),
-            "Writing notes…"
+            SummaryPane::Queued { position: Some(2) }.message().actions[0].kind,
+            PaneActionKind::CancelNotes
+        );
+
+        // 走っている間はモデルと経過を出し、操作は出さない。
+        let running = SummaryPane::Summarizing {
+            model: "Llama 8B".to_owned(),
+            started_ago: Some("3 minutes".to_owned()),
+        }
+        .message();
+        assert!(running.body.contains("Llama 8B"));
+        assert!(running.body.contains("3 minutes"));
+        assert!(running.actions.is_empty());
+
+        // 失敗は理由と、そこから取れる 2 つの手を出す。
+        let failed = SummaryPane::Failed {
+            reason: Some("The model returned nothing to write.".to_owned()),
+        }
+        .message();
+        assert_eq!(failed.body, "The model returned nothing to write.");
+        assert_eq!(
+            failed
+                .actions
+                .iter()
+                .map(|action| action.kind)
+                .collect::<Vec<_>>(),
+            vec![PaneActionKind::WriteNotes, PaneActionKind::OpenNotes]
+        );
+    }
+
+    /// `Blocked` と `NotSummarized` はどちらも「未生成」に落ちる（説明だけが違う）。
+    #[test]
+    fn summary_pane_status_matches_the_variant() {
+        assert_eq!(SummaryPane::Blocked.status(), SummaryStatus::NotSummarized);
+        assert_eq!(
+            SummaryPane::NotSummarized { auto_on: true }.status(),
+            SummaryStatus::NotSummarized
         );
         assert_eq!(
-            summary_placeholder_text(SummaryStatus::Done),
-            "No notes yet"
+            SummaryPane::Queued { position: None }.status(),
+            SummaryStatus::Queued
         );
         assert_eq!(
-            summary_placeholder_text(SummaryStatus::Failed),
-            "Notes could not be written"
+            SummaryPane::Summarizing {
+                model: "Llama 8B".to_owned(),
+                started_ago: None,
+            }
+            .status(),
+            SummaryStatus::Summarizing
         );
+        assert_eq!(SummaryPane::Done.status(), SummaryStatus::Done);
+        assert_eq!(
+            SummaryPane::Failed { reason: None }.status(),
+            SummaryStatus::Failed
+        );
+    }
+
+    /// 経過は読める粒度へ丸める（100ms の tick で秒が動き続けないように、1 分以上は分だけ）。
+    #[test]
+    fn elapsed_text_rounds_to_a_readable_unit() {
+        assert_eq!(elapsed_text(Duration::from_secs(0)), "0 seconds");
+        assert_eq!(elapsed_text(Duration::from_secs(40)), "40 seconds");
+        assert_eq!(elapsed_text(Duration::from_secs(59)), "59 seconds");
+        // **単複を揃える**。そのまま `started 1 minute ago` として画面に出る。
+        assert_eq!(elapsed_text(Duration::from_secs(1)), "1 second");
+        assert_eq!(elapsed_text(Duration::from_secs(60)), "1 minute");
+        assert_eq!(elapsed_text(Duration::from_secs(200)), "3 minutes");
     }
 
     /// `summary.md` の行分け: 見出しは記号を落として heading を立て、他はそのまま。
