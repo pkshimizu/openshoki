@@ -316,6 +316,9 @@ export component RecordingsWindow inherits Window {
     // 選択中セッションの一覧インデックス。未選択は -1。行クリックで更新し select-session を呼ぶ。
     in-out property <int> selected-index: -1;
     // 選択セッションの詳細（Rust 側が選択時に更新する）。
+    // 選んだ録音の中身を読み込んでいる最中か（#152）。**重い読み込みは別スレッドで行う**ので、
+    // その間も操作はできる。空白のまま待たせないために、読み込み中であることを出す。
+    in property <bool> loading;
     in property <bool> has-selection;
     in property <string> detail-datetime;
     in property <string> detail-sources;
@@ -818,7 +821,12 @@ export component RecordingsWindow inherits Window {
                                             // transcript_placeholder_text 参照。JSON の欠落・破損は状態 Done の
                                             // ままセグメントが空になり、未実施と同じ表示に落ちる）。完了済みの
                                             // 再実行中は旧トランスクリプトが残るため上の一覧表示が維持される。
-                                            text: root.detail-transcript-placeholder;
+                                            //
+                                            // **読み込み中はそう言う**（#152）。空白のまま待たせると、
+                                            // 「文字起こしが無い」のか「まだ読んでいる」のか分からない。
+                                            text: root.loading
+                                                ? "Loading…"
+                                                : root.detail-transcript-placeholder;
                                             font-size: Style.body-size;
                                             horizontal-alignment: center;
                                             vertical-alignment: center;
@@ -860,7 +868,7 @@ export component RecordingsWindow inherits Window {
                                             // ラベルの対応は Rust 側の summary_placeholder_text 参照
                                             // （`summary.md` の欠落・破損・空はいずれも未生成と同じ表示に
                                             // 落ちる）。再生成中は旧議事録が残るため一覧表示が維持される。
-                                            text: root.detail-summary-placeholder;
+                                            text: root.loading ? "Loading…" : root.detail-summary-placeholder;
                                             font-size: Style.body-size;
                                             horizontal-alignment: center;
                                             vertical-alignment: center;

@@ -90,14 +90,44 @@ impl AudioPlayer {
     /// 再生対象ファイルをロードして再生準備する（停止状態でセット。`play_pause` で再生開始）。
     /// 失敗時は前のセッションの状態を残さない（stale な `path` が残ると、後続の seek /
     /// play_pause が前のセッションの音声を開き直し、表示中のトランスクリプトと食い違う）。
+    ///
+    /// **重い部分（デコーダを開いて全長を得る）を含む**ので、UI スレッドから呼ぶと固まる。
+    /// 選択時のように応答を保ちたい経路では `prepare` を別スレッドで走らせ、その結果を
+    /// `adopt` で受け取る（#152）。
     pub fn load(&mut self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        // **開く前に手放す**。`prepare` が失敗したときに前の対象が残ると、後続の seek /
+        // play_pause がそれを開き直して、表示中のトランスクリプトと食い違う音が鳴る
+        // （`failed_load_leaves_nothing_loaded` が固定している契約）。
         self.unload();
-        let source = open_decoder(path)?;
-        self.duration = source.total_duration();
-        self.path = Some(path.to_path_buf());
-        self.player.append(source);
-        self.player.pause();
+        let prepared = Self::prepare(path)?;
+        self.adopt(prepared);
         Ok(())
+    }
+
+    /// 再生の準備のうち**重い部分だけ**を行う（デコーダを開き、全長を読む）。
+    ///
+    /// `AudioPlayer` に触らないので**別スレッドで呼べる**。MP3 の全長はヘッダだけでは分からず、
+    /// 実装によってはファイルを走査するため、1 時間の録音では数百 MB を読むことになる——これを
+    /// UI スレッドでやると、その間クリックもスクロールも効かない（#152）。
+    pub fn prepare(path: &Path) -> Result<PreparedSource, Box<dyn std::error::Error>> {
+        let source = open_decoder(path)?;
+        let duration = source.total_duration();
+        Ok(PreparedSource {
+            path: path.to_path_buf(),
+            source,
+            duration,
+        })
+    }
+
+    /// `prepare` の結果を受け取って再生準備を終える（**軽い**。UI スレッドで呼ぶ）。
+    ///
+    /// 前の対象は必ず手放してから入れ替える（`load` と同じ約束。stale な `path` を残さない）。
+    pub fn adopt(&mut self, prepared: PreparedSource) {
+        self.unload();
+        self.duration = prepared.duration;
+        self.path = Some(prepared.path);
+        self.player.append(prepared.source);
+        self.player.pause();
     }
 
     /// 再生と一時停止をトグルする。終端に達して（または停止後で）キューが空なら、対象ファイルを
@@ -210,6 +240,31 @@ impl AudioPlayer {
     /// 再生中か（一時停止でなく、キューが空でない）。
     pub fn is_playing(&self) -> bool {
         !self.player.is_paused() && !self.player.empty()
+    }
+}
+
+/// `AudioPlayer::prepare` が作る、再生に必要なものひと揃い。**別スレッドから UI スレッドへ
+/// 渡すためにある**ので、`AudioPlayer` そのものには触れない。
+pub struct PreparedSource {
+    path: PathBuf,
+    source: Decoder<BufReader<File>>,
+    /// 全体長（分からないこともある。シークバーを表示専用へ縮退させる判断に使う）。
+    duration: Option<Duration>,
+}
+
+impl PreparedSource {
+    /// **別スレッドで作って UI スレッドへ送れる**ことを型で確かめる（`Send` でなくなったら
+    /// コンパイルが通らない）。`#152` の分離はこれが前提。
+    #[cfg(test)]
+    fn assert_send()
+    where
+        Self: Send,
+    {
+    }
+
+    /// 全体長（`AudioPlayer` へ渡す前に、呼び出し側が表示の判断に使う）。
+    pub fn duration(&self) -> Option<Duration> {
+        self.duration
     }
 }
 
@@ -570,6 +625,63 @@ mod tests {
         assert!(
             player.is_playing(),
             "playing after a stop must restart from the beginning"
+        );
+    }
+
+    /// **重い部分を別スレッドへ出しても、`load` と同じ状態になる**（#152）。
+    ///
+    /// 選択時は `prepare` を別スレッドで走らせ、その結果を UI スレッドで `adopt` する。この 2 段が
+    /// `load` と食い違うと、「一覧から選ぶと再生できないが、別経路からは再生できる」という形で
+    /// 静かに壊れる。ここで両者の結果を突き合わせて固定する。
+    #[test]
+    fn preparing_and_adopting_matches_a_direct_load() {
+        let (_dir, path) = fixture("prepare-adopt");
+
+        let (mut direct, _direct_output) = player_driven_by_fake_output();
+        direct.load(&path).expect("loading the test MP3 succeeds");
+
+        let (mut staged, _staged_output) = player_driven_by_fake_output();
+        let prepared = AudioPlayer::prepare(&path).expect("preparing the test MP3 succeeds");
+        // 呼び出し側は `adopt` の前に全体長を読む（シークバーを出すかの判断に使う）。
+        assert_eq!(prepared.duration(), direct.duration());
+        staged.adopt(prepared);
+
+        assert!(staged.is_loaded(), "adopting must leave a playable target");
+        assert_eq!(staged.duration(), direct.duration());
+        assert_eq!(staged.position(), direct.position());
+        assert!(
+            !staged.is_playing() && !direct.is_playing(),
+            "both paths must leave the player paused, ready for Play"
+        );
+    }
+
+    /// `adopt` は**前の対象を手放してから**入れ替える（`load` と同じ約束）。
+    #[test]
+    fn adopting_replaces_the_previous_target() {
+        let (dir, first) = fixture("adopt-replace");
+        let (mut player, _output) = player_driven_by_fake_output();
+        player.load(&first).expect("loading the first MP3 succeeds");
+
+        // **位置を進めてから**差し替える。手放さずに積み足すと前の音源がキューに残り、位置が
+        // 巻き戻らない（前の録音の続きが鳴る、という形で出る）。
+        player
+            .seek(Duration::from_millis(200))
+            .expect("seeking within the fixture should work");
+        assert!(
+            player.position() > Duration::ZERO,
+            "the seek must take effect"
+        );
+
+        let second = dir.path().join("second.mp3");
+        std::fs::copy(&first, &second).expect("copying the fixture should work");
+        let prepared = AudioPlayer::prepare(&second).expect("preparing the second MP3 succeeds");
+        player.adopt(prepared);
+
+        assert!(player.is_loaded());
+        assert_eq!(
+            player.position(),
+            Duration::ZERO,
+            "a replaced target starts from the beginning"
         );
     }
 
