@@ -329,7 +329,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 誰も見ていない画面へ適用され、音声のハンドルと文字起こし本文を次に開くまで抱え続ける。
         let generation = Rc::clone(&load_generation);
         recordings_ui.window().on_close_requested(move || {
-            generation.set(generation.get().wrapping_add(1));
+            advance_load_generation(&generation);
             slint::CloseRequestResponse::HideWindow
         });
     }
@@ -384,8 +384,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             else {
                 return;
             };
-            let generation_id = generation.get().wrapping_add(1);
-            generation.set(generation_id);
+            let generation_id = advance_load_generation(&generation);
 
             // --- ここまでが即時。ディスクを読まずに出せるものだけを入れる ---
             rec.set_has_selection(true);
@@ -1328,8 +1327,7 @@ fn build_menu_event_handler(
             if reload_selected {
                 let sessions = recordings.sessions.borrow();
                 if let Some(session) = selected.and_then(|i| sessions.get(i)) {
-                    let generation_id = recordings.load_generation.get().wrapping_add(1);
-                    recordings.load_generation.set(generation_id);
+                    let generation_id = advance_load_generation(&recordings.load_generation);
                     spawn_session_load(
                         session,
                         generation_id,
@@ -1458,6 +1456,27 @@ fn load_is_current(current: u64, loaded: u64) -> bool {
     current == loaded
 }
 
+/// 選択の世代を 1 つ進めて、**走っている読み込みへ知らせる**。進めた世代を返す。
+///
+/// 世代は 2 つの役目を持つ。(1) 遅れて届いた結果を捨てる（`load_is_current`）。(2) まだ重い処理に
+/// 入っていない読み込みを**降ろす**——連打したぶんだけ数百 MB を読み切るのは、いま見たい録音の
+/// 読み込みを自分で遅くする。
+///
+/// **世代を進める操作はすべてここを通す**（選ぶ・解除する・ウィンドウを閉じる・中身が変わって
+/// 読み直す）。直接 `set` すると (2) が効かず、降りられたはずの読み込みが走り続ける。
+fn advance_load_generation(generation: &Cell<u64>) -> u64 {
+    let next = generation.get().wrapping_add(1);
+    generation.set(next);
+    LOAD_WATCHERS.with(|watchers| {
+        let mut watchers = watchers.borrow_mut();
+        watchers.retain(|w| Arc::strong_count(w) > 1);
+        for w in watchers.iter() {
+            w.store(next, Ordering::Relaxed);
+        }
+    });
+    next
+}
+
 /// 選んだ録音の重い読み込みを別スレッドで始める。
 ///
 /// **`set_segments` を書く経路をここ 1 本に絞る**ための入口（#152）。読み込み中に文字起こしや
@@ -1479,19 +1498,14 @@ fn spawn_session_load(
     // 確かめて、すでに古ければ何も読まない**——連打したぶんだけ数百 MB を読み切るのは、
     // いま見たい録音の読み込みを自分で遅くする。
     let live = Arc::new(AtomicU64::new(generation_id));
-    let watcher = Arc::clone(&live);
-    let generation = Rc::clone(generation);
-    // 世代が進んだことをスレッドへ伝える手（UI スレッドから書き、スレッドが読む）。
+    // 世代が進んだことをスレッドへ伝える手を登録する（書き込むのは `advance_load_generation`）。
     LOAD_WATCHERS.with(|watchers| {
         let mut watchers = watchers.borrow_mut();
+        // 終わったスレッドの手は落とす（`Vec` だけが持っている＝相手がいない）。
         watchers.retain(|w| Arc::strong_count(w) > 1);
-        watchers.push(watcher);
-        // 進んだ世代を全員へ知らせる（古い読み込みは自分で降りる）。
-        let current = generation.get();
-        for w in watchers.iter() {
-            w.store(current, Ordering::Relaxed);
-        }
+        watchers.push(Arc::clone(&live));
     });
+    let _ = generation;
 
     let spawned = std::thread::Builder::new()
         .name("session-load".to_owned())
@@ -1648,7 +1662,7 @@ fn clear_recordings_selection(
     transcript_segments: &RefCell<Vec<transcript::TranscriptSegment>>,
     load_generation: &Cell<u64>,
 ) {
-    load_generation.set(load_generation.get().wrapping_add(1));
+    advance_load_generation(load_generation);
     rec.set_loading(false);
     rec.set_selected_index(-1);
     rec.set_has_selection(false);
