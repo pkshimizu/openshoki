@@ -268,8 +268,11 @@ fn tray_glyph() -> Option<&'static RgbaImage> {
 /// グリフを 1 色（RGB）で塗り直す。**アルファは素材のまま残す**ので、縁のアンチエイリアスが
 /// 保たれ、透明な画素は透明のままになる（塗りにアルファを持たせない＝消えた表示を作れない）。
 fn tinted_glyph(pixels: &[u8], color: [u8; 3]) -> Vec<u8> {
+    // RGBA の 4 バイトずつ見る（端数は捨てる。`.0` だけを使う）。
     pixels
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .flat_map(|pixel| {
             let alpha = pixel[3];
             if alpha == 0 {
@@ -385,7 +388,12 @@ mod tests {
         );
         // グリフが実際に描かれている（不透明画素がある）こと。空の素材を埋め込む事故を防ぐ。
         assert!(
-            glyph.pixels.chunks_exact(4).any(|pixel| pixel[3] > 0),
+            glyph
+                .pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|pixel| pixel[3] > 0),
             "the tray glyph must contain visible pixels"
         );
     }
@@ -423,10 +431,16 @@ mod tests {
         assert_eq!(tinted.len(), glyph.pixels.len());
 
         let mut recolored = 0usize;
-        for (source, painted) in glyph.pixels.chunks_exact(4).zip(tinted.chunks_exact(4)) {
+        for (source, painted) in glyph
+            .pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(tinted.as_chunks::<4>().0.iter())
+        {
             assert_eq!(painted[3], source[3], "the alpha channel must be preserved");
             if source[3] == 0 {
-                assert_eq!(painted, [0, 0, 0, 0], "transparent pixels must stay empty");
+                assert_eq!(*painted, [0, 0, 0, 0], "transparent pixels must stay empty");
             } else {
                 assert_eq!(
                     &painted[..3],
