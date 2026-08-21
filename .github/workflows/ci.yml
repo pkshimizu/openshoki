@@ -111,12 +111,16 @@ jobs:
       # 明示的に確認して早く・明確に失敗させる。
       - name: CMake の存在確認（whisper.cpp / llama.cpp のビルドに必要）
         run: cmake --version
-      # **バージョンは `rust-toolchain.toml` が正**（#156）。ここで `@stable` を指定すると、
-      # そのときの最新が使われて手元と食い違う——clippy の lint はバージョンが上がるたびに
-      # 増えるので、CI だけ新しいと「手元では検出しようがない指摘」で落ちる。
-      # `@master` は toolchain を指定しないときだけファイルを読む。components も同じ理由で
-      # ファイル側に置いてある。
-      - uses: dtolnay/rust-toolchain@master
+      # **バージョンは `rust-toolchain.toml` が正**（#156）。`dtolnay/rust-toolchain` は
+      # `toolchain` の明示を要求する（ファイルを読まない）ので、ここでは使わず rustup へ直接
+      # 任せる——rustup はこのファイルを自動で読み、書かれた版と `components` を用意する。
+      # アクションで版を指定すると、ファイルと二重管理になって片方だけ古くなる。
+      - name: Rust ツールチェーンの用意（rust-toolchain.toml に従う）
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version
+          cargo clippy --version
+          cargo fmt --version
       - uses: Swatinem/rust-cache@v2
       - name: fmt
         run: cargo fmt --check
