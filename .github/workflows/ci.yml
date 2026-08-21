@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
 
+# **トークンの権限はここで宣言する**。既定はリポジトリ設定側にあり、ワークフローの外で
+# 変えられてしまう——このワークフローが要るのは checkout だけなので、読み取りだけに固定する。
+permissions:
+  contents: read
+
 # 同一参照で古い実行が走っていればキャンセルする（無駄な実行を避ける）。
 concurrency:
   group: ci-${{ github.ref }}
@@ -111,9 +116,26 @@ jobs:
       # 明示的に確認して早く・明確に失敗させる。
       - name: CMake の存在確認（whisper.cpp / llama.cpp のビルドに必要）
         run: cmake --version
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      # **バージョンは `rust-toolchain.toml` が正**（#156。rustup の挙動と上げ方はあちら）。
+      # `dtolnay/rust-toolchain` は `toolchain` の明示を要求する——アクションに版を書くと
+      # ファイルと二重管理になり、片方だけ古くなる余地が残るので、使わず rustup に任せる。
+      - name: Rust ツールチェーンの用意（rust-toolchain.toml に従う）
+        run: |
+          # `cargo` を叩けば自動で入るが、ここで先に用意して早く失敗させる。rustup 1.28 以降の
+          # `show` は未導入のツールチェーンを暗黙に入れなくなったので、後段で明示的に入れる。
+          rustup show active-toolchain || rustup toolchain install
+          # **固定が効いていることを確かめる**。`RUSTUP_TOOLCHAIN` や `[toolchain] path` は
+          # ファイルを黙って上書きするので、照合しないと固定が外れたまま緑で通ってしまう
+          # ——それでは「手元と CI で同じ Rust」という前提がいつ崩れたか分からない。
+          expected="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)"
+          actual="$(rustc --version)"
+          if ! printf '%s' "$actual" | grep -q "^rustc $expected "; then
+            echo "rust-toolchain.toml は $expected だが、実際は $actual" >&2
+            exit 1
+          fi
+          echo "$actual"
+          cargo clippy --version
+          cargo fmt --version
       - uses: Swatinem/rust-cache@v2
       - name: fmt
         run: cargo fmt --check

@@ -145,7 +145,9 @@
 
 ### 前提
 
-- **Rust ツールチェーン**（edition 2024 を使うため Rust 1.85 以降）。
+- **rustup**（Rust ツールチェーンの管理）。使う版は `rust-toolchain.toml` が固定しており、
+  `cargo` を叩けば rustup が自動で用意します（手元と CI で同じものを使うため。下限や上げ方は
+  そのファイルに書いてあります）。
 - **C コンパイラ**: `mp3lame-encoder` が libmp3lame をビルドするために必要です。
 - **CMake**: `whisper-rs` が whisper.cpp を、`llama-cpp-2` が llama.cpp をビルドするために
   必要です（`brew install cmake`）。どちらもソースからビルドするため、初回ビルドは数分かかります。

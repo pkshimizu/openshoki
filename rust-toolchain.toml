@@ -1,0 +1,30 @@
+# 手元と CI で**同じ Rust を使う**ための固定（#156）。
+#
+# rustup はこのファイルを自動で読み、書かれたバージョンが無ければ取ってくる。CI も同じファイルを
+# 見るので、「手元では通ったのに CI で落ちる」が起きない。
+#
+# 固定する前は CI が `stable`（そのときの最新）、手元は更新を忘れて古いまま、という差があった。
+# clippy の lint はバージョンが上がるたびに増えるので、CI だけが新しいと**手元では検出しようが
+# ない指摘**で赤くなる（#152 で 3 度落とした）。
+#
+# ## 上げ方
+#
+# 1. 最新の安定版を調べる。`rustup update stable`（未導入なら `rustup toolchain install stable`）
+#    してから `rustup run stable rustc --version`。ここで固定しているのは具体的な版なので、
+#    `rustup check` の一覧には出てこない
+# 2. 下の `channel` をその版へ書き換える
+# 3. `docs/rules/coding-conventions.md` の検証コマンド一式を通す。新しい lint や rustfmt の
+#    出力変化で落ちることがあり、CI は fmt から順に回るので clippy だけでは足りない。
+#    バージョンが変われば全体が解析し直されるので、そのまま流せばよい
+# 4. 上げたこと自体を 1 コミットにする（他の変更と混ぜると、lint 対応の差分が読めなくなる）
+#
+# 固定した以上、放っておいて CI が落ちることはない。上げるのは**必要になったとき**——使いたい
+# 言語機能があるとき、依存が新しい版を要求するとき、取り込みたい lint があるとき。
+[toolchain]
+# 書き方の制約が 2 つある。`.github/workflows/ci.yml` が実際の `rustc --version` と突き合わせる
+# ので、`stable` のようなチャンネル名ではなく**具体的な版**にすること。そして edition 2024 を
+# 使っているので、**1.85 未満にはできない**。
+channel = "1.98.0"
+# 手元でも CI でも `cargo fmt --check` / `cargo clippy` を通す（`docs/rules/coding-conventions.md`
+# の検証コマンド）。ここに書いておけば、ワークフロー側で `components:` を指定しなくてよい。
+components = ["rustfmt", "clippy"]
