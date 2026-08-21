@@ -2292,8 +2292,6 @@ fn refresh_detail_summary_status(
     );
 }
 
-/// 選択中セッションの `summary.md` を読み直して Summary タブへ反映する（選択時・生成完了時）。
-
 /// 保存先パスを画面表示用の文字列に変換する。
 fn recording_dir_text(dir: &std::path::Path) -> slint::SharedString {
     dir.display().to_string().into()
