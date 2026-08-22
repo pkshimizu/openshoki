@@ -89,7 +89,8 @@ fn transcript_pane(has_transcript: bool) -> reading_pane::TranscriptPane {
             ]),
         };
     }
-    // 文字起こしはあるが読めない（`transcript-unreadable`）も、状態としては生成済み。
+    // `transcript-unreadable`（生成済みなのに中身が読めない）も、状態としては生成済み。
+    // 違いは行が 0 件になることで、それは呼び出し側が `set_segments` を省いて作る。
     if has_transcript {
         return reading_pane::TranscriptPane::Done;
     }
@@ -259,7 +260,8 @@ fn main() {
     // 最長文言で崩れないか、ボタンが 2 つ並んだときに収まるかを目視する。文言は本番と同じ
     // `reading_pane` が組む（#160）。
     apply_transcript_pane(&win, &transcript_pane.message());
-    if has_transcript {
+    // `transcript-unreadable` は行を入れない——「生成済みなのに読めない」ときの空表示を見る。
+    if has_transcript && !flag("transcript-unreadable") {
         win.set_segments(ModelRc::from(Rc::new(VecModel::from(rows))));
         // 追従（#154）の確認: `far` は再生位置を一覧の末尾寄りに置く。ON なら開いた時点で
         // その行が見えているはず（`no-follow` なら先頭のまま）。
