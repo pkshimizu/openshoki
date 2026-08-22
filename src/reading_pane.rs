@@ -184,12 +184,14 @@ impl TranscriptPane {
             // （`ui/recordings-window.slint`）、こちらはセグメントが 0 行のときだけ出る。
             // **主操作にはしない**——押しに来る人より、進み具合を見に来る人のほうが多い。
             .with_secondary("Stop", PaneActionKind::StopTranscription),
-            // **「何も保存されない」とは言えない**。音源は 1 本ずつ保存されるので、mic を
-            // 終えて system の途中で止めれば `mic.json` は残る（途中結果の扱いは #164）。
-            // 保証できるのは「いま処理している分は保存しない」だけ。
+            // **言えることだけを言う**。「何も保存されない」は嘘（音源は 1 本ずつ保存されるので、
+            // mic を終えて system の途中で止めれば `mic.json` は残る。途中結果の扱いは #164）。
+            // 「いま仕上げている最中」も嘘になりうる——モデルの取得や推論スロットの待ちで
+            // 止めた場合、まだ何も処理していない（そこは待つだけで、降りるのは待ちが明けた
+            // とき。`TranscribeState::Stopping` の doc）。
             Self::Stopping { model } => PaneMessage::new(
                 STOPPING_LABEL,
-                format!("{model} is finishing the part it is on. That part will not be saved."),
+                format!("Waiting for {model} to stop. The part it is on will not be saved."),
             ),
             Self::Done => PaneMessage::new(
                 "No transcript to show",

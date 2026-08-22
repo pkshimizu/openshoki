@@ -2598,6 +2598,12 @@ fn breathing_level(elapsed: std::time::Duration, cycle_secs: f32) -> f32 {
 /// `Done`（既に書けた音源がある）でも `NotTranscribed`（1 本も書けなかった）でもありうる。
 /// 「`Transcribing` から `Done` へ」だけを見ていると、止めた後に一覧と読む領域が古いまま
 /// 固定され、選び直すまで直らない。
+///
+/// **行き先を数え上げない**（本物の失敗と重なれば `Failed` からもここを通る）。数え上げると
+/// 状態を足した日に静かに漏れるので、見るのは「走っていた／走っていない」の 2 つだけ。
+///
+/// **行き先を数え上げない**（`Failed` からもここを通る）。数え上げると、状態を足した日に
+/// 静かに漏れる。見るのは「走っていた／走っていない」の 2 つだけ。
 fn came_off_the_worker(previous: TranscriptStatus, status: TranscriptStatus) -> bool {
     let on_the_worker = |status| {
         matches!(

@@ -88,9 +88,12 @@ pub enum TranscribeState {
     /// 表示は JSON の有無ベース（未実施／生成済み）へ戻る。
     ///
     /// **進行中と分ける**のは、Stop を押してから実際に降りるまでの間を「押しても何も起きて
-    /// いない」に見せないため。降りるのは推論の切れ目なので、待つのは短ければ数百 ms、モデルの
-    /// ロード中なら十数秒になる。ここに割合は持たない——止めると決めた後の進捗は、読み手の
-    /// 判断に何も足さない。
+    /// いない」に見せないため。降りるのは重い処理の切れ目（モデルの取得・推論スロットの待ち・
+    /// モデルのロード・音源の切れ目・推論）なので、**待つ長さは押した場所で桁が変わる**——
+    /// 推論中なら数百 ms、モデルのロード中なら十数秒、**モデルの取得や推論スロットの待ちに
+    /// 入っていれば分オーダー**になる（待ちの最中は中断フラグを見ておらず、明けてから降りる。
+    /// 待ちそのものを切る話は `#150` の領分）。ここに割合は持たない——止めると決めた後の
+    /// 進捗は、読み手の判断に何も足さない。
     Stopping { model_label: String },
     /// 全音源の文字起こしが完了した。
     Done,
@@ -282,10 +285,10 @@ impl ProgressSink {
     /// **進行中のエントリにしか書かない**。完了・失敗が先に書かれた後で遅れて届いた進捗が
     /// 状態を巻き戻さないようにする（whisper のコールバックは推論スレッドから来る）。
     ///
-    /// **ここでパニックしない**こと。呼び出し元は whisper.cpp の C フレームで、whisper-rs の
-    /// トランポリンは `catch_unwind` を挟まない——巻き戻しが FFI 境界を越えると未定義動作に
-    /// なる。いま安全なのは、ロックが poison を吸収し、`total == 0` を先に弾き、`as` が
-    /// 飽和キャストだから。`expect` や添字アクセスを足さないこと（`docs/rules/ffi.md`）。
+    /// **ここでパニックしない**こと（理由は `abort_if_stopped` の doc。同じ `extern "C"` の
+    /// 境界で、whisper-rs のトランポリンは `catch_unwind` を挟まない）。いま安全なのは、
+    /// ロックが poison を吸収し、`total == 0` を先に弾き、`as` が飽和キャストだから。
+    /// `expect` や添字アクセスを足さないこと（`docs/rules/ffi.md`）。
     fn report(&self, file_percent: i32) {
         if self.total == 0 {
             return;
@@ -362,6 +365,8 @@ impl TranscribeWorker {
                         &model_label,
                         &cancel,
                     ) {
+                        // 止められたか、後続に追い越されたジョブ（`claim_job` の doc）。
+                        println!("Skipping transcription because the job is no longer current");
                         continue;
                     }
                     // 文字起こし中のパニックでワーカースレッドを殺さない。死ぬと状態が
@@ -379,6 +384,14 @@ impl TranscribeWorker {
                             );
                             JobOutcome::Failed(TranscribeFailure::Panicked)
                         }
+                    };
+                    // **止めた後に本物の失敗が重なっても、失敗としては出さない**。押した人に
+                    // とって起きたことは「止めた」で、そこへ赤い「Transcription failed」を
+                    // 出しても直しようがない（理由はログに残る）。
+                    let outcome = if cancel.load(Ordering::Relaxed) {
+                        outcome.stopped_instead_of_failed()
+                    } else {
+                        outcome
                     };
                     // 要約は「全音源の文字起こしに成功した」ときだけ続ける。部分的に失敗した
                     // 文字起こしから議事録を作ると、欠けたまま完成品に見えてしまう。止めた
@@ -443,7 +456,8 @@ impl TranscribeWorker {
     /// 走っている（またはキュー待ちの）文字起こしを止める（#163）。
     ///
     /// **止めるのは失敗ではない**。降りたジョブは状態マップから消え、表示は JSON の有無ベース
-    /// （未実施／生成済み）へ戻る。赤い失敗表示にはしない。
+    /// （未実施／生成済み）へ戻る。止めた後に本物の失敗が重なっても赤い失敗表示にはしない
+    /// （`JobOutcome::stopped_instead_of_failed`）。
     ///
     /// **判定と実行は 1 回のロックでまとめる**。「走っているか」を別に問い合わせてから止めると、
     /// その隙間でワーカーがジョブを取り出し、「キュー待ちを取り消した」と答えたあとに走り出す
@@ -663,6 +677,21 @@ impl JobOutcome {
         match self {
             Self::Done => true,
             Self::Failed(_) | Self::Skipped | Self::Stopped => false,
+        }
+    }
+
+    /// 止められたジョブの結果を畳む。**失敗は「止めた」に丸める**。
+    ///
+    /// 止めた後に本物の失敗が重なる経路が実在する（モデルの取得やロードが失敗する、最後の
+    /// 音源のデコードが失敗する）。そこで赤い「Transcription failed」を出しても、押した人に
+    /// とって起きたことは「止めた」なので直しようがない。失敗の理由はログに残る。
+    ///
+    /// **ワイルドカードを置かない**（結果を足したら扱いを書くまで通らない）。
+    fn stopped_instead_of_failed(self) -> Self {
+        match self {
+            Self::Failed(_) | Self::Stopped => Self::Stopped,
+            Self::Done => Self::Done,
+            Self::Skipped => Self::Skipped,
         }
     }
 }
@@ -1568,6 +1597,29 @@ mod tests {
             !JobOutcome::Failed(TranscribeFailure::Panicked).keeps_summary(),
             "a partial transcription would make an incomplete summary look finished"
         );
+    }
+
+    /// 止めた後に本物の失敗が重なっても、失敗としては出さない（#163）。**全結果を網羅**で
+    /// 固定する——ここが緩むと「止めたのに赤くなる」が静かに戻る。
+    #[test]
+    fn a_failure_that_lands_after_a_stop_is_reported_as_stopped() {
+        assert!(matches!(
+            JobOutcome::Failed(TranscribeFailure::ModelDownload).stopped_instead_of_failed(),
+            JobOutcome::Stopped
+        ));
+        assert!(matches!(
+            JobOutcome::Stopped.stopped_instead_of_failed(),
+            JobOutcome::Stopped
+        ));
+        // 止めるより先に終わっていたものは、そのまま。
+        assert!(matches!(
+            JobOutcome::Done.stopped_instead_of_failed(),
+            JobOutcome::Done
+        ));
+        assert!(matches!(
+            JobOutcome::Skipped.stopped_instead_of_failed(),
+            JobOutcome::Skipped
+        ));
     }
 
     /// 止められたジョブは、**重い準備を始める前に**降りる（#163）。モデルの取得・推論スロット
