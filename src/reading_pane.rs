@@ -213,6 +213,20 @@ pub fn actions_allowed_while_busy(actions: Vec<PaneAction>, jobs_pending: bool) 
         .collect()
 }
 
+/// 一覧の行に出す文字起こしの状態（**網羅 match**。状態を足したら語を決めるまで通らない）。
+pub fn session_transcript_word(status: TranscriptStatus, percent: Option<u8>) -> String {
+    match status {
+        TranscriptStatus::NotTranscribed => "not transcribed".to_owned(),
+        // 割合が来ていれば出す（#162）。読む領域を開かなくても、どれが動いているか分かる。
+        TranscriptStatus::Transcribing => match percent {
+            Some(percent) => format!("transcribing {percent}%"),
+            None => "transcribing".to_owned(),
+        },
+        TranscriptStatus::Done => "transcribed".to_owned(),
+        TranscriptStatus::Failed => "transcription failed".to_owned(),
+    }
+}
+
 /// 議事録生成の表示状態 → 詳細ペインの状態テキスト。
 pub fn summary_status_text(display_status: SummaryStatus) -> &'static str {
     match display_status {

@@ -29,8 +29,8 @@ mod whisper_model;
 mod windows;
 
 use reading_pane::{
-    SummaryPane, TranscriptPane, actions_allowed_while_busy, elapsed_text, summary_status_text,
-    transcript_status_text,
+    SummaryPane, TranscriptPane, actions_allowed_while_busy, elapsed_text, session_transcript_word,
+    summary_status_text, transcript_status_text,
 };
 
 use std::cell::{Cell, RefCell};
@@ -1687,20 +1687,6 @@ fn session_date_text(session: &recordings::RecordingSession) -> String {
     match session.duration.map(tray::format_elapsed) {
         Some(length) => format!("{} · {length}", session.display_date()),
         None => session.display_date(),
-    }
-}
-
-/// 一覧の行に出す文字起こしの状態（**網羅 match**。状態を足したら語を決めるまで通らない）。
-fn session_transcript_word(status: TranscriptStatus, percent: Option<u8>) -> String {
-    match status {
-        TranscriptStatus::NotTranscribed => "not transcribed".to_owned(),
-        // 割合が来ていれば出す（#162）。読む領域を開かなくても、どれが動いているか分かる。
-        TranscriptStatus::Transcribing => match percent {
-            Some(percent) => format!("transcribing {percent}%"),
-            None => "transcribing".to_owned(),
-        },
-        TranscriptStatus::Done => "transcribed".to_owned(),
-        TranscriptStatus::Failed => "transcription failed".to_owned(),
     }
 }
 

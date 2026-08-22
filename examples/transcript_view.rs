@@ -163,28 +163,35 @@ fn main() {
         })
         .collect();
     // 一覧のサンプル（見出しのまとまり・選択の縦罫・状態のドットを目視する）。**行の高さは
-    // 固定**なので、いちばん長い文言でクリップされることも見る。文言は `src/main.rs` の
-    // `session_detail_text` の複製（あちらを変えたらここも合わせること）。
+    // 固定**なので、いちばん長い文言でクリップされることも見る。状態の語は本番と同じ
+    // `reading_pane::session_transcript_word` が組む（#160）。
+    let detail = |sources: &str, status, percent| -> slint::SharedString {
+        format!(
+            "{sources} · {}",
+            reading_pane::session_transcript_word(status, percent)
+        )
+        .into()
+    };
     win.set_sessions(ModelRc::from(Rc::new(VecModel::from(vec![
         SessionRow {
             group_heading: "Today".into(),
             time_text: "14:02".into(),
             date_text: "Aug 10, 2026 · 1:12:40".into(),
-            detail_text: "Mic + system · transcribing 48%".into(),
+            detail_text: detail("Mic + system", TranscriptStatus::Transcribing, Some(48)),
             transcript_status: TranscriptStatus::Transcribing,
         },
         SessionRow {
             group_heading: "".into(),
             time_text: "09:30".into(),
             date_text: "Aug 10, 2026 · 27:05".into(),
-            detail_text: "Mic only · transcribed".into(),
+            detail_text: detail("Mic only", TranscriptStatus::Done, None),
             transcript_status: TranscriptStatus::Done,
         },
         SessionRow {
             group_heading: "Yesterday".into(),
             time_text: "16:45".into(),
             date_text: "Aug 9, 2026 · 2:41:18".into(),
-            detail_text: "System only · transcription failed".into(),
+            detail_text: detail("System only", TranscriptStatus::Failed, None),
             transcript_status: TranscriptStatus::Failed,
         },
         SessionRow {
@@ -192,7 +199,7 @@ fn main() {
             time_text: "11:00".into(),
             // 長さが分からない録音（区切りごと出ないことを見る）。
             date_text: "Aug 9, 2026".into(),
-            detail_text: "Mic + system · not transcribed".into(),
+            detail_text: detail("Mic + system", TranscriptStatus::NotTranscribed, None),
             transcript_status: TranscriptStatus::NotTranscribed,
         },
         SessionRow {
@@ -200,7 +207,7 @@ fn main() {
             time_text: "15:30".into(),
             // デザインの `6:20` に対して、プレイヤーへ揃えたゼロ詰めの形も見る。
             date_text: "Aug 5, 2026 · 06:20".into(),
-            detail_text: "Mic + system · transcribed".into(),
+            detail_text: detail("Mic + system", TranscriptStatus::Done, None),
             transcript_status: TranscriptStatus::Done,
         },
     ]))));
@@ -224,9 +231,8 @@ fn main() {
     win.set_detail_sources("Mic + system".into());
 
     // 文字起こしと議事録は**実アプリで起こりうる組み合わせ**に揃える（要約は文字起こしを
-    // 入力にするので、文字起こしが無いセッションには議事録も無い）。状態の文言は `src/main.rs` の
-    // transcript_* / summary_* の対応表の複製（bin クレートなので import できない。あちらを
-    // 変えたらここも合わせること）。
+    // 入力にするので、文字起こしが無いセッションには議事録も無い）。状態の文言は本番と同じ
+    // `reading_pane` が組む（#160）。
     // 読み込み中の表示（#152）。選んだ直後は中身が空で、その間もウィンドウは操作できる。
     if flag("loading") {
         win.set_loading(true);
@@ -243,11 +249,9 @@ fn main() {
     } else {
         TranscriptStatus::NotTranscribed
     });
-    win.set_detail_transcript_text(if has_transcript {
-        "Transcribed".into()
-    } else {
-        "Not transcribed".into()
-    });
+    win.set_detail_transcript_text(
+        reading_pane::transcript_status_text(win.get_detail_transcript_status()).into(),
+    );
     // 読む領域の空表示（#154）。**状態を引数で選べる**ようにする——見出し・理由・操作の 3 段が
     // 最長文言で崩れないか、ボタンが 2 つ並んだときに収まるかを目視する。文言は本番と同じ
     // `reading_pane` が組む（#160）。
@@ -282,16 +286,7 @@ fn main() {
         SummaryStatus::Done
     };
     win.set_detail_summary_status(summary_status);
-    win.set_detail_summary_status_text(
-        match summary_status {
-            SummaryStatus::NotSummarized => "Not summarized",
-            SummaryStatus::Queued => reading_pane::SUMMARY_QUEUED_LABEL,
-            SummaryStatus::Summarizing => reading_pane::SUMMARIZING_LABEL,
-            SummaryStatus::Done => "Notes ready",
-            SummaryStatus::Failed => "Summarization failed",
-        }
-        .into(),
-    );
+    win.set_detail_summary_status_text(reading_pane::summary_status_text(summary_status).into());
     apply_pane(
         &win,
         &summary_pane(summary_status, has_transcript).message(),
