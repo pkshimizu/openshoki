@@ -27,6 +27,15 @@ slint::include_modules!();
 #[path = "verification/snapshot.rs"]
 mod snapshot;
 
+// **文言は複製せず、本番と同じものを使う**（#160）。複製していたときは実際にずれた
+// （#161 で `Waiting to summarize…` と `Waiting to write notes…` に割れているのが見つかった）。
+// 目視で確認するのが出荷される文言でなくなると、確認そのものが意味を失う。
+// 確認用バイナリは一部の変種しか作らないので、作らないものは「未使用」に見える。
+// **本番では全部使う**（`TranscriptPane::message` の網羅 match）ので、ここでは許可する。
+#[allow(dead_code)]
+#[path = "../src/reading_pane.rs"]
+mod reading_pane;
+
 use std::rc::Rc;
 
 use slint::{ModelRc, VecModel};
@@ -39,135 +48,69 @@ fn flag(name: &str) -> bool {
 /// 引数で件数を指定しなかったときのセグメント件数。
 const DEFAULT_SEGMENT_COUNT: usize = 30;
 
-/// 生成中のラベル。状態テキストと空表示の見出しで同じ文言を使うため 1 箇所に置く
-/// （`src/main.rs` の `SUMMARIZING_LABEL` の複製。あちらを変えたらここも合わせること）。
-const SUMMARIZING_LABEL: &str = "Writing notes…";
-
-/// キュー待ちのラベル（同上。`src/main.rs` の複製。状態行と空表示で同じ文言）。
-const SUMMARY_QUEUED_LABEL: &str = "Waiting to write notes…";
-
-/// 空表示のボタン列を Slint のモデルにする。
-fn pane_actions(actions: Vec<(&str, PaneActionKind, bool)>) -> ModelRc<PaneAction> {
-    ModelRc::from(Rc::new(VecModel::from(
-        actions
-            .into_iter()
-            .map(|(label, kind, primary)| PaneAction {
-                label: label.into(),
-                kind,
-                primary,
-            })
-            .collect::<Vec<_>>(),
-    )))
+/// 空表示を入れる（本番の `main::apply_detail_*_status` と同じ 3 つを埋める）。
+fn apply_pane(
+    win: &RecordingsWindow,
+    message: &reading_pane::PaneMessage,
+    heading: impl Fn(&RecordingsWindow, slint::SharedString),
+    body: impl Fn(&RecordingsWindow, slint::SharedString),
+    actions: impl Fn(&RecordingsWindow, ModelRc<PaneAction>),
+) {
+    heading(win, message.heading.as_str().into());
+    body(win, message.body.as_str().into());
+    actions(
+        win,
+        ModelRc::from(Rc::new(VecModel::from(message.actions.clone()))),
+    );
 }
 
-/// Transcript タブの空表示（`src/main.rs` の `TranscriptPane::message` の複製。bin クレート
-/// なので import できない。あちらを変えたらここも合わせること）。
-fn transcript_empty_state() -> (
-    &'static str,
-    &'static str,
-    Vec<(&'static str, PaneActionKind, bool)>,
-) {
+/// Transcript タブに出す状態を引数で選ぶ。**文言は組まない**——`reading_pane` が組む（#160）。
+fn transcript_pane() -> reading_pane::PaneMessage {
     if flag("transcribing") {
-        return (
-            "Transcribing — 48%",
-            "Medium is running on this Mac. Finished lines appear here as they are recognized.",
-            Vec::new(),
-        );
-    }
-    if flag("transcript-unreadable") {
-        // JSON が読めなかった経路（状態は Done のままセグメントだけ空になる）。
-        return (
-            "No transcript to show",
-            "The transcript file is missing or could not be read. Transcribing again will \
-             rebuild it.",
-            vec![("Transcribe again", PaneActionKind::Transcribe, true)],
-        );
-    }
-    if flag("auto-on") {
-        return (
-            "No transcript yet",
-            "Automatic transcription is on, but this recording has not been through it.",
-            vec![("Transcribe now", PaneActionKind::Transcribe, true)],
-        );
+        return reading_pane::TranscriptPane::Transcribing {
+            model: "Medium".to_owned(),
+            percent: Some(48),
+        }
+        .message();
     }
     if flag("transcript-failed") {
-        return (
-            "Transcription failed",
-            // ワーカーが返す中でいちばん長い理由（折り返しを見る）。
-            "mic.mp3, system.mp3 could not be transcribed.",
-            vec![("Try again", PaneActionKind::Transcribe, true)],
-        );
+        // ワーカーが返す中でいちばん長い理由（折り返しを見る）。
+        return reading_pane::TranscriptPane::Failed {
+            reason: reading_pane::TranscribeFailure::Files(vec![
+                "mic.mp3".to_owned(),
+                "system.mp3".to_owned(),
+            ]),
+        }
+        .message();
     }
-    (
-        "No transcript yet",
-        "Automatic transcription is off, so this recording was kept as audio only.",
-        vec![("Transcribe now", PaneActionKind::Transcribe, true)],
-    )
+    if flag("transcript-unreadable") {
+        return reading_pane::TranscriptPane::Done.message();
+    }
+    reading_pane::TranscriptPane::NotTranscribed {
+        auto_on: flag("auto-on"),
+    }
+    .message()
 }
 
-/// Notes タブの空表示（同上。`src/main.rs` の `SummaryPane::message` の複製）。
-fn summary_empty_state(
-    status: SummaryStatus,
-    has_transcript: bool,
-) -> (
-    &'static str,
-    &'static str,
-    Vec<(&'static str, PaneActionKind, bool)>,
-) {
+/// Notes タブに出す状態（同上）。
+fn summary_pane(status: SummaryStatus, has_transcript: bool) -> reading_pane::SummaryPane {
     if !has_transcript {
-        return (
-            "No notes yet",
-            "Notes are written from the transcript, and this recording has none. Transcribing it \
-             first will let notes run.",
-            vec![
-                ("Transcribe now", PaneActionKind::Transcribe, true),
-                (
-                    "Open transcription",
-                    PaneActionKind::OpenTranscription,
-                    false,
-                ),
-            ],
-        );
+        return reading_pane::SummaryPane::Blocked;
     }
     match status {
-        SummaryStatus::Queued => (
-            "Waiting to start — number 2 in the queue",
-            "Notes start once the work ahead of this recording finishes. Nothing is running for \
-             it yet, so it can still be canceled.",
-            vec![("Cancel", PaneActionKind::CancelNotes, false)],
-        ),
-        SummaryStatus::Summarizing => (
-            SUMMARIZING_LABEL,
-            "Qwen2.5 3B Instruct is running on this Mac, started 40 seconds ago. Re-transcribing \
-             is unavailable until this finishes, because it would change the input.",
-            Vec::new(),
-        ),
-        SummaryStatus::Failed => (
-            "Notes could not be written",
-            // いちばん長い理由（2 つ並ぶボタンと一緒に収まるかを見る）。
-            "The model could not finish. It may need more free memory than this Mac has right \
-             now — closing other apps, or choosing a smaller model, can let it run.",
-            vec![
-                ("Try again", PaneActionKind::WriteNotes, true),
-                ("Open meeting notes", PaneActionKind::OpenNotes, false),
-            ],
-        ),
-        // `summary.md` が読めなかった経路（状態は Done のまま行だけ空になる）。
-        SummaryStatus::Done => (
-            "No notes to show",
-            "The notes file is missing or could not be read. Writing them again will rebuild it.",
-            vec![("Write notes again", PaneActionKind::WriteNotes, true)],
-        ),
-        SummaryStatus::NotSummarized if flag("auto-on") => (
-            "No notes yet",
-            "Automatic notes are on, but this recording has not been through them.",
-            vec![("Write notes", PaneActionKind::WriteNotes, true)],
-        ),
-        SummaryStatus::NotSummarized => (
-            "No notes yet",
-            "Notes are not written automatically, so this recording does not have any.",
-            vec![("Write notes", PaneActionKind::WriteNotes, true)],
-        ),
+        SummaryStatus::Queued => reading_pane::SummaryPane::Queued { position: 2 },
+        SummaryStatus::Summarizing => reading_pane::SummaryPane::Summarizing {
+            model: "Qwen2.5 3B Instruct".to_owned(),
+            started_ago: "40 seconds".to_owned(),
+        },
+        // いちばん長い理由（2 つ並ぶボタンと一緒に収まるかを見る）。
+        SummaryStatus::Failed => reading_pane::SummaryPane::Failed {
+            reason: reading_pane::SummarizeFailure::ModelRun,
+        },
+        SummaryStatus::Done => reading_pane::SummaryPane::Done,
+        SummaryStatus::NotSummarized => reading_pane::SummaryPane::NotSummarized {
+            auto_on: flag("auto-on"),
+        },
     }
 }
 
@@ -305,12 +248,16 @@ fn main() {
     } else {
         "Not transcribed".into()
     });
-    // 読む領域の空表示（#154）。**9 通りの状態を引数で選べる**ようにする——見出し・理由・
-    // 操作の 3 段が最長文言で崩れないか、ボタンが 2 つ並んだときに収まるかを目視する。
-    let (heading, body, actions) = transcript_empty_state();
-    win.set_detail_transcript_heading(heading.into());
-    win.set_detail_transcript_body(body.into());
-    win.set_detail_transcript_actions(pane_actions(actions));
+    // 読む領域の空表示（#154）。**状態を引数で選べる**ようにする——見出し・理由・操作の 3 段が
+    // 最長文言で崩れないか、ボタンが 2 つ並んだときに収まるかを目視する。文言は本番と同じ
+    // `reading_pane` が組む（#160）。
+    apply_pane(
+        &win,
+        &transcript_pane(),
+        RecordingsWindow::set_detail_transcript_heading,
+        RecordingsWindow::set_detail_transcript_body,
+        RecordingsWindow::set_detail_transcript_actions,
+    );
     if has_transcript {
         win.set_segments(ModelRc::from(Rc::new(VecModel::from(rows))));
         // 追従（#154）の確認: `far` は再生位置を一覧の末尾寄りに置く。ON なら開いた時点で
@@ -338,17 +285,20 @@ fn main() {
     win.set_detail_summary_status_text(
         match summary_status {
             SummaryStatus::NotSummarized => "Not summarized",
-            SummaryStatus::Queued => SUMMARY_QUEUED_LABEL,
-            SummaryStatus::Summarizing => SUMMARIZING_LABEL,
+            SummaryStatus::Queued => reading_pane::SUMMARY_QUEUED_LABEL,
+            SummaryStatus::Summarizing => reading_pane::SUMMARIZING_LABEL,
             SummaryStatus::Done => "Notes ready",
             SummaryStatus::Failed => "Summarization failed",
         }
         .into(),
     );
-    let (heading, body, actions) = summary_empty_state(summary_status, has_transcript);
-    win.set_detail_summary_heading(heading.into());
-    win.set_detail_summary_body(body.into());
-    win.set_detail_summary_actions(pane_actions(actions));
+    apply_pane(
+        &win,
+        &summary_pane(summary_status, has_transcript).message(),
+        RecordingsWindow::set_detail_summary_heading,
+        RecordingsWindow::set_detail_summary_body,
+        RecordingsWindow::set_detail_summary_actions,
+    );
     win.set_detail_summary_footer("Written from the transcript · Aug 9, 2026 · 09:14".into());
     // 生成済みのときだけ行を入れる（生成中・失敗は旧議事録が無い状態＝空表示を見る）。
     if summary_status == SummaryStatus::Done {

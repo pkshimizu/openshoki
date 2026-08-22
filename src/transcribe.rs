@@ -10,6 +10,7 @@
 //! ブロックしない。モデル未指定/欠如・デコード失敗・whisper 失敗は握りつぶさずログし、
 //! 他音源・アプリ・録音を巻き込まない（`docs/rules/error-handling.md`）。
 
+use crate::reading_pane::TranscribeFailure;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
@@ -135,31 +136,6 @@ impl TranscribeProgress {
             Self::Done | Self::Failed => None,
         }
     }
-}
-
-/// 文字起こしが失敗した理由（#159）。
-///
-/// **文言はここに持たない**。ワーカー層が UI のコピーを持つと、状態→文言の対応表が
-/// `main::TranscriptPane::message` と 2 箇所に割れる（`docs/rules/messages.md` の管轄）。
-/// 種別を足せば向こうの網羅 match が割れて、書き忘れに気づける。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TranscribeFailure {
-    /// モデルを取ってこられなかった。
-    ModelDownload,
-    /// モデルのファイルが無い。
-    ModelMissing,
-    /// モデルのパスを開けない（UTF-8 でない等）。
-    ModelUnreadable,
-    /// モデルは在るが読み込めなかった。
-    ModelLoad,
-    /// 音源の文字起こしに失敗した。**ファイル名だけ**を持つ（パスは持たない。
-    /// `docs/rules/security.md`）。名前を作るのは `audio_display_name` だけで、そこが保証する。
-    ///
-    /// **空にならない**——構築するのは `run_job` の 1 箇所で、1 本以上失敗したときにしか作らない
-    /// （空だと文言が ` could not be transcribed.` になる）。
-    Files(Vec<String>),
-    /// ワーカーがパニックした（**なぜかは分からない**）。
-    Panicked,
 }
 
 /// セッション単位の文字起こしの進行状況。Recordings ウィンドウの状態表示に使う。

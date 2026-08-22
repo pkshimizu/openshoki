@@ -18,6 +18,7 @@
 
 mod on_device;
 
+use crate::reading_pane::SummarizeFailure;
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -179,21 +180,6 @@ impl SummarizeEntry {
             Self::Failed { .. } => SummarizeStatus::Failed,
         }
     }
-}
-
-/// 議事録の生成が失敗した理由（#159。文言は `main::summarize_failure_text` が正）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SummarizeFailure {
-    /// モデルを用意できなかった。
-    ModelPrepare,
-    /// モデルが走り切らなかった（メモリ不足が最も多い）。
-    ModelRun,
-    /// 走ったが何も返さなかった。
-    EmptyOutput,
-    /// 生成はできたが保存に失敗した。
-    Save,
-    /// ワーカーがパニックした。
-    Panicked,
 }
 
 /// 読む領域が読む、セッション 1 件分の要約の状態。`SummarizeEntry` から組み立てる
