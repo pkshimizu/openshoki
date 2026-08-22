@@ -2595,9 +2595,7 @@ impl PaneMessage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TranscriptPane {
     /// まだ走らせていない。`auto_on` は設定の自動文字起こし（なぜ無いのかの説明が変わる）。
-    NotTranscribed {
-        auto_on: bool,
-    },
+    NotTranscribed { auto_on: bool },
     Transcribing {
         model: String,
         /// whisper が返した進捗（返し始めるまでは `None`）。
@@ -2606,8 +2604,9 @@ enum TranscriptPane {
     /// 走り終わっている。**この空表示が出るのは JSON が読めなかったときだけ**
     /// （セグメントがあれば一覧が出るので、ここへは来ない）。
     Done,
+    /// **理由は必ずある**（失敗の記録は理由と一緒にしか作られない。#159）。文言はここで組む。
     Failed {
-        reason: Option<String>,
+        reason: transcribe::TranscribeFailure,
     },
 }
 
@@ -2652,13 +2651,10 @@ impl TranscriptPane {
                  rebuild it.",
             )
             .with_primary("Transcribe again", PaneActionKind::Transcribe),
-            Self::Failed { reason } => PaneMessage::new(
-                "Transcription failed",
-                reason.clone().unwrap_or_else(|| {
-                    "Something went wrong while transcribing this recording.".to_owned()
-                }),
-            )
-            .with_primary("Try again", PaneActionKind::Transcribe),
+            Self::Failed { reason } => {
+                PaneMessage::new("Transcription failed", transcribe_failure_text(reason))
+                    .with_primary("Try again", PaneActionKind::Transcribe)
+            }
         }
     }
 }
@@ -2761,16 +2757,17 @@ fn transcript_pane_of(
     auto_on: bool,
 ) -> TranscriptPane {
     match state {
-        Some(state) => match state.status {
-            transcribe::TranscribeStatus::Transcribing => TranscriptPane::Transcribing {
-                model: state.model_label,
-                percent: state.percent,
-            },
-            transcribe::TranscribeStatus::Done => TranscriptPane::Done,
-            transcribe::TranscribeStatus::Failed => TranscriptPane::Failed {
-                reason: state.reason,
-            },
+        Some(transcribe::TranscribeState::Transcribing {
+            model_label,
+            percent,
+        }) => TranscriptPane::Transcribing {
+            model: model_label,
+            percent,
         },
+        Some(transcribe::TranscribeState::Done { .. }) => TranscriptPane::Done,
+        Some(transcribe::TranscribeState::Failed { reason, .. }) => {
+            TranscriptPane::Failed { reason }
+        }
         None if has_transcript => TranscriptPane::Done,
         None => TranscriptPane::NotTranscribed { auto_on },
     }
@@ -2865,23 +2862,22 @@ enum SummaryPane {
     /// 「まだ書いていない」ではなく「まだ書けない」。
     Blocked,
     /// 文字起こしはあるが、まだ書いていない。
-    NotSummarized {
-        auto_on: bool,
-    },
+    NotSummarized { auto_on: bool },
     Queued {
-        /// キュー待ちの中で何番目か（1 始まり）。
-        position: Option<usize>,
+        /// キュー待ちの中で何番目か（1 始まり）。**必ず分かる**（キュー待ちの記録は順番と
+        /// 一緒にしか作られない。#159）。
+        position: usize,
     },
     Summarizing {
         model: String,
-        /// 始めてからの経過（読める粒度に丸めた文字列。無ければ経過を出さない）。
-        started_ago: Option<String>,
+        /// 始めてからの経過（読める粒度に丸めた文字列）。**必ず分かる**（生成中の記録は開始
+        /// 時刻と一緒にしか作られない）。
+        started_ago: String,
     },
     /// 書き終わっている。**この空表示が出るのは `summary.md` が読めなかったときだけ**。
     Done,
-    Failed {
-        reason: Option<String>,
-    },
+    /// **理由は必ずある**（失敗の記録は理由と一緒にしか作られない。#159）。
+    Failed { reason: summarize::SummarizeFailure },
 }
 
 impl SummaryPane {
@@ -2918,26 +2914,17 @@ impl SummaryPane {
             )
             .with_primary("Write notes", PaneActionKind::WriteNotes),
             Self::Queued { position } => PaneMessage::new(
-                match position {
-                    Some(position) => format!("Waiting to start — number {position} in the queue"),
-                    None => SUMMARY_QUEUED_LABEL.to_owned(),
-                },
+                format!("Waiting to start — number {position} in the queue"),
                 "Notes start once the work ahead of this recording finishes. Nothing is running \
                  for it yet, so it can still be canceled.",
             )
             .with_secondary("Cancel", PaneActionKind::CancelNotes),
             Self::Summarizing { model, started_ago } => PaneMessage::new(
                 SUMMARIZING_LABEL,
-                match started_ago {
-                    Some(ago) => format!(
-                        "{model} is running on this Mac, started {ago} ago. Re-transcribing is \
-                         unavailable until this finishes, because it would change the input."
-                    ),
-                    None => format!(
-                        "{model} is running on this Mac. Re-transcribing is unavailable until \
-                         this finishes, because it would change the input."
-                    ),
-                },
+                format!(
+                    "{model} is running on this Mac, started {started_ago} ago. Re-transcribing \
+                     is unavailable until this finishes, because it would change the input."
+                ),
             ),
             Self::Done => PaneMessage::new(
                 "No notes to show",
@@ -2945,15 +2932,62 @@ impl SummaryPane {
                  rebuild it.",
             )
             .with_primary("Write notes again", PaneActionKind::WriteNotes),
-            Self::Failed { reason } => PaneMessage::new(
-                "Notes could not be written",
-                reason.clone().unwrap_or_else(|| {
-                    "Something went wrong while writing notes for this recording.".to_owned()
-                }),
-            )
-            .with_primary("Try again", PaneActionKind::WriteNotes)
-            .with_secondary("Open meeting notes", PaneActionKind::OpenNotes),
+            Self::Failed { reason } => {
+                PaneMessage::new("Notes could not be written", summarize_failure_text(reason))
+                    .with_primary("Try again", PaneActionKind::WriteNotes)
+                    .with_secondary("Open meeting notes", PaneActionKind::OpenNotes)
+            }
         }
+    }
+}
+
+/// 文字起こしが失敗した理由 → 読む領域に出す 1 文（#159）。
+///
+/// **ワイルドカードを置かない**。種別を足したらここが割れて、書き忘れに気づける
+/// （文言をワーカー層に置かないのはこのため。`docs/rules/messages.md` の管轄が割れる）。
+fn transcribe_failure_text(reason: &transcribe::TranscribeFailure) -> String {
+    match reason {
+        transcribe::TranscribeFailure::ModelDownload => {
+            "The transcription model could not be downloaded.".to_owned()
+        }
+        transcribe::TranscribeFailure::ModelMissing => {
+            "The transcription model file is missing.".to_owned()
+        }
+        transcribe::TranscribeFailure::ModelUnreadable => {
+            "The transcription model file could not be opened.".to_owned()
+        }
+        transcribe::TranscribeFailure::ModelLoad => {
+            "The transcription model could not be loaded.".to_owned()
+        }
+        // **件数で文の形は変えない**（`docs/rules/messages.md`）ので、1 本でも複数でも
+        // 名前を並べた同じ形にする。
+        transcribe::TranscribeFailure::Files(names) => {
+            format!("{} could not be transcribed.", names.join(", "))
+        }
+        // **なぜ止まったかは分からない**ので、分かったふりをしない。
+        transcribe::TranscribeFailure::Panicked => {
+            "Transcribing this recording stopped unexpectedly.".to_owned()
+        }
+    }
+}
+
+/// 議事録の生成が失敗した理由 → 読む領域に出す 1 文（#159。`transcribe_failure_text` と対称）。
+fn summarize_failure_text(reason: &summarize::SummarizeFailure) -> String {
+    match reason {
+        summarize::SummarizeFailure::ModelPrepare => {
+            "The meeting notes model could not be prepared.".to_owned()
+        }
+        // **なぜ落ちたかは分からない**（llama.cpp は理由を返さないことが多い）ので、断定せずに
+        // 「いちばんよくある原因」と、そこから取れる手を添える。
+        summarize::SummarizeFailure::ModelRun => "The model could not finish. It may need more \
+             free memory than this Mac has right now — closing other apps, or choosing a smaller \
+             model, can let it run."
+            .to_owned(),
+        summarize::SummarizeFailure::EmptyOutput => {
+            "The model returned nothing to write.".to_owned()
+        }
+        summarize::SummarizeFailure::Save => "The notes could not be saved.".to_owned(),
+        summarize::SummarizeFailure::Panicked => "Writing notes stopped unexpectedly.".to_owned(),
     }
 }
 
@@ -3068,19 +3102,18 @@ fn summary_pane_of(
     auto_on: bool,
 ) -> SummaryPane {
     match state {
-        Some(state) => match state.status {
-            summarize::SummarizeStatus::Queued => SummaryPane::Queued {
-                position: state.queue_position,
-            },
-            summarize::SummarizeStatus::Summarizing => SummaryPane::Summarizing {
-                model: state.model_label,
-                started_ago: state.elapsed.map(elapsed_text),
-            },
-            summarize::SummarizeStatus::Done => SummaryPane::Done,
-            summarize::SummarizeStatus::Failed => SummaryPane::Failed {
-                reason: state.reason,
-            },
+        Some(summarize::SummarizeState::Queued { position, .. }) => {
+            SummaryPane::Queued { position }
+        }
+        Some(summarize::SummarizeState::Summarizing {
+            model_label,
+            elapsed,
+        }) => SummaryPane::Summarizing {
+            model: model_label,
+            started_ago: elapsed_text(elapsed),
         },
+        Some(summarize::SummarizeState::Done) => SummaryPane::Done,
+        Some(summarize::SummarizeState::Failed { reason }) => SummaryPane::Failed { reason },
         None if has_summary => SummaryPane::Done,
         // 文字起こしが無いと議事録は動かせない。**「まだ書いていない」ではなく「まだ書けない」**
         // と言い分けるのは、押しても何も起きないボタンを出さないため。
@@ -3620,7 +3653,9 @@ mod tests {
                 percent: None,
             },
             TranscriptPane::Done,
-            TranscriptPane::Failed { reason: None },
+            TranscriptPane::Failed {
+                reason: transcribe::TranscribeFailure::Panicked,
+            },
         ];
         for pane in &panes {
             let message = pane.message();
@@ -3678,18 +3713,34 @@ mod tests {
             .body
             .contains("Large v3")
         );
-        // 失敗はワーカーが持つ理由をそのまま出し、無ければ言い切らない文へ落とす。
+        // 失敗は種別から文を組む。**件数で形を変えない**ので、1 本でも複数でも同じ形。
         assert_eq!(
             TranscriptPane::Failed {
-                reason: Some("mic.mp3 could not be transcribed.".to_owned()),
+                reason: transcribe::TranscribeFailure::Files(vec!["mic.mp3".to_owned()]),
             }
             .message()
             .body,
             "mic.mp3 could not be transcribed."
         );
         assert_eq!(
-            TranscriptPane::Failed { reason: None }.message().body,
-            "Something went wrong while transcribing this recording."
+            TranscriptPane::Failed {
+                reason: transcribe::TranscribeFailure::Files(vec![
+                    "mic.mp3".to_owned(),
+                    "system.mp3".to_owned(),
+                ]),
+            }
+            .message()
+            .body,
+            "mic.mp3, system.mp3 could not be transcribed."
+        );
+        // **なぜ止まったか分からない**ときは、分かったふりをしない。
+        assert_eq!(
+            TranscriptPane::Failed {
+                reason: transcribe::TranscribeFailure::Panicked,
+            }
+            .message()
+            .body,
+            "Transcribing this recording stopped unexpectedly."
         );
     }
 
@@ -3755,19 +3806,13 @@ mod tests {
     /// この選び方（ワーカー優先・JSON の有無での解決）が壊れても気づけない。
     #[test]
     fn transcript_pane_of_prefers_the_worker_over_the_transcript_file() {
-        let state = |status, percent, reason| {
-            Some(transcribe::TranscribeState {
-                status,
-                model_label: "Medium".to_owned(),
-                percent,
-                reason,
-            })
-        };
-
         // ワーカーの状態があれば、JSON の有無より優先する。
         assert_eq!(
             transcript_pane_of(
-                state(transcribe::TranscribeStatus::Transcribing, Some(48), None),
+                Some(transcribe::TranscribeState::Transcribing {
+                    model_label: "Medium".to_owned(),
+                    percent: Some(48),
+                }),
                 true,
                 false,
             ),
@@ -3778,16 +3823,15 @@ mod tests {
         );
         assert_eq!(
             transcript_pane_of(
-                state(
-                    transcribe::TranscribeStatus::Failed,
-                    None,
-                    Some("mic.mp3 could not be transcribed.".to_owned()),
-                ),
+                Some(transcribe::TranscribeState::Failed {
+                    model_label: "Medium".to_owned(),
+                    reason: transcribe::TranscribeFailure::Files(vec!["mic.mp3".to_owned()]),
+                }),
                 true,
                 false,
             ),
             TranscriptPane::Failed {
-                reason: Some("mic.mp3 could not be transcribed.".to_owned()),
+                reason: transcribe::TranscribeFailure::Files(vec!["mic.mp3".to_owned()]),
             }
         );
 
@@ -3807,18 +3851,12 @@ mod tests {
     /// 議事録側の選び方。**`Blocked` に落ちる条件はここでしか決まらない**。
     #[test]
     fn summary_pane_of_blocks_only_when_there_is_no_transcript() {
-        let queued = Some(summarize::SummarizeState {
-            status: summarize::SummarizeStatus::Queued,
-            model_label: "Qwen2.5 3B Instruct".to_owned(),
-            queue_position: Some(2),
-            elapsed: None,
-            reason: None,
-        });
+        let queued = Some(summarize::SummarizeState::Queued { position: 2 });
 
         // ワーカーの状態があれば、`summary.md` の有無より優先する。
         assert_eq!(
             summary_pane_of(queued, true, true, false),
-            SummaryPane::Queued { position: Some(2) }
+            SummaryPane::Queued { position: 2 }
         );
 
         // 文字起こしが無ければ「まだ書けない」。ただし**既にある議事録は読ませる**ので、
@@ -3881,13 +3919,13 @@ mod tests {
         // キュー待ちも数える（走り出す前に文字起こしを重ねさせない）。
         assert!(jobs_pending(
             &idle_transcript,
-            &SummaryPane::Queued { position: None }
+            &SummaryPane::Queued { position: 1 }
         ));
         assert!(jobs_pending(
             &idle_transcript,
             &SummaryPane::Summarizing {
                 model: "Llama 8B".to_owned(),
-                started_ago: None,
+                started_ago: "1 second".to_owned(),
             }
         ));
     }
@@ -3909,7 +3947,10 @@ mod tests {
         );
         assert_eq!(TranscriptPane::Done.status(), TranscriptStatus::Done);
         assert_eq!(
-            TranscriptPane::Failed { reason: None }.status(),
+            TranscriptPane::Failed {
+                reason: transcribe::TranscribeFailure::Panicked,
+            }
+            .status(),
             TranscriptStatus::Failed
         );
     }
@@ -3972,18 +4013,16 @@ mod tests {
             SummaryPane::Blocked,
             SummaryPane::NotSummarized { auto_on: false },
             SummaryPane::NotSummarized { auto_on: true },
-            SummaryPane::Queued { position: Some(2) },
-            SummaryPane::Queued { position: None },
+            SummaryPane::Queued { position: 2 },
+            SummaryPane::Queued { position: 1 },
             SummaryPane::Summarizing {
                 model: "Qwen2.5 3B Instruct".to_owned(),
-                started_ago: Some("40 seconds".to_owned()),
-            },
-            SummaryPane::Summarizing {
-                model: "Qwen2.5 3B Instruct".to_owned(),
-                started_ago: None,
+                started_ago: "40 seconds".to_owned(),
             },
             SummaryPane::Done,
-            SummaryPane::Failed { reason: None },
+            SummaryPane::Failed {
+                reason: summarize::SummarizeFailure::ModelRun,
+            },
         ];
         for pane in &panes {
             let message = pane.message();
@@ -4013,22 +4052,18 @@ mod tests {
 
         // キュー待ちは順番まで出し、取り消しを添える。
         assert_eq!(
-            SummaryPane::Queued { position: Some(2) }.message().heading,
+            SummaryPane::Queued { position: 2 }.message().heading,
             "Waiting to start — number 2 in the queue"
         );
         assert_eq!(
-            SummaryPane::Queued { position: None }.message().heading,
-            "Waiting to write notes…"
-        );
-        assert_eq!(
-            SummaryPane::Queued { position: Some(2) }.message().actions[0].kind,
+            SummaryPane::Queued { position: 2 }.message().actions[0].kind,
             PaneActionKind::CancelNotes
         );
 
         // 走っている間はモデルと経過を出し、操作は出さない。
         let running = SummaryPane::Summarizing {
             model: "Llama 8B".to_owned(),
-            started_ago: Some("3 minutes".to_owned()),
+            started_ago: "3 minutes".to_owned(),
         }
         .message();
         assert!(running.body.contains("Llama 8B"));
@@ -4037,7 +4072,7 @@ mod tests {
 
         // 失敗は理由と、そこから取れる 2 つの手を出す。
         let failed = SummaryPane::Failed {
-            reason: Some("The model returned nothing to write.".to_owned()),
+            reason: summarize::SummarizeFailure::EmptyOutput,
         }
         .message();
         assert_eq!(failed.body, "The model returned nothing to write.");
@@ -4060,20 +4095,23 @@ mod tests {
             SummaryStatus::NotSummarized
         );
         assert_eq!(
-            SummaryPane::Queued { position: None }.status(),
+            SummaryPane::Queued { position: 1 }.status(),
             SummaryStatus::Queued
         );
         assert_eq!(
             SummaryPane::Summarizing {
                 model: "Llama 8B".to_owned(),
-                started_ago: None,
+                started_ago: "1 second".to_owned(),
             }
             .status(),
             SummaryStatus::Summarizing
         );
         assert_eq!(SummaryPane::Done.status(), SummaryStatus::Done);
         assert_eq!(
-            SummaryPane::Failed { reason: None }.status(),
+            SummaryPane::Failed {
+                reason: summarize::SummarizeFailure::Save,
+            }
+            .status(),
             SummaryStatus::Failed
         );
     }
