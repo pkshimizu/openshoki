@@ -1458,14 +1458,35 @@ fn build_menu_event_handler(
 
             if !transcribed.is_empty() || summarized.is_some() {
                 let mut sessions_mut = recordings.sessions.borrow_mut();
-                for i in transcribed {
-                    if let Some(session) = sessions_mut.get_mut(i) {
+                // **絞り込む前の一覧にも書き戻す**（#161）。ここだけ書くと、検索を解除して
+                // `all_sessions` から作り直したときに古い値へ戻り、文字起こしが済んでいるのに
+                // 「まだ書けない」と出る。
+                let mut all_mut = recordings.all_sessions.borrow_mut();
+                let mut mark = |index: usize, done_transcript: bool| {
+                    let Some(session) = sessions_mut.get_mut(index) else {
+                        return;
+                    };
+                    if done_transcript {
                         session.has_transcript = true;
+                    } else {
+                        session.has_summary = true;
                     }
+                    // 全件側は**ディレクトリで引く**（絞り込みで添字が食い違っている）。
+                    if let Some(same) = all_mut
+                        .iter_mut()
+                        .find(|candidate| candidate.dir == session.dir)
+                    {
+                        same.has_transcript = session.has_transcript;
+                        same.has_summary = session.has_summary;
+                    }
+                };
+                for i in transcribed {
+                    mark(i, true);
                 }
-                if let Some(session) = summarized.and_then(|i| sessions_mut.get_mut(i)) {
-                    session.has_summary = true;
+                if let Some(i) = summarized {
+                    mark(i, false);
                 }
+                drop(all_mut);
                 // 選択中セッションのボタン活性（議事録は文字起こしの有無で決まる）を、書き戻した
                 // 値から更新する。
                 if let Some(session) = selected.and_then(|i| sessions_mut.get(i)) {
