@@ -55,7 +55,9 @@ export struct SessionRow {
     group-heading: string,
     // 時刻（`14:02`）。行の中でいちばん大きく出す——同じ日の中では時刻で見分けるため。
     time-text: string,
-    // 日付（`Aug 10, 2026`）。見出しと重なるが、スクロールで見出しが流れても分かるように残す。
+    // 日付と長さ（`Aug 10, 2026 · 1:12:40`）。日付は見出しと重なるが、スクロールで見出しが
+    // 流れても分かるように残す。長さが分からない録音では**区切りごと出さない**（#162）ので、
+    // ここでは分岐しない（組み立ては `main::session_date_text`）。
     date-text: string,
     // 音源と状態を 1 行にしたもの（`Mic + system · transcribing 48%`）。**Rust が組む**
     // （状態→文言の対応表は Rust の網羅 match が正。`docs/rules/slint.md`）。
