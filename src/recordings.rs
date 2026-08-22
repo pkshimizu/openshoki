@@ -90,6 +90,9 @@ pub struct RecordingSession {
     /// 議事録要約（`summary.md`）があるか。中身の妥当性は見ない（表示側の `load_summary` が
     /// 破損・空を縮退させる）。
     pub has_summary: bool,
+    /// 録音の長さ（#162）。**再生に使う音源のサイズから割り出した見積もり**
+    /// （`duration_from_size`）。読めない・空のときは `None` で、一覧には出さない。
+    pub duration: Option<Duration>,
 }
 
 impl RecordingSession {
@@ -107,6 +110,7 @@ impl RecordingSession {
             has_mix: false,
             has_transcript: false,
             has_summary: false,
+            duration: None,
         }
     }
 
@@ -145,12 +149,7 @@ impl RecordingSession {
     /// 両音源で `mix.mp3` を再生対象にするのは、選択時に毎回デコード＋ミックスすると UI が固まる
     /// ため（重い処理は録音直後の生成へ移す。`src/mixdown.rs`）。
     pub fn playback_path(&self) -> Option<PathBuf> {
-        match (self.has_mic, self.has_system) {
-            (true, true) => self.has_mix.then(|| self.dir.join(MIX_MP3)),
-            (true, false) => Some(self.dir.join(MIC_MP3)),
-            (false, true) => Some(self.dir.join(SYSTEM_MP3)),
-            (false, false) => None,
-        }
+        playback_source(&self.dir, self.has_mic, self.has_system, self.has_mix)
     }
 
     /// 文字起こしの対象となる音源ファイル（存在する `mic.mp3` / `system.mp3`）。
@@ -182,6 +181,33 @@ impl RecordingSession {
 ///
 /// ディレクトリが無い・読めないときは空一覧を返す（縮退。ログを残す）。名前が日時形式でない
 /// エントリ、ディレクトリでないエントリ、音源が 1 つも無いセッションはスキップする。
+/// 録音の MP3 を書くビットレート（`recorder::BITRATE` / `mixdown::BITRATE` と同じ値）。
+/// **CBR で書いている**ので、長さはファイルサイズから割り出せる——デコードしなくてよい
+/// （デコードは 1 本で数百 ms かかることがあり、一覧の全件では開いた瞬間に固まる。#152）。
+///
+/// 片方だけ変えると長さがずれるので、変えるときは 3 箇所を揃えること。
+const BITRATE_BYTES_PER_SEC: u64 = 128 * 1000 / 8;
+
+/// 再生に使う音源を選ぶ。**走査中（`RecordingSession` を組む前）からも使う**ので、フィールド
+/// ではなく素の値で受ける（長さの見積もりが再生対象と同じファイルを見るようにするため）。
+fn playback_source(dir: &Path, has_mic: bool, has_system: bool, has_mix: bool) -> Option<PathBuf> {
+    match (has_mic, has_system) {
+        (true, true) => has_mix.then(|| dir.join(MIX_MP3)),
+        (true, false) => Some(dir.join(MIC_MP3)),
+        (false, true) => Some(dir.join(SYSTEM_MP3)),
+        (false, false) => None,
+    }
+}
+
+/// MP3 のファイルサイズから再生時間を割り出す。
+///
+/// **CBR 前提の見積もり**（`BITRATE_BYTES_PER_SEC`）。ID3 タグや LAME ヘッダのぶんだけ実際より
+/// わずかに長く出るが、一覧に「どれくらいの長さか」を示す用途には十分で、**ディスクを読まずに
+/// 済む**ほうが効く。0 バイト・読めないファイルは長さ不明として `None`。
+fn duration_from_size(bytes: u64) -> Option<Duration> {
+    (bytes > 0).then(|| Duration::from_secs(bytes / BITRATE_BYTES_PER_SEC))
+}
+
 pub fn list_sessions(recording_dir: &Path) -> Vec<RecordingSession> {
     let entries = match std::fs::read_dir(recording_dir) {
         Ok(entries) => entries,
@@ -215,6 +241,11 @@ pub fn list_sessions(recording_dir: &Path) -> Vec<RecordingSession> {
         let has_mix = dir.join(MIX_MP3).is_file();
         let has_transcript = dir.join(MIC_JSON).is_file() || dir.join(SYSTEM_JSON).is_file();
         let has_summary = dir.join(crate::summarize::SUMMARY_FILENAME).is_file();
+        // 長さは**再生に使う音源**から見積もる（`playback_path` と同じ選び方。片方だけ変えると
+        // 「長さは出るのに再生できない」がありえる）。`metadata` だけなのでデコードしない。
+        let duration = playback_source(&dir, has_mic, has_system, has_mix)
+            .and_then(|path| std::fs::metadata(path).ok())
+            .and_then(|meta| duration_from_size(meta.len()));
 
         sessions.push(RecordingSession {
             datetime,
@@ -224,6 +255,7 @@ pub fn list_sessions(recording_dir: &Path) -> Vec<RecordingSession> {
             has_mix,
             has_transcript,
             has_summary,
+            duration,
         });
     }
 
@@ -309,12 +341,29 @@ fn parse_session_datetime(name: &str) -> Option<NaiveDateTime> {
 #[cfg(test)]
 mod tests {
     use super::{
-        RecordingSession, STALE_SESSION_PART_AGE, list_sessions, parse_session_datetime,
-        session_dirs, spawn_session_part_sweep, sweep_session_dirs,
+        RecordingSession, STALE_SESSION_PART_AGE, duration_from_size, list_sessions,
+        parse_session_datetime, session_dirs, spawn_session_part_sweep, sweep_session_dirs,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime};
+
+    /// 長さは**サイズから割り出す**（デコードしない。#162）。CBR で書いている前提なので、
+    /// 1 秒 = 16000 バイト。0 バイトは長さ不明。
+    #[test]
+    fn duration_from_size_uses_the_constant_bitrate() {
+        assert_eq!(
+            duration_from_size(16_000 * 60),
+            Some(Duration::from_secs(60))
+        );
+        // 端数は切り捨てる（見積もりなので、長めに出すより短めに倒す）。
+        assert_eq!(
+            duration_from_size(16_000 * 60 + 15_999),
+            Some(Duration::from_secs(60))
+        );
+        // 空のファイルは長さ不明（`—:—` を出さず、段ごと落とす）。
+        assert_eq!(duration_from_size(0), None);
+    }
 
     /// 掃除を同期で走らせる（本番は `spawn_session_part_sweep` が別スレッドで呼ぶ。テストは
     /// 決定的にしたいので本体を直接呼ぶ）。対象の組み立ても本番と同じ関数を通す。

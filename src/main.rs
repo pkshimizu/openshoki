@@ -1434,18 +1434,23 @@ fn build_menu_event_handler(
                     let Some(mut row) = recordings.sessions_model.row_data(i) else {
                         continue;
                     };
+                    let progress = recordings.transcriber.progress_of(&session.dir);
                     let status = transcript_display_status(
-                        recordings.transcriber.status_of(&session.dir),
+                        progress.map(|(status, _)| status),
                         session.has_transcript,
                     );
-                    if row.transcript_status == status {
+                    // **割合が動いたときも組み直す**（#162）。状態だけを見ると、走っている間ずっと
+                    // 同じ数字が出たままになる。
+                    let detail_text: slint::SharedString =
+                        session_detail_text(session, status, progress.and_then(|(_, p)| p)).into();
+                    if row.transcript_status == status && row.detail_text == detail_text {
                         continue;
                     }
                     let previous = row.transcript_status;
                     row.transcript_status = status;
                     // **文言も一緒に組み直す**。行は状態を enum と文字列の 2 つで持っているので、
                     // 片方だけ更新すると「完了したのに `transcribing` のまま」が残る。
-                    row.detail_text = session_detail_text(session, status).into();
+                    row.detail_text = detail_text;
                     recordings.sessions_model.set_row_data(i, row);
                     if previous == TranscriptStatus::Transcribing
                         && status == TranscriptStatus::Done
@@ -1640,23 +1645,43 @@ fn session_group_heading(
 /// 一覧の行の 3 行目（`Mic + system · transcribed`）。音源と文字起こしの状態を 1 行にまとめる。
 ///
 /// **行の高さを固定してある**ので、ここは 1 行に収める（溢れたらクリップされる）。
-fn session_detail_text(session: &recordings::RecordingSession, status: TranscriptStatus) -> String {
+fn session_detail_text(
+    session: &recordings::RecordingSession,
+    status: TranscriptStatus,
+    percent: Option<u8>,
+) -> String {
     // 音源の語は `source_summary` の 1 箇所に持つ（詳細ヘッダと削除の確認も同じ語を使うので、
     // ここで別の表を持つと片方だけ直って表記が割れる）。
     format!(
         "{} · {}",
         session.source_summary(),
-        session_transcript_word(status)
+        session_transcript_word(status, percent)
     )
 }
 
+/// 一覧の行に出す録音の長さ（`1:12:40` / `06:20`）。**長さが分からない録音では段ごと出さない**
+/// ——`—:—` のような穴を作ると、行の意味が分からなくなる（#162）。
+///
+/// 整形は `tray::format_elapsed` を使い回す。デザインは 1 時間未満を `6:20` と書いているが、
+/// 同じウィンドウのプレイヤーが `01:45 / 05:00` を出すので、そちらへ揃えた。
+fn session_duration_text(session: &recordings::RecordingSession) -> String {
+    session
+        .duration
+        .map(tray::format_elapsed)
+        .unwrap_or_default()
+}
+
 /// 一覧の行に出す文字起こしの状態（**網羅 match**。状態を足したら語を決めるまで通らない）。
-fn session_transcript_word(status: TranscriptStatus) -> &'static str {
+fn session_transcript_word(status: TranscriptStatus, percent: Option<u8>) -> String {
     match status {
-        TranscriptStatus::NotTranscribed => "not transcribed",
-        TranscriptStatus::Transcribing => "transcribing",
-        TranscriptStatus::Done => "transcribed",
-        TranscriptStatus::Failed => "transcription failed",
+        TranscriptStatus::NotTranscribed => "not transcribed".to_owned(),
+        // 割合が来ていれば出す（#162）。読む領域を開かなくても、どれが動いているか分かる。
+        TranscriptStatus::Transcribing => match percent {
+            Some(percent) => format!("transcribing {percent}%"),
+            None => "transcribing".to_owned(),
+        },
+        TranscriptStatus::Done => "transcribed".to_owned(),
+        TranscriptStatus::Failed => "transcription failed".to_owned(),
     }
 }
 
@@ -2153,8 +2178,9 @@ fn session_rows(
     list.iter()
         .enumerate()
         .map(|(index, session)| {
+            let progress = transcriber.progress_of(&session.dir);
             let status = transcript_display_status(
-                transcriber.status_of(&session.dir),
+                progress.map(|(status, _)| status),
                 session.has_transcript,
             );
             SessionRow {
@@ -2163,7 +2189,9 @@ fn session_rows(
                 group_heading: session_group_heading(list, index, now).into(),
                 time_text: session.display_time().into(),
                 date_text: session.display_date().into(),
-                detail_text: session_detail_text(session, status).into(),
+                detail_text: session_detail_text(session, status, progress.and_then(|(_, p)| p))
+                    .into(),
+                duration_text: session_duration_text(session).into(),
                 transcript_status: status,
             }
         })
@@ -3515,20 +3543,43 @@ mod tests {
         session.has_mic = true;
         session.has_system = true;
         assert_eq!(
-            super::session_detail_text(&session, TranscriptStatus::Transcribing),
+            super::session_detail_text(&session, TranscriptStatus::Transcribing, None),
             "Mic + system · transcribing"
+        );
+        // 割合が来ていれば行にも出す（#162）。読む領域を開かなくても、どれが動いているか分かる。
+        assert_eq!(
+            super::session_detail_text(&session, TranscriptStatus::Transcribing, Some(48)),
+            "Mic + system · transcribing 48%"
         );
         session.has_system = false;
         assert_eq!(
-            super::session_detail_text(&session, TranscriptStatus::Done),
+            super::session_detail_text(&session, TranscriptStatus::Done, None),
             "Mic only · transcribed"
         );
         session.has_mic = false;
         assert_eq!(
-            super::session_detail_text(&session, TranscriptStatus::Failed),
+            super::session_detail_text(&session, TranscriptStatus::Failed, None),
             "No audio · transcription failed",
             "a session without audio still says what it is"
         );
+    }
+
+    /// 長さは**分からないときに段ごと出さない**（`—:—` のような穴を作らない。#162）。
+    #[test]
+    fn a_row_shows_the_length_only_when_it_is_known() {
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 8, 10)
+            .expect("a valid date")
+            .and_hms_opt(14, 0, 0)
+            .expect("a valid time");
+        let mut session = crate::recordings::RecordingSession::for_test(now);
+        assert_eq!(super::session_duration_text(&session), "");
+        session.duration = Some(Duration::from_secs(4360));
+        assert_eq!(super::session_duration_text(&session), "1:12:40");
+        // **既存の整形をそのまま使う**（`tray::format_elapsed`）。デザインは `6:20` だが、
+        // 同じウィンドウのプレイヤーが `01:45 / 05:00` を出すので、1 時間未満のゼロ詰めは
+        // 揃えるほうを取った（形を 2 つ持つと、どちらが正か分からなくなる）。
+        session.duration = Some(Duration::from_secs(380));
+        assert_eq!(super::session_duration_text(&session), "06:20");
     }
 
     /// 一覧の合計は**件数だけ**（単数形も出す）。容量は全ファイルを開かないと分からない。

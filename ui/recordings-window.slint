@@ -57,6 +57,8 @@ export struct SessionRow {
     time-text: string,
     // 日付（`Aug 10, 2026`）。見出しと重なるが、スクロールで見出しが流れても分かるように残す。
     date-text: string,
+    // 録音の長さ（`1:12:40`）。**分からない録音では空**にして、段ごと出さない（#162）。
+    duration-text: string,
     // 音源と状態を 1 行にしたもの（`Mic + system · transcribing 48%`）。**Rust が組む**
     // （状態→文言の対応表は Rust の網羅 match が正。`docs/rules/slint.md`）。
     detail-text: string,
@@ -779,11 +781,32 @@ export component RecordingsWindow inherits Window {
                                                 }
                                             }
 
-                                            Text {
-                                                text: row.date-text;
-                                                font-size: Style.caption-size;
-                                                color: Style.ink-muted;
-                                                overflow: clip;
+                                            // 日付と長さを 1 行に並べる（#162）。**行の高さは
+                                            // 変えない**——一覧は全行同じ高さで可視範囲だけ描く
+                                            // 前提（`docs/rules/slint.md`）。長さが分からない
+                                            // 録音では区切りごと出さない。
+                                            HorizontalLayout {
+                                                spacing: 6px;
+                                                Text {
+                                                    text: row.date-text;
+                                                    font-size: Style.caption-size;
+                                                    color: Style.ink-muted;
+                                                    overflow: clip;
+                                                }
+
+                                                if row.duration-text != "": Text {
+                                                    text: "·";
+                                                    font-size: Style.caption-size;
+                                                    color: Style.ink-faint;
+                                                }
+
+                                                if row.duration-text != "": Text {
+                                                    text: row.duration-text;
+                                                    font-size: Style.caption-size;
+                                                    color: Style.ink-muted;
+                                                    overflow: clip;
+                                                    horizontal-stretch: 1;
+                                                }
                                             }
 
                                             Text {

@@ -349,6 +349,22 @@ impl TranscribeWorker {
             .map(TranscribeState::status)
     }
 
+    /// 一覧の行が要る分だけ（状態と進捗）を、**確保なしで**取る。
+    ///
+    /// `state_of` はモデル名まで clone するので、全行を毎 tick 回すこの経路には重い
+    /// （`status_of` を `state_of` へ委譲しないのと同じ理由）。
+    pub fn progress_of(&self, session_dir: &Path) -> Option<(TranscribeStatus, Option<u8>)> {
+        lock_status(&self.status)
+            .get(session_dir)
+            .map(|state| match state {
+                TranscribeState::Transcribing { percent, .. } => {
+                    (TranscribeStatus::Transcribing, *percent)
+                }
+                TranscribeState::Done => (TranscribeStatus::Done, None),
+                TranscribeState::Failed { .. } => (TranscribeStatus::Failed, None),
+            })
+    }
+
     /// セッションの進行状況と、読む領域に出す中身（モデル名・進捗・失敗の理由）。
     ///
     /// **`status_of` はこれの一部を取り出したもの**なので、状態と説明が食い違わない
