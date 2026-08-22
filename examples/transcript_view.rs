@@ -11,7 +11,7 @@
 //!   失敗の状態にした状態（状態行の色・空表示の 3 段・状態行の隣に出る取り消しの確認）
 //! - `no-transcript`: 文字起こしも議事録も無いセッション（両タブの空表示・Summarize の無効化）。
 //!   要約は入力が無いので、上の要約状態の指定より優先される
-//! - `transcribing` / `transcript-failed` / `transcript-unreadable`: Transcript タブの空表示を
+//! - `transcribing` / `stopping` / `transcript-failed` / `transcript-unreadable`: Transcript タブの空表示を
 //!   実行中／失敗／JSON が読めなかった状態にする（見出し・理由・操作の 3 段と、最長の理由の
 //!   折り返しの確認。件数 0 と組み合わせる）
 //! - `auto-on`: 未実施の理由を「自動は ON だがまだ回っていない」にする（両タブ）
@@ -78,6 +78,11 @@ fn transcript_pane(has_transcript: bool) -> reading_pane::TranscriptPane {
         return reading_pane::TranscriptPane::Transcribing {
             model: "Medium".to_owned(),
             percent: Some(48),
+        };
+    }
+    if flag("stopping") {
+        return reading_pane::TranscriptPane::Stopping {
+            model: "Medium".to_owned(),
         };
     }
     if flag("transcript-failed") {
