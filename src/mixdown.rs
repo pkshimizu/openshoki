@@ -249,7 +249,15 @@ fn generate_mix(session_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
         mix_into(system_pcm, &mic_pcm)
     };
     let mp3 = encode_mp3(&to_i16(mixed), channels, sample_rate)?;
-    crate::private_file::write(&session_dir.join(MIX_FILENAME), &mp3)?;
+    // **一時ファイルへ書いてから置き換える**（`normalize_if_quiet` と同じ流儀）。直接書くと、
+    // 書いている途中や失敗したあとの `mix.mp3` が「在る」状態になり、再生が壊れるうえ、
+    // 一覧が**もっともらしく間違った長さ**を出す（サイズから見積もるので。#162）。
+    // `mix.mp3` が在る＝完成している、を不変条件にする。
+    let dest = session_dir.join(MIX_FILENAME);
+    let part = crate::atomic_replace::PartFile::for_dest(&dest)
+        .ok_or_else(|| std::io::Error::other("the mix path does not end in a file name"))?;
+    crate::private_file::write(part.path(), &mp3)?;
+    part.commit()?;
     Ok(())
 }
 

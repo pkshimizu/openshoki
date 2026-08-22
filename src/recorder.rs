@@ -24,14 +24,13 @@ use mp3lame_encoder::{Bitrate, Builder, FlushNoGap, InterleavedPcm, MonoPcm, Qua
 pub(crate) type RecordError = Box<dyn std::error::Error + Send + Sync>;
 
 /// エンコードのビットレート。音声録音として十分な品質と容量のバランスで 128 kbps。
-/// MP3 のビットレート。**録音・ミックス・長さの見積もりが同じ値を見る**——別々に持つと、
-/// 変えたときに一覧の長さだけずれる（`docs/rules/coding-conventions.md`）。
+/// MP3 のビットレート。**録音とミックスが同じ値を見る**（正はここ）。
+///
+/// **頼んだ値が書かれるとは限らない**——LAME は入力のサンプルレートが低いと MPEG-2 / 2.5 に
+/// なり、この値をエラーにせず落とす。一覧の長さはそれに引きずられないよう、書かれた MP3 の
+/// フレームヘッダから読む（`recordings::bytes_per_sec_from_header`）。
 pub const BITRATE: Bitrate = Bitrate::Kbps128;
 
-/// 1 秒あたりのバイト数。`BITRATE` から導くので、上を変えれば自動で追従する
-/// （`Bitrate` の判別値は kbps そのもの）。CBR で書いているので、これでサイズから長さを
-/// 割り出せる（`recordings::duration_from_size`）。
-pub const BITRATE_BYTES_PER_SEC: u64 = (BITRATE as u64) * 1000 / 8;
 /// エンコード品質（0=最良〜9=最低）。速度と品質のバランスで Good。
 const QUALITY: Quality = Quality::Good;
 /// マイク音源の出力ファイル名。録音セッションのディレクトリ内に固定名で置く

@@ -202,17 +202,74 @@ impl RecordingSession {
     }
 }
 
-/// MP3 のファイルサイズから再生時間を割り出す。
+/// MPEG-1 / MPEG-2 / MPEG-2.5 の Layer III のビットレート表（kbps）。添字はヘッダのビットレート
+/// インデックス。`0`（自由形式）と `15`（不正）は使わない。
+const MPEG1_BITRATES: [u32; 16] = [
+    0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0,
+];
+const MPEG2_BITRATES: [u32; 16] = [
+    0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0,
+];
+
+/// MP3 の**先頭フレームヘッダ**（4 バイト）から 1 秒あたりのバイト数を読む。
 ///
-/// **CBR 前提の見積もり**（`recorder::BITRATE_BYTES_PER_SEC`。録音が書くのと同じ値を見る）。
-/// LAME が先頭に置く Info フレーム 1 つぶん（128kbps で約 417 バイト＝ 0.03 秒）だけ長く出るが、
-/// 秒に丸める表示には効かない。**ディスクを読まずに済む**ほうが大きい。
+/// **設定した値を信じない**（#162）。LAME は入力のサンプルレートが低いと MPEG-2 / 2.5 になり、
+/// 頼んだ 128kbps を**エラーにせず落とす**（8kHz のマイク——macOS の Bluetooth ヘッドセットが
+/// 報告しうる——では 64kbps になり、見積もりが 2 倍ずれる）。書かれた値を読めば前提が要らない。
+///
+/// CBR 前提は残る（このアプリが書く MP3 は CBR）。同期語が無い・自由形式なら `None`。
+fn bytes_per_sec_from_header(header: [u8; 4]) -> Option<u64> {
+    // 同期語（11 bit）が無ければ MP3 のフレームではない。
+    if header[0] != 0xFF || (header[1] & 0xE0) != 0xE0 {
+        return None;
+    }
+    // Layer III だけ扱う（このアプリが書くのはそれだけ）。
+    if (header[1] >> 1) & 0b11 != 0b01 {
+        return None;
+    }
+    let mpeg1 = (header[1] >> 3) & 0b11 == 0b11;
+    let table = if mpeg1 {
+        MPEG1_BITRATES
+    } else {
+        MPEG2_BITRATES
+    };
+    let kbps = table[usize::from(header[2] >> 4)];
+    (kbps > 0).then(|| u64::from(kbps) * 1000 / 8)
+}
+
+/// MP3 のファイルサイズと 1 秒あたりのバイト数から再生時間を割り出す。
+///
+/// LAME タグ（Info/Xing フレーム）は**書いていない**ので、余剰は末尾フレームの端数だけ
+/// （数百バイト＝ 0.02 秒未満）。秒に丸める表示には効かない。
 ///
 /// **1 秒に満たないものは長さ不明にする**。録音に失敗してヘッダだけが残ったファイルで `00:00`
 /// と出しても、`—:—` と同じくらい情報が無い。
-fn duration_from_size(bytes: u64) -> Option<Duration> {
-    let seconds = bytes / crate::recorder::BITRATE_BYTES_PER_SEC;
+fn duration_from_size(bytes: u64, bytes_per_sec: u64) -> Option<Duration> {
+    if bytes_per_sec == 0 {
+        return None;
+    }
+    let seconds = bytes / bytes_per_sec;
     (seconds > 0).then(|| Duration::from_secs(seconds))
+}
+
+/// 音源の長さを測る。**ヘッダを 4 バイトだけ読む**——デコードはしない（1 本で数百 ms かかり、
+/// 一覧の全件では開いた瞬間に固まる。#152）。
+fn measure_duration(path: &Path) -> Option<Duration> {
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) => {
+            // **パスは出さない**（`docs/rules/security.md`）。長さが出ないだけなので一覧は続ける。
+            eprintln!(
+                "Skipping the length of a recording because its audio could not be opened: {}",
+                err.kind()
+            );
+            return None;
+        }
+    };
+    let bytes = file.metadata().ok()?.len();
+    let mut header = [0u8; 4];
+    std::io::Read::read_exact(&mut file, &mut header).ok()?;
+    duration_from_size(bytes, bytes_per_sec_from_header(header)?)
 }
 
 /// `recording_dir` を走査して録音セッションを新しい順（日時降順）で返す。
@@ -265,22 +322,9 @@ pub fn list_sessions(recording_dir: &Path) -> Vec<RecordingSession> {
         // **組み上がってから長さを入れる**（#162）。選び方を素の `bool` で受ける関数に切り出すと、
         // 引数の順序を取り違えても通ってしまう——同じ `RecordingSession` の `duration_source` を
         // 通すことで、再生対象と同じ選び方であることが構造で決まる。
-        session.duration =
-            session
-                .duration_source()
-                .and_then(|path| match std::fs::metadata(&path) {
-                    Ok(meta) => duration_from_size(meta.len()),
-                    Err(err) => {
-                        // **パスは出さない**（`docs/rules/security.md`）。長さが出ないだけなので
-                        // 一覧は続ける。
-                        eprintln!(
-                            "Skipping the length of a recording because its audio could not be \
-                         measured: {}",
-                            err.kind()
-                        );
-                        None
-                    }
-                });
+        session.duration = session
+            .duration_source()
+            .and_then(|path| measure_duration(&path));
         sessions.push(session);
     }
 
@@ -366,28 +410,56 @@ fn parse_session_datetime(name: &str) -> Option<NaiveDateTime> {
 #[cfg(test)]
 mod tests {
     use super::{
-        RecordingSession, STALE_SESSION_PART_AGE, duration_from_size, list_sessions,
-        parse_session_datetime, session_dirs, spawn_session_part_sweep, sweep_session_dirs,
+        RecordingSession, STALE_SESSION_PART_AGE, bytes_per_sec_from_header, duration_from_size,
+        list_sessions, parse_session_datetime, session_dirs, spawn_session_part_sweep,
+        sweep_session_dirs,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime};
 
-    /// 長さは**サイズから割り出す**（デコードしない。#162）。CBR で書いている前提なので、
-    /// 1 秒 = 16000 バイト。0 バイトは長さ不明。
+    /// 長さは**サイズから割り出す**（デコードしない。#162）。
     #[test]
-    fn duration_from_size_uses_the_constant_bitrate() {
+    fn duration_from_size_divides_by_the_rate_it_is_given() {
         assert_eq!(
-            duration_from_size(16_000 * 60),
+            duration_from_size(16_000 * 60, 16_000),
             Some(Duration::from_secs(60))
         );
         // 端数は切り捨てる（見積もりなので、長めに出すより短めに倒す）。
         assert_eq!(
-            duration_from_size(16_000 * 60 + 15_999),
+            duration_from_size(16_000 * 60 + 15_999, 16_000),
             Some(Duration::from_secs(60))
         );
-        // 空のファイルは長さ不明（`—:—` を出さず、段ごと落とす）。
-        assert_eq!(duration_from_size(0), None);
+        // 1 秒に満たないものは長さ不明（`00:00` は `—:—` と同じくらい情報が無い）。
+        assert_eq!(duration_from_size(0, 16_000), None);
+        assert_eq!(duration_from_size(15_999, 16_000), None);
+    }
+
+    /// ビットレートは**書かれた値を読む**（#162）。LAME はサンプルレートが低いと頼んだ 128kbps を
+    /// エラーにせず落とすので、設定値を信じると見積もりが倍ずれる。
+    #[test]
+    fn bytes_per_sec_comes_from_the_frame_header() {
+        // MPEG-1 Layer III, 128kbps（`0xFB` = MPEG-1 / Layer III、`0x9` = 128kbps）。
+        assert_eq!(
+            bytes_per_sec_from_header([0xFF, 0xFB, 0x90, 0x00]),
+            Some(16_000)
+        );
+        // **MPEG-2.5 Layer III, 64kbps**——8kHz のマイクで LAME が落とす先。同じインデックス
+        // `0x8` でも表が違い、MPEG-1 なら 112kbps・MPEG-2 系なら 64kbps。取り違えると倍ずれる。
+        assert_eq!(
+            bytes_per_sec_from_header([0xFF, 0xE3, 0x80, 0x00]),
+            Some(8_000)
+        );
+        assert_eq!(
+            bytes_per_sec_from_header([0xFF, 0xFB, 0x80, 0x00]),
+            Some(14_000),
+            "the same index means a different rate on MPEG-1"
+        );
+        // 同期語が無い（ID3 タグなど）。
+        assert_eq!(bytes_per_sec_from_header([0x49, 0x44, 0x33, 0x04]), None);
+        // 自由形式（インデックス 0）と不正（15）は使わない。
+        assert_eq!(bytes_per_sec_from_header([0xFF, 0xFB, 0x00, 0x00]), None);
+        assert_eq!(bytes_per_sec_from_header([0xFF, 0xFB, 0xF0, 0x00]), None);
     }
 
     /// 掃除を同期で走らせる（本番は `spawn_session_part_sweep` が別スレッドで呼ぶ。テストは
@@ -411,7 +483,10 @@ mod tests {
         let dir = root.join(name);
         fs::create_dir_all(&dir).expect("creating the session dir succeeds in test");
         for (file, secs) in files {
-            let bytes = vec![0u8; (secs * crate::recorder::BITRATE_BYTES_PER_SEC) as usize];
+            // **本物のフレームヘッダで始める**（MPEG-1 Layer III / 128kbps）。長さはここから
+            // 読んだビットレートで割るので、先頭が無いと測れない。
+            let mut bytes = vec![0xFFu8, 0xFB, 0x90, 0x00];
+            bytes.resize((secs * 16_000) as usize, 0);
             fs::write(dir.join(file), &bytes).expect("writing the sized file succeeds in test");
         }
     }
