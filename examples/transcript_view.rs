@@ -19,6 +19,7 @@
 //! - `far`: 再生位置を一覧の末尾寄りに置く（追従でその行が見えているかの確認。`no-follow`
 //!   と組み合わせると先頭のままになる）。**スナップショットは表示後の更新を反映しない**ので、
 //!   追従はここで見える初期表示ぶんだけを確認できる
+//! - `search` / `no-match`: 一覧を絞り込み中／0 件にする（検索欄・件数・解除の導線の確認）
 //! - `snapshot <path>`: PNG に書き出す（画面収録の許可が無い環境用）
 
 slint::include_modules!();
@@ -260,6 +261,18 @@ fn main() {
     ]))));
     win.set_selected_index(0);
     win.set_library_summary("5 recordings".into());
+    // 検索（#161）。`search` は絞り込み中、`no-match` は 0 件（解除の導線を見る）。
+    if flag("search") || flag("no-match") {
+        win.set_search_text("recording format".into());
+        win.set_search_summary(
+            if flag("no-match") {
+                "0 of 5 recordings mention it"
+            } else {
+                "3 of 5 recordings mention it"
+            }
+            .into(),
+        );
+    }
 
     win.set_has_selection(true);
     win.set_detail_datetime("Aug 10, 2026 · 14:02".into());
@@ -272,6 +285,11 @@ fn main() {
     // 読み込み中の表示（#152）。選んだ直後は中身が空で、その間もウィンドウは操作できる。
     if flag("loading") {
         win.set_loading(true);
+    }
+    // 0 件の一覧を見るための縮退（`no-match` のときだけ）。
+    if flag("no-match") {
+        win.set_sessions(ModelRc::from(Rc::new(VecModel::<SessionRow>::default())));
+        win.set_has_selection(false);
     }
     let has_transcript = !flag("no-transcript");
     win.set_has_transcript(has_transcript);

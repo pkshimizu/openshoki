@@ -764,6 +764,128 @@ export component Select inherits Rectangle {
     }
 }
 
+// 検索欄（#161）。**`std-widgets` の `LineEdit` を使わない**——OS の配色のままになり、
+// アプリのトークンに追従しない（`docs/rules/slint.md`）。素の `TextInput` を自分で囲む。
+//
+// 標準が持っていたものは自分で用意する: フォーカスの可視化、`accessible-role`、
+// プレースホルダ、消す操作。
+export component SearchField inherits Rectangle {
+    in-out property <string> text;
+    // 何も入っていないときに薄く出す文（`accessible-placeholder-text` にも渡す）。
+    in property <string> placeholder;
+    // 支援技術が読むラベル。可視ラベルを置かない場所なので、ここで役割を言う。
+    in property <string> label;
+
+    callback edited(string);
+    // 「消す」を押した（`✕`）。中身を空にするのは呼び出し側の仕事——検索の解除には
+    // 一覧の作り直しが要るので、ここで `text` だけ空にすると表示と結果がずれる。
+    callback cleared();
+
+    // 消す操作の唯一の口。**先にフォーカスを入力へ返す**——`×` は中身が空になると要素ごと
+    // 消えるので、押した本人にフォーカスが乗ったままだと行き先が無くなる。
+    function clear() {
+        input.focus();
+        root.cleared();
+    }
+
+    height: 30px;
+    border-radius: Style.control-radius;
+    border-width: 1px;
+    border-color: input.has-focus ? Style.seal : Style.rule;
+    background: Style.sheet-sunken;
+
+    FocusRing {
+        shown: input.has-focus;
+        radius: root.border-radius;
+    }
+
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 6px;
+        spacing: 6px;
+
+        // **虫めがねの記号は置かない**。フォントを同梱していないので `⌕` は多くの環境で豆腐に
+        // なり、意味を伝えないうえに汚い（`+` のような ASCII なら出る。`docs/rules/messages.md`）。
+        // 何の欄かはプレースホルダが言う。
+
+        Rectangle {
+            horizontal-stretch: 1;
+            // 枠からはみ出して描かせない。**root には付けない**——`clip` はフォーカスリングを
+            // 消す（`docs/rules/slint.md`）。
+            clip: true;
+            // プレースホルダは入力の**下**に敷く（入力の中に文字を入れると、消し忘れが
+            // そのまま検索語になる）。
+            if root.text == "": Text {
+                text: root.placeholder;
+                font-size: Style.body-size;
+                color: Style.ink-faint;
+                vertical-alignment: center;
+                accessible-role: none;
+            }
+
+            input := TextInput {
+                text <=> root.text;
+                font-size: Style.body-size;
+                color: Style.ink;
+                vertical-alignment: center;
+                single-line: true;
+                accessible-role: text-input;
+                accessible-label: root.label;
+                accessible-placeholder-text: root.placeholder;
+                edited => {
+                    root.edited(self.text);
+                }
+            }
+        }
+
+        // 入っているときだけ「消す」を出す。
+        if root.text != "": Rectangle {
+            width: 20px;
+            border-radius: 10px;
+            background: clear-touch.has-hover ? Style.control-hover : transparent;
+            y: (parent.height - self.height) / 2;
+            height: 20px;
+
+            clear-focus := FocusScope {
+                key-pressed(event) => {
+                    if (event.text == " " || event.text == "\n") {
+                        root.clear();
+                        return accept;
+                    }
+                    return reject;
+                }
+            }
+
+            clear-touch := TouchArea {
+                clicked => {
+                    root.clear();
+                }
+            }
+
+            FocusRing {
+                shown: clear-focus.has-focus;
+                radius: parent.border-radius;
+            }
+
+            Text {
+                // `✕` ではなく Latin-1 の `×`（同梱フォント無しでも出る）。
+                text: "×";
+                font-size: Style.body-size;
+                color: Style.ink-muted;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                accessible-role: none;
+            }
+
+            accessible-role: button;
+            accessible-label: "Clear search";
+            accessible-action-default => {
+                root.clear();
+            }
+        }
+    }
+}
+
 // 機能ウィンドウの見出し（漢字グリフ・機能名・いまの状態を 1 行）。
 //
 // グリフは**フォントを同梱していない**ので OS の日本語フォントに任せる（#127 で同梱を見送った）。

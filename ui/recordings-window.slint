@@ -1,6 +1,6 @@
 import { ListView, ScrollView } from "std-widgets.slint";
 import { Style, StatusTone } from "style.slint";
-import { DangerButton, FocusRing, ActionButton, ButtonRole, Toggle } from "controls.slint";
+import { DangerButton, FocusRing, ActionButton, ButtonRole, Toggle, SearchField } from "controls.slint";
 
 // 文字起こしの表示状態。Rust 側（main.rs の transcript_display_status）がワーカーの
 // 進行状況と JSON の有無から合成して詰める。
@@ -515,6 +515,10 @@ export component RecordingsWindow inherits Window {
     in property <[SessionRow]> sessions;
     // 一覧の下端に出す合計（`148 recordings`）。Rust が組む。
     in property <string> library-summary;
+    // 検索欄の中身（#161）。**Rust が絞り込みの正**を持つので、ここは入力の受け皿。
+    in-out property <string> search-text;
+    // 絞り込み中に一覧の下へ出す件数（`3 of 148 recordings mention it`）。空なら合計を出す。
+    in property <string> search-summary;
     // 選択中セッションの一覧インデックス。未選択は -1。行クリックで更新し select-session を呼ぶ。
     in-out property <int> selected-index: -1;
     // 選択セッションの詳細（Rust 側が選択時に更新する）。
@@ -599,6 +603,10 @@ export component RecordingsWindow inherits Window {
     in-out property <bool> showing-summary: false;
 
     // 行クリックでの選択通知。Rust 側で詳細更新・再生対象のロードを行う。
+    // 検索語が変わった。**絞り込みは Rust が行う**（本文を読むので UI スレッドでは決めない）。
+    callback search(string);
+    // 検索を解除する（`✕` と 0 件表示の導線から）。
+    callback clear-search();
     callback select-session(int);
     // 再生/一時停止トグルと停止。
     callback play-pause();
@@ -631,154 +639,189 @@ export component RecordingsWindow inherits Window {
 
             // --- 探す: 左の固定幅の列（デザインの「find」） ---
             // **幅を固定する**のは、読む領域を可変にするため（ウィンドウを広げたぶんは本文が受け取る）。
-            Rectangle {
+            VerticalLayout {
                 width: 300px;
-                border-width: 1px;
-                border-color: Style.rule;
-                border-radius: 8px;
-                background: Style.sheet;
-                clip: true;
+                spacing: 10px;
 
-                if root.sessions.length == 0: VerticalLayout {
-                    alignment: center;
-                    padding: 24px;
-                    spacing: 8px;
-                    Text {
-                        text: "No recordings yet";
-                        font-size: Style.body-size;
-                        font-weight: Style.semibold;
-                        horizontal-alignment: center;
-                        color: Style.ink;
+                // 検索欄。**一覧の外に置く**——絞り込んで 0 件になっても、消す手が残るように。
+                SearchField {
+                    vertical-stretch: 0;
+                    label: "Search recordings";
+                    placeholder: "Search transcripts and notes";
+                    text <=> root.search-text;
+                    edited(text) => {
+                        root.search(text);
                     }
-
-                    Text {
-                        text: "Start one from the shoki icon in the menu bar, or turn on Record automatically in Settings so meetings are captured for you.";
-                        font-size: Style.caption-size;
-                        wrap: word-wrap;
-                        horizontal-alignment: center;
-                        color: Style.ink-muted;
+                    cleared => {
+                        root.clear-search();
                     }
                 }
 
-                if root.sessions.length > 0: VerticalLayout {
-                    // **一覧は仮想化する**（`ListView`。`docs/rules/slint.md`）。
-                    //
-                    // ただし行の高さは 2 種類ある（見出しを持つ行だけ 28px 高い）。`ListView` は
-                    // **平均の行高から総スクロール量を推定する**ので、見出しが可視範囲を出入りすると
-                    // スクロールバーのつまみがわずかに揺れる。表示そのものは崩れない（要素の生成・
-                    // 破棄は正しく行われる）ので、日付のまとまりが見える利点を取ってこの形にした。
-                    ListView {
-                        vertical-stretch: 1;
-                        for row[i] in root.sessions: VerticalLayout {
-                            // 日付のまとまりの見出し（`Today` など）。**行に持たせてある**ので、
-                            // 仮想化しても添字がずれない（`SessionRow` の doc）。
-                            if row.group-heading != "": Rectangle {
-                                height: 28px;
-                                background: Style.sheet-sunken;
-                                HorizontalLayout {
-                                    padding-left: 12px;
-                                    padding-right: 12px;
-                                    Text {
-                                        text: row.group-heading;
-                                        font-size: Style.caption-size;
-                                        font-weight: Style.semibold;
-                                        letter-spacing: Style.badge-tracking;
-                                        color: Style.ink-faint;
-                                        vertical-alignment: center;
-                                    }
-                                }
-                            }
+                Rectangle {
+                    vertical-stretch: 1;
+                    border-width: 1px;
+                    border-color: Style.rule;
+                    border-radius: 8px;
+                    background: Style.sheet;
+                    clip: true;
 
-                            rowbg := Rectangle {
-                                // **高さを固定する**（デザイン: 62px）。各項目は 1 行でクリップし、
-                                // 長い文言で行が伸びないようにする——行ごとに高さが変わると、上の
-                                // 平均高の推定がさらに荒くなる。
-                                height: 62px;
-                                // 選択状態は id で参照する（レイアウトを跨ぐ parent 参照は Slint で
-                                // 使えないため）。
-                                property <bool> selected: i == root.selected-index;
-                                background: rowbg.selected ? Style.seal.transparentize(0.9) : transparent;
+                    // 空表示は**録音が無いのか、絞り込んで消えたのか**で言い分ける。同じ文にすると、
+                    // 検索語を消せば戻ることが分からない。
+                    if root.sessions.length == 0: VerticalLayout {
+                        alignment: center;
+                        padding: 24px;
+                        spacing: 8px;
+                        Text {
+                            text: root.search-text != "" ? "No matches" : "No recordings yet";
+                            font-size: Style.body-size;
+                            font-weight: Style.semibold;
+                            horizontal-alignment: center;
+                            color: Style.ink;
+                        }
 
-                                HorizontalLayout {
-                                    // 選択中の行は左端に朱の縦罫（一覧を目で走ったときに行頭で分かる）。
-                                    Rectangle {
-                                        width: 3px;
-                                        background: rowbg.selected ? Style.seal : transparent;
-                                    }
+                        Text {
+                            text: root.search-text != ""
+                                ? "No transcript or notes mention it. Recordings that have not been transcribed are not searched."
+                                : "Start one from the shoki icon in the menu bar, or turn on Record automatically in Settings so meetings are captured for you.";
+                            font-size: Style.caption-size;
+                            wrap: word-wrap;
+                            horizontal-alignment: center;
+                            color: Style.ink-muted;
+                        }
 
-                                    VerticalLayout {
-                                        padding-left: 11px;
-                                        padding-right: 11px;
-                                        spacing: 2px;
-                                        alignment: center;
-
-                                        HorizontalLayout {
-                                            spacing: 8px;
-                                            Text {
-                                                text: row.time-text;
-                                                font-size: Style.body-size;
-                                                font-weight: Style.semibold;
-                                                color: Style.ink;
-                                                overflow: clip;
-                                                horizontal-stretch: 1;
-                                            }
-                                            // 文字起こしの状態を表すドット（前=透明で場所だけ確保 /
-                                            // 中=進行中 / 完了 / 失敗）。
-                                            Rectangle {
-                                                width: 6px;
-                                                height: 6px;
-                                                y: 6px;
-                                                border-radius: 3px;
-                                                background: row.transcript-status == TranscriptStatus.done
-                                                    ? Style.done-mark
-                                                    : row.transcript-status == TranscriptStatus.transcribing
-                                                        ? Style.caution-mark
-                                                        : row.transcript-status == TranscriptStatus.failed
-                                                            ? Style.danger
-                                                            : transparent;
-                                            }
-                                        }
-
-                                        Text {
-                                            text: row.date-text;
-                                            font-size: Style.caption-size;
-                                            color: Style.ink-muted;
-                                            overflow: clip;
-                                        }
-
-                                        Text {
-                                            text: row.detail-text;
-                                            font-size: Style.caption-size;
-                                            color: row.transcript-status == TranscriptStatus.failed
-                                                ? Style.danger
-                                                : Style.ink-faint;
-                                            overflow: clip;
-                                        }
-                                    }
-                                }
-
-                                TouchArea {
-                                    clicked => {
-                                        root.selected-index = i;
-                                        root.select-session(i);
-                                    }
+                        if root.search-text != "": HorizontalLayout {
+                            alignment: center;
+                            ActionButton {
+                                text: "Clear search";
+                                clicked => {
+                                    root.clear-search();
                                 }
                             }
                         }
                     }
 
-                    // 一覧の合計（何件あるか）。**下端に固定**して、スクロールしても件数が分かるように。
-                    Rectangle {
-                        height: 1px;
-                        background: Style.hairline;
-                    }
-                    HorizontalLayout {
-                        padding: 10px;
-                        Text {
-                            text: root.library-summary;
-                            font-size: Style.caption-size;
-                            color: Style.ink-faint;
-                            overflow: elide;
+                    if root.sessions.length > 0: VerticalLayout {
+                        // **一覧は仮想化する**（`ListView`。`docs/rules/slint.md`）。
+                        //
+                        // ただし行の高さは 2 種類ある（見出しを持つ行だけ 28px 高い）。`ListView` は
+                        // **平均の行高から総スクロール量を推定する**ので、見出しが可視範囲を出入りすると
+                        // スクロールバーのつまみがわずかに揺れる。表示そのものは崩れない（要素の生成・
+                        // 破棄は正しく行われる）ので、日付のまとまりが見える利点を取ってこの形にした。
+                        ListView {
+                            vertical-stretch: 1;
+                            for row[i] in root.sessions: VerticalLayout {
+                                // 日付のまとまりの見出し（`Today` など）。**行に持たせてある**ので、
+                                // 仮想化しても添字がずれない（`SessionRow` の doc）。
+                                if row.group-heading != "": Rectangle {
+                                    height: 28px;
+                                    background: Style.sheet-sunken;
+                                    HorizontalLayout {
+                                        padding-left: 12px;
+                                        padding-right: 12px;
+                                        Text {
+                                            text: row.group-heading;
+                                            font-size: Style.caption-size;
+                                            font-weight: Style.semibold;
+                                            letter-spacing: Style.badge-tracking;
+                                            color: Style.ink-faint;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                }
+
+                                rowbg := Rectangle {
+                                    // **高さを固定する**（デザイン: 62px）。各項目は 1 行でクリップし、
+                                    // 長い文言で行が伸びないようにする——行ごとに高さが変わると、上の
+                                    // 平均高の推定がさらに荒くなる。
+                                    height: 62px;
+                                    // 選択状態は id で参照する（レイアウトを跨ぐ parent 参照は Slint で
+                                    // 使えないため）。
+                                    property <bool> selected: i == root.selected-index;
+                                    background: rowbg.selected ? Style.seal.transparentize(0.9) : transparent;
+
+                                    HorizontalLayout {
+                                        // 選択中の行は左端に朱の縦罫（一覧を目で走ったときに行頭で分かる）。
+                                        Rectangle {
+                                            width: 3px;
+                                            background: rowbg.selected ? Style.seal : transparent;
+                                        }
+
+                                        VerticalLayout {
+                                            padding-left: 11px;
+                                            padding-right: 11px;
+                                            spacing: 2px;
+                                            alignment: center;
+
+                                            HorizontalLayout {
+                                                spacing: 8px;
+                                                Text {
+                                                    text: row.time-text;
+                                                    font-size: Style.body-size;
+                                                    font-weight: Style.semibold;
+                                                    color: Style.ink;
+                                                    overflow: clip;
+                                                    horizontal-stretch: 1;
+                                                }
+                                                // 文字起こしの状態を表すドット（前=透明で場所だけ確保 /
+                                                // 中=進行中 / 完了 / 失敗）。
+                                                Rectangle {
+                                                    width: 6px;
+                                                    height: 6px;
+                                                    y: 6px;
+                                                    border-radius: 3px;
+                                                    background: row.transcript-status == TranscriptStatus.done
+                                                        ? Style.done-mark
+                                                        : row.transcript-status == TranscriptStatus.transcribing
+                                                            ? Style.caution-mark
+                                                            : row.transcript-status == TranscriptStatus.failed
+                                                                ? Style.danger
+                                                                : transparent;
+                                                }
+                                            }
+
+                                            Text {
+                                                text: row.date-text;
+                                                font-size: Style.caption-size;
+                                                color: Style.ink-muted;
+                                                overflow: clip;
+                                            }
+
+                                            Text {
+                                                text: row.detail-text;
+                                                font-size: Style.caption-size;
+                                                color: row.transcript-status == TranscriptStatus.failed
+                                                    ? Style.danger
+                                                    : Style.ink-faint;
+                                                overflow: clip;
+                                            }
+                                        }
+                                    }
+
+                                    TouchArea {
+                                        clicked => {
+                                            root.selected-index = i;
+                                            root.select-session(i);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // 一覧の合計（何件あるか）。**下端に固定**して、スクロールしても件数が分かるように。
+                        Rectangle {
+                            height: 1px;
+                            background: Style.hairline;
+                        }
+                        HorizontalLayout {
+                            padding: 10px;
+                            Text {
+                                text: root.search-summary != ""
+                                    ? root.search-summary
+                                    : root.library-summary;
+                                font-size: Style.caption-size;
+                                color: Style.ink-faint;
+                                overflow: elide;
+                            }
                         }
                     }
                 }

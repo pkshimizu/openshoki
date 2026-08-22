@@ -114,3 +114,37 @@ fn follow_transcript_switch_toggles() {
         "pressing it again turns following back on"
     );
 }
+
+/// 検索欄（#161）は、**押した操作をそのまま返す**（絞り込みは Rust が決める）。
+/// `✕` は中身を空にするだけでなく、一覧を戻す `clear-search` を通す必要がある。
+#[test]
+#[cfg_attr(
+    not(slint_debug_info),
+    ignore = "needs Slint debug info (see docs/rules/slint.md)"
+)]
+fn clearing_the_search_asks_for_the_list_to_be_restored() {
+    let window = window_with_empty_pane(Vec::new());
+    window.set_search_text("recording format".into());
+
+    let cleared: Rc<RefCell<u32>> = Rc::new(RefCell::new(0));
+    {
+        let cleared = Rc::clone(&cleared);
+        window.on_clear_search(move || *cleared.borrow_mut() += 1);
+    }
+
+    ElementHandle::find_by_accessible_label(&window, "Clear search")
+        .next()
+        .expect("no Clear search control was found in the search field")
+        .invoke_accessible_default_action();
+
+    assert_eq!(
+        *cleared.borrow(),
+        1,
+        "pressing it must ask for the list to be restored, not just blank the field"
+    );
+    assert_eq!(
+        window.get_search_text(),
+        "recording format",
+        "the field is blanked by the Rust side, together with rebuilding the list"
+    );
+}
