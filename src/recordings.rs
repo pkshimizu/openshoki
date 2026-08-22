@@ -90,8 +90,11 @@ pub struct RecordingSession {
     /// 議事録要約（`summary.md`）があるか。中身の妥当性は見ない（表示側の `load_summary` が
     /// 破損・空を縮退させる）。
     pub has_summary: bool,
-    /// 録音の長さ（#162）。**再生に使う音源のサイズから割り出した見積もり**
-    /// （`duration_from_size`）。読めない・空のときは `None` で、一覧には出さない。
+    /// 録音の長さ（#162）。**音源のサイズから割り出した見積もり**（`duration_source` /
+    /// `duration_from_size`）。1 秒未満・読めないときは `None` で、一覧には段ごと出さない。
+    ///
+    /// **走査した時点のスナップショット**。録音中のセッションを一覧に出すと、その長さは止まった
+    /// まま（かつ実際より短いまま）になる——一覧を作り直すのはウィンドウを開いたときだけ。
     pub duration: Option<Duration>,
 }
 
@@ -149,7 +152,29 @@ impl RecordingSession {
     /// 両音源で `mix.mp3` を再生対象にするのは、選択時に毎回デコード＋ミックスすると UI が固まる
     /// ため（重い処理は録音直後の生成へ移す。`src/mixdown.rs`）。
     pub fn playback_path(&self) -> Option<PathBuf> {
-        playback_source(&self.dir, self.has_mic, self.has_system, self.has_mix)
+        match (self.has_mic, self.has_system) {
+            (true, true) => self.has_mix.then(|| self.dir.join(MIX_MP3)),
+            (true, false) => Some(self.dir.join(MIC_MP3)),
+            (false, true) => Some(self.dir.join(SYSTEM_MP3)),
+            (false, false) => None,
+        }
+    }
+
+    /// 長さを測る音源（#162）。**再生できるかとは別の関心事**——両音源セッションは `mix.mp3` が
+    /// 出来るまで再生できないが、長さは片方の音源から分かる（同時に録っているので同じ長さ）。
+    ///
+    /// これを `playback_path` に合わせてしまうと、**録音を止めた直後**——いちばん一覧を見に行く
+    /// 瞬間——に長さが出ない。
+    fn duration_source(&self) -> Option<PathBuf> {
+        self.playback_path().or_else(|| {
+            if self.has_mic {
+                Some(self.dir.join(MIC_MP3))
+            } else if self.has_system {
+                Some(self.dir.join(SYSTEM_MP3))
+            } else {
+                None
+            }
+        })
     }
 
     /// 文字起こしの対象となる音源ファイル（存在する `mic.mp3` / `system.mp3`）。
@@ -177,30 +202,23 @@ impl RecordingSession {
     }
 }
 
+/// MP3 のファイルサイズから再生時間を割り出す。
+///
+/// **CBR 前提の見積もり**（`recorder::BITRATE_BYTES_PER_SEC`。録音が書くのと同じ値を見る）。
+/// LAME が先頭に置く Info フレーム 1 つぶん（128kbps で約 417 バイト＝ 0.03 秒）だけ長く出るが、
+/// 秒に丸める表示には効かない。**ディスクを読まずに済む**ほうが大きい。
+///
+/// **1 秒に満たないものは長さ不明にする**。録音に失敗してヘッダだけが残ったファイルで `00:00`
+/// と出しても、`—:—` と同じくらい情報が無い。
+fn duration_from_size(bytes: u64) -> Option<Duration> {
+    let seconds = bytes / crate::recorder::BITRATE_BYTES_PER_SEC;
+    (seconds > 0).then(|| Duration::from_secs(seconds))
+}
+
 /// `recording_dir` を走査して録音セッションを新しい順（日時降順）で返す。
 ///
 /// ディレクトリが無い・読めないときは空一覧を返す（縮退。ログを残す）。名前が日時形式でない
 /// エントリ、ディレクトリでないエントリ、音源が 1 つも無いセッションはスキップする。
-/// 再生に使う音源を選ぶ。**走査中（`RecordingSession` を組む前）からも使う**ので、フィールド
-/// ではなく素の値で受ける（長さの見積もりが再生対象と同じファイルを見るようにするため）。
-fn playback_source(dir: &Path, has_mic: bool, has_system: bool, has_mix: bool) -> Option<PathBuf> {
-    match (has_mic, has_system) {
-        (true, true) => has_mix.then(|| dir.join(MIX_MP3)),
-        (true, false) => Some(dir.join(MIC_MP3)),
-        (false, true) => Some(dir.join(SYSTEM_MP3)),
-        (false, false) => None,
-    }
-}
-
-/// MP3 のファイルサイズから再生時間を割り出す。
-///
-/// **CBR 前提の見積もり**（`recorder::BITRATE_BYTES_PER_SEC`。録音が書くのと同じ値を見る）。ID3 タグや LAME ヘッダのぶんだけ実際より
-/// わずかに長く出るが、一覧に「どれくらいの長さか」を示す用途には十分で、**ディスクを読まずに
-/// 済む**ほうが効く。0 バイト・読めないファイルは長さ不明として `None`。
-fn duration_from_size(bytes: u64) -> Option<Duration> {
-    (bytes > 0).then(|| Duration::from_secs(bytes / crate::recorder::BITRATE_BYTES_PER_SEC))
-}
-
 pub fn list_sessions(recording_dir: &Path) -> Vec<RecordingSession> {
     let entries = match std::fs::read_dir(recording_dir) {
         Ok(entries) => entries,
@@ -234,13 +252,7 @@ pub fn list_sessions(recording_dir: &Path) -> Vec<RecordingSession> {
         let has_mix = dir.join(MIX_MP3).is_file();
         let has_transcript = dir.join(MIC_JSON).is_file() || dir.join(SYSTEM_JSON).is_file();
         let has_summary = dir.join(crate::summarize::SUMMARY_FILENAME).is_file();
-        // 長さは**再生に使う音源**から見積もる（`playback_path` と同じ選び方。片方だけ変えると
-        // 「長さは出るのに再生できない」がありえる）。`metadata` だけなのでデコードしない。
-        let duration = playback_source(&dir, has_mic, has_system, has_mix)
-            .and_then(|path| std::fs::metadata(path).ok())
-            .and_then(|meta| duration_from_size(meta.len()));
-
-        sessions.push(RecordingSession {
+        let mut session = RecordingSession {
             datetime,
             dir,
             has_mic,
@@ -248,8 +260,28 @@ pub fn list_sessions(recording_dir: &Path) -> Vec<RecordingSession> {
             has_mix,
             has_transcript,
             has_summary,
-            duration,
-        });
+            duration: None,
+        };
+        // **組み上がってから長さを入れる**（#162）。選び方を素の `bool` で受ける関数に切り出すと、
+        // 引数の順序を取り違えても通ってしまう——同じ `RecordingSession` の `duration_source` を
+        // 通すことで、再生対象と同じ選び方であることが構造で決まる。
+        session.duration =
+            session
+                .duration_source()
+                .and_then(|path| match std::fs::metadata(&path) {
+                    Ok(meta) => duration_from_size(meta.len()),
+                    Err(err) => {
+                        // **パスは出さない**（`docs/rules/security.md`）。長さが出ないだけなので
+                        // 一覧は続ける。
+                        eprintln!(
+                            "Skipping the length of a recording because its audio could not be \
+                         measured: {}",
+                            err.kind()
+                        );
+                        None
+                    }
+                });
+        sessions.push(session);
     }
 
     // 新しい順（日時降順）。同時刻はディレクトリ名でも安定させる必要はないが、決定的にするため
@@ -371,6 +403,64 @@ mod tests {
         for f in files {
             fs::write(dir.join(f), b"").expect("writing the placeholder file succeeds in test");
         }
+    }
+
+    /// サイズ付きでセッションを作る（長さの見積もりを見るテスト用）。`secs` は CBR から逆算した
+    /// バイト数を書き込む。
+    fn make_sized_session(root: &Path, name: &str, files: &[(&str, u64)]) {
+        let dir = root.join(name);
+        fs::create_dir_all(&dir).expect("creating the session dir succeeds in test");
+        for (file, secs) in files {
+            let bytes = vec![0u8; (secs * crate::recorder::BITRATE_BYTES_PER_SEC) as usize];
+            fs::write(dir.join(file), &bytes).expect("writing the sized file succeeds in test");
+        }
+    }
+
+    /// **長さを測る対象は再生の対象と同じ選び方**（両音源なら `mix.mp3`）。ここが取り違わると、
+    /// 一覧に別の音源の長さが出る（#162）。
+    #[test]
+    fn duration_comes_from_the_source_that_playback_uses() {
+        let root = unique_root("duration");
+        let _ = fs::remove_dir_all(&root);
+        // 両音源＋ミックス済み。**それぞれ別の長さ**にして、どれを見たか分かるようにする。
+        make_sized_session(
+            &root,
+            "20260810-140200",
+            &[("mic.mp3", 60), ("system.mp3", 120), ("mix.mp3", 180)],
+        );
+        // 両音源だがミックス未生成。**再生はできないが長さは出す**（録音直後がこの状態）。
+        make_sized_session(
+            &root,
+            "20260810-130200",
+            &[("mic.mp3", 90), ("system.mp3", 240)],
+        );
+        // 単一音源。
+        make_sized_session(&root, "20260810-120200", &[("mic.mp3", 30)]);
+
+        let sessions = list_sessions(&root);
+        let duration_of = |name: &str| {
+            sessions
+                .iter()
+                .find(|session| session.dir.ends_with(name))
+                .unwrap_or_else(|| panic!("{name} should be listed"))
+                .duration
+        };
+        assert_eq!(
+            duration_of("20260810-140200"),
+            Some(Duration::from_secs(180)),
+            "a mixed session measures the file that playback uses"
+        );
+        assert_eq!(
+            duration_of("20260810-130200"),
+            Some(Duration::from_secs(90)),
+            "without a mix, the length still comes from one of the sources"
+        );
+        assert_eq!(
+            duration_of("20260810-120200"),
+            Some(Duration::from_secs(30))
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     fn unique_root(tag: &str) -> PathBuf {

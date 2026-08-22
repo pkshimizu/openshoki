@@ -1436,13 +1436,22 @@ fn build_menu_event_handler(
                     };
                     let progress = recordings.transcriber.progress_of(&session.dir);
                     let status = transcript_display_status(
-                        progress.map(|(status, _)| status),
+                        progress.map(transcribe::TranscribeProgress::status),
                         session.has_transcript,
                     );
-                    // **割合が動いたときも組み直す**（#162）。状態だけを見ると、走っている間ずっと
-                    // 同じ数字が出たままになる。
-                    let detail_text: slint::SharedString =
-                        session_detail_text(session, status, progress.and_then(|(_, p)| p)).into();
+                    // **走っていない行は文言を組み直さない**（#162）。割合が動きうるのは
+                    // `Transcribing` のときだけで、それ以外は状態が同じなら文言も同じ。
+                    // ここは全行を毎 tick 回す経路なので、`format!` を無条件に払うと、
+                    // 確保を避けるために `progress_of` を足した意味が消える。
+                    if row.transcript_status == status && status != TranscriptStatus::Transcribing {
+                        continue;
+                    }
+                    let detail_text: slint::SharedString = session_detail_text(
+                        session,
+                        status,
+                        progress.and_then(transcribe::TranscribeProgress::percent),
+                    )
+                    .into();
                     if row.transcript_status == status && row.detail_text == detail_text {
                         continue;
                     }
@@ -1659,16 +1668,18 @@ fn session_detail_text(
     )
 }
 
-/// 一覧の行に出す録音の長さ（`1:12:40` / `06:20`）。**長さが分からない録音では段ごと出さない**
+/// 一覧の行の 2 段目（`Aug 10, 2026 · 1:12:40`）。**長さが分からない録音では区切りごと出さない**
 /// ——`—:—` のような穴を作ると、行の意味が分からなくなる（#162）。
 ///
 /// 整形は `tray::format_elapsed` を使い回す。デザインは 1 時間未満を `6:20` と書いているが、
 /// 同じウィンドウのプレイヤーが `01:45 / 05:00` を出すので、そちらへ揃えた。
-fn session_duration_text(session: &recordings::RecordingSession) -> String {
-    session
-        .duration
-        .map(tray::format_elapsed)
-        .unwrap_or_default()
+fn session_date_text(session: &recordings::RecordingSession) -> String {
+    // **区切りごと Rust が組む**（`SessionRow` の doc どおり文言は Rust が持つ）。Slint 側で
+    // `if` を書くと、`·` が Rust と `.slint` に散る。
+    match session.duration.map(tray::format_elapsed) {
+        Some(length) => format!("{} · {length}", session.display_date()),
+        None => session.display_date(),
+    }
 }
 
 /// 一覧の行に出す文字起こしの状態（**網羅 match**。状態を足したら語を決めるまで通らない）。
@@ -2180,7 +2191,7 @@ fn session_rows(
         .map(|(index, session)| {
             let progress = transcriber.progress_of(&session.dir);
             let status = transcript_display_status(
-                progress.map(|(status, _)| status),
+                progress.map(transcribe::TranscribeProgress::status),
                 session.has_transcript,
             );
             SessionRow {
@@ -2188,10 +2199,13 @@ fn session_rows(
                 // 理由は `SessionRow` の doc。
                 group_heading: session_group_heading(list, index, now).into(),
                 time_text: session.display_time().into(),
-                date_text: session.display_date().into(),
-                detail_text: session_detail_text(session, status, progress.and_then(|(_, p)| p))
-                    .into(),
-                duration_text: session_duration_text(session).into(),
+                date_text: session_date_text(session).into(),
+                detail_text: session_detail_text(
+                    session,
+                    status,
+                    progress.and_then(transcribe::TranscribeProgress::percent),
+                )
+                .into(),
                 transcript_status: status,
             }
         })
@@ -3572,14 +3586,14 @@ mod tests {
             .and_hms_opt(14, 0, 0)
             .expect("a valid time");
         let mut session = crate::recordings::RecordingSession::for_test(now);
-        assert_eq!(super::session_duration_text(&session), "");
+        assert_eq!(super::session_date_text(&session), "Aug 10, 2026");
         session.duration = Some(Duration::from_secs(4360));
-        assert_eq!(super::session_duration_text(&session), "1:12:40");
+        assert_eq!(super::session_date_text(&session), "Aug 10, 2026 · 1:12:40");
         // **既存の整形をそのまま使う**（`tray::format_elapsed`）。デザインは `6:20` だが、
         // 同じウィンドウのプレイヤーが `01:45 / 05:00` を出すので、1 時間未満のゼロ詰めは
         // 揃えるほうを取った（形を 2 つ持つと、どちらが正か分からなくなる）。
         session.duration = Some(Duration::from_secs(380));
-        assert_eq!(super::session_duration_text(&session), "06:20");
+        assert_eq!(super::session_date_text(&session), "Aug 10, 2026 · 06:20");
     }
 
     /// 一覧の合計は**件数だけ**（単数形も出す）。容量は全ファイルを開かないと分からない。
