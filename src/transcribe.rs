@@ -59,33 +59,73 @@ pub struct TranscribeJob {
     pub summarize: Option<crate::summarize::SummarizeJob>,
 }
 
-/// セッション単位の進行状況と、**読む領域に出す中身**（#154）。
+/// セッション単位の進行状況と、**読む領域に出す中身**（#154。enum 化は #159）。
 ///
-/// 状態と説明を 1 つの値にまとめてあるのは、別々のマップに分けると「状態は `Failed` なのに
-/// 理由は前回のもの」のような食い違いを作れてしまうため。書き込みはこの型ごと差し替える。
+/// **状態ごとに、その状態でだけ意味のあるものを持つ**。以前は `status` と `Option` を並べて
+/// いたが、`Done` なのに理由がある、`Failed` なのに進捗がある、といった組み合わせを型が許して
+/// しまい、正しさが実行時のガードとテスト頼みになっていた（`ProgressSink::report` の
+/// 「進行中のときだけ書く」など）。
+///
+/// **モデル名を持つのは走っている間だけ**。読む領域が「何が動いているか」を言うのはそこで、
+/// 終わったあとに出しても読み手の役に立たない（`SummarizeEntry` と同じ基準。要るように
+/// なったら足す）。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TranscribeState {
-    pub status: TranscribeStatus,
-    /// 使っているモデルの表示名。**ジョブ投入時のスナップショット**なので、処理中に設定を
-    /// 変えても動かない（走っているジョブが読むのは投入時のモデル）。
-    pub model_label: String,
-    /// 進捗の百分率（0〜100）。whisper が進捗を返し始めてから入るので、キュー待ちと
-    /// 読み込み中は `None`（そのときは割合を出さない）。
-    pub percent: Option<u8>,
-    /// 失敗した理由（`Failed` のときだけ入る）。**パスを含めない**（`docs/rules/security.md`）。
-    pub reason: Option<String>,
+pub enum TranscribeState {
+    /// 投入済み（キュー待ちを含む）または処理中。
+    Transcribing {
+        model_label: String,
+        /// 進捗の百分率（0〜100）。whisper が返し始めてから入るので、キュー待ちと読み込み中は
+        /// `None`（そのときは割合を出さない）。**この `None` は実在する**。
+        percent: Option<u8>,
+    },
+    /// 全音源の文字起こしが完了した。
+    Done,
+    /// 少なくとも 1 音源が失敗した。
+    Failed { reason: TranscribeFailure },
 }
 
 impl TranscribeState {
-    /// 投入・処理開始時の状態（進捗と理由は持たない）。
+    /// 投入・処理開始時の状態（進捗はまだ無い）。
     fn starting(model_label: String) -> Self {
-        Self {
-            status: TranscribeStatus::Transcribing,
+        Self::Transcribing {
             model_label,
             percent: None,
-            reason: None,
         }
     }
+
+    /// 一覧の行や削除ガードが読む、粗い進行状況。
+    pub fn status(&self) -> TranscribeStatus {
+        match self {
+            Self::Transcribing { .. } => TranscribeStatus::Transcribing,
+            Self::Done => TranscribeStatus::Done,
+            Self::Failed { .. } => TranscribeStatus::Failed,
+        }
+    }
+}
+
+/// 文字起こしが失敗した理由（#159）。
+///
+/// **文言はここに持たない**。ワーカー層が UI のコピーを持つと、状態→文言の対応表が
+/// `main::TranscriptPane::message` と 2 箇所に割れる（`docs/rules/messages.md` の管轄）。
+/// 種別を足せば向こうの網羅 match が割れて、書き忘れに気づける。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TranscribeFailure {
+    /// モデルを取ってこられなかった。
+    ModelDownload,
+    /// モデルのファイルが無い。
+    ModelMissing,
+    /// モデルのパスを開けない（UTF-8 でない等）。
+    ModelUnreadable,
+    /// モデルは在るが読み込めなかった。
+    ModelLoad,
+    /// 音源の文字起こしに失敗した。**ファイル名だけ**を持つ（パスは持たない。
+    /// `docs/rules/security.md`）。名前を作るのは `audio_display_name` だけで、そこが保証する。
+    ///
+    /// **空にならない**——構築するのは `run_job` の 1 箇所で、1 本以上失敗したときにしか作らない
+    /// （空だと文言が ` could not be transcribed.` になる）。
+    Files(Vec<String>),
+    /// ワーカーがパニックした（**なぜかは分からない**）。
+    Panicked,
 }
 
 /// セッション単位の文字起こしの進行状況。Recordings ウィンドウの状態表示に使う。
@@ -161,10 +201,11 @@ impl ProgressSink {
         let overall = ((self.index as f64 + within_file) / self.total as f64 * 100.0).round();
         let overall = overall.clamp(0.0, 100.0) as u8;
         let mut map = lock_status(&self.status);
-        if let Some(state) = map.get_mut(&self.session_dir)
-            && state.status == TranscribeStatus::Transcribing
+        // **型が「進行中のときだけ」を保証する**。完了・失敗のあとに遅れて届いた進捗は、
+        // 書き込む先そのものが無い（以前はここが実行時のガードだった。#159）。
+        if let Some(TranscribeState::Transcribing { percent, .. }) = map.get_mut(&self.session_dir)
         {
-            state.percent = Some(overall);
+            *percent = Some(overall);
         }
     }
 }
@@ -231,7 +272,7 @@ impl TranscribeWorker {
                             eprintln!(
                                 "Skipping transcription because transcribing the session panicked"
                             );
-                            JobOutcome::Failed(PANIC_REASON.to_owned())
+                            JobOutcome::Failed(TranscribeFailure::Panicked)
                         }
                     };
                     // 要約は「全音源の文字起こしに成功した」ときだけ続ける。部分的に失敗した
@@ -249,26 +290,10 @@ impl TranscribeWorker {
                                 map.remove(&job.session_dir);
                             }
                             JobOutcome::Done => {
-                                map.insert(
-                                    job.session_dir,
-                                    TranscribeState {
-                                        status: TranscribeStatus::Done,
-                                        model_label,
-                                        percent: None,
-                                        reason: None,
-                                    },
-                                );
+                                map.insert(job.session_dir, TranscribeState::Done);
                             }
                             JobOutcome::Failed(reason) => {
-                                map.insert(
-                                    job.session_dir,
-                                    TranscribeState {
-                                        status: TranscribeStatus::Failed,
-                                        model_label,
-                                        percent: None,
-                                        reason: Some(reason),
-                                    },
-                                );
+                                map.insert(job.session_dir, TranscribeState::Failed { reason });
                             }
                         }
                     }
@@ -321,7 +346,7 @@ impl TranscribeWorker {
         // 委譲しなくても状態と説明は食い違わない。
         lock_status(&self.status)
             .get(session_dir)
-            .map(|state| state.status)
+            .map(TranscribeState::status)
     }
 
     /// セッションの進行状況と、読む領域に出す中身（モデル名・進捗・失敗の理由）。
@@ -348,7 +373,7 @@ impl TranscribeWorker {
     pub fn has_pending_jobs(&self) -> bool {
         lock_status(&self.status)
             .values()
-            .any(|state| counts_as_pending(state.status))
+            .any(|state| counts_as_pending(state.status()))
     }
 
     /// セッションの進行状況の記録を破棄する（セッション削除時の掃除）。未登録なら何もしない。
@@ -365,17 +390,12 @@ fn lock_status(status: &Mutex<StatusMap>) -> MutexGuard<'_, StatusMap> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// ワーカースレッドがパニックしたときに読む領域へ出す理由。**なぜ止まったかは分からない**ので、
-/// 分かったふりをせず「途中で止まった」とだけ言う。
-const PANIC_REASON: &str = "Transcribing this recording stopped unexpectedly.";
-
 /// 1 ジョブの処理結果（状態マップへの反映用）。
 enum JobOutcome {
     /// 全音源の文字起こしに成功した。
     Done,
-    /// 少なくとも 1 音源が失敗した（モデル準備の失敗を含む）。**理由は読む領域にそのまま出る**
-    /// ので、パスを含めず 1 文で書く（`docs/rules/messages.md` / `docs/rules/security.md`）。
-    Failed(String),
+    /// 少なくとも 1 音源が失敗した（モデル準備の失敗を含む）。
+    Failed(TranscribeFailure),
     /// 対象なしで何もしなかった。
     Skipped,
 }
@@ -406,9 +426,7 @@ fn run_job(
                     eprintln!(
                         "Skipping transcription because the Whisper model could not be prepared: {err}"
                     );
-                    return JobOutcome::Failed(
-                        "The transcription model could not be downloaded.".to_owned(),
-                    );
+                    return JobOutcome::Failed(TranscribeFailure::ModelDownload);
                 }
             }
         }
@@ -418,11 +436,11 @@ fn run_job(
             "Skipping transcription because the Whisper model file was not found: {}",
             model_path.display()
         );
-        return JobOutcome::Failed("The transcription model file is missing.".to_owned());
+        return JobOutcome::Failed(TranscribeFailure::ModelMissing);
     }
     let Some(model_path_str) = model_path.to_str() else {
         eprintln!("Skipping transcription because the Whisper model path is not valid UTF-8");
-        return JobOutcome::Failed("The transcription model file could not be opened.".to_owned());
+        return JobOutcome::Failed(TranscribeFailure::ModelUnreadable);
     };
     // ここから先が重い区間。要約 LLM と同時に走らせない（`crate::inference_slot`）。
     // モデルの準備（ダウンロード）はスロットの外で済ませてある。
@@ -437,19 +455,14 @@ fn run_job(
                 "Skipping transcription because loading the Whisper model failed ({}): {err}",
                 model_path.display()
             );
-            return JobOutcome::Failed("The transcription model could not be loaded.".to_owned());
+            return JobOutcome::Failed(TranscribeFailure::ModelLoad);
         }
     };
-    // 失敗した音源の名前を集める。**件数で文を変えない**（`docs/rules/messages.md`）ので、
-    // 1 本でも複数でも同じ形の 1 文になるように名前を並べる。
+    // 失敗した音源の名前を集める（文にするのは読む領域の仕事。`TranscribeFailure`）。
     let mut failed_names: Vec<String> = Vec::new();
     let total = job.audio_paths.len();
     for (index, path) in job.audio_paths.iter().enumerate() {
-        // ログには（既存の録音保存ログと同じ方針で）フルパスを出さず、ファイル名だけにする。
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "audio".to_owned());
+        let name = audio_display_name(path);
         let progress = ProgressSink {
             status: Arc::clone(status),
             session_dir: job.session_dir.clone(),
@@ -467,11 +480,17 @@ fn run_job(
     if failed_names.is_empty() {
         JobOutcome::Done
     } else {
-        JobOutcome::Failed(format!(
-            "{} could not be transcribed.",
-            failed_names.join(", ")
-        ))
+        JobOutcome::Failed(TranscribeFailure::Files(failed_names))
     }
+}
+
+/// 音源を指す**ファイル名だけ**を取り出す。ログにも読む領域にも出るので、ディレクトリ成分を
+/// 混ぜない（`docs/rules/security.md`）。**この保証を作っているのはここだけ**なので、テストで
+/// 固定してある。
+fn audio_display_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "audio".to_owned())
 }
 
 /// 1 音源を文字起こしして `<音源名>.json` に保存する。成功時はセグメント数を返す。
@@ -726,6 +745,62 @@ mod tests {
     use super::*;
     use crate::summarize::{SummarizeWorker, SummaryEngine};
 
+    /// 音源の名前は**ファイル名だけ**になる。この保証は `audio_display_name` の 1 箇所が
+    /// 作っていて、そのまま失敗の理由として画面に出る（`docs/rules/security.md`）。
+    #[test]
+    fn audio_display_name_drops_the_directories() {
+        assert_eq!(
+            audio_display_name(Path::new(
+                "/Users/someone/Recordings/20260810-140200/mic.mp3"
+            )),
+            "mic.mp3"
+        );
+        // 取り出せない形でも、パスを落として当たり障りのない名前にする。
+        assert_eq!(audio_display_name(Path::new("/")), "audio");
+        assert_eq!(audio_display_name(Path::new("..")), "audio");
+    }
+
+    /// モデル名も**ファイル名だけ**になる。上書き指定は任意のパスを取れて、その値は走っている
+    /// 間の本文（`{model} is running on this Mac…`）としてそのまま画面に出る
+    /// （`docs/rules/security.md`。`audio_display_name` と対）。
+    #[test]
+    fn job_model_label_drops_the_directories() {
+        let job = |model_override: Option<&str>| TranscribeJob {
+            session_dir: PathBuf::from("/tmp/shoki-label"),
+            audio_paths: Vec::new(),
+            model_id: crate::whisper_model::DEFAULT_MODEL_ID.to_owned(),
+            model_override: model_override.map(PathBuf::from),
+            language: "en".to_owned(),
+            summarize: None,
+        };
+
+        assert_eq!(
+            job_model_label(&job(Some("/Users/someone/models/ggml-medium.bin"))),
+            "ggml-medium.bin"
+        );
+        // 取り出せない形は当たり障りのない名前へ落とす（パスを出さない）。
+        assert_eq!(job_model_label(&job(Some("/"))), "Custom model");
+        // 上書きが無ければカタログの表示名。
+        assert_eq!(
+            job_model_label(&job(None)),
+            crate::whisper_model::default_spec().display_name
+        );
+    }
+
+    /// テスト用の状態（状態だけ指定し、ペイロードは既定で埋める）。
+    fn test_state(status: TranscribeStatus) -> TranscribeState {
+        match status {
+            TranscribeStatus::Transcribing => TranscribeState::Transcribing {
+                model_label: "Small".to_owned(),
+                percent: None,
+            },
+            TranscribeStatus::Done => TranscribeState::Done,
+            TranscribeStatus::Failed => TranscribeState::Failed {
+                reason: TranscribeFailure::ModelMissing,
+            },
+        }
+    }
+
     /// テスト用の要約ワーカー。ジョブが渡ったかどうかは状態マップの有無で判定する。
     fn summarize_worker() -> SummarizeWorker {
         SummarizeWorker::start(
@@ -776,15 +851,7 @@ mod tests {
         );
         // 終わったジョブは数えない（消してよい）。
         for status in [TranscribeStatus::Done, TranscribeStatus::Failed] {
-            lock_status(&worker.status).insert(
-                dir.clone(),
-                TranscribeState {
-                    status,
-                    model_label: "Small".into(),
-                    percent: None,
-                    reason: None,
-                },
-            );
+            lock_status(&worker.status).insert(dir.clone(), test_state(status));
             assert!(
                 !worker.has_pending_jobs(),
                 "{status:?} must not count as a pending job"
@@ -823,19 +890,18 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert_eq!(worker.status_of(&dir), Some(TranscribeStatus::Failed));
-        // 読む領域は理由を出す（#154）。**パスは出さない**ので、上書き指定のパスが混ざって
-        // いないことまで見る。
+        // 読む領域は理由を出す（#154）。
         let state = worker
             .state_of(&dir)
             .expect("the session should have a state");
-        let reason = state.reason.expect("a failed job must carry its reason");
-        assert_eq!(reason, "The transcription model file is missing.");
-        assert!(
-            !reason.contains(&*dir.to_string_lossy()),
-            "the reason must not leak the session path: {reason}"
+        // **理由は種別で持つ**（文言は読む領域が組む。#159）。
+        assert_eq!(
+            state,
+            TranscribeState::Failed {
+                reason: TranscribeFailure::ModelMissing,
+            },
+            "a failed job must carry why it failed"
         );
-        // モデル名は投入時のスナップショット。上書き指定はファイル名だけを出す。
-        assert_eq!(state.model_label, "missing-model.bin");
         // セッション削除時の掃除（forget）で記録が消える。
         worker.forget(&dir);
         assert_eq!(worker.status_of(&dir), None);
@@ -848,11 +914,9 @@ mod tests {
         let status: Arc<Mutex<StatusMap>> = Arc::new(Mutex::new(StatusMap::new()));
         let dir = PathBuf::from("/tmp/shoki-progress");
         lock_status(&status).insert(dir.clone(), TranscribeState::starting("Small".into()));
-        let percent_now = || {
-            lock_status(&status)
-                .get(&dir)
-                .expect("the entry should exist")
-                .percent
+        let percent_now = || match lock_status(&status).get(&dir) {
+            Some(TranscribeState::Transcribing { percent, .. }) => *percent,
+            other => panic!("the entry should still be transcribing, got {other:?}"),
         };
 
         let first = ProgressSink {
@@ -888,15 +952,7 @@ mod tests {
     fn progress_sink_ignores_sessions_that_already_finished() {
         let status: Arc<Mutex<StatusMap>> = Arc::new(Mutex::new(StatusMap::new()));
         let dir = PathBuf::from("/tmp/shoki-progress-late");
-        lock_status(&status).insert(
-            dir.clone(),
-            TranscribeState {
-                status: TranscribeStatus::Failed,
-                model_label: "Small".into(),
-                percent: None,
-                reason: Some("The transcription model file is missing.".into()),
-            },
-        );
+        lock_status(&status).insert(dir.clone(), test_state(TranscribeStatus::Failed));
         ProgressSink {
             status: Arc::clone(&status),
             session_dir: dir.clone(),
@@ -908,11 +964,8 @@ mod tests {
             .get(&dir)
             .cloned()
             .expect("the entry should exist");
-        assert_eq!(state.status, TranscribeStatus::Failed);
-        assert_eq!(
-            state.percent, None,
-            "a finished state must not be rewritten with progress"
-        );
+        // **型が巻き戻しを塞ぐ**（#159）。`Failed` には進捗を入れる場所そのものが無い。
+        assert!(matches!(state, TranscribeState::Failed { .. }));
     }
 
     /// 対象音源なし（Skipped）の投入は状態を残さない（「文字起こし中」のまま固まらない）。
