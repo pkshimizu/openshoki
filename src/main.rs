@@ -670,7 +670,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("Stopping the transcription that is running");
                 }
                 transcribe::StopOutcome::Cancelled => {
-                    println!("Cancelled the transcription that was waiting to start");
+                    println!("Canceled the transcription that was waiting to start");
                 }
                 transcribe::StopOutcome::NotRunning => {
                     // 走ってもキューにも載っていなかった（終わった直後に押された）。tick が
@@ -1501,15 +1501,11 @@ fn build_menu_event_handler(
                     // 片方だけ更新すると「完了したのに `transcribing` のまま」が残る。
                     row.detail_text = detail_text;
                     recordings.sessions_model.set_row_data(i, row);
-                    if previous == TranscriptStatus::Transcribing
-                        && status == TranscriptStatus::Done
-                    {
+                    let came_off_the_worker = came_off_the_worker(previous, status);
+                    if came_off_the_worker && status == TranscriptStatus::Done {
                         transcribed.push(i);
                     }
-                    if selected == Some(i)
-                        && previous == TranscriptStatus::Transcribing
-                        && status == TranscriptStatus::Done
-                    {
+                    if selected == Some(i) && came_off_the_worker {
                         // **表示は書かず、読み込みをやり直す**（#152）。ここで直接差し替えると、
                         // 少し前に始まった読み込みの古いスナップショット（まだ何も無かった頃の
                         // 内容）があとから届いて上書きし、**完成した文字起こしが消える**。
@@ -2596,6 +2592,22 @@ fn breathing_level(elapsed: std::time::Duration, cycle_secs: f32) -> f32 {
     ((2.0 * PI * t / cycle_secs).sin() + 1.0) / 2.0
 }
 
+/// ワーカーの手を離れたか（走っていた状態から、走っていない状態へ移ったか）。
+///
+/// **止め終わりも含める**（#163）。止めたジョブは記録ごと消えるので、そこから落ちる先は
+/// `Done`（既に書けた音源がある）でも `NotTranscribed`（1 本も書けなかった）でもありうる。
+/// 「`Transcribing` から `Done` へ」だけを見ていると、止めた後に一覧と読む領域が古いまま
+/// 固定され、選び直すまで直らない。
+fn came_off_the_worker(previous: TranscriptStatus, status: TranscriptStatus) -> bool {
+    let on_the_worker = |status| {
+        matches!(
+            status,
+            TranscriptStatus::Transcribing | TranscriptStatus::Stopping
+        )
+    };
+    on_the_worker(previous) && !on_the_worker(status)
+}
+
 /// 文字起こしの表示状態（`ui/recordings-window.slint` の `TranscriptStatus`）を合成する。
 /// ワーカーの進行状況（メモリ）があればそれを優先し、無ければ JSON の有無で解決する。
 fn transcript_display_status(
@@ -3178,10 +3190,10 @@ mod tests {
     use super::{
         PaneAction, PaneActionKind, StatusTone, SummaryPane, SummaryStatus, TranscriptPane,
         TranscriptStatus, actions_allowed_while_busy, app_version_text, breathing_level,
-        jobs_pending, model_downloads_on_select, model_status_line, playback_progress,
-        search_summary_text, seek_position_from_ratio, session_matches, summary_display_status,
-        summary_model_status_line, summary_pane_of, summary_rows, summary_status_text,
-        transcript_display_status, transcript_pane_of, transcript_status_text,
+        came_off_the_worker, jobs_pending, model_downloads_on_select, model_status_line,
+        playback_progress, search_summary_text, seek_position_from_ratio, session_matches,
+        summary_display_status, summary_model_status_line, summary_pane_of, summary_rows,
+        summary_status_text, transcript_display_status, transcript_pane_of, transcript_status_text,
         whisper_model_status_line,
     };
     use super::{elapsed_text, recordings, summarize, transcribe};
@@ -3367,6 +3379,24 @@ mod tests {
         });
         assert_eq!(row.name, "Google Chrome");
         assert!(row.limitation_note.is_empty());
+    }
+
+    /// 止め終わりも「ワーカーの手を離れた」に数える（#163）。ここを `Transcribing → Done` に
+    /// 狭めると、止めた後の一覧と読む領域が選び直すまで古いままになる。
+    #[test]
+    fn coming_off_the_worker_includes_being_stopped() {
+        use TranscriptStatus as S;
+        // 止め終わりは、書けた音源があれば Done、1 本も無ければ未実施へ落ちる。
+        assert!(came_off_the_worker(S::Stopping, S::Done));
+        assert!(came_off_the_worker(S::Stopping, S::NotTranscribed));
+        assert!(came_off_the_worker(S::Transcribing, S::Done));
+        assert!(came_off_the_worker(S::Transcribing, S::Failed));
+        // 走り出した・止めるよう伝えた、はまだ手を離れていない。
+        assert!(!came_off_the_worker(S::NotTranscribed, S::Transcribing));
+        assert!(!came_off_the_worker(S::Transcribing, S::Stopping));
+        assert!(!came_off_the_worker(S::Stopping, S::Stopping));
+        // もともと走っていなければ、何へ移っても合図にしない。
+        assert!(!came_off_the_worker(S::Done, S::NotTranscribed));
     }
 
     /// ワーカーの進行状況（メモリ）があればそれを優先し、無ければ JSON の有無で解決する。

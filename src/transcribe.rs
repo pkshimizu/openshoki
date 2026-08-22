@@ -87,9 +87,10 @@ pub enum TranscribeState {
     /// 止めるよう伝えたが、ワーカーがまだ降りていない（#163）。降りたらエントリごと消えて、
     /// 表示は JSON の有無ベース（未実施／生成済み）へ戻る。
     ///
-    /// **進行中と分ける**のは、Stop を押してから実際に降りるまでの数百 ms を「押しても何も
-    /// 起きていない」に見せないため。ここに割合は持たない——止めると決めた後の進捗は、
-    /// 読み手の判断に何も足さない。
+    /// **進行中と分ける**のは、Stop を押してから実際に降りるまでの間を「押しても何も起きて
+    /// いない」に見せないため。降りるのは推論の切れ目なので、待つのは短ければ数百 ms、モデルの
+    /// ロード中なら十数秒になる。ここに割合は持たない——止めると決めた後の進捗は、読み手の
+    /// 判断に何も足さない。
     Stopping { model_label: String },
     /// 全音源の文字起こしが完了した。
     Done,
@@ -202,12 +203,26 @@ struct QueueState {
 /// いま走っているジョブと、その中断フラグ。
 struct RunningJob {
     session_dir: PathBuf,
+    /// このジョブの通番。**`stop` はこれをマップへ書き戻す**——止めた時点で後続が積まれて
+    /// いても、通番が走っている側に戻れば後続は `claim_job` が捨てる。
+    seq: u64,
+    /// 走らせているモデルの表示名。「止めています」の理由に出す。マップのエントリは後続に
+    /// 差し替わっていることがあるので、**走っている側の名前はここから取る**。
+    model_label: String,
     /// `true` になったら降りる。whisper の推論ループ（abort コールバック）と、
-    /// 音源の切れ目の両方が見る。
+    /// 重い処理の切れ目の両方が見る。
     cancel: Arc<AtomicBool>,
 }
 
 impl QueueState {
+    /// 次のジョブの通番を採る。**ロックの中でしか呼べない**（`&mut self`）ので、採番順と
+    /// マップへの登録順がずれない（`SummarizeWorker` の `QueueState::next_seq` と同じ形）。
+    fn next_seq(&mut self) -> u64 {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        seq
+    }
+
     /// `session_dir` の最新のジョブが `seq` か。載っていなければ（取り消された）偽。
     fn is_current(&self, session_dir: &Path, seq: u64) -> bool {
         self.status
@@ -339,14 +354,7 @@ impl TranscribeWorker {
                 while let Ok(QueuedJob { seq, mut job }) = rx.recv() {
                     let model_label = job_model_label(&job);
                     let cancel = Arc::new(AtomicBool::new(false));
-                    // **走らせてよいかの判定・「処理中」への遷移・走っている印を 1 つの
-                    // クリティカルセクションで行う**（別々にすると、その隙間に入った `stop` が
-                    // 「キュー待ちを取り消した」と答えたあとでジョブが走り出す。
-                    // `SummarizeWorker` と同じ形）。マップに自分の通番が載っていなければ、
-                    // 止められたか後続に追い越されたジョブ（`StatusMap`）。
-                    //
-                    // 処理開始でも「文字起こし中」を入れ直すのは、先行ジョブの完了
-                    // （Done/Failed）が後続の処理中表示を上書きしたままにならないようにするため。
+                    // 走らせてよいかの判定と印を 1 つのロックで（理由は `claim_job` の doc）。
                     if !claim_job(
                         &queue_for_worker,
                         &job.session_dir,
@@ -375,9 +383,10 @@ impl TranscribeWorker {
                     // 要約は「全音源の文字起こしに成功した」ときだけ続ける。部分的に失敗した
                     // 文字起こしから議事録を作ると、欠けたまま完成品に見えてしまう。止めた
                     // ジョブも同じで、続けると「止めたのに議事録が出てくる」ことになる。
-                    let summarize = match outcome {
-                        JobOutcome::Done => job.summarize.take(),
-                        JobOutcome::Failed(_) | JobOutcome::Skipped | JobOutcome::Stopped => None,
+                    let summarize = if outcome.keeps_summary() {
+                        job.summarize.take()
+                    } else {
+                        None
                     };
                     apply_outcome(&queue_for_worker, &job.session_dir, seq, outcome);
                     // 状態マップのロックを放してから投入する（要約ワーカー側も同じ流儀で
@@ -410,8 +419,7 @@ impl TranscribeWorker {
         };
         let seq = {
             let mut queue = lock_queue(&self.queue);
-            let seq = queue.next_seq;
-            queue.next_seq += 1;
+            let seq = queue.next_seq();
             queue.status.insert(
                 job.session_dir.clone(),
                 (seq, TranscribeState::starting(job_model_label(&job))),
@@ -443,25 +451,28 @@ impl TranscribeWorker {
     ///
     /// 走っているジョブは即座には降りない。whisper の推論ループは abort コールバックで、
     /// 音源の切れ目は `run_job` が中断フラグを見て降りる。その間の表示は `Stopping`。
+    #[must_use = "the caller decides what to log and when to redraw; dropping it hides a no-op"]
     pub fn stop(&self, session_dir: &Path) -> StopOutcome {
         let mut queue = lock_queue(&self.queue);
-        let running_here = queue
+        let running = queue
             .running
             .as_ref()
-            .is_some_and(|running| running.session_dir == session_dir);
-        if running_here {
-            if let Some(running) = &queue.running {
+            .filter(|running| running.session_dir == session_dir)
+            .map(|running| {
                 running.cancel.store(true, Ordering::Relaxed);
-            }
-            // 押した瞬間に表示を「止めています」へ移す。ここを進行中のままにすると、
-            // ワーカーが気づくまでの数百 ms、Stop を押しても何も起きていないように見える。
-            if let Some((_, state)) = queue.status.get_mut(session_dir)
-                && let TranscribeState::Transcribing { model_label, .. } = state
-            {
-                *state = TranscribeState::Stopping {
-                    model_label: std::mem::take(model_label),
-                };
-            }
+                (running.seq, running.model_label.clone())
+            });
+        if let Some((seq, model_label)) = running {
+            // **エントリを走っているジョブへ書き戻す**。止めた時点で後続が積まれていても、
+            // 通番が走っている側に戻るので後続は `claim_job` が捨てる（「走っているほうだけ
+            // 止めて、後ろに積まれたほうが走り出す」を作らない）。降りたら
+            // `apply_outcome(seq)` がこのエントリを消し、未実施／生成済みの表示へ戻る。
+            //
+            // 表示をここで `Stopping` へ移す理由は `TranscribeState::Stopping` の doc。
+            queue.status.insert(
+                session_dir.to_path_buf(),
+                (seq, TranscribeState::Stopping { model_label }),
+            );
             return StopOutcome::Stopping;
         }
         match queue
@@ -562,8 +573,10 @@ fn lock_queue(queue: &Mutex<QueueState>) -> MutexGuard<'_, QueueState> {
 /// （`SummarizeWorker` と同じ形）。マップに自分の通番が載っていなければ、止められたか
 /// 後続に追い越されたジョブ（`StatusMap`）。
 ///
-/// 処理開始でも「文字起こし中」を入れ直すのは、先行ジョブの完了（Done/Failed）が後続の
-/// 処理中表示を上書きしたままにならないようにするため。
+/// **エントリは書き換えない**。通番と状態の照合を通った時点で、そこに在るのは `submit` が
+/// 入れた「文字起こし中（割合なし）」そのものだと分かっている（通番はジョブごとに 1 つで、
+/// 進捗は自分の通番のときしか書かれない）。以前は「先行ジョブの完了が後続の処理中表示を
+/// 上書きしたままにならないように」入れ直していたが、それは通番の照合が引き受けた。
 fn claim_job(
     queue: &Mutex<QueueState>,
     session_dir: &Path,
@@ -572,15 +585,21 @@ fn claim_job(
     cancel: &Arc<AtomicBool>,
 ) -> bool {
     let mut queue = lock_queue(queue);
-    if !queue.is_current(session_dir, seq) {
+    // **通番と状態の両方を見る**。通番だけだと、`stop` が走っているジョブへ書き戻した
+    // `Stopping` を「自分のものだ」と見なして走り出せてしまう（状態を足したときに静かに
+    // 壊れないための備え）。
+    if !queue.is_current(session_dir, seq)
+        || !matches!(
+            queue.status.get(session_dir),
+            Some((_, TranscribeState::Transcribing { .. }))
+        )
+    {
         return false;
     }
-    queue.status.insert(
-        session_dir.to_path_buf(),
-        (seq, TranscribeState::starting(model_label.to_owned())),
-    );
     queue.running = Some(RunningJob {
         session_dir: session_dir.to_path_buf(),
+        seq,
+        model_label: model_label.to_owned(),
         cancel: Arc::clone(cancel),
     });
     true
@@ -632,6 +651,22 @@ enum JobOutcome {
     Stopped,
 }
 
+impl JobOutcome {
+    /// この結果のあと、積んであった要約を続けてよいか。
+    ///
+    /// **全音源の文字起こしに成功したときだけ**。部分的に失敗した文字起こしから議事録を作ると、
+    /// 欠けたまま完成品に見えてしまう。止めたジョブも同じで、続けると「止めたのに議事録が
+    /// 出てくる」ことになる。
+    ///
+    /// **ワイルドカードを置かない**（結果を足したら扱いを書くまで通らない）。
+    fn keeps_summary(&self) -> bool {
+        match self {
+            Self::Done => true,
+            Self::Failed(_) | Self::Skipped | Self::Stopped => false,
+        }
+    }
+}
+
 /// 1 ジョブ（1 回の録音停止分）を処理する。モデルはジョブ内で 1 回だけロードして
 /// 複数音源で使い回す（モデルのロードが重いため）。音源単位の失敗は他の音源へ波及させない。
 fn run_job(
@@ -645,6 +680,13 @@ fn run_job(
     if job.audio_paths.is_empty() {
         // 対象なしでモデル（数百 MB〜）をロードしない防御。通常は投入側が空を渡さない。
         return JobOutcome::Skipped;
+    }
+    // **重い処理の手前で毎回フラグを見る**。この先はモデルの取得（分オーダーになりうる）・
+    // 推論スロットの待ち（要約 LLM が握っていれば分オーダー）・モデルのロードと、止められ
+    // ないまま数分固まる区間が続く。#163 の動機がまさに「間違ったモデルで流し始めた」＝
+    // ダウンロード中なので、そこで効かないと意味がない。
+    if cancel.load(Ordering::Relaxed) {
+        return JobOutcome::Stopped;
     }
     // モデルを解決する。上書き指定があればそれを、無ければ設定で選ばれた内蔵モデルを使う
     // （カタログ外の手編集値は既定へフォールバック。未取得ならここで自動ダウンロードする。
@@ -665,6 +707,10 @@ fn run_job(
             }
         }
     };
+    // 取得が終わった直後（ダウンロード自体の打ち切りは `ModelDownloader` の領分）。
+    if cancel.load(Ordering::Relaxed) {
+        return JobOutcome::Stopped;
+    }
     if !model_path.is_file() {
         eprintln!(
             "Skipping transcription because the Whisper model file was not found: {}",
@@ -679,6 +725,10 @@ fn run_job(
     // ここから先が重い区間。要約 LLM と同時に走らせない（`crate::inference_slot`）。
     // モデルの準備（ダウンロード）はスロットの外で済ませてある。
     let _slot = slot.acquire();
+    // スロットが空くまで待たされた後（要約 LLM が長く握っていることがある）。
+    if cancel.load(Ordering::Relaxed) {
+        return JobOutcome::Stopped;
+    }
     let ctx = match WhisperContext::new_with_params(
         model_path_str,
         WhisperContextParameters::default(),
@@ -692,6 +742,10 @@ fn run_job(
             return JobOutcome::Failed(TranscribeFailure::ModelLoad);
         }
     };
+    // モデルのロードが終わった直後（数百 MB〜数 GB を読むので秒〜十数秒かかる）。
+    if cancel.load(Ordering::Relaxed) {
+        return JobOutcome::Stopped;
+    }
     // 失敗した音源の名前を集める（文にするのは読む領域の仕事。`TranscribeFailure`）。
     let mut failed_names: Vec<String> = Vec::new();
     let total = job.audio_paths.len();
@@ -746,8 +800,9 @@ enum FileOutcome {
 /// `trampoline::<Box<dyn FnMut(i32)>>` と正しく書かれていて、abort 側だけが取り違えている。
 /// クレートを上げるときに直っているか確かめること。
 ///
-/// **ここでパニックしないこと**。呼び出し元は whisper.cpp の C フレームで、巻き戻しが FFI 境界を
-/// 越えると未定義動作になる（`docs/rules/ffi.md`）。`load` はパニックしない。
+/// **ここでパニックしないこと**。呼び出し元は whisper.cpp の C フレームで、`extern "C"` の
+/// 境界を巻き戻しが越えようとするとプロセスが abort する（未定義動作ではないが、常駐アプリを
+/// その場で失う。`docs/rules/ffi.md`）。`load` はパニックしない。
 ///
 /// # Safety
 ///
@@ -841,6 +896,12 @@ fn transcribe_file(
     // whisper.cpp 側の都合なので、どちらでも「止められた」を優先する（`Err` のまま流すと
     // 失敗として赤く出る。`Ok` のまま流すと途中までの結果を完成品として保存する）。
     if cancel.load(Ordering::Relaxed) {
+        // 打ち切りの `Err` は失敗として扱わないが、黙って捨てない
+        // （`docs/rules/error-handling.md`）。止めた瞬間に本物の失敗が重なっていたら、
+        // ここだけが痕跡になる。
+        if let Err(err) = full_result {
+            eprintln!("Ignoring the Whisper error because the transcription was stopped: {err}");
+        }
         return Ok(FileOutcome::Stopped);
     }
     full_result?;
@@ -1233,6 +1294,8 @@ mod tests {
                 .insert(dir.clone(), (0, TranscribeState::starting("Small".into())));
             queue.running = Some(RunningJob {
                 session_dir: dir.clone(),
+                seq: 0,
+                model_label: "Small".to_owned(),
                 cancel: Arc::clone(&cancel),
             });
         }
@@ -1275,6 +1338,8 @@ mod tests {
             );
             queue.running = Some(RunningJob {
                 session_dir: running.clone(),
+                seq: 0,
+                model_label: "Small".to_owned(),
                 cancel: Arc::clone(&cancel),
             });
         }
@@ -1303,6 +1368,8 @@ mod tests {
             .insert(dir.clone(), (1, TranscribeState::starting("Medium".into())));
         lock_queue(&queue).running = Some(RunningJob {
             session_dir: dir.clone(),
+            seq: 0,
+            model_label: "Small".to_owned(),
             cancel: Arc::new(AtomicBool::new(false)),
         });
 
@@ -1379,6 +1446,156 @@ mod tests {
                 .as_ref()
                 .map(|running| running.session_dir.clone()),
             Some(dir)
+        );
+    }
+
+    /// 走っているジョブの後ろに積み直されたジョブが在っても、**両方止まる**（#163）。
+    ///
+    /// 走っている側にだけ中断を伝えて後続を放置すると、Stop を押したのに後続がそのまま走り
+    /// 出す（表示も `Stopping…` から `Transcribing…` へ戻る）。通番を走っている側へ書き戻す
+    /// ことで、後続は `claim_job` が捨てる。
+    #[test]
+    fn stop_also_drops_a_job_queued_behind_the_running_one() {
+        let worker = TranscribeWorker::start(
+            crate::model_download::ModelDownloader::new(),
+            summarize_worker(),
+            crate::inference_slot::InferenceSlot::new(),
+        );
+        let dir = PathBuf::from("/tmp/shoki-stop-successor");
+        let cancel = Arc::new(AtomicBool::new(false));
+        {
+            let mut queue = lock_queue(&worker.queue);
+            // 通番 0 が走っていて、通番 1 が積み直されている（マップは後続のもの）。
+            queue.running = Some(RunningJob {
+                session_dir: dir.clone(),
+                seq: 0,
+                model_label: "Small".to_owned(),
+                cancel: Arc::clone(&cancel),
+            });
+            queue
+                .status
+                .insert(dir.clone(), (1, TranscribeState::starting("Medium".into())));
+        }
+
+        assert_eq!(worker.stop(&dir), StopOutcome::Stopping);
+        assert!(
+            cancel.load(Ordering::Relaxed),
+            "the running job must be told to come down"
+        );
+        // 走っているモデルの名前で「止めています」を出す（マップに載っていたのは後続の名前）。
+        assert_eq!(
+            worker.state_of(&dir),
+            Some(TranscribeState::Stopping {
+                model_label: "Small".to_owned(),
+            })
+        );
+        // 後続はワーカーが取り出しても走らない。
+        assert!(
+            !claim_job(
+                &worker.queue,
+                &dir,
+                1,
+                "Medium",
+                &Arc::new(AtomicBool::new(false))
+            ),
+            "the job queued behind the stopped one must not start"
+        );
+        // 走っていたジョブが降りたら、記録ごと消えて未実施／生成済みの表示へ戻る。
+        apply_outcome(&worker.queue, &dir, 0, JobOutcome::Stopped);
+        assert_eq!(worker.status_of(&dir), None);
+    }
+
+    /// 止めるよう伝えたエントリを、ワーカーが「自分のものだ」と見なして走り出さないこと。
+    /// 通番だけの照合では通ってしまう組み合わせなので、状態も見ている。
+    #[test]
+    fn a_job_that_was_told_to_stop_is_not_started() {
+        let queue = test_queue();
+        let dir = PathBuf::from("/tmp/shoki-claim-stopping");
+        lock_queue(&queue).status.insert(
+            dir.clone(),
+            (
+                7,
+                TranscribeState::Stopping {
+                    model_label: "Small".to_owned(),
+                },
+            ),
+        );
+        assert!(!claim_job(
+            &queue,
+            &dir,
+            7,
+            "Small",
+            &Arc::new(AtomicBool::new(false))
+        ));
+    }
+
+    /// 一覧の行が読む経路でも、止めている最中は割合を出さない（#163）。
+    #[test]
+    fn the_row_shows_no_percentage_while_stopping() {
+        let worker = TranscribeWorker::start(
+            crate::model_download::ModelDownloader::new(),
+            summarize_worker(),
+            crate::inference_slot::InferenceSlot::new(),
+        );
+        let dir = PathBuf::from("/tmp/shoki-progress-stopping");
+        lock_queue(&worker.queue).status.insert(
+            dir.clone(),
+            (
+                0,
+                TranscribeState::Stopping {
+                    model_label: "Small".to_owned(),
+                },
+            ),
+        );
+        let progress = worker.progress_of(&dir).expect("the entry should exist");
+        assert_eq!(progress, TranscribeProgress::Stopping);
+        assert_eq!(progress.status(), TranscribeStatus::Stopping);
+        assert_eq!(
+            progress.percent(),
+            None,
+            "the progress after deciding to stop tells the reader nothing"
+        );
+    }
+
+    /// 止めたジョブから議事録を続けない（#163）。**全結果を網羅**で固定する——ここが緩むと
+    /// 「止めたのに議事録が出てくる」が静かに戻る。
+    #[test]
+    fn only_a_complete_transcription_keeps_its_summary() {
+        assert!(JobOutcome::Done.keeps_summary());
+        assert!(!JobOutcome::Stopped.keeps_summary());
+        assert!(!JobOutcome::Skipped.keeps_summary());
+        assert!(
+            !JobOutcome::Failed(TranscribeFailure::Panicked).keeps_summary(),
+            "a partial transcription would make an incomplete summary look finished"
+        );
+    }
+
+    /// 止められたジョブは、**重い準備を始める前に**降りる（#163）。モデルの取得・推論スロット
+    /// 待ち・モデルのロードはどれも分オーダーになりうるので、そこへ入ってからでは遅い。
+    ///
+    /// 存在しないモデル上書きパスを渡してあるので、降りずに進めば `Failed` になる——
+    /// `Stopped` が返ることが、準備より手前で降りた証拠になる。
+    #[test]
+    fn a_stopped_job_comes_down_before_it_loads_anything() {
+        let dir = PathBuf::from("/tmp/shoki-stop-before-loading");
+        let outcome = run_job(
+            &TranscribeJob {
+                session_dir: dir.clone(),
+                audio_paths: vec![dir.join("mic.mp3")],
+                model_id: crate::whisper_model::DEFAULT_MODEL_ID.to_owned(),
+                model_override: Some(PathBuf::from("/tmp/shoki-no-such-model.bin")),
+                language: "en".to_owned(),
+                summarize: None,
+            },
+            &crate::model_download::ModelDownloader::new(),
+            &crate::inference_slot::InferenceSlot::new(),
+            &test_queue(),
+            0,
+            &Arc::new(AtomicBool::new(true)),
+        );
+        assert!(
+            matches!(outcome, JobOutcome::Stopped),
+            "a job that was stopped must not load the model"
         );
     }
 

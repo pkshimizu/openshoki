@@ -550,6 +550,9 @@ export component RecordingsWindow inherits Window {
     // 状態 enum から導出し、Rust から個別に set しない（bool と enum の食い違いを作らない）。
     property <bool> detail-transcribing: root.detail-transcript-status == TranscriptStatus.transcribing
         || root.detail-transcript-status == TranscriptStatus.stopping;
+    // 止められる状態か（#163）。**`detail-transcribing` と違い stopping を含まない**——
+    // 止めるよう伝えた後に押しても何も変わらないので、そこでは出さない。
+    property <bool> detail-transcript-stoppable: root.detail-transcript-status == TranscriptStatus.transcribing;
     // 選択中セッションの議事録要約の状態テキスト（文言の対応表は Rust 側の
     // `summary_status_text` が正）。
     in property <string> detail-summary-status-text;
@@ -913,9 +916,9 @@ export component RecordingsWindow inherits Window {
                                             : Style.ink-muted;
                                     }
 
-                                    // 走っている間だけ。止めるよう伝えた後（stopping）は出さない
-                                    // ——2 度押しても変わらないものを押せるようにしない。
-                                    if root.detail-transcript-status == TranscriptStatus.transcribing: ActionButton {
+                                    // 出す条件は `detail-transcript-stoppable`（この窓の操作系
+                                    // ゲートは 1 箇所に名前付きで集めてある）。
+                                    if root.detail-transcript-stoppable: ActionButton {
                                         text: "Stop";
                                         compact: true;
                                         // 録音の停止と読み上げが衝突するので、支援技術向けには

@@ -180,13 +180,16 @@ impl TranscriptPane {
                      recognized."
                 ),
             )
-            // 止める口はここだけ（詳細ヘッダの Transcribe は走っている間は無効なので、
-            // 同じ場所には置けない）。**主操作にはしない**——押しに来る人より、進み具合を
-            // 見に来る人のほうが多い。
+            // 空表示側の Stop。詳細ヘッダの状態行にも同じ操作があり
+            // （`ui/recordings-window.slint`）、こちらはセグメントが 0 行のときだけ出る。
+            // **主操作にはしない**——押しに来る人より、進み具合を見に来る人のほうが多い。
             .with_secondary("Stop", PaneActionKind::StopTranscription),
+            // **「何も保存されない」とは言えない**。音源は 1 本ずつ保存されるので、mic を
+            // 終えて system の途中で止めれば `mic.json` は残る（途中結果の扱いは #164）。
+            // 保証できるのは「いま処理している分は保存しない」だけ。
             Self::Stopping { model } => PaneMessage::new(
                 STOPPING_LABEL,
-                format!("{model} is finishing the part it is on. Nothing will be saved."),
+                format!("{model} is finishing the part it is on. That part will not be saved."),
             ),
             Self::Done => PaneMessage::new(
                 "No transcript to show",
