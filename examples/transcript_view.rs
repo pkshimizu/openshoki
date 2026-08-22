@@ -226,27 +226,28 @@ fn main() {
         SessionRow {
             group_heading: "Today".into(),
             time_text: "14:02".into(),
-            date_text: "Aug 10, 2026".into(),
-            detail_text: "Mic + system · transcribing".into(),
+            date_text: "Aug 10, 2026 · 1:12:40".into(),
+            detail_text: "Mic + system · transcribing 48%".into(),
             transcript_status: TranscriptStatus::Transcribing,
         },
         SessionRow {
             group_heading: "".into(),
             time_text: "09:30".into(),
-            date_text: "Aug 10, 2026".into(),
+            date_text: "Aug 10, 2026 · 27:05".into(),
             detail_text: "Mic only · transcribed".into(),
             transcript_status: TranscriptStatus::Done,
         },
         SessionRow {
             group_heading: "Yesterday".into(),
             time_text: "16:45".into(),
-            date_text: "Aug 9, 2026".into(),
+            date_text: "Aug 9, 2026 · 2:41:18".into(),
             detail_text: "System only · transcription failed".into(),
             transcript_status: TranscriptStatus::Failed,
         },
         SessionRow {
             group_heading: "".into(),
             time_text: "11:00".into(),
+            // 長さが分からない録音（区切りごと出ないことを見る）。
             date_text: "Aug 9, 2026".into(),
             detail_text: "Mic + system · not transcribed".into(),
             transcript_status: TranscriptStatus::NotTranscribed,
@@ -254,7 +255,8 @@ fn main() {
         SessionRow {
             group_heading: "Aug 5, 2026".into(),
             time_text: "15:30".into(),
-            date_text: "Aug 5, 2026".into(),
+            // デザインの `6:20` に対して、プレイヤーへ揃えたゼロ詰めの形も見る。
+            date_text: "Aug 5, 2026 · 06:20".into(),
             detail_text: "Mic + system · transcribed".into(),
             transcript_status: TranscriptStatus::Done,
         },

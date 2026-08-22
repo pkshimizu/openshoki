@@ -103,6 +103,40 @@ impl TranscribeState {
     }
 }
 
+/// 一覧の行が要る分だけの進行状況（#162）。`TranscribeState` からモデル名と理由を落としたもので、
+/// **確保しない**。
+///
+/// 状態と割合をタプルで並べない——`(Done, Some(50))` のようなありえない組み合わせを型が許して
+/// しまう（`docs/rules/coding-conventions.md`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscribeProgress {
+    Transcribing {
+        /// whisper が返し始めるまでは `None`（そのときは割合を出さない）。
+        percent: Option<u8>,
+    },
+    Done,
+    Failed,
+}
+
+impl TranscribeProgress {
+    /// 一覧の行が読む、粗い進行状況。
+    pub fn status(self) -> TranscribeStatus {
+        match self {
+            Self::Transcribing { .. } => TranscribeStatus::Transcribing,
+            Self::Done => TranscribeStatus::Done,
+            Self::Failed => TranscribeStatus::Failed,
+        }
+    }
+
+    /// 走っている間の割合（それ以外では `None`）。
+    pub fn percent(self) -> Option<u8> {
+        match self {
+            Self::Transcribing { percent } => percent,
+            Self::Done | Self::Failed => None,
+        }
+    }
+}
+
 /// 文字起こしが失敗した理由（#159）。
 ///
 /// **文言はここに持たない**。ワーカー層が UI のコピーを持つと、状態→文言の対応表が
@@ -347,6 +381,22 @@ impl TranscribeWorker {
         lock_status(&self.status)
             .get(session_dir)
             .map(TranscribeState::status)
+    }
+
+    /// 一覧の行が要る分だけ（状態と進捗）を、**確保なしで**取る。
+    ///
+    /// `state_of` はモデル名まで clone するので、全行を毎 tick 回すこの経路には重い
+    /// （`status_of` を `state_of` へ委譲しないのと同じ理由）。
+    pub fn progress_of(&self, session_dir: &Path) -> Option<TranscribeProgress> {
+        lock_status(&self.status)
+            .get(session_dir)
+            .map(|state| match state {
+                TranscribeState::Transcribing { percent, .. } => {
+                    TranscribeProgress::Transcribing { percent: *percent }
+                }
+                TranscribeState::Done => TranscribeProgress::Done,
+                TranscribeState::Failed { .. } => TranscribeProgress::Failed,
+            })
     }
 
     /// セッションの進行状況と、読む領域に出す中身（モデル名・進捗・失敗の理由）。

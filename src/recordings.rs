@@ -30,9 +30,9 @@ const MIX_MP3: &str = "mix.mp3";
 
 /// 取り残された一時ファイルと見なす、最終更新からの経過時間（`spawn_session_part_sweep`）。
 ///
-/// セッション側の一時ファイルは**寿命が短い**: 書き手（`mixdown::normalize_if_quiet` と
-/// `summarize::write_summary`）はどちらも中身を先にメモリで作り、一時ファイルへは 1 回書いて
-/// すぐ rename するので、通常は 1 秒に満たない（モデル取得の `STALE_MODEL_PART_AGE` が 3 時間
+/// セッション側の一時ファイルは**寿命が短い**: 書き手（`mixdown::normalize_if_quiet` /
+/// `mixdown::generate_mix` / `summarize::write_summary`）はいずれも中身を先にメモリで作り、
+/// 一時ファイルへは 1 回書いてすぐ rename するので、通常は 1 秒に満たない（モデル取得の `STALE_MODEL_PART_AGE` が 3 時間
 /// なのは、受信そのものが数十分かかることに由来する別の理由）。時計のずれ・mtime の粒度ぶんの
 /// 余裕もこの 1 時間に含む。
 ///
@@ -43,9 +43,11 @@ const MIX_MP3: &str = "mix.mp3";
 const STALE_SESSION_PART_AGE: Duration = Duration::from_secs(60 * 60);
 
 /// 掃除する一時ファイルの宛先名（`spawn_session_part_sweep`）。セッションディレクトリは
-/// **ユーザーが中身を置ける場所**なので、アプリが `PartFile` 経由で書く宛先だけに絞る
-/// （`mix.mp3` は `PartFile` を通さず直接書くので入れない）。絞る理由は
-/// `atomic_replace::PartScope`。
+/// **ユーザーが中身を置ける場所**なので、アプリが `PartFile` 経由で書く宛先だけに絞る。
+/// 絞る理由は `atomic_replace::PartScope`。
+///
+/// **書き手が増えたらここへ足す**。足し忘れると、その断片だけどの経路でも回収されない
+/// （#162 で `mix.mp3` を `PartFile` 経由に変えたとき、実際に穴が空いた）。
 ///
 /// 参照するのは**そのファイルを書くモジュールの定数**（この一覧の判定用に置いた `MIC_MP3` などの
 /// 写しではない）。一時ファイルの名前は宛先の名前から作られる（`atomic_replace::PartFile`）ので、
@@ -57,6 +59,7 @@ const SWEPT_PART_DESTS: &[&str] = &[
     crate::recorder::MIC_FILENAME,
     #[cfg(target_os = "macos")]
     crate::system_audio::SYSTEM_FILENAME,
+    crate::mixdown::MIX_FILENAME,
     crate::summarize::SUMMARY_FILENAME,
 ];
 
@@ -90,6 +93,12 @@ pub struct RecordingSession {
     /// 議事録要約（`summary.md`）があるか。中身の妥当性は見ない（表示側の `load_summary` が
     /// 破損・空を縮退させる）。
     pub has_summary: bool,
+    /// 録音の長さ（#162）。**音源のサイズから割り出した見積もり**（`duration_source` /
+    /// `duration_from_size`）。1 秒未満・読めないときは `None` で、一覧には段ごと出さない。
+    ///
+    /// **走査した時点のスナップショット**。録音中のセッションを一覧に出すと、その長さは止まった
+    /// まま（かつ実際より短いまま）になる——一覧を作り直すのはウィンドウを開いたときだけ。
+    pub duration: Option<Duration>,
 }
 
 impl RecordingSession {
@@ -107,6 +116,7 @@ impl RecordingSession {
             has_mix: false,
             has_transcript: false,
             has_summary: false,
+            duration: None,
         }
     }
 
@@ -153,6 +163,23 @@ impl RecordingSession {
         }
     }
 
+    /// 長さを測る音源（#162）。**再生できるかとは別の関心事**——両音源セッションは `mix.mp3` が
+    /// 出来るまで再生できないが、長さは片方の音源から分かる（同時に録っているので同じ長さ）。
+    ///
+    /// これを `playback_path` に合わせてしまうと、**録音を止めた直後**——いちばん一覧を見に行く
+    /// 瞬間——に長さが出ない。
+    fn duration_source(&self) -> Option<PathBuf> {
+        self.playback_path().or_else(|| {
+            if self.has_mic {
+                Some(self.dir.join(MIC_MP3))
+            } else if self.has_system {
+                Some(self.dir.join(SYSTEM_MP3))
+            } else {
+                None
+            }
+        })
+    }
+
     /// 文字起こしの対象となる音源ファイル（存在する `mic.mp3` / `system.mp3`）。
     /// 手動再実行（Recordings ウィンドウの Transcribe ボタン）の投入対象に使う。
     pub fn audio_source_paths(&self) -> Vec<PathBuf> {
@@ -176,6 +203,83 @@ impl RecordingSession {
             (false, false) => "No audio",
         }
     }
+}
+
+/// MPEG-1 / MPEG-2 / MPEG-2.5 の Layer III のビットレート表（kbps）。添字はヘッダのビットレート
+/// インデックス。`0`（自由形式）と `15`（不正）は使わない。
+const MPEG1_BITRATES: [u32; 16] = [
+    0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0,
+];
+const MPEG2_BITRATES: [u32; 16] = [
+    0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0,
+];
+
+/// MP3 の**先頭フレームヘッダ**（4 バイト）から 1 秒あたりのバイト数を読む。
+///
+/// **設定した値を信じない**（#162）。LAME は入力のサンプルレートが低いと MPEG-2 / 2.5 になり、
+/// 頼んだ 128kbps を**エラーにせず落とす**（8kHz のマイク——macOS の Bluetooth ヘッドセットが
+/// 報告しうる——では 64kbps になり、見積もりが 2 倍ずれる）。書かれた値を読めば前提が要らない。
+///
+/// **読んでいるのは先頭のタグフレームのヘッダ**（上記のとおり枠は書かれる）。そこに実際の
+/// ビットレートが入るのは **CBR のときだけ**——LAME は `vbr_off` のときに `avg_bitrate`（低い
+/// サンプルレートで落とされた後の値）をこのヘッダへ写す。VBR に切り替えると、このヘッダは
+/// 128kbps を名乗るようになり、この関数は黙って倍の見積もりを返す。**そのときはここごと
+/// 見直すこと**（`recorder::BITRATE` の doc も）。
+///
+/// 同期語が無い・自由形式なら `None`。
+fn bytes_per_sec_from_header(header: [u8; 4]) -> Option<u64> {
+    // 同期語（11 bit）が無ければ MP3 のフレームではない。
+    if header[0] != 0xFF || (header[1] & 0xE0) != 0xE0 {
+        return None;
+    }
+    // Layer III だけ扱う（このアプリが書くのはそれだけ）。
+    if (header[1] >> 1) & 0b11 != 0b01 {
+        return None;
+    }
+    let mpeg1 = (header[1] >> 3) & 0b11 == 0b11;
+    let table = if mpeg1 {
+        MPEG1_BITRATES
+    } else {
+        MPEG2_BITRATES
+    };
+    let kbps = table[usize::from(header[2] >> 4)];
+    (kbps > 0).then(|| u64::from(kbps) * 1000 / 8)
+}
+
+/// MP3 のファイルサイズと 1 秒あたりのバイト数から再生時間を割り出す。
+///
+/// 余剰は **LAME が先頭に置くタグフレーム 1 つ＋末尾フレームの端数**。`lame_get_lametag_frame`
+/// を呼んでいないので中身は埋まらないが、`write_lame_tag` は既定で有効なので**枠は書かれる**
+/// （128kbps/44.1kHz で 417 バイト）。合わせても 0.1 秒未満なので、秒に丸める表示には効かない。
+///
+/// **1 秒に満たないものは長さ不明にする**。録音に失敗してヘッダだけが残ったファイルで `00:00`
+/// と出しても、`—:—` と同じくらい情報が無い。
+fn duration_from_size(bytes: u64, bytes_per_sec: u64) -> Option<Duration> {
+    if bytes_per_sec == 0 {
+        return None;
+    }
+    let seconds = bytes / bytes_per_sec;
+    (seconds > 0).then(|| Duration::from_secs(seconds))
+}
+
+/// 音源の長さを測る。**ヘッダを 4 バイトだけ読む**——デコードはしない（1 本で数百 ms かかり、
+/// 一覧の全件では開いた瞬間に固まる。#152）。
+fn measure_duration(path: &Path) -> Option<Duration> {
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) => {
+            // **パスは出さない**（`docs/rules/security.md`）。長さが出ないだけなので一覧は続ける。
+            eprintln!(
+                "Skipping the length of a recording because its audio could not be opened: {}",
+                err.kind()
+            );
+            return None;
+        }
+    };
+    let bytes = file.metadata().ok()?.len();
+    let mut header = [0u8; 4];
+    std::io::Read::read_exact(&mut file, &mut header).ok()?;
+    duration_from_size(bytes, bytes_per_sec_from_header(header)?)
 }
 
 /// `recording_dir` を走査して録音セッションを新しい順（日時降順）で返す。
@@ -215,8 +319,7 @@ pub fn list_sessions(recording_dir: &Path) -> Vec<RecordingSession> {
         let has_mix = dir.join(MIX_MP3).is_file();
         let has_transcript = dir.join(MIC_JSON).is_file() || dir.join(SYSTEM_JSON).is_file();
         let has_summary = dir.join(crate::summarize::SUMMARY_FILENAME).is_file();
-
-        sessions.push(RecordingSession {
+        let mut session = RecordingSession {
             datetime,
             dir,
             has_mic,
@@ -224,7 +327,15 @@ pub fn list_sessions(recording_dir: &Path) -> Vec<RecordingSession> {
             has_mix,
             has_transcript,
             has_summary,
-        });
+            duration: None,
+        };
+        // **組み上がってから長さを入れる**（#162）。選び方を素の `bool` で受ける関数に切り出すと、
+        // 引数の順序を取り違えても通ってしまう——同じ `RecordingSession` の `duration_source` を
+        // 通すことで、再生対象と同じ選び方であることが構造で決まる。
+        session.duration = session
+            .duration_source()
+            .and_then(|path| measure_duration(&path));
+        sessions.push(session);
     }
 
     // 新しい順（日時降順）。同時刻はディレクトリ名でも安定させる必要はないが、決定的にするため
@@ -309,12 +420,57 @@ fn parse_session_datetime(name: &str) -> Option<NaiveDateTime> {
 #[cfg(test)]
 mod tests {
     use super::{
-        RecordingSession, STALE_SESSION_PART_AGE, list_sessions, parse_session_datetime,
-        session_dirs, spawn_session_part_sweep, sweep_session_dirs,
+        RecordingSession, STALE_SESSION_PART_AGE, bytes_per_sec_from_header, duration_from_size,
+        list_sessions, parse_session_datetime, session_dirs, spawn_session_part_sweep,
+        sweep_session_dirs,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime};
+
+    /// 長さは**サイズから割り出す**（デコードしない。#162）。
+    #[test]
+    fn duration_from_size_divides_by_the_rate_it_is_given() {
+        assert_eq!(
+            duration_from_size(16_000 * 60, 16_000),
+            Some(Duration::from_secs(60))
+        );
+        // 端数は切り捨てる（見積もりなので、長めに出すより短めに倒す）。
+        assert_eq!(
+            duration_from_size(16_000 * 60 + 15_999, 16_000),
+            Some(Duration::from_secs(60))
+        );
+        // 1 秒に満たないものは長さ不明（`00:00` は `—:—` と同じくらい情報が無い）。
+        assert_eq!(duration_from_size(0, 16_000), None);
+        assert_eq!(duration_from_size(15_999, 16_000), None);
+    }
+
+    /// ビットレートは**書かれた値を読む**（#162）。LAME はサンプルレートが低いと頼んだ 128kbps を
+    /// エラーにせず落とすので、設定値を信じると見積もりが倍ずれる。
+    #[test]
+    fn bytes_per_sec_comes_from_the_frame_header() {
+        // MPEG-1 Layer III, 128kbps（`0xFB` = MPEG-1 / Layer III、`0x9` = 128kbps）。
+        assert_eq!(
+            bytes_per_sec_from_header([0xFF, 0xFB, 0x90, 0x00]),
+            Some(16_000)
+        );
+        // **MPEG-2.5 Layer III, 64kbps**——8kHz のマイクで LAME が落とす先。同じインデックス
+        // `0x8` でも表が違い、MPEG-1 なら 112kbps・MPEG-2 系なら 64kbps。取り違えると倍ずれる。
+        assert_eq!(
+            bytes_per_sec_from_header([0xFF, 0xE3, 0x80, 0x00]),
+            Some(8_000)
+        );
+        assert_eq!(
+            bytes_per_sec_from_header([0xFF, 0xFB, 0x80, 0x00]),
+            Some(14_000),
+            "the same index means a different rate on MPEG-1"
+        );
+        // 同期語が無い（ID3 タグなど）。
+        assert_eq!(bytes_per_sec_from_header([0x49, 0x44, 0x33, 0x04]), None);
+        // 自由形式（インデックス 0）と不正（15）は使わない。
+        assert_eq!(bytes_per_sec_from_header([0xFF, 0xFB, 0x00, 0x00]), None);
+        assert_eq!(bytes_per_sec_from_header([0xFF, 0xFB, 0xF0, 0x00]), None);
+    }
 
     /// 掃除を同期で走らせる（本番は `spawn_session_part_sweep` が別スレッドで呼ぶ。テストは
     /// 決定的にしたいので本体を直接呼ぶ）。対象の組み立ても本番と同じ関数を通す。
@@ -329,6 +485,67 @@ mod tests {
         for f in files {
             fs::write(dir.join(f), b"").expect("writing the placeholder file succeeds in test");
         }
+    }
+
+    /// サイズ付きでセッションを作る（長さの見積もりを見るテスト用）。`secs` は CBR から逆算した
+    /// バイト数を書き込む。
+    fn make_sized_session(root: &Path, name: &str, files: &[(&str, u64)]) {
+        let dir = root.join(name);
+        fs::create_dir_all(&dir).expect("creating the session dir succeeds in test");
+        for (file, secs) in files {
+            // **本物のフレームヘッダで始める**（MPEG-1 Layer III / 128kbps）。長さはここから
+            // 読んだビットレートで割るので、先頭が無いと測れない。
+            let mut bytes = vec![0xFFu8, 0xFB, 0x90, 0x00];
+            bytes.resize((secs * 16_000) as usize, 0);
+            fs::write(dir.join(file), &bytes).expect("writing the sized file succeeds in test");
+        }
+    }
+
+    /// **長さを測る対象は再生の対象と同じ選び方**（両音源なら `mix.mp3`）。ここが取り違わると、
+    /// 一覧に別の音源の長さが出る（#162）。
+    #[test]
+    fn duration_comes_from_the_source_that_playback_uses() {
+        let root = unique_root("duration");
+        let _ = fs::remove_dir_all(&root);
+        // 両音源＋ミックス済み。**それぞれ別の長さ**にして、どれを見たか分かるようにする。
+        make_sized_session(
+            &root,
+            "20260810-140200",
+            &[("mic.mp3", 60), ("system.mp3", 120), ("mix.mp3", 180)],
+        );
+        // 両音源だがミックス未生成。**再生はできないが長さは出す**（録音直後がこの状態）。
+        make_sized_session(
+            &root,
+            "20260810-130200",
+            &[("mic.mp3", 90), ("system.mp3", 240)],
+        );
+        // 単一音源。
+        make_sized_session(&root, "20260810-120200", &[("mic.mp3", 30)]);
+
+        let sessions = list_sessions(&root);
+        let duration_of = |name: &str| {
+            sessions
+                .iter()
+                .find(|session| session.dir.ends_with(name))
+                .unwrap_or_else(|| panic!("{name} should be listed"))
+                .duration
+        };
+        assert_eq!(
+            duration_of("20260810-140200"),
+            Some(Duration::from_secs(180)),
+            "a mixed session measures the file that playback uses"
+        );
+        assert_eq!(
+            duration_of("20260810-130200"),
+            Some(Duration::from_secs(90)),
+            "without a mix, the length still comes from one of the sources"
+        );
+        assert_eq!(
+            duration_of("20260810-120200"),
+            Some(Duration::from_secs(30))
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     fn unique_root(tag: &str) -> PathBuf {
@@ -353,6 +570,9 @@ mod tests {
 
         let listed_old = root.join("20260628-143025").join("mic.mp3.part.123");
         let listed_summary = root.join("20260628-143025").join("summary.md.part.123");
+        // **ミックスの断片も回収する**（#162 で `PartFile` 経由の書き手になった）。1 時間の録音
+        // なら数十 MB の発話がそのまま残るので、宛先一覧から漏れると気づかないまま溜まる。
+        let listed_mix = root.join("20260628-143025").join("mix.mp3.part.123");
         let listed_second = root.join("20260628-150000").join("system.mp3.part.456");
         let listed_other_name = root.join("20260628-143025").join("archive.zip.part.1");
         let listed_user_file = root.join("20260628-143025").join("notes.part.txt");
@@ -363,6 +583,7 @@ mod tests {
         for path in [
             &listed_old,
             &listed_summary,
+            &listed_mix,
             &listed_second,
             &listed_other_name,
             &listed_user_file,
@@ -381,6 +602,10 @@ mod tests {
         assert!(
             !listed_summary.exists(),
             "the summary is written through PartFile too, so its leftovers must be removed"
+        );
+        assert!(
+            !listed_mix.exists(),
+            "the mix is written through PartFile too, so its leftovers must be removed"
         );
         assert!(
             !listed_second.exists(),
