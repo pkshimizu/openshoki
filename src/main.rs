@@ -685,6 +685,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let sessions_model = Rc::clone(&sessions_model);
         let search_generation = Rc::clone(&search_generation);
         let player = Rc::clone(&player);
+        let load_sender = load_sender.clone();
         let transcriber = transcriber.clone();
         let transcript_segments = Rc::clone(&transcript_segments);
         let load_generation = Rc::clone(&load_generation);
@@ -705,6 +706,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &player,
                 &transcript_segments,
                 &load_generation,
+                &load_sender,
             );
         });
     }
@@ -746,6 +748,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let sessions = Rc::clone(&sessions);
         let sessions_model = Rc::clone(&sessions_model);
         let all_sessions = Rc::clone(&all_sessions);
+        let search_generation = Rc::clone(&search_generation);
         let player = Rc::clone(&player);
         let transcript_segments = Rc::clone(&transcript_segments);
         let load_generation = Rc::clone(&load_generation);
@@ -840,6 +843,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             all_sessions
                 .borrow_mut()
                 .retain(|session| session.dir != dir);
+            // **走っている検索も降ろす**（#161）。結果は削除前のスナップショットなので、
+            // 届いた瞬間に消したはずの録音が一覧へ戻る。捨てる経路はここも含めて全部が
+            // `advance_search_generation` を通る。
+            advance_search_generation(&search_generation);
             // 削除で**隣接行の見出しと合計が変わる**。見出しは直前の行との比較で決まるので、
             // その日の先頭を消すと繰り上がった行が見出しを引き継ぐ必要がある。
             {
@@ -1355,19 +1362,26 @@ fn build_menu_event_handler(
             let Some(rec) = recordings.ui.upgrade() else {
                 continue;
             };
-            // 結果は**打鍵した時点のスナップショット**なので、絞り込んでいる間に終わった
-            // 文字起こし・議事録が載っていない。全件側（tick が埋め直している）から拾い直す。
+            // 結果は**打鍵した時点のスナップショット**なので、そのままでは古い。
             let mut matched = result.matched;
-            {
+            let total = {
                 let all = recordings.all_sessions.borrow();
-                for session in matched.iter_mut() {
-                    if let Some(latest) = all.iter().find(|other| other.dir == session.dir) {
-                        session.has_transcript = latest.has_transcript;
-                        session.has_summary = latest.has_summary;
-                    }
-                }
+                // 絞り込んでいる間に消えた録音は落とす（削除は世代を進めるので通常は届かないが、
+                // 取りこぼしたときに消したはずの行を戻さない）。
+                matched.retain(|session| all.iter().any(|other| other.dir == session.dir));
+                all.len()
+            };
+            // 文字起こし・議事録の有無は**ワーカーの状態から埋め直す**。全件側から写すと、
+            // それを埋めるのがこの tick の末尾なので 1 周ぶん古くなり、直後に組む行
+            // （`session_rows` は現在の状態を見る）と食い違う。食い違うと行の差分が
+            // 「変化なし」と判断し、以後どの tick でも直らない。
+            for session in matched.iter_mut() {
+                session.has_transcript |= recordings.transcriber.status_of(&session.dir)
+                    == Some(transcribe::TranscribeStatus::Done);
+                session.has_summary |= recordings.summarizer.status_of(&session.dir)
+                    == Some(summarize::SummarizeStatus::Done);
             }
-            apply_list_counts(&rec, matched.len(), result.total);
+            apply_list_counts(&rec, matched.len(), total);
             recordings
                 .sessions_model
                 .set_vec(session_rows(&matched, &recordings.transcriber));
@@ -1378,6 +1392,7 @@ fn build_menu_event_handler(
                 &recordings.player,
                 &recordings.transcript_segments,
                 &recordings.load_generation,
+                &recordings.load_sender,
             );
         }
 
@@ -1981,10 +1996,9 @@ fn clear_recordings_selection(
 struct SearchResult {
     /// どの検索に対する結果か。**受け取る側が世代を確かめて、古い結果を捨てる**。
     generation: u64,
-    /// 一致したセッション（元の並び順のまま）。
+    /// 一致したセッション（元の並び順のまま）。**件数は持たない**——絞り込んでいる間に
+    /// 削除されることがあるので、合計は受け取った側が `all_sessions` から数える。
     matched: Vec<recordings::RecordingSession>,
-    /// 絞り込む前の件数（`3 of 148 recordings mention it` を組むのに使う）。
-    total: usize,
 }
 
 /// 検索語がセッションの本文に一致するか。**大小を無視する**（打ち込むときに気にさせない）。
@@ -2013,7 +2027,6 @@ fn spawn_search(
     generation: u64,
     sender: &std::sync::mpsc::Sender<SearchResult>,
 ) {
-    let total = sessions.len();
     let sender = sender.clone();
     // **走っている検索へ「もう要らない」を伝える手**（`spawn_session_load` と同じ機構）。
     // 打鍵のたびに投げるので、降りる手が無いと 1 語打つ間に何本もが全件を読み切り、いま見たい
@@ -2042,7 +2055,6 @@ fn spawn_search(
                 .send(SearchResult {
                     generation,
                     matched,
-                    total,
                 })
                 .is_err()
             {
@@ -2068,6 +2080,7 @@ fn reselect_after_list_change(
     player: &Rc<RefCell<Option<player::AudioPlayer>>>,
     segments: &Rc<RefCell<Vec<transcript::TranscriptSegment>>>,
     load_generation: &Rc<Cell<u64>>,
+    load_sender: &std::sync::mpsc::Sender<LoadedSession>,
 ) {
     // 入れ替える**前**に、いま選んでいる録音を控える（添字は入れ替えで意味が変わる）。
     let selected_dir = usize::try_from(rec.get_selected_index())
@@ -2080,7 +2093,23 @@ fn reselect_after_list_change(
     });
     *sessions.borrow_mut() = next;
     match moved_to {
-        Some(index) => rec.set_selected_index(index),
+        Some(index) => {
+            rec.set_selected_index(index);
+            // **中身は読み直す**。絞り込んでいる間に文字起こし・議事録が終わっていることが
+            // あり、添字を付け替えるだけでは古い内容が残る。音声は読み直さないので、
+            // 鳴っているものは止まらない（`PlaybackLoad::Keep`）。
+            let sessions = sessions.borrow();
+            if let Some(session) = usize::try_from(index).ok().and_then(|i| sessions.get(i)) {
+                let generation_id = advance_load_generation(load_generation);
+                spawn_session_load(
+                    session,
+                    generation_id,
+                    load_generation,
+                    load_sender,
+                    load_replaces_playback(false),
+                );
+            }
+        }
         None => {
             if let Some(p) = player.borrow_mut().as_mut() {
                 p.unload();
