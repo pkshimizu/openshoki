@@ -220,3 +220,64 @@ fn summarizing_also_disables_transcribe() {
     window.set_detail_summary_status(SummaryStatus::Done);
     assert_eq!(transcribe.accessible_enabled(), Some(true));
 }
+
+/// 走っている文字起こしを止める操作が配線されていること（#163）。
+///
+/// **押す場所は状態行**（読む領域の空表示にも同じ操作があるが、そちらはセグメントが 0 行の
+/// ときしか出ない——やり直し中は一覧が出ているので、押す場所がここにしか無い）。
+#[test]
+#[cfg_attr(
+    not(slint_debug_info),
+    ignore = "needs Slint debug info (SLINT_EMIT_DEBUG_INFO=1)"
+)]
+fn stopping_a_running_transcription_reports_the_index() {
+    let window = open_window();
+    window.set_selected_index(2);
+
+    let calls: Rc<RefCell<Vec<i32>>> = Rc::new(RefCell::new(Vec::new()));
+    let recorded = Rc::clone(&calls);
+    window.on_stop_transcription(move |index| recorded.borrow_mut().push(index));
+    // 止めるつもりでやり直しを投入してしまわないこと（取り違えが致命的な組み合わせ）。
+    window.on_transcribe_session(|_| panic!("stopping must not re-submit the transcription"));
+
+    window.set_detail_transcript_status(TranscriptStatus::Transcribing);
+    button(&window, "Stop transcription").mock_single_click(PointerEventButton::Left);
+    assert_eq!(*calls.borrow(), vec![2], "the selected index is passed");
+}
+
+/// 止める操作は**走っている間だけ**出す（#163）。伝えた後（`Stopping`）に押せても何も
+/// 変わらないので、押せる見た目のまま残さない。
+#[test]
+#[cfg_attr(
+    not(slint_debug_info),
+    ignore = "needs Slint debug info (SLINT_EMIT_DEBUG_INFO=1)"
+)]
+fn stop_is_offered_only_while_the_transcription_is_running() {
+    let window = open_window();
+    let stop_buttons = |window: &RecordingsWindow| {
+        ElementHandle::find_by_accessible_label(window, "Stop transcription").count()
+    };
+
+    window.set_detail_transcript_status(TranscriptStatus::Transcribing);
+    assert_eq!(
+        stop_buttons(&window),
+        1,
+        "a running transcription can be stopped"
+    );
+
+    window.set_detail_transcript_status(TranscriptStatus::Stopping);
+    assert_eq!(
+        stop_buttons(&window),
+        0,
+        "pressing Stop again would not change anything"
+    );
+
+    for status in [
+        TranscriptStatus::NotTranscribed,
+        TranscriptStatus::Done,
+        TranscriptStatus::Failed,
+    ] {
+        window.set_detail_transcript_status(status);
+        assert_eq!(stop_buttons(&window), 0, "{status:?} has nothing to stop");
+    }
+}

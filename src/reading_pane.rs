@@ -71,6 +71,10 @@ const SUMMARIZING_LABEL: &str = "Writing notes…";
 /// なった（#159 で順番が必ず分かるようになった。`SummaryPane::message`）。
 const SUMMARY_QUEUED_LABEL: &str = "Waiting to write notes…";
 
+/// 「止めています」の表示ラベル（#163）。状態テキストと Transcript の空表示で同じ文言を使う
+/// ため 1 箇所で管理する（`TRANSCRIBING_LABEL` と同じ理由）。
+const STOPPING_LABEL: &str = "Stopping…";
+
 /// 読む領域に出す 1 タブ分の中身（#154）。見出し・理由・次の操作の 3 つで 1 組。
 ///
 /// **3 つをまとめて返す**のは、状態ごとに別々の関数で組み立てると「見出しは失敗なのに
@@ -130,6 +134,9 @@ pub enum TranscriptPane {
         /// whisper が返した進捗（返し始めるまでは `None`）。
         percent: Option<u8>,
     },
+    /// 止めるよう伝えたが、ワーカーがまだ降りていない（#163）。**割合は持たない**——止めると
+    /// 決めた後の進捗は読み手の判断に何も足さない。
+    Stopping { model: String },
     /// 走り終わっている。**この空表示が出るのは JSON が読めなかったときだけ**
     /// （セグメントがあれば一覧が出るので、ここへは来ない）。
     Done,
@@ -143,6 +150,7 @@ impl TranscriptPane {
         match self {
             Self::NotTranscribed { .. } => TranscriptStatus::NotTranscribed,
             Self::Transcribing { .. } => TranscriptStatus::Transcribing,
+            Self::Stopping { .. } => TranscriptStatus::Stopping,
             Self::Done => TranscriptStatus::Done,
             Self::Failed { .. } => TranscriptStatus::Failed,
         }
@@ -171,6 +179,19 @@ impl TranscriptPane {
                     "{model} is running on this Mac. Finished lines appear here as they are \
                      recognized."
                 ),
+            )
+            // 空表示側の Stop。詳細ヘッダの状態行にも同じ操作があり
+            // （`ui/recordings-window.slint`）、こちらはセグメントが 0 行のときだけ出る。
+            // **主操作にはしない**——押しに来る人より、進み具合を見に来る人のほうが多い。
+            .with_secondary("Stop", PaneActionKind::StopTranscription),
+            // **言えることだけを言う**。「何も保存されない」は嘘（音源は 1 本ずつ保存されるので、
+            // mic を終えて system の途中で止めれば `mic.json` は残る。途中結果の扱いは #164）。
+            // 「いま仕上げている最中」も嘘になりうる——モデルの取得や推論スロットの待ちで
+            // 止めた場合、まだ何も処理していない（そこは待つだけで、降りるのは待ちが明けた
+            // とき。`TranscribeState::Stopping` の doc）。
+            Self::Stopping { model } => PaneMessage::new(
+                STOPPING_LABEL,
+                format!("Waiting for {model} to stop. The part it is on will not be saved."),
             ),
             Self::Done => PaneMessage::new(
                 "No transcript to show",
@@ -191,6 +212,7 @@ pub fn transcript_status_text(display_status: TranscriptStatus) -> &'static str 
     match display_status {
         TranscriptStatus::NotTranscribed => "Not transcribed",
         TranscriptStatus::Transcribing => TRANSCRIBING_LABEL,
+        TranscriptStatus::Stopping => STOPPING_LABEL,
         TranscriptStatus::Done => "Transcribed",
         TranscriptStatus::Failed => "Transcription failed",
     }
@@ -209,7 +231,10 @@ pub fn actions_allowed_while_busy(actions: Vec<PaneAction>, jobs_pending: bool) 
         .into_iter()
         .filter(|action| match action.kind {
             PaneActionKind::Transcribe | PaneActionKind::WriteNotes => false,
-            PaneActionKind::CancelNotes
+            // 止める操作は**走っている間しか出ない**ので、ここで落とすと出す先が無くなる
+            // （`docs/rules/slint.md`。取り消しと窓を開くのは残すのと同じ理由）。
+            PaneActionKind::StopTranscription
+            | PaneActionKind::CancelNotes
             | PaneActionKind::OpenTranscription
             | PaneActionKind::OpenNotes => true,
         })
@@ -225,6 +250,7 @@ pub fn session_transcript_word(status: TranscriptStatus, percent: Option<u8>) ->
             Some(percent) => format!("transcribing {percent}%"),
             None => "transcribing".to_owned(),
         },
+        TranscriptStatus::Stopping => "stopping".to_owned(),
         TranscriptStatus::Done => "transcribed".to_owned(),
         TranscriptStatus::Failed => "transcription failed".to_owned(),
     }

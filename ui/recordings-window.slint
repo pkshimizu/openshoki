@@ -7,6 +7,8 @@ import { DangerButton, FocusRing, ActionButton, ButtonRole, Toggle, SearchField 
 export enum TranscriptStatus {
     not-transcribed,
     transcribing,
+    // 止めるよう伝えたが、ワーカーがまだ降りていない（#163）。降りたら未実施／生成済みへ戻る。
+    stopping,
     done,
     failed,
 }
@@ -32,6 +34,8 @@ export enum PaneActionKind {
     write-notes,
     // キュー待ちの議事録を取り消す。
     cancel-notes,
+    // 走っている（またはキュー待ちの）文字起こしを止める。
+    stop-transcription,
     // 文字起こしの設定ウィンドウを開く。
     open-transcription,
     // 議事録の設定ウィンドウを開く。
@@ -541,9 +545,14 @@ export component RecordingsWindow inherits Window {
     in property <string> detail-transcript-heading;
     in property <string> detail-transcript-body;
     in property <[PaneAction]> detail-transcript-actions;
-    // 選択中セッションが文字起こし中か。状態 enum から導出し、Rust から個別に set しない
-    // （bool と enum の食い違いを作らない）。
-    property <bool> detail-transcribing: root.detail-transcript-status == TranscriptStatus.transcribing;
+    // 選択中セッションでワーカーが動いているか。**止めている最中も含む**——降りるまでは
+    // ワーカーがこのセッションの JSON を書きうるので、Delete を開けてはいけない（#163）。
+    // 状態 enum から導出し、Rust から個別に set しない（bool と enum の食い違いを作らない）。
+    property <bool> detail-transcribing: root.detail-transcript-status == TranscriptStatus.transcribing
+        || root.detail-transcript-status == TranscriptStatus.stopping;
+    // 止められる状態か（#163）。**`detail-transcribing` と違い stopping を含まない**——
+    // 止めるよう伝えた後に押しても何も変わらないので、そこでは出さない。
+    property <bool> detail-transcript-stoppable: root.detail-transcript-status == TranscriptStatus.transcribing;
     // 選択中セッションの議事録要約の状態テキスト（文言の対応表は Rust 側の
     // `summary_status_text` が正）。
     in property <string> detail-summary-status-text;
@@ -626,6 +635,8 @@ export component RecordingsWindow inherits Window {
     callback summarize-session(int);
     // 「Cancel」押下（キュー待ちの間だけ出る）。積んだ要約ジョブを取り消す。
     callback cancel-summary(int);
+    // 「Stop」押下（文字起こしが走っている間だけ出る）。走っている文字起こしを止める。
+    callback stop-transcription(int);
     // 確認モーダルの Delete 押下。選択中セッションをゴミ箱へ移動する（インデックスを渡す）。
     callback delete-session(int);
     // 読む領域の空表示から起こす操作（#154）。どれを出すかは Rust が状態から決めるので、
@@ -774,6 +785,7 @@ export component RecordingsWindow inherits Window {
                                                     background: row.transcript-status == TranscriptStatus.done
                                                         ? Style.done-mark
                                                         : row.transcript-status == TranscriptStatus.transcribing
+                                                            || row.transcript-status == TranscriptStatus.stopping
                                                             ? Style.caution-mark
                                                             : row.transcript-status == TranscriptStatus.failed
                                                                 ? Style.danger
@@ -888,6 +900,9 @@ export component RecordingsWindow inherits Window {
                                 // 話をしているのかを目で追い直すことになる。キュー待ちの間だけ、その場に
                                 // 取り消しを出す——**ボタン列と差し替えない**（同じ位置で「積む」と
                                 // 「やめる」が入れ替わると、投入直後の 2 度押しが取り消しになる）。
+                                // 文字起こしを止める口も同じ流儀でここに出す（#163）。読む領域の
+                                // 空表示にも同じ操作があるが、そちらはセグメントが 1 行も無いときしか
+                                // 出ない——やり直し中は一覧が出ているので、押す場所がここにしか無い。
                                 HorizontalLayout {
                                     alignment: start;
                                     spacing: 8px;
@@ -899,6 +914,19 @@ export component RecordingsWindow inherits Window {
                                         color: root.detail-transcript-status == TranscriptStatus.failed
                                             ? Style.danger
                                             : Style.ink-muted;
+                                    }
+
+                                    // 出す条件は `detail-transcript-stoppable`（この窓の操作系
+                                    // ゲートは 1 箇所に名前付きで集めてある）。
+                                    if root.detail-transcript-stoppable: ActionButton {
+                                        text: "Stop";
+                                        compact: true;
+                                        // 録音の停止と読み上げが衝突するので、支援技術向けには
+                                        // 何を止めるのかを明示する。
+                                        accessible-label: "Stop transcription";
+                                        clicked => {
+                                            root.stop-transcription(root.selected-index);
+                                        }
                                     }
 
                                     Text {

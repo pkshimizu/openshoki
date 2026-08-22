@@ -651,6 +651,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // 「Stop」押下（#163）。走っている文字起こしへ中断を伝える（キュー待ちならその場で外す）。
+    // **結果は即反映する**——押した瞬間に「Stopping…」へ移らないと、押しても何も起きていない
+    // ように見える（実際に降りるのはワーカーが気づいたとき。tick が拾って未実施へ戻す）。
+    {
+        let sessions = Rc::clone(&sessions);
+        let transcriber = transcriber.clone();
+        let summarizer = summarizer.clone();
+        let config = Rc::clone(&config);
+        let rec_weak = recordings_ui.as_weak();
+        recordings_ui.on_stop_transcription(move |index| {
+            let sessions = sessions.borrow();
+            let Some(session) = usize::try_from(index).ok().and_then(|i| sessions.get(i)) else {
+                return;
+            };
+            match transcriber.stop(&session.dir) {
+                transcribe::StopOutcome::Stopping => {
+                    println!("Stopping the transcription that is running");
+                }
+                transcribe::StopOutcome::Cancelled => {
+                    println!("Canceled the transcription that was waiting to start");
+                }
+                transcribe::StopOutcome::NotRunning => {
+                    // 走ってもキューにも載っていなかった（終わった直後に押された）。tick が
+                    // 状態を更新する前の数十 ms に押されると起こる。表示は次の tick が直す。
+                    eprintln!("Skipping the stop because the transcription is no longer running");
+                }
+            }
+            if let Some(rec) = rec_weak.upgrade() {
+                refresh_detail_panes(&rec, &transcriber, &summarizer, session, &config);
+            }
+        });
+    }
+
     // 一覧の検索（#161）。**絞り込みは背景スレッド**で行い、結果は tick が拾って反映する。
     // ここでは世代を進めて投げるだけ——打ち込むたびに走るので、古い結果が新しい入力を
     // 上書きしないようにする。
@@ -733,6 +766,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 PaneActionKind::Transcribe => rec.invoke_transcribe_session(index),
                 PaneActionKind::WriteNotes => rec.invoke_summarize_session(index),
                 PaneActionKind::CancelNotes => rec.invoke_cancel_summary(index),
+                PaneActionKind::StopTranscription => rec.invoke_stop_transcription(index),
                 PaneActionKind::OpenTranscription => {
                     if let Some(ui) = app_weak.upgrade() {
                         ui.invoke_open_transcription_window();
@@ -1467,15 +1501,11 @@ fn build_menu_event_handler(
                     // 片方だけ更新すると「完了したのに `transcribing` のまま」が残る。
                     row.detail_text = detail_text;
                     recordings.sessions_model.set_row_data(i, row);
-                    if previous == TranscriptStatus::Transcribing
-                        && status == TranscriptStatus::Done
-                    {
+                    let came_off_the_worker = came_off_the_worker(previous, status);
+                    if came_off_the_worker && status == TranscriptStatus::Done {
                         transcribed.push(i);
                     }
-                    if selected == Some(i)
-                        && previous == TranscriptStatus::Transcribing
-                        && status == TranscriptStatus::Done
-                    {
+                    if selected == Some(i) && came_off_the_worker {
                         // **表示は書かず、読み込みをやり直す**（#152）。ここで直接差し替えると、
                         // 少し前に始まった読み込みの古いスナップショット（まだ何も無かった頃の
                         // 内容）があとから届いて上書きし、**完成した文字起こしが消える**。
@@ -2562,6 +2592,28 @@ fn breathing_level(elapsed: std::time::Duration, cycle_secs: f32) -> f32 {
     ((2.0 * PI * t / cycle_secs).sin() + 1.0) / 2.0
 }
 
+/// ワーカーの手を離れたか（走っていた状態から、走っていない状態へ移ったか）。
+///
+/// **止め終わりも含める**（#163）。止めたジョブは記録ごと消えるので、そこから落ちる先は
+/// `Done`（既に書けた音源がある）でも `NotTranscribed`（1 本も書けなかった）でもありうる。
+/// 「`Transcribing` から `Done` へ」だけを見ていると、止めた後に一覧と読む領域が古いまま
+/// 固定され、選び直すまで直らない。
+///
+/// **行き先を数え上げない**（本物の失敗と重なれば `Failed` からもここを通る）。数え上げると
+/// 状態を足した日に静かに漏れるので、見るのは「走っていた／走っていない」の 2 つだけ。
+///
+/// **行き先を数え上げない**（`Failed` からもここを通る）。数え上げると、状態を足した日に
+/// 静かに漏れる。見るのは「走っていた／走っていない」の 2 つだけ。
+fn came_off_the_worker(previous: TranscriptStatus, status: TranscriptStatus) -> bool {
+    let on_the_worker = |status| {
+        matches!(
+            status,
+            TranscriptStatus::Transcribing | TranscriptStatus::Stopping
+        )
+    };
+    on_the_worker(previous) && !on_the_worker(status)
+}
+
 /// 文字起こしの表示状態（`ui/recordings-window.slint` の `TranscriptStatus`）を合成する。
 /// ワーカーの進行状況（メモリ）があればそれを優先し、無ければ JSON の有無で解決する。
 fn transcript_display_status(
@@ -2570,6 +2622,7 @@ fn transcript_display_status(
 ) -> TranscriptStatus {
     match worker_status {
         Some(transcribe::TranscribeStatus::Transcribing) => TranscriptStatus::Transcribing,
+        Some(transcribe::TranscribeStatus::Stopping) => TranscriptStatus::Stopping,
         Some(transcribe::TranscribeStatus::Done) => TranscriptStatus::Done,
         Some(transcribe::TranscribeStatus::Failed) => TranscriptStatus::Failed,
         None if has_transcript => TranscriptStatus::Done,
@@ -2652,6 +2705,9 @@ fn transcript_pane_of(
             model: model_label,
             percent,
         },
+        Some(transcribe::TranscribeState::Stopping { model_label }) => {
+            TranscriptPane::Stopping { model: model_label }
+        }
         Some(transcribe::TranscribeState::Done) => TranscriptPane::Done,
         Some(transcribe::TranscribeState::Failed { reason }) => TranscriptPane::Failed { reason },
         None if has_transcript => TranscriptPane::Done,
@@ -2695,11 +2751,14 @@ fn refresh_detail_panes(
 /// 詳細ヘッダの `detail-jobs-pending`（Slint 側が状態 enum から導出する）と**同じ条件**にする。
 /// 片方だけ変えると、同じ操作がヘッダからは押せないのに空表示からは押せる、という穴になる。
 fn jobs_pending(transcript: &TranscriptPane, summary: &SummaryPane) -> bool {
-    matches!(transcript.status(), TranscriptStatus::Transcribing)
-        || matches!(
-            summary.status(),
-            SummaryStatus::Queued | SummaryStatus::Summarizing
-        )
+    matches!(
+        transcript.status(),
+        // 止めている最中も「積まれている」。降りるまではワーカーが JSON を触りうる。
+        TranscriptStatus::Transcribing | TranscriptStatus::Stopping
+    ) || matches!(
+        summary.status(),
+        SummaryStatus::Queued | SummaryStatus::Summarizing
+    )
 }
 
 /// 議事録生成の表示状態（`ui/recordings-window.slint` の `SummaryStatus`）を合成する。
@@ -3137,10 +3196,10 @@ mod tests {
     use super::{
         PaneAction, PaneActionKind, StatusTone, SummaryPane, SummaryStatus, TranscriptPane,
         TranscriptStatus, actions_allowed_while_busy, app_version_text, breathing_level,
-        jobs_pending, model_downloads_on_select, model_status_line, playback_progress,
-        search_summary_text, seek_position_from_ratio, session_matches, summary_display_status,
-        summary_model_status_line, summary_pane_of, summary_rows, summary_status_text,
-        transcript_display_status, transcript_pane_of, transcript_status_text,
+        came_off_the_worker, jobs_pending, model_downloads_on_select, model_status_line,
+        playback_progress, search_summary_text, seek_position_from_ratio, session_matches,
+        summary_display_status, summary_model_status_line, summary_pane_of, summary_rows,
+        summary_status_text, transcript_display_status, transcript_pane_of, transcript_status_text,
         whisper_model_status_line,
     };
     use super::{elapsed_text, recordings, summarize, transcribe};
@@ -3233,6 +3292,11 @@ mod tests {
             super::session_detail_text(&session, TranscriptStatus::Transcribing, Some(48)),
             "Mic + system · transcribing 48%"
         );
+        // 止めている最中は割合を出さない（止めると決めた後の進捗は読み手に何も足さない）。
+        assert_eq!(
+            super::session_detail_text(&session, TranscriptStatus::Stopping, Some(48)),
+            "Mic + system · stopping"
+        );
         session.has_system = false;
         assert_eq!(
             super::session_detail_text(&session, TranscriptStatus::Done, None),
@@ -3323,6 +3387,24 @@ mod tests {
         assert!(row.limitation_note.is_empty());
     }
 
+    /// 止め終わりも「ワーカーの手を離れた」に数える（#163）。ここを `Transcribing → Done` に
+    /// 狭めると、止めた後の一覧と読む領域が選び直すまで古いままになる。
+    #[test]
+    fn coming_off_the_worker_includes_being_stopped() {
+        use TranscriptStatus as S;
+        // 止め終わりは、書けた音源があれば Done、1 本も無ければ未実施へ落ちる。
+        assert!(came_off_the_worker(S::Stopping, S::Done));
+        assert!(came_off_the_worker(S::Stopping, S::NotTranscribed));
+        assert!(came_off_the_worker(S::Transcribing, S::Done));
+        assert!(came_off_the_worker(S::Transcribing, S::Failed));
+        // 走り出した・止めるよう伝えた、はまだ手を離れていない。
+        assert!(!came_off_the_worker(S::NotTranscribed, S::Transcribing));
+        assert!(!came_off_the_worker(S::Transcribing, S::Stopping));
+        assert!(!came_off_the_worker(S::Stopping, S::Stopping));
+        // もともと走っていなければ、何へ移っても合図にしない。
+        assert!(!came_off_the_worker(S::Done, S::NotTranscribed));
+    }
+
     /// ワーカーの進行状況（メモリ）があればそれを優先し、無ければ JSON の有無で解決する。
     #[test]
     fn transcript_display_status_prefers_worker_status_over_json() {
@@ -3334,6 +3416,11 @@ mod tests {
         assert_eq!(
             transcript_display_status(Some(TranscribeStatus::Done), false),
             TranscriptStatus::Done
+        );
+        // 止めている最中も、JSON があっても優先する（降りるまでは「止めています」）。
+        assert_eq!(
+            transcript_display_status(Some(TranscribeStatus::Stopping), true),
+            TranscriptStatus::Stopping
         );
         // 失敗の記録は JSON があっても優先する（古い JSON で失敗を隠さない）。
         assert_eq!(
@@ -3362,6 +3449,10 @@ mod tests {
             "Transcribing…"
         );
         assert_eq!(
+            transcript_status_text(TranscriptStatus::Stopping),
+            "Stopping…"
+        );
+        assert_eq!(
             transcript_status_text(TranscriptStatus::Done),
             "Transcribed"
         );
@@ -3385,6 +3476,9 @@ mod tests {
             TranscriptPane::Transcribing {
                 model: "Medium".to_owned(),
                 percent: None,
+            },
+            TranscriptPane::Stopping {
+                model: "Medium".to_owned(),
             },
             TranscriptPane::Done,
             TranscriptPane::Failed {
@@ -3427,11 +3521,25 @@ mod tests {
             .heading,
             "Transcribing…"
         );
-        // 走っている状態には操作を出さない（Stop はまだ無い。#128）。
+        // 走っている間は止められる（#163）。**主操作にはしない**——押しに来る人より進み具合を
+        // 見に来る人のほうが多い。
+        let running = TranscriptPane::Transcribing {
+            model: "Medium".to_owned(),
+            percent: None,
+        }
+        .message();
+        assert_eq!(
+            running
+                .actions
+                .iter()
+                .map(|action| (action.kind, action.primary))
+                .collect::<Vec<_>>(),
+            vec![(PaneActionKind::StopTranscription, false)]
+        );
+        // 止めるよう伝えた後は、もう押せる操作を出さない（二度押しても何も変わらない）。
         assert!(
-            TranscriptPane::Transcribing {
+            TranscriptPane::Stopping {
                 model: "Medium".to_owned(),
-                percent: None,
             }
             .message()
             .actions
@@ -3629,7 +3737,22 @@ mod tests {
             }
         );
 
-        // ワーカーに記録が無ければ JSON の有無で解決する。
+        // 止めている最中は、使っているモデルを持ち越す（「止めています」の理由に出る）。
+        assert_eq!(
+            transcript_pane_of(
+                Some(transcribe::TranscribeState::Stopping {
+                    model_label: "Medium".to_owned(),
+                }),
+                true,
+                false,
+            ),
+            TranscriptPane::Stopping {
+                model: "Medium".to_owned(),
+            }
+        );
+
+        // ワーカーに記録が無ければ JSON の有無で解決する。**止め終わった後もここへ来る**
+        // （降りたジョブは記録ごと消えるので、未実施／生成済みへ戻る）。
         assert_eq!(transcript_pane_of(None, true, false), TranscriptPane::Done);
         // 自動文字起こしの状態は、なぜ無いのかの説明を変えるので pane まで届く。
         assert_eq!(
@@ -3686,6 +3809,12 @@ mod tests {
                 kind: PaneActionKind::OpenNotes,
                 primary: false,
             },
+            // 止める操作は走っている間しか出ないので、ここで落とすと出す先が無くなる（#163）。
+            PaneAction {
+                label: "Stop".into(),
+                kind: PaneActionKind::StopTranscription,
+                primary: false,
+            },
         ];
         assert_eq!(actions_allowed_while_busy(all.clone(), false), all);
         assert_eq!(
@@ -3693,7 +3822,11 @@ mod tests {
                 .iter()
                 .map(|action| action.kind)
                 .collect::<Vec<_>>(),
-            vec![PaneActionKind::CancelNotes, PaneActionKind::OpenNotes]
+            vec![
+                PaneActionKind::CancelNotes,
+                PaneActionKind::OpenNotes,
+                PaneActionKind::StopTranscription,
+            ]
         );
     }
 
@@ -3707,6 +3840,13 @@ mod tests {
             &TranscriptPane::Transcribing {
                 model: "Medium".to_owned(),
                 percent: None,
+            },
+            &idle_summary
+        ));
+        // 止めている最中も数える（降りるまではワーカーが JSON を触りうる）。
+        assert!(jobs_pending(
+            &TranscriptPane::Stopping {
+                model: "Medium".to_owned(),
             },
             &idle_summary
         ));
