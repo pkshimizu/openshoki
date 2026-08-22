@@ -10,7 +10,6 @@
 //! ブロックしない。モデル未指定/欠如・デコード失敗・whisper 失敗は握りつぶさずログし、
 //! 他音源・アプリ・録音を巻き込まない（`docs/rules/error-handling.md`）。
 
-use crate::reading_pane::TranscribeFailure;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
@@ -26,6 +25,11 @@ use symphonia::core::formats::{FormatOptions, TrackType};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+
+/// 失敗の種別は、文言表（網羅 match）の隣に置くために `reading_pane` が持っている。
+/// ただし値を作るのはこのモジュールなので、読む人が探す場所はここでもある——同じ名前で
+/// 引けるように再エクスポートしておく。
+pub use crate::reading_pane::TranscribeFailure;
 
 /// whisper が入力に取るサンプルレート（Hz）。これ以外のレートの音声はここへリサンプルする。
 const WHISPER_SAMPLE_RATE: usize = 16_000;

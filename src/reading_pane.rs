@@ -58,23 +58,26 @@ pub enum SummarizeFailure {
 
 /// 「文字起こし中」の表示ラベル。状態テキストと Transcript の空表示の両方で同じ文言を
 /// 使うため、1 箇所で管理する（片方だけ変えて食い違うのを防ぐ）。
-pub const TRANSCRIBING_LABEL: &str = "Transcribing…";
+const TRANSCRIBING_LABEL: &str = "Transcribing…";
 
 /// 「要約生成中」の表示ラベル。状態テキストと Notes の空表示で同じ文言を使うため 1 箇所で
 /// 管理する（`TRANSCRIBING_LABEL` と同じ理由）。
-pub const SUMMARIZING_LABEL: &str = "Writing notes…";
+const SUMMARIZING_LABEL: &str = "Writing notes…";
 
 /// 「キュー待ち」の表示ラベル。生成中と区別できる語にする: この間はまだ CPU を使っておらず、
 /// 取り消せる（`SummarizeWorker::cancel`）。
 ///
 /// **いまの参照は状態行（`summary_status_text`）だけ**。空表示の見出しは常に番号まで出すように
 /// なった（#159 で順番が必ず分かるようになった。`SummaryPane::message`）。
-pub const SUMMARY_QUEUED_LABEL: &str = "Waiting to write notes…";
+const SUMMARY_QUEUED_LABEL: &str = "Waiting to write notes…";
 
 /// 読む領域に出す 1 タブ分の中身（#154）。見出し・理由・次の操作の 3 つで 1 組。
 ///
 /// **3 つをまとめて返す**のは、状態ごとに別々の関数で組み立てると「見出しは失敗なのに
 /// ボタンは Transcribe now」のような食い違いを作れてしまうため。
+//
+// `Eq` だけ無いのは、`PaneAction` が Slint 由来の struct で `PartialEq` までしか持たないため。
+#[derive(Debug, Clone, PartialEq)]
 pub struct PaneMessage {
     pub heading: String,
     /// 見出しの下の 1〜2 文。空なら段ごと出さない。
@@ -85,7 +88,7 @@ pub struct PaneMessage {
 
 impl PaneMessage {
     /// 見出しと理由だけの土台。操作は `with_primary` / `with_secondary` で足す。
-    pub fn new(heading: impl Into<String>, body: impl Into<String>) -> Self {
+    fn new(heading: impl Into<String>, body: impl Into<String>) -> Self {
         Self {
             heading: heading.into(),
             body: body.into(),
@@ -94,7 +97,7 @@ impl PaneMessage {
     }
 
     /// 主操作を 1 つ添える（並ぶのは最大 2 つで、主はこれ 1 つだけ）。
-    pub fn with_primary(mut self, label: &str, kind: PaneActionKind) -> Self {
+    fn with_primary(mut self, label: &str, kind: PaneActionKind) -> Self {
         self.actions.push(PaneAction {
             label: label.into(),
             kind,
@@ -104,7 +107,7 @@ impl PaneMessage {
     }
 
     /// 補助の操作を添える（`with_action` の後ろに並ぶ）。
-    pub fn with_secondary(mut self, label: &str, kind: PaneActionKind) -> Self {
+    fn with_secondary(mut self, label: &str, kind: PaneActionKind) -> Self {
         self.actions.push(PaneAction {
             label: label.into(),
             kind,
@@ -380,7 +383,7 @@ pub fn elapsed_text(elapsed: Duration) -> String {
 
 /// 数と単位を英語として揃える（`1 minute` / `3 minutes`）。**そのまま画面に出る**文なので、
 /// 単複が崩れると読みにくい（`docs/rules/messages.md`）。
-pub fn plural(count: u64, unit: &str) -> String {
+fn plural(count: u64, unit: &str) -> String {
     if count == 1 {
         format!("1 {unit}")
     } else {

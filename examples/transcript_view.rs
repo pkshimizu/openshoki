@@ -48,30 +48,37 @@ fn flag(name: &str) -> bool {
 /// 引数で件数を指定しなかったときのセグメント件数。
 const DEFAULT_SEGMENT_COUNT: usize = 30;
 
-/// 空表示を入れる（本番の `main::apply_detail_*_status` と同じ 3 つを埋める）。
-fn apply_pane(
-    win: &RecordingsWindow,
-    message: &reading_pane::PaneMessage,
-    heading: impl Fn(&RecordingsWindow, slint::SharedString),
-    body: impl Fn(&RecordingsWindow, slint::SharedString),
-    actions: impl Fn(&RecordingsWindow, ModelRc<PaneAction>),
-) {
-    heading(win, message.heading.as_str().into());
-    body(win, message.body.as_str().into());
-    actions(
-        win,
-        ModelRc::from(Rc::new(VecModel::from(message.actions.clone()))),
-    );
+/// Transcript タブの空表示を入れる（本番の `main::apply_detail_transcript_status` と同じ
+/// 3 つを埋める）。
+///
+/// **タブごとに関数を分ける**——見出しと理由の setter を引数で受けると、同じ型なので取り違えても
+/// 通ってしまう（`docs/rules/coding-conventions.md`）。
+fn apply_transcript_pane(win: &RecordingsWindow, message: &reading_pane::PaneMessage) {
+    win.set_detail_transcript_heading(message.heading.as_str().into());
+    win.set_detail_transcript_body(message.body.as_str().into());
+    win.set_detail_transcript_actions(ModelRc::from(Rc::new(VecModel::from(
+        message.actions.clone(),
+    ))));
 }
 
-/// Transcript タブに出す状態を引数で選ぶ。**文言は組まない**——`reading_pane` が組む（#160）。
-fn transcript_pane() -> reading_pane::PaneMessage {
+/// Notes タブの空表示を入れる（`apply_transcript_pane` と同じ理由で分けてある）。
+fn apply_summary_pane(win: &RecordingsWindow, message: &reading_pane::PaneMessage) {
+    win.set_detail_summary_heading(message.heading.as_str().into());
+    win.set_detail_summary_body(message.body.as_str().into());
+    win.set_detail_summary_actions(ModelRc::from(Rc::new(VecModel::from(
+        message.actions.clone(),
+    ))));
+}
+
+/// Transcript タブに出す状態を引数で選ぶ。**状態そのものを返す**——状態行と空表示を別々に
+/// 選ぶと、本番では作れない組み合わせ（「Transcribed」なのに空表示は「Transcribing」）が
+/// 出せてしまう。文言は `reading_pane` が組む（#160）。
+fn transcript_pane(has_transcript: bool) -> reading_pane::TranscriptPane {
     if flag("transcribing") {
         return reading_pane::TranscriptPane::Transcribing {
             model: "Medium".to_owned(),
             percent: Some(48),
-        }
-        .message();
+        };
     }
     if flag("transcript-failed") {
         // ワーカーが返す中でいちばん長い理由（折り返しを見る）。
@@ -80,16 +87,15 @@ fn transcript_pane() -> reading_pane::PaneMessage {
                 "mic.mp3".to_owned(),
                 "system.mp3".to_owned(),
             ]),
-        }
-        .message();
+        };
     }
-    if flag("transcript-unreadable") {
-        return reading_pane::TranscriptPane::Done.message();
+    // 文字起こしはあるが読めない（`transcript-unreadable`）も、状態としては生成済み。
+    if has_transcript {
+        return reading_pane::TranscriptPane::Done;
     }
     reading_pane::TranscriptPane::NotTranscribed {
         auto_on: flag("auto-on"),
     }
-    .message()
 }
 
 /// Notes タブに出す状態（同上）。
@@ -244,24 +250,15 @@ fn main() {
     }
     let has_transcript = !flag("no-transcript");
     win.set_has_transcript(has_transcript);
-    win.set_detail_transcript_status(if has_transcript {
-        TranscriptStatus::Done
-    } else {
-        TranscriptStatus::NotTranscribed
-    });
+    let transcript_pane = transcript_pane(has_transcript);
+    win.set_detail_transcript_status(transcript_pane.status());
     win.set_detail_transcript_text(
-        reading_pane::transcript_status_text(win.get_detail_transcript_status()).into(),
+        reading_pane::transcript_status_text(transcript_pane.status()).into(),
     );
     // 読む領域の空表示（#154）。**状態を引数で選べる**ようにする——見出し・理由・操作の 3 段が
     // 最長文言で崩れないか、ボタンが 2 つ並んだときに収まるかを目視する。文言は本番と同じ
     // `reading_pane` が組む（#160）。
-    apply_pane(
-        &win,
-        &transcript_pane(),
-        RecordingsWindow::set_detail_transcript_heading,
-        RecordingsWindow::set_detail_transcript_body,
-        RecordingsWindow::set_detail_transcript_actions,
-    );
+    apply_transcript_pane(&win, &transcript_pane.message());
     if has_transcript {
         win.set_segments(ModelRc::from(Rc::new(VecModel::from(rows))));
         // 追従（#154）の確認: `far` は再生位置を一覧の末尾寄りに置く。ON なら開いた時点で
@@ -285,15 +282,12 @@ fn main() {
     } else {
         SummaryStatus::Done
     };
-    win.set_detail_summary_status(summary_status);
-    win.set_detail_summary_status_text(reading_pane::summary_status_text(summary_status).into());
-    apply_pane(
-        &win,
-        &summary_pane(summary_status, has_transcript).message(),
-        RecordingsWindow::set_detail_summary_heading,
-        RecordingsWindow::set_detail_summary_body,
-        RecordingsWindow::set_detail_summary_actions,
+    let summary_pane = summary_pane(summary_status, has_transcript);
+    win.set_detail_summary_status(summary_pane.status());
+    win.set_detail_summary_status_text(
+        reading_pane::summary_status_text(summary_pane.status()).into(),
     );
+    apply_summary_pane(&win, &summary_pane.message());
     win.set_detail_summary_footer("Written from the transcript · Aug 9, 2026 · 09:14".into());
     // 生成済みのときだけ行を入れる（生成中・失敗は旧議事録が無い状態＝空表示を見る）。
     if summary_status == SummaryStatus::Done {

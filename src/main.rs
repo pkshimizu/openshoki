@@ -3131,7 +3131,9 @@ pub(crate) fn init_test_backend() {
 
 #[cfg(test)]
 mod tests {
-    use super::reading_pane::{summarize_failure_text, transcribe_failure_text};
+    use super::reading_pane::{
+        SummarizeFailure, TranscribeFailure, summarize_failure_text, transcribe_failure_text,
+    };
     use super::{
         PaneAction, PaneActionKind, StatusTone, SummaryPane, SummaryStatus, TranscriptPane,
         TranscriptStatus, actions_allowed_while_busy, app_version_text, breathing_level,
@@ -3386,7 +3388,7 @@ mod tests {
             },
             TranscriptPane::Done,
             TranscriptPane::Failed {
-                reason: super::reading_pane::TranscribeFailure::Panicked,
+                reason: TranscribeFailure::Panicked,
             },
         ];
         for pane in &panes {
@@ -3448,7 +3450,7 @@ mod tests {
         // 失敗は種別から文を組む。**件数で形を変えない**ので、1 本でも複数でも同じ形。
         assert_eq!(
             TranscriptPane::Failed {
-                reason: super::reading_pane::TranscribeFailure::Files(vec!["mic.mp3".to_owned()]),
+                reason: TranscribeFailure::Files(vec!["mic.mp3".to_owned()]),
             }
             .message()
             .body,
@@ -3456,7 +3458,7 @@ mod tests {
         );
         assert_eq!(
             TranscriptPane::Failed {
-                reason: super::reading_pane::TranscribeFailure::Files(vec![
+                reason: TranscribeFailure::Files(vec![
                     "mic.mp3".to_owned(),
                     "system.mp3".to_owned(),
                 ]),
@@ -3468,7 +3470,7 @@ mod tests {
         // **なぜ止まったか分からない**ときは、分かったふりをしない。
         assert_eq!(
             TranscriptPane::Failed {
-                reason: super::reading_pane::TranscribeFailure::Panicked,
+                reason: TranscribeFailure::Panicked,
             }
             .message()
             .body,
@@ -3545,8 +3547,7 @@ mod tests {
     /// `transcribe::job_model_label`）。そちらのテストが対で押さえる。
     #[test]
     fn failure_text_is_fixed_for_every_kind() {
-        use super::reading_pane::SummarizeFailure as S;
-        use super::reading_pane::TranscribeFailure as T;
+        use crate::reading_pane::{SummarizeFailure as S, TranscribeFailure as T};
 
         let transcribe_cases = [
             (
@@ -3618,15 +3619,13 @@ mod tests {
         assert_eq!(
             transcript_pane_of(
                 Some(transcribe::TranscribeState::Failed {
-                    reason: super::reading_pane::TranscribeFailure::Files(vec![
-                        "mic.mp3".to_owned()
-                    ]),
+                    reason: TranscribeFailure::Files(vec!["mic.mp3".to_owned()]),
                 }),
                 true,
                 false,
             ),
             TranscriptPane::Failed {
-                reason: super::reading_pane::TranscribeFailure::Files(vec!["mic.mp3".to_owned()]),
+                reason: TranscribeFailure::Files(vec!["mic.mp3".to_owned()]),
             }
         );
 
@@ -3743,7 +3742,7 @@ mod tests {
         assert_eq!(TranscriptPane::Done.status(), TranscriptStatus::Done);
         assert_eq!(
             TranscriptPane::Failed {
-                reason: super::reading_pane::TranscribeFailure::Panicked,
+                reason: TranscribeFailure::Panicked,
             }
             .status(),
             TranscriptStatus::Failed
@@ -3815,7 +3814,7 @@ mod tests {
             },
             SummaryPane::Done,
             SummaryPane::Failed {
-                reason: super::reading_pane::SummarizeFailure::ModelRun,
+                reason: SummarizeFailure::ModelRun,
             },
         ];
         for pane in &panes {
@@ -3866,7 +3865,7 @@ mod tests {
 
         // 失敗は理由と、そこから取れる 2 つの手を出す。
         let failed = SummaryPane::Failed {
-            reason: super::reading_pane::SummarizeFailure::EmptyOutput,
+            reason: SummarizeFailure::EmptyOutput,
         }
         .message();
         assert_eq!(failed.body, "The model returned nothing to write.");
@@ -3903,7 +3902,7 @@ mod tests {
         assert_eq!(SummaryPane::Done.status(), SummaryStatus::Done);
         assert_eq!(
             SummaryPane::Failed {
-                reason: super::reading_pane::SummarizeFailure::Save,
+                reason: SummarizeFailure::Save,
             }
             .status(),
             SummaryStatus::Failed

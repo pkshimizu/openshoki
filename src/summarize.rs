@@ -18,7 +18,6 @@
 
 mod on_device;
 
-use crate::reading_pane::SummarizeFailure;
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -26,6 +25,10 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
+/// 失敗の種別は、文言表（網羅 match）の隣に置くために `reading_pane` が持っている。
+/// ただし値を作るのはこのモジュールなので、読む人が探す場所はここでもある——同じ名前で
+/// 引けるように再エクスポートしておく。
+pub use crate::reading_pane::SummarizeFailure;
 use crate::transcript::TranscriptSegment;
 
 /// 生成した議事録の保存ファイル名。セッションディレクトリに固定名で置く
