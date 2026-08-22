@@ -1,6 +1,6 @@
 import { ListView, ScrollView } from "std-widgets.slint";
 import { Style, StatusTone } from "style.slint";
-import { DangerButton, FocusRing, ActionButton, ButtonRole, Toggle } from "controls.slint";
+import { DangerButton, FocusRing, ActionButton, ButtonRole, Toggle, SearchField } from "controls.slint";
 
 // 文字起こしの表示状態。Rust 側（main.rs の transcript_display_status）がワーカーの
 // 進行状況と JSON の有無から合成して詰める。
@@ -515,6 +515,10 @@ export component RecordingsWindow inherits Window {
     in property <[SessionRow]> sessions;
     // 一覧の下端に出す合計（`148 recordings`）。Rust が組む。
     in property <string> library-summary;
+    // 検索欄の中身（#161）。**Rust が絞り込みの正**を持つので、ここは入力の受け皿。
+    in-out property <string> search-text;
+    // 絞り込み中に一覧の下へ出す件数（`3 of 148 recordings mention it`）。空なら合計を出す。
+    in property <string> search-summary;
     // 選択中セッションの一覧インデックス。未選択は -1。行クリックで更新し select-session を呼ぶ。
     in-out property <int> selected-index: -1;
     // 選択セッションの詳細（Rust 側が選択時に更新する）。
@@ -599,6 +603,10 @@ export component RecordingsWindow inherits Window {
     in-out property <bool> showing-summary: false;
 
     // 行クリックでの選択通知。Rust 側で詳細更新・再生対象のロードを行う。
+    // 検索語が変わった。**絞り込みは Rust が行う**（本文を読むので UI スレッドでは決めない）。
+    callback search(string);
+    // 検索を解除する（`✕` と 0 件表示の導線から）。
+    callback clear-search();
     callback select-session(int);
     // 再生/一時停止トグルと停止。
     callback play-pause();
@@ -631,20 +639,40 @@ export component RecordingsWindow inherits Window {
 
             // --- 探す: 左の固定幅の列（デザインの「find」） ---
             // **幅を固定する**のは、読む領域を可変にするため（ウィンドウを広げたぶんは本文が受け取る）。
-            Rectangle {
+            VerticalLayout {
                 width: 300px;
+                spacing: 10px;
+
+                // 検索欄。**一覧の外に置く**——絞り込んで 0 件になっても、消す手が残るように。
+                SearchField {
+                    vertical-stretch: 0;
+                    label: "Search recordings";
+                    placeholder: "Search transcripts and notes";
+                    text <=> root.search-text;
+                    edited(text) => {
+                        root.search(text);
+                    }
+                    cleared => {
+                        root.clear-search();
+                    }
+                }
+
+            Rectangle {
+                vertical-stretch: 1;
                 border-width: 1px;
                 border-color: Style.rule;
                 border-radius: 8px;
                 background: Style.sheet;
                 clip: true;
 
+                // 空表示は**録音が無いのか、絞り込んで消えたのか**で言い分ける。同じ文にすると、
+                // 検索語を消せば戻ることが分からない。
                 if root.sessions.length == 0: VerticalLayout {
                     alignment: center;
                     padding: 24px;
                     spacing: 8px;
                     Text {
-                        text: "No recordings yet";
+                        text: root.search-text != "" ? "No matches" : "No recordings yet";
                         font-size: Style.body-size;
                         font-weight: Style.semibold;
                         horizontal-alignment: center;
@@ -652,11 +680,23 @@ export component RecordingsWindow inherits Window {
                     }
 
                     Text {
-                        text: "Start one from the shoki icon in the menu bar, or turn on Record automatically in Settings so meetings are captured for you.";
+                        text: root.search-text != ""
+                            ? "No transcript or notes mention it. Recordings that have not been transcribed are not searched."
+                            : "Start one from the shoki icon in the menu bar, or turn on Record automatically in Settings so meetings are captured for you.";
                         font-size: Style.caption-size;
                         wrap: word-wrap;
                         horizontal-alignment: center;
                         color: Style.ink-muted;
+                    }
+
+                    if root.search-text != "": HorizontalLayout {
+                        alignment: center;
+                        ActionButton {
+                            text: "Clear search";
+                            clicked => {
+                                root.clear-search();
+                            }
+                        }
                     }
                 }
 
@@ -775,13 +815,16 @@ export component RecordingsWindow inherits Window {
                     HorizontalLayout {
                         padding: 10px;
                         Text {
-                            text: root.library-summary;
+                            text: root.search-summary != ""
+                                ? root.search-summary
+                                : root.library-summary;
                             font-size: Style.caption-size;
                             color: Style.ink-faint;
                             overflow: elide;
                         }
                     }
                 }
+            }
             }
 
             // --- 読む: 残り全部を使い、本文だけ measure で止める（デザインの「read」） ---

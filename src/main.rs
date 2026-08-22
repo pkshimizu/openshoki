@@ -351,6 +351,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Rc::new(RefCell::new(Vec::new()));
     // 一覧の Slint モデル。開いたときの再構築に加え、文字起こし状態の変化を tick が
     // 行単位で反映する（set_row_data）ため、Rc で保持し続ける。
+    // 走査で見つかった全部（検索を解除したときに戻す元。`RecordingsHandles::all_sessions`）。
+    let all_sessions: Rc<RefCell<Vec<recordings::RecordingSession>>> =
+        Rc::new(RefCell::new(Vec::new()));
+    let (search_sender, search_receiver) = std::sync::mpsc::channel::<SearchResult>();
+    let search_generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
     let sessions_model: Rc<slint::VecModel<SessionRow>> = Rc::new(slint::VecModel::default());
     recordings_ui.set_sessions(sessions_model.clone().into());
     // 選択中セッションのトランスクリプト（セグメントクリック→開始秒の解決、tick→現在セグメントの
@@ -633,6 +638,62 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(rec) = rec_weak.upgrade() {
                 refresh_detail_panes(&rec, &transcriber, &summarizer, session, &config);
             }
+        });
+    }
+
+    // 一覧の検索（#161）。**絞り込みは背景スレッド**で行い、結果は tick が拾って反映する。
+    // ここでは世代を進めて投げるだけ——打ち込むたびに走るので、古い結果が新しい入力を
+    // 上書きしないようにする。
+    {
+        let all_sessions = Rc::clone(&all_sessions);
+        let search_generation = Rc::clone(&search_generation);
+        let search_sender = search_sender.clone();
+        let rec_weak = recordings_ui.as_weak();
+        recordings_ui.on_search(move |needle| {
+            let generation = search_generation.get().wrapping_add(1);
+            search_generation.set(generation);
+            let needle = needle.trim().to_owned();
+            if needle.is_empty() {
+                // 空は解除。走らせずにその場で全部へ戻す（待たせない）。
+                if let Some(rec) = rec_weak.upgrade() {
+                    rec.invoke_clear_search();
+                }
+                return;
+            }
+            spawn_search(
+                needle,
+                all_sessions.borrow().clone(),
+                generation,
+                &search_sender,
+            );
+        });
+    }
+
+    // 検索の解除。**世代を進めてから戻す**——走っている検索の結果が後から届いて絞り直すのを
+    // 防ぐ。
+    {
+        let all_sessions = Rc::clone(&all_sessions);
+        let sessions = Rc::clone(&sessions);
+        let sessions_model = Rc::clone(&sessions_model);
+        let search_generation = Rc::clone(&search_generation);
+        let transcriber = transcriber.clone();
+        let transcript_segments = Rc::clone(&transcript_segments);
+        let load_generation = Rc::clone(&load_generation);
+        let rec_weak = recordings_ui.as_weak();
+        recordings_ui.on_clear_search(move || {
+            let Some(rec) = rec_weak.upgrade() else {
+                return;
+            };
+            search_generation.set(search_generation.get().wrapping_add(1));
+            rec.set_search_text(slint::SharedString::new());
+            rec.set_search_summary(slint::SharedString::new());
+            let all = all_sessions.borrow().clone();
+            sessions_model.set_vec(session_rows(&all, &transcriber));
+            rec.set_library_summary(library_summary(all.len()).into());
+            *sessions.borrow_mut() = all;
+            // 一覧が入れ替わると添字の意味が変わる。**選択は畳む**（同じ添字が別の録音を
+            // 指したまま操作されるのを防ぐ）。
+            clear_recordings_selection(&rec, &transcript_segments, &load_generation);
         });
     }
 
@@ -999,6 +1060,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 load_sender: load_sender.clone(),
                 load_generation: Rc::clone(&load_generation),
                 sessions: Rc::clone(&sessions),
+                all_sessions: Rc::clone(&all_sessions),
+                search_receiver,
+                search_generation: Rc::clone(&search_generation),
                 sessions_model: Rc::clone(&sessions_model),
                 transcript_segments: Rc::clone(&transcript_segments),
                 transcriber: transcriber.clone(),
@@ -1053,7 +1117,17 @@ struct RecordingsHandles {
     /// いま表示している選択の世代。届いた結果がこれと違えば**捨てる**（速く切り替えたときに、
     /// 前の読み込みがあとから返って新しい選択を上書きするのを防ぐ）。
     load_generation: Rc<Cell<u64>>,
+    /// **一覧に出ている**セッション。行と 1 対 1 で、添字が操作対象の解決に使われる
+    /// （絞り込むとここも縮む。`docs/rules/slint.md`）。
     sessions: Rc<RefCell<Vec<recordings::RecordingSession>>>,
+    /// 走査で見つかった**全部**のセッション（#161）。検索を解除したときに戻す元で、
+    /// 絞り込みの対象でもある。
+    all_sessions: Rc<RefCell<Vec<recordings::RecordingSession>>>,
+    /// 検索結果の受け口。本文を読むので背景スレッドで絞り、結果だけ送る（`#152` と同じ流儀）。
+    search_receiver: std::sync::mpsc::Receiver<SearchResult>,
+    /// いま出している検索の世代。届いた結果がこれと違えば捨てる（打ち込むたびに投げるので、
+    /// 古い結果が新しい入力を上書きしないように）。
+    search_generation: Rc<Cell<u64>>,
     sessions_model: Rc<slint::VecModel<SessionRow>>,
     transcript_segments: Rc<RefCell<Vec<transcript::TranscriptSegment>>>,
     transcriber: transcribe::TranscribeWorker,
@@ -1250,6 +1324,29 @@ fn build_menu_event_handler(
             .and_then(|index| i32::try_from(index).ok())
             .unwrap_or(-1);
             rec.set_current_segment(current);
+        }
+
+        // 絞り込みが終わった検索結果を一覧へ入れる（#161）。読み込みと同じく、閉じていても
+        // 受け取って捨てる（溜めたままにしない）。
+        while let Ok(result) = recordings.search_receiver.try_recv() {
+            if result.generation != recordings.search_generation.get() {
+                // もっと打ち込まれている。古い絞り込みで一覧を書き換えない。
+                continue;
+            }
+            let Some(rec) = recordings.ui.upgrade() else {
+                continue;
+            };
+            rec.set_search_summary(search_summary_text(result.matched.len(), result.total).into());
+            recordings
+                .sessions_model
+                .set_vec(session_rows(&result.matched, &recordings.transcriber));
+            *recordings.sessions.borrow_mut() = result.matched;
+            // 一覧が入れ替わると添字の意味が変わる。**選択は畳む**（`on_clear_search` と同じ理由）。
+            clear_recordings_selection(
+                &rec,
+                &recordings.transcript_segments,
+                &recordings.load_generation,
+            );
         }
 
         // 読み込みが終わった録音を表示へ入れる（#152）。**ウィンドウが閉じていても受け取る**——
@@ -1798,6 +1895,104 @@ fn clear_recordings_selection(
     apply_playback_position(rec, Duration::ZERO, None);
 }
 
+/// 背景スレッドで絞り込んだ結果（#161）。
+struct SearchResult {
+    /// どの検索に対する結果か。**受け取る側が世代を確かめて、古い結果を捨てる**。
+    generation: u64,
+    /// 一致したセッション（元の並び順のまま）。
+    matched: Vec<recordings::RecordingSession>,
+    /// 絞り込む前の件数（`3 of 148 recordings mention it` を組むのに使う）。
+    total: usize,
+}
+
+/// 検索語がセッションの本文に一致するか。**大小を無視する**（打ち込むときに気にさせない）。
+///
+/// 対象は**文字起こしと議事録の本文**。日時や音源は目で追えるので入れない——入れると
+/// `mic` のような語が全件に当たって絞り込みにならない。
+fn session_matches(session: &recordings::RecordingSession, needle: &str) -> bool {
+    let hit = |text: &str| text.to_lowercase().contains(needle);
+    if let Some(summary) = summarize::load_summary(&session.dir)
+        && hit(&summary)
+    {
+        return true;
+    }
+    transcript::load_transcript(&session.dir)
+        .iter()
+        .any(|segment| hit(&segment.text))
+}
+
+/// 検索を背景スレッドで走らせる。**本文は UI スレッドで読まない**——文字起こし JSON と
+/// `summary.md` は数百 KB になりうるし、保存先はネットワーク越しのこともある（`#152` と同じ理由）。
+///
+/// 空の検索語では走らせない（呼び出し側が解除として扱う）。
+fn spawn_search(
+    needle: String,
+    sessions: Vec<recordings::RecordingSession>,
+    generation: u64,
+    sender: &std::sync::mpsc::Sender<SearchResult>,
+) {
+    let total = sessions.len();
+    let sender = sender.clone();
+    let spawned = std::thread::Builder::new()
+        .name("session-search".to_owned())
+        .spawn(move || {
+            let needle = needle.to_lowercase();
+            let matched = sessions
+                .into_iter()
+                .filter(|session| session_matches(session, &needle))
+                .collect();
+            if sender
+                .send(SearchResult {
+                    generation,
+                    matched,
+                    total,
+                })
+                .is_err()
+            {
+                eprintln!("Skipping the search result because the app is shutting down");
+            }
+        });
+    if let Err(err) = spawned {
+        // スレッドを作れない（資源の枯渇）。**絞り込まないまま**返し、一覧を消さない。
+        eprintln!("Skipping the search because spawning failed: {err}");
+    }
+}
+
+/// 絞り込み中に一覧の下へ出す件数。**解除の手を文に入れる**（0 件のときは本文側で出す）。
+fn search_summary_text(matched: usize, total: usize) -> String {
+    format!("{matched} of {total} recordings mention it")
+}
+
+/// セッションの並びから一覧の行を組み立てる。**開くときと絞り込み後で同じ経路を通す**
+/// （片方だけ古い組み立てのまま残らないように。`docs/rules/slint.md`）。
+///
+/// 行と渡した並びは 1 対 1。**間引くならこの関数へ渡す前**に間引くこと——ここで絞ると添字が
+/// ずれ、`get(i)` は範囲内を返すので黙って別の録音を操作する。
+fn session_rows(
+    list: &[recordings::RecordingSession],
+    transcriber: &transcribe::TranscribeWorker,
+) -> Vec<SessionRow> {
+    let now = chrono::Local::now().naive_local();
+    list.iter()
+        .enumerate()
+        .map(|(index, session)| {
+            let status = transcript_display_status(
+                transcriber.status_of(&session.dir),
+                session.has_transcript,
+            );
+            SessionRow {
+                // 見出しは**その日の最初の行だけ**が持つ（直前の行と比べて決める）。行に持たせる
+                // 理由は `SessionRow` の doc。
+                group_heading: session_group_heading(list, index, now).into(),
+                time_text: session.display_time().into(),
+                date_text: session.display_date().into(),
+                detail_text: session_detail_text(session, status).into(),
+                transcript_status: status,
+            }
+        })
+        .collect()
+}
+
 /// トレイの「Recordings…」で Recordings ウィンドウを開く。保存先を走査して一覧を更新し、
 /// 選択・再生状態を初期化してから表示する（初回表示はジオメトリを明示する。`docs/rules/slint.md`）。
 fn open_recordings_window(
@@ -1812,28 +2007,15 @@ fn open_recordings_window(
     // 範囲と時期の判断は `recordings::spawn_session_part_sweep` の doc）。表示には使わない
     // 副作用なので、完了は待たない。
     recordings::spawn_session_part_sweep(&list, SystemTime::now());
-    let now = chrono::Local::now().naive_local();
-    let rows: Vec<SessionRow> = list
-        .iter()
-        .enumerate()
-        .map(|(index, session)| {
-            let status = transcript_display_status(
-                handles.transcriber.status_of(&session.dir),
-                session.has_transcript,
-            );
-            SessionRow {
-                // 見出しは**その日の最初の行だけ**が持つ（直前の行と比べて決める）。行に持たせる
-                // 理由は `SessionRow` の doc。
-                group_heading: session_group_heading(&list, index, now).into(),
-                time_text: session.display_time().into(),
-                date_text: session.display_date().into(),
-                detail_text: session_detail_text(session, status).into(),
-                transcript_status: status,
-            }
-        })
-        .collect();
-    handles.sessions_model.set_vec(rows);
+    handles
+        .sessions_model
+        .set_vec(session_rows(&list, &handles.transcriber));
     rec.set_library_summary(library_summary(list.len()).into());
+    // 開くたびに検索は解除しておく（前に開いたときの絞り込みが残っていると、録音が消えたように
+    // 見える）。
+    rec.set_search_text(slint::SharedString::new());
+    rec.set_search_summary(slint::SharedString::new());
+    *handles.all_sessions.borrow_mut() = list.clone();
     // 開くたびに未選択・停止表示へ初期化する。
     clear_recordings_selection(rec, &handles.transcript_segments, &handles.load_generation);
     *handles.sessions.borrow_mut() = list;
@@ -3036,11 +3218,12 @@ mod tests {
         PaneAction, PaneActionKind, StatusTone, SummaryPane, SummaryStatus, TranscriptPane,
         TranscriptStatus, actions_allowed_while_busy, app_version_text, breathing_level,
         jobs_pending, model_downloads_on_select, model_status_line, playback_progress,
-        seek_position_from_ratio, summary_display_status, summary_model_status_line,
-        summary_pane_of, summary_rows, summary_status_text, transcript_display_status,
-        transcript_pane_of, transcript_status_text, whisper_model_status_line,
+        search_summary_text, seek_position_from_ratio, session_matches, summary_display_status,
+        summary_model_status_line, summary_pane_of, summary_rows, summary_status_text,
+        transcript_display_status, transcript_pane_of, transcript_status_text,
+        whisper_model_status_line,
     };
-    use super::{elapsed_text, summarize, transcribe};
+    use super::{elapsed_text, recordings, summarize, transcribe};
     use chrono::{Datelike as _, Timelike as _};
 
     use crate::transcribe::TranscribeStatus;
@@ -3331,6 +3514,61 @@ mod tests {
         assert_eq!(
             TranscriptPane::Failed { reason: None }.message().body,
             "Something went wrong while transcribing this recording."
+        );
+    }
+
+    /// 検索の一致判定。**大小を無視し、対象は文字起こしと議事録の本文だけ**（日時や音源を
+    /// 入れると `mic` のような語が全件に当たって絞り込みにならない）。
+    #[test]
+    fn session_matches_looks_at_the_transcript_and_the_notes() {
+        // 走査はディレクトリ名が日時形式で、音源が 1 つ以上あるものだけを拾う。
+        let root = std::env::temp_dir().join(format!("shoki-search-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("20260810-140200");
+        std::fs::create_dir_all(&dir).expect("creating the temp dir should succeed");
+        std::fs::write(dir.join("mic.mp3"), b"not a real mp3")
+            .expect("writing the audio placeholder should succeed");
+        std::fs::write(
+            dir.join("mic.json"),
+            r#"{"source":"mic","model":"small","segments":[{"start":0.0,"end":1.0,"text":"Closing on the Recording Format"}]}"#,
+        )
+        .expect("writing the transcript should succeed");
+        std::fs::write(
+            dir.join("summary.md"),
+            "決定事項
+- リリースは来週",
+        )
+        .expect("writing the notes should succeed");
+        // 走査結果からそのまま取る（`RecordingSession` は非公開のフィールドを持つので、
+        // テストで組み立てない）。
+        let session = recordings::list_sessions(&root)
+            .into_iter()
+            .find(|session| session.dir == dir)
+            .expect("the session should be listed");
+
+        // 文字起こしに一致する（大小を無視する）。
+        assert!(session_matches(&session, "recording format"));
+        // 議事録にも当たる。
+        assert!(session_matches(&session, "リリース"));
+        // 当たらない語は落ちる。
+        assert!(!session_matches(&session, "no such phrase"));
+        // **日時や音源では当たらない**（`mic.json` というファイル名に引きずられない）。
+        assert!(!session_matches(&session, "mic"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 絞り込み中の件数。**解除すれば戻ることが分かる形**にする。
+    #[test]
+    fn search_summary_text_shows_both_counts() {
+        assert_eq!(
+            search_summary_text(3, 148),
+            "3 of 148 recordings mention it"
+        );
+        // 0 件でも同じ形（件数で文を変えない。`docs/rules/messages.md`）。
+        assert_eq!(
+            search_summary_text(0, 148),
+            "0 of 148 recordings mention it"
         );
     }
 
