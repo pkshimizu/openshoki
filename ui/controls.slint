@@ -764,10 +764,6 @@ export component Select inherits Rectangle {
     }
 }
 
-// 機能ウィンドウの見出し（漢字グリフ・機能名・いまの状態を 1 行）。
-//
-// グリフは**フォントを同梱していない**ので OS の日本語フォントに任せる（#127 で同梱を見送った）。
-// 出せない環境では豆腐になるが、右の機能名が本体なので意味は失われない。
 // 検索欄（#161）。**`std-widgets` の `LineEdit` を使わない**——OS の配色のままになり、
 // アプリのトークンに追従しない（`docs/rules/slint.md`）。素の `TextInput` を自分で囲む。
 //
@@ -784,6 +780,13 @@ export component SearchField inherits Rectangle {
     // 「消す」を押した（`✕`）。中身を空にするのは呼び出し側の仕事——検索の解除には
     // 一覧の作り直しが要るので、ここで `text` だけ空にすると表示と結果がずれる。
     callback cleared();
+
+    // 消す操作の唯一の口。**先にフォーカスを入力へ返す**——`×` は中身が空になると要素ごと
+    // 消えるので、押した本人にフォーカスが乗ったままだと行き先が無くなる。
+    function clear() {
+        input.focus();
+        root.cleared();
+    }
 
     height: 30px;
     border-radius: Style.control-radius;
@@ -807,6 +810,9 @@ export component SearchField inherits Rectangle {
 
         Rectangle {
             horizontal-stretch: 1;
+            // 枠からはみ出して描かせない。**root には付けない**——`clip` はフォーカスリングを
+            // 消す（`docs/rules/slint.md`）。
+            clip: true;
             // プレースホルダは入力の**下**に敷く（入力の中に文字を入れると、消し忘れが
             // そのまま検索語になる）。
             if root.text == "": Text {
@@ -843,7 +849,7 @@ export component SearchField inherits Rectangle {
             clear-focus := FocusScope {
                 key-pressed(event) => {
                     if (event.text == " " || event.text == "\n") {
-                        root.cleared();
+                        root.clear();
                         return accept;
                     }
                     return reject;
@@ -852,7 +858,7 @@ export component SearchField inherits Rectangle {
 
             clear-touch := TouchArea {
                 clicked => {
-                    root.cleared();
+                    root.clear();
                 }
             }
 
@@ -874,12 +880,16 @@ export component SearchField inherits Rectangle {
             accessible-role: button;
             accessible-label: "Clear search";
             accessible-action-default => {
-                root.cleared();
+                root.clear();
             }
         }
     }
 }
 
+// 機能ウィンドウの見出し（漢字グリフ・機能名・いまの状態を 1 行）。
+//
+// グリフは**フォントを同梱していない**ので OS の日本語フォントに任せる（#127 で同梱を見送った）。
+// 出せない環境では豆腐になるが、右の機能名が本体なので意味は失われない。
 export component FeatureHeading inherits HorizontalLayout {
     in property <string> glyph;
     in property <string> title;
