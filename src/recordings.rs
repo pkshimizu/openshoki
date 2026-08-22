@@ -181,13 +181,6 @@ impl RecordingSession {
 ///
 /// ディレクトリが無い・読めないときは空一覧を返す（縮退。ログを残す）。名前が日時形式でない
 /// エントリ、ディレクトリでないエントリ、音源が 1 つも無いセッションはスキップする。
-/// 録音の MP3 を書くビットレート（`recorder::BITRATE` / `mixdown::BITRATE` と同じ値）。
-/// **CBR で書いている**ので、長さはファイルサイズから割り出せる——デコードしなくてよい
-/// （デコードは 1 本で数百 ms かかることがあり、一覧の全件では開いた瞬間に固まる。#152）。
-///
-/// 片方だけ変えると長さがずれるので、変えるときは 3 箇所を揃えること。
-const BITRATE_BYTES_PER_SEC: u64 = 128 * 1000 / 8;
-
 /// 再生に使う音源を選ぶ。**走査中（`RecordingSession` を組む前）からも使う**ので、フィールド
 /// ではなく素の値で受ける（長さの見積もりが再生対象と同じファイルを見るようにするため）。
 fn playback_source(dir: &Path, has_mic: bool, has_system: bool, has_mix: bool) -> Option<PathBuf> {
@@ -201,11 +194,11 @@ fn playback_source(dir: &Path, has_mic: bool, has_system: bool, has_mix: bool) -
 
 /// MP3 のファイルサイズから再生時間を割り出す。
 ///
-/// **CBR 前提の見積もり**（`BITRATE_BYTES_PER_SEC`）。ID3 タグや LAME ヘッダのぶんだけ実際より
+/// **CBR 前提の見積もり**（`recorder::BITRATE_BYTES_PER_SEC`。録音が書くのと同じ値を見る）。ID3 タグや LAME ヘッダのぶんだけ実際より
 /// わずかに長く出るが、一覧に「どれくらいの長さか」を示す用途には十分で、**ディスクを読まずに
 /// 済む**ほうが効く。0 バイト・読めないファイルは長さ不明として `None`。
 fn duration_from_size(bytes: u64) -> Option<Duration> {
-    (bytes > 0).then(|| Duration::from_secs(bytes / BITRATE_BYTES_PER_SEC))
+    (bytes > 0).then(|| Duration::from_secs(bytes / crate::recorder::BITRATE_BYTES_PER_SEC))
 }
 
 pub fn list_sessions(recording_dir: &Path) -> Vec<RecordingSession> {

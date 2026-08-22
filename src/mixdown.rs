@@ -33,7 +33,9 @@ const MIC_FILENAME: &str = "mic.mp3";
 const SYSTEM_FILENAME: &str = "system.mp3";
 
 /// エンコード設定は `recorder.rs` の録音出力と揃える（同じ音質・容量特性で保存する）。
-const BITRATE: Bitrate = Bitrate::Kbps128;
+/// 録音と**同じ値**を使う（正は `recorder::BITRATE`。ここで別に持つとミックスだけ音質が
+/// 変わり、長さの見積もりもずれる）。
+const BITRATE: Bitrate = crate::recorder::BITRATE;
 const QUALITY: Quality = Quality::Good;
 
 /// 正規化を発動するピークのしきい値（dBFS）。正常な発話はピーク -12〜-3dB 程度で、実例の
