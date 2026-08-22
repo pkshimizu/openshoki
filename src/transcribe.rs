@@ -66,7 +66,9 @@ pub struct TranscribeJob {
 /// しまい、正しさが実行時のガードとテスト頼みになっていた（`ProgressSink::report` の
 /// 「進行中のときだけ書く」など）。
 ///
-/// どの状態でも**使うモデルは分かる**ので、モデル名は全バリアントが持つ。
+/// **モデル名を持つのは走っている間だけ**。読む領域が「何が動いているか」を言うのはそこで、
+/// 終わったあとに出しても読み手の役に立たない（`SummarizeEntry` と同じ基準。要るように
+/// なったら足す）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TranscribeState {
     /// 投入済み（キュー待ちを含む）または処理中。
@@ -77,12 +79,9 @@ pub enum TranscribeState {
         percent: Option<u8>,
     },
     /// 全音源の文字起こしが完了した。
-    Done { model_label: String },
+    Done,
     /// 少なくとも 1 音源が失敗した。
-    Failed {
-        model_label: String,
-        reason: TranscribeFailure,
-    },
+    Failed { reason: TranscribeFailure },
 }
 
 impl TranscribeState {
@@ -98,7 +97,7 @@ impl TranscribeState {
     pub fn status(&self) -> TranscribeStatus {
         match self {
             Self::Transcribing { .. } => TranscribeStatus::Transcribing,
-            Self::Done { .. } => TranscribeStatus::Done,
+            Self::Done => TranscribeStatus::Done,
             Self::Failed { .. } => TranscribeStatus::Failed,
         }
     }
@@ -120,7 +119,10 @@ pub enum TranscribeFailure {
     /// モデルは在るが読み込めなかった。
     ModelLoad,
     /// 音源の文字起こしに失敗した。**ファイル名だけ**を持つ（パスは持たない。
-    /// `docs/rules/security.md`）。
+    /// `docs/rules/security.md`）。名前を作るのは `audio_display_name` だけで、そこが保証する。
+    ///
+    /// **空にならない**——構築するのは `run_job` の 1 箇所で、1 本以上失敗したときにしか作らない
+    /// （空だと文言が ` could not be transcribed.` になる）。
     Files(Vec<String>),
     /// ワーカーがパニックした（**なぜかは分からない**）。
     Panicked,
@@ -288,16 +290,10 @@ impl TranscribeWorker {
                                 map.remove(&job.session_dir);
                             }
                             JobOutcome::Done => {
-                                map.insert(job.session_dir, TranscribeState::Done { model_label });
+                                map.insert(job.session_dir, TranscribeState::Done);
                             }
                             JobOutcome::Failed(reason) => {
-                                map.insert(
-                                    job.session_dir,
-                                    TranscribeState::Failed {
-                                        model_label,
-                                        reason,
-                                    },
-                                );
+                                map.insert(job.session_dir, TranscribeState::Failed { reason });
                             }
                         }
                     }
@@ -466,11 +462,7 @@ fn run_job(
     let mut failed_names: Vec<String> = Vec::new();
     let total = job.audio_paths.len();
     for (index, path) in job.audio_paths.iter().enumerate() {
-        // ログには（既存の録音保存ログと同じ方針で）フルパスを出さず、ファイル名だけにする。
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "audio".to_owned());
+        let name = audio_display_name(path);
         let progress = ProgressSink {
             status: Arc::clone(status),
             session_dir: job.session_dir.clone(),
@@ -490,6 +482,15 @@ fn run_job(
     } else {
         JobOutcome::Failed(TranscribeFailure::Files(failed_names))
     }
+}
+
+/// 音源を指す**ファイル名だけ**を取り出す。ログにも読む領域にも出るので、ディレクトリ成分を
+/// 混ぜない（`docs/rules/security.md`）。**この保証を作っているのはここだけ**なので、テストで
+/// 固定してある。
+fn audio_display_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "audio".to_owned())
 }
 
 /// 1 音源を文字起こしして `<音源名>.json` に保存する。成功時はセグメント数を返す。
@@ -742,23 +743,36 @@ fn write_transcription(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::summarize::{SummarizeWorker, SummaryEngine};
+
+    /// 音源の名前は**ファイル名だけ**になる。この保証は `audio_display_name` の 1 箇所が
+    /// 作っていて、そのまま失敗の理由として画面に出る（`docs/rules/security.md`）。
+    #[test]
+    fn audio_display_name_drops_the_directories() {
+        assert_eq!(
+            audio_display_name(Path::new(
+                "/Users/someone/Recordings/20260810-140200/mic.mp3"
+            )),
+            "mic.mp3"
+        );
+        // 取り出せない形でも、パスを落として当たり障りのない名前にする。
+        assert_eq!(audio_display_name(Path::new("/")), "audio");
+        assert_eq!(audio_display_name(Path::new("..")), "audio");
+    }
 
     /// テスト用の状態（状態だけ指定し、ペイロードは既定で埋める）。
     fn test_state(status: TranscribeStatus) -> TranscribeState {
-        let model_label = "Small".to_owned();
         match status {
             TranscribeStatus::Transcribing => TranscribeState::Transcribing {
-                model_label,
+                model_label: "Small".to_owned(),
                 percent: None,
             },
-            TranscribeStatus::Done => TranscribeState::Done { model_label },
+            TranscribeStatus::Done => TranscribeState::Done,
             TranscribeStatus::Failed => TranscribeState::Failed {
-                model_label,
                 reason: TranscribeFailure::ModelMissing,
             },
         }
     }
-    use crate::summarize::{SummarizeWorker, SummaryEngine};
 
     /// テスト用の要約ワーカー。ジョブが渡ったかどうかは状態マップの有無で判定する。
     fn summarize_worker() -> SummarizeWorker {
@@ -854,15 +868,13 @@ mod tests {
         let state = worker
             .state_of(&dir)
             .expect("the session should have a state");
-        // **理由は種別で持つ**（文言は読む領域が組む。#159）。種別のどこにもパスは入らず、
-        // モデル名は投入時のスナップショット（上書き指定はファイル名だけ）。
+        // **理由は種別で持つ**（文言は読む領域が組む。#159）。
         assert_eq!(
             state,
             TranscribeState::Failed {
-                model_label: "missing-model.bin".to_owned(),
                 reason: TranscribeFailure::ModelMissing,
             },
-            "a failed job must carry its reason and the model it used"
+            "a failed job must carry why it failed"
         );
         // セッション削除時の掃除（forget）で記録が消える。
         worker.forget(&dir);

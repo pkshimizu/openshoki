@@ -2764,10 +2764,8 @@ fn transcript_pane_of(
             model: model_label,
             percent,
         },
-        Some(transcribe::TranscribeState::Done { .. }) => TranscriptPane::Done,
-        Some(transcribe::TranscribeState::Failed { reason, .. }) => {
-            TranscriptPane::Failed { reason }
-        }
+        Some(transcribe::TranscribeState::Done) => TranscriptPane::Done,
+        Some(transcribe::TranscribeState::Failed { reason }) => TranscriptPane::Failed { reason },
         None if has_transcript => TranscriptPane::Done,
         None => TranscriptPane::NotTranscribed { auto_on },
     }
@@ -2840,8 +2838,8 @@ const SUMMARIZING_LABEL: &str = "Writing notes…";
 /// 「キュー待ち」の表示ラベル。生成中と区別できる語にする: この間はまだ CPU を使っておらず、
 /// 取り消せる（`SummarizeWorker::cancel`）。
 ///
-/// 状態行と、**順番が取れていないときの**空表示の見出しで同じ文言を使う（#128 で語を `notes` に
-/// 揃えたら一致した）。順番が取れているときの見出しは番号まで出す（`SummaryPane::message`）。
+/// **いまの参照は状態行（`summary_status_text`）だけ**。空表示の見出しは常に番号まで出すように
+/// なった（#159 で順番が必ず分かるようになった。`SummaryPane::message`）。
 const SUMMARY_QUEUED_LABEL: &str = "Waiting to write notes…";
 
 /// 議事録生成の表示状態 → 詳細ペインの状態テキスト。
@@ -3432,7 +3430,10 @@ mod tests {
         transcript_display_status, transcript_pane_of, transcript_status_text,
         whisper_model_status_line,
     };
-    use super::{elapsed_text, recordings, summarize, transcribe};
+    use super::{
+        elapsed_text, recordings, summarize, summarize_failure_text, transcribe,
+        transcribe_failure_text,
+    };
     use chrono::{Datelike as _, Timelike as _};
 
     use crate::transcribe::TranscribeStatus;
@@ -3802,6 +3803,73 @@ mod tests {
         assert_eq!(search_summary_text(0, 1), "0 of 1 recording mentions it");
     }
 
+    /// 失敗の理由 → 文言を**全種別で固定する**。
+    ///
+    /// 網羅 match が守るのは「種別を足したら割れる」ことだけで、**既存の文の書き換えは何も
+    /// 検知しない**。ここは画面にそのまま出る文なので、値で押さえる（`docs/rules/testing.md`）。
+    /// **表をテスト側で `match` にしない**——実装を写すだけになって、意味が無くなる。
+    #[test]
+    fn failure_text_is_fixed_for_every_kind() {
+        use summarize::SummarizeFailure as S;
+        use transcribe::TranscribeFailure as T;
+
+        let transcribe_cases = [
+            (
+                T::ModelDownload,
+                "The transcription model could not be downloaded.",
+            ),
+            (T::ModelMissing, "The transcription model file is missing."),
+            (
+                T::ModelUnreadable,
+                "The transcription model file could not be opened.",
+            ),
+            (T::ModelLoad, "The transcription model could not be loaded."),
+            (
+                T::Files(vec!["mic.mp3".to_owned()]),
+                "mic.mp3 could not be transcribed.",
+            ),
+            (
+                // **件数で文の形は変えない**（`docs/rules/messages.md`）。
+                T::Files(vec!["mic.mp3".to_owned(), "system.mp3".to_owned()]),
+                "mic.mp3, system.mp3 could not be transcribed.",
+            ),
+            (
+                T::Panicked,
+                "Transcribing this recording stopped unexpectedly.",
+            ),
+        ];
+        for (reason, expected) in &transcribe_cases {
+            assert_eq!(&transcribe_failure_text(reason), expected);
+            // **パスを混ぜない**（`docs/rules/security.md`）。理由はそのまま画面に出る。
+            assert!(
+                !expected.contains(std::path::MAIN_SEPARATOR),
+                "a failure reason must not carry a path: {expected}"
+            );
+        }
+
+        let summarize_cases = [
+            (
+                S::ModelPrepare,
+                "The meeting notes model could not be prepared.",
+            ),
+            (
+                S::ModelRun,
+                "The model could not finish. It may need more free memory than this Mac has right \
+                 now — closing other apps, or choosing a smaller model, can let it run.",
+            ),
+            (S::EmptyOutput, "The model returned nothing to write."),
+            (S::Save, "The notes could not be saved."),
+            (S::Panicked, "Writing notes stopped unexpectedly."),
+        ];
+        for (reason, expected) in &summarize_cases {
+            assert_eq!(&summarize_failure_text(reason), expected);
+            assert!(
+                !expected.contains(std::path::MAIN_SEPARATOR),
+                "a failure reason must not carry a path: {expected}"
+            );
+        }
+    }
+
     /// **どの状態に落とすか**を固定する。文言のテストは変種を手で作って呼ぶだけなので、
     /// この選び方（ワーカー優先・JSON の有無での解決）が壊れても気づけない。
     #[test]
@@ -3824,7 +3892,6 @@ mod tests {
         assert_eq!(
             transcript_pane_of(
                 Some(transcribe::TranscribeState::Failed {
-                    model_label: "Medium".to_owned(),
                     reason: transcribe::TranscribeFailure::Files(vec!["mic.mp3".to_owned()]),
                 }),
                 true,
@@ -4014,7 +4081,6 @@ mod tests {
             SummaryPane::NotSummarized { auto_on: false },
             SummaryPane::NotSummarized { auto_on: true },
             SummaryPane::Queued { position: 2 },
-            SummaryPane::Queued { position: 1 },
             SummaryPane::Summarizing {
                 model: "Qwen2.5 3B Instruct".to_owned(),
                 started_ago: "40 seconds".to_owned(),

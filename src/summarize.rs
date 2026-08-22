@@ -1774,14 +1774,13 @@ mod tests {
     #[test]
     fn demote_superseded_only_touches_a_session_that_still_shows_running() {
         let dir = std::path::PathBuf::from("/tmp/shoki-demote");
-        let entry = test_entry;
         let state = |status: Option<SummarizeStatus>| {
             let mut queue = QueueState {
                 status: HashMap::new(),
                 next_seq: 0,
             };
             if let Some(status) = status {
-                queue.status.insert(dir.clone(), (7, entry(status)));
+                queue.status.insert(dir.clone(), (7, test_entry(status)));
             }
             queue
         };
@@ -1865,12 +1864,11 @@ mod tests {
         );
         let dir = std::path::PathBuf::from("/tmp/shoki-pending");
         assert!(!worker.has_pending_jobs(), "an empty queue is not pending");
-        let entry = test_entry;
 
         for status in [SummarizeStatus::Queued, SummarizeStatus::Summarizing] {
             lock_queue(&worker.queue)
                 .status
-                .insert(dir.clone(), (1, entry(status)));
+                .insert(dir.clone(), (1, test_entry(status)));
             assert!(
                 worker.has_pending_jobs(),
                 "{status:?} must count as a pending job"
@@ -1880,7 +1878,7 @@ mod tests {
         for status in [SummarizeStatus::Done, SummarizeStatus::Failed] {
             lock_queue(&worker.queue)
                 .status
-                .insert(dir.clone(), (1, entry(status)));
+                .insert(dir.clone(), (1, test_entry(status)));
             assert!(
                 !worker.has_pending_jobs(),
                 "{status:?} must not count as a pending job"
