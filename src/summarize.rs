@@ -1114,6 +1114,30 @@ mod tests {
     use super::*;
     use crate::transcript::Speaker;
 
+    /// モデル名は**ファイル名だけ**になる。上書き指定は任意のパスを取れて、その値は生成中の
+    /// 本文としてそのまま画面に出る（`docs/rules/security.md`。`transcribe` 側と対）。
+    #[test]
+    fn job_model_label_drops_the_directories() {
+        let job = |model_override: Option<&str>| SummarizeJob {
+            session_dir: PathBuf::from("/tmp/shoki-label"),
+            engine: SummaryEngine::OnDevice,
+            model_id: crate::summary_model::DEFAULT_MODEL_ID.to_owned(),
+            model_override: model_override.map(PathBuf::from),
+            language: "ja".to_owned(),
+            existing_is_stale: false,
+        };
+
+        assert_eq!(
+            job_model_label(&job(Some("/Users/someone/models/qwen2.5-3b.gguf"))),
+            "qwen2.5-3b.gguf"
+        );
+        assert_eq!(job_model_label(&job(Some("/"))), "Custom model");
+        assert_eq!(
+            job_model_label(&job(None)),
+            crate::summary_model::default_spec().display_name
+        );
+    }
+
     /// テスト用のキューのエントリ（状態だけ指定し、ペイロードは既定で埋める）。
     fn test_entry(status: SummarizeStatus) -> SummarizeEntry {
         let model_label = "Qwen2.5 3B Instruct".to_owned();

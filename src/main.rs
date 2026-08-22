@@ -3808,6 +3808,10 @@ mod tests {
     /// 網羅 match が守るのは「種別を足したら割れる」ことだけで、**既存の文の書き換えは何も
     /// 検知しない**。ここは画面にそのまま出る文なので、値で押さえる（`docs/rules/testing.md`）。
     /// **表をテスト側で `match` にしない**——実装を写すだけになって、意味が無くなる。
+    ///
+    /// **パスが混ざらないことはここでは見ない**。この関数は渡された名前をそのまま並べるだけで、
+    /// 保証を作っているのは名前を作る側（`transcribe::audio_display_name` /
+    /// `transcribe::job_model_label`）。そちらのテストが対で押さえる。
     #[test]
     fn failure_text_is_fixed_for_every_kind() {
         use summarize::SummarizeFailure as S;
@@ -3840,11 +3844,6 @@ mod tests {
         ];
         for (reason, expected) in &transcribe_cases {
             assert_eq!(&transcribe_failure_text(reason), expected);
-            // **パスを混ぜない**（`docs/rules/security.md`）。理由はそのまま画面に出る。
-            assert!(
-                !expected.contains(std::path::MAIN_SEPARATOR),
-                "a failure reason must not carry a path: {expected}"
-            );
         }
 
         let summarize_cases = [
@@ -3863,10 +3862,6 @@ mod tests {
         ];
         for (reason, expected) in &summarize_cases {
             assert_eq!(&summarize_failure_text(reason), expected);
-            assert!(
-                !expected.contains(std::path::MAIN_SEPARATOR),
-                "a failure reason must not carry a path: {expected}"
-            );
         }
     }
 

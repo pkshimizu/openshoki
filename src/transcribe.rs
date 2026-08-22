@@ -760,6 +760,33 @@ mod tests {
         assert_eq!(audio_display_name(Path::new("..")), "audio");
     }
 
+    /// モデル名も**ファイル名だけ**になる。上書き指定は任意のパスを取れて、その値は走っている
+    /// 間の本文（`{model} is running on this Mac…`）としてそのまま画面に出る
+    /// （`docs/rules/security.md`。`audio_display_name` と対）。
+    #[test]
+    fn job_model_label_drops_the_directories() {
+        let job = |model_override: Option<&str>| TranscribeJob {
+            session_dir: PathBuf::from("/tmp/shoki-label"),
+            audio_paths: Vec::new(),
+            model_id: crate::whisper_model::DEFAULT_MODEL_ID.to_owned(),
+            model_override: model_override.map(PathBuf::from),
+            language: "en".to_owned(),
+            summarize: None,
+        };
+
+        assert_eq!(
+            job_model_label(&job(Some("/Users/someone/models/ggml-medium.bin"))),
+            "ggml-medium.bin"
+        );
+        // 取り出せない形は当たり障りのない名前へ落とす（パスを出さない）。
+        assert_eq!(job_model_label(&job(Some("/"))), "Custom model");
+        // 上書きが無ければカタログの表示名。
+        assert_eq!(
+            job_model_label(&job(None)),
+            crate::whisper_model::default_spec().display_name
+        );
+    }
+
     /// テスト用の状態（状態だけ指定し、ペイロードは既定で埋める）。
     fn test_state(status: TranscribeStatus) -> TranscribeState {
         match status {
@@ -863,8 +890,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert_eq!(worker.status_of(&dir), Some(TranscribeStatus::Failed));
-        // 読む領域は理由を出す（#154）。**パスは出さない**ので、上書き指定のパスが混ざって
-        // いないことまで見る。
+        // 読む領域は理由を出す（#154）。
         let state = worker
             .state_of(&dir)
             .expect("the session should have a state");
