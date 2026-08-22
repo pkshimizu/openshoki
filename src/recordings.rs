@@ -30,9 +30,9 @@ const MIX_MP3: &str = "mix.mp3";
 
 /// 取り残された一時ファイルと見なす、最終更新からの経過時間（`spawn_session_part_sweep`）。
 ///
-/// セッション側の一時ファイルは**寿命が短い**: 書き手（`mixdown::normalize_if_quiet` と
-/// `summarize::write_summary`）はどちらも中身を先にメモリで作り、一時ファイルへは 1 回書いて
-/// すぐ rename するので、通常は 1 秒に満たない（モデル取得の `STALE_MODEL_PART_AGE` が 3 時間
+/// セッション側の一時ファイルは**寿命が短い**: 書き手（`mixdown::normalize_if_quiet` /
+/// `mixdown::generate_mix` / `summarize::write_summary`）はいずれも中身を先にメモリで作り、
+/// 一時ファイルへは 1 回書いてすぐ rename するので、通常は 1 秒に満たない（モデル取得の `STALE_MODEL_PART_AGE` が 3 時間
 /// なのは、受信そのものが数十分かかることに由来する別の理由）。時計のずれ・mtime の粒度ぶんの
 /// 余裕もこの 1 時間に含む。
 ///
@@ -43,9 +43,11 @@ const MIX_MP3: &str = "mix.mp3";
 const STALE_SESSION_PART_AGE: Duration = Duration::from_secs(60 * 60);
 
 /// 掃除する一時ファイルの宛先名（`spawn_session_part_sweep`）。セッションディレクトリは
-/// **ユーザーが中身を置ける場所**なので、アプリが `PartFile` 経由で書く宛先だけに絞る
-/// （`mix.mp3` は `PartFile` を通さず直接書くので入れない）。絞る理由は
-/// `atomic_replace::PartScope`。
+/// **ユーザーが中身を置ける場所**なので、アプリが `PartFile` 経由で書く宛先だけに絞る。
+/// 絞る理由は `atomic_replace::PartScope`。
+///
+/// **書き手が増えたらここへ足す**。足し忘れると、その断片だけどの経路でも回収されない
+/// （#162 で `mix.mp3` を `PartFile` 経由に変えたとき、実際に穴が空いた）。
 ///
 /// 参照するのは**そのファイルを書くモジュールの定数**（この一覧の判定用に置いた `MIC_MP3` などの
 /// 写しではない）。一時ファイルの名前は宛先の名前から作られる（`atomic_replace::PartFile`）ので、
@@ -57,6 +59,7 @@ const SWEPT_PART_DESTS: &[&str] = &[
     crate::recorder::MIC_FILENAME,
     #[cfg(target_os = "macos")]
     crate::system_audio::SYSTEM_FILENAME,
+    crate::mixdown::MIX_FILENAME,
     crate::summarize::SUMMARY_FILENAME,
 ];
 
@@ -217,7 +220,13 @@ const MPEG2_BITRATES: [u32; 16] = [
 /// 頼んだ 128kbps を**エラーにせず落とす**（8kHz のマイク——macOS の Bluetooth ヘッドセットが
 /// 報告しうる——では 64kbps になり、見積もりが 2 倍ずれる）。書かれた値を読めば前提が要らない。
 ///
-/// CBR 前提は残る（このアプリが書く MP3 は CBR）。同期語が無い・自由形式なら `None`。
+/// **読んでいるのは先頭のタグフレームのヘッダ**（上記のとおり枠は書かれる）。そこに実際の
+/// ビットレートが入るのは **CBR のときだけ**——LAME は `vbr_off` のときに `avg_bitrate`（低い
+/// サンプルレートで落とされた後の値）をこのヘッダへ写す。VBR に切り替えると、このヘッダは
+/// 128kbps を名乗るようになり、この関数は黙って倍の見積もりを返す。**そのときはここごと
+/// 見直すこと**（`recorder::BITRATE` の doc も）。
+///
+/// 同期語が無い・自由形式なら `None`。
 fn bytes_per_sec_from_header(header: [u8; 4]) -> Option<u64> {
     // 同期語（11 bit）が無ければ MP3 のフレームではない。
     if header[0] != 0xFF || (header[1] & 0xE0) != 0xE0 {
@@ -239,8 +248,9 @@ fn bytes_per_sec_from_header(header: [u8; 4]) -> Option<u64> {
 
 /// MP3 のファイルサイズと 1 秒あたりのバイト数から再生時間を割り出す。
 ///
-/// LAME タグ（Info/Xing フレーム）は**書いていない**ので、余剰は末尾フレームの端数だけ
-/// （数百バイト＝ 0.02 秒未満）。秒に丸める表示には効かない。
+/// 余剰は **LAME が先頭に置くタグフレーム 1 つ＋末尾フレームの端数**。`lame_get_lametag_frame`
+/// を呼んでいないので中身は埋まらないが、`write_lame_tag` は既定で有効なので**枠は書かれる**
+/// （128kbps/44.1kHz で 417 バイト）。合わせても 0.1 秒未満なので、秒に丸める表示には効かない。
 ///
 /// **1 秒に満たないものは長さ不明にする**。録音に失敗してヘッダだけが残ったファイルで `00:00`
 /// と出しても、`—:—` と同じくらい情報が無い。
@@ -560,6 +570,9 @@ mod tests {
 
         let listed_old = root.join("20260628-143025").join("mic.mp3.part.123");
         let listed_summary = root.join("20260628-143025").join("summary.md.part.123");
+        // **ミックスの断片も回収する**（#162 で `PartFile` 経由の書き手になった）。1 時間の録音
+        // なら数十 MB の発話がそのまま残るので、宛先一覧から漏れると気づかないまま溜まる。
+        let listed_mix = root.join("20260628-143025").join("mix.mp3.part.123");
         let listed_second = root.join("20260628-150000").join("system.mp3.part.456");
         let listed_other_name = root.join("20260628-143025").join("archive.zip.part.1");
         let listed_user_file = root.join("20260628-143025").join("notes.part.txt");
@@ -570,6 +583,7 @@ mod tests {
         for path in [
             &listed_old,
             &listed_summary,
+            &listed_mix,
             &listed_second,
             &listed_other_name,
             &listed_user_file,
@@ -588,6 +602,10 @@ mod tests {
         assert!(
             !listed_summary.exists(),
             "the summary is written through PartFile too, so its leftovers must be removed"
+        );
+        assert!(
+            !listed_mix.exists(),
+            "the mix is written through PartFile too, so its leftovers must be removed"
         );
         assert!(
             !listed_second.exists(),
