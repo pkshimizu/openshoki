@@ -40,6 +40,8 @@ export enum PaneActionKind {
     open-transcription,
     // 議事録の設定ウィンドウを開く。
     open-notes,
+    // 文字起こしを走らせ、成功したら続けて議事録を書く（#165）。
+    transcribe-then-notes,
     // 途中までの文字起こしを開く（#164）。失敗の理由を伏せて一覧に切り替えるだけで、
     // ディスクには何も起こさない。
     show-partial-transcript,
@@ -652,6 +654,8 @@ export component RecordingsWindow inherits Window {
     callback cancel-summary(int);
     // 「Stop」押下（文字起こしが走っている間だけ出る）。走っている文字起こしを止める。
     callback stop-transcription(int);
+    // 文字起こしを走らせ、成功したら続けて議事録を書く（#165）。引数は選択中の行の添字。
+    callback transcribe-then-notes(int);
     // 確認モーダルの Delete 押下。選択中セッションをゴミ箱へ移動する（インデックスを渡す）。
     callback delete-session(int);
     // 読む領域の空表示から起こす操作（#154）。どれを出すかは Rust が状態から決めるので、

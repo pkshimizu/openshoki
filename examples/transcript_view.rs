@@ -17,6 +17,8 @@
 //! - `transcript-partial`: 途中まで読めて失敗した状態（#164）。**件数と組み合わせる**——
 //!   セグメントが在っても `Show partial` を押すまで空表示が出るところを見る
 //! - `show-partial`: その途中結果を開いた状態（一覧に切り替わるところを見る）
+//!   Notes タブの入力待ち・入力の失敗（#165）は、`no-transcript` に `transcribing` /
+//!   `transcript-failed` を重ねて作る（Transcript タブと同じ値から出るので、別のフラグは無い）
 //! - `auto-on`: 未実施の理由を「自動は ON だがまだ回っていない」にする（両タブ）
 //! - `no-follow`: 再生位置の追従を OFF にした状態（プレイヤー帯のスイッチの確認）
 //! - `far`: 再生位置を一覧の末尾寄りに置く（追従でその行が見えているかの確認。`no-follow`
@@ -129,9 +131,18 @@ fn transcript_pane(has_transcript: bool) -> reading_pane::TranscriptPane {
 }
 
 /// Notes タブに出す状態（同上）。
-fn summary_pane(status: SummaryStatus, has_transcript: bool) -> reading_pane::SummaryPane {
-    if !has_transcript {
-        return reading_pane::SummaryPane::Blocked;
+///
+/// **入力（文字起こし）の様子は、Transcript タブと同じ値から出す**（#165）。フラグで直接
+/// 選ぶと、本番では作れない組み合わせ（「文字起こし失敗」なのに Notes は「まだ書けない」）を
+/// 目視することになる（`docs/rules/testing.md`）。
+fn summary_pane(
+    status: SummaryStatus,
+    transcript: &reading_pane::TranscriptPane,
+    has_transcript: bool,
+) -> reading_pane::SummaryPane {
+    let input = reading_pane::TranscriptInput::of(transcript, has_transcript);
+    if input != reading_pane::TranscriptInput::Ready {
+        return input.pane_when_no_notes(flag("auto-on"));
     }
     match status {
         SummaryStatus::Queued => reading_pane::SummaryPane::Queued { position: 2 },
@@ -314,7 +325,7 @@ fn main() {
     } else {
         SummaryStatus::Done
     };
-    let summary_pane = summary_pane(summary_status, has_transcript);
+    let summary_pane = summary_pane(summary_status, &transcript_pane, has_transcript);
     win.set_detail_summary_status(summary_pane.status());
     win.set_detail_summary_status_text(
         reading_pane::summary_status_text(summary_pane.status()).into(),

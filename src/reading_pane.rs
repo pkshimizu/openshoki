@@ -322,7 +322,9 @@ pub fn actions_allowed_while_busy(actions: Vec<PaneAction>, jobs_pending: bool) 
     actions
         .into_iter()
         .filter(|action| match action.kind {
-            PaneActionKind::Transcribe | PaneActionKind::WriteNotes => false,
+            PaneActionKind::Transcribe
+            | PaneActionKind::WriteNotes
+            | PaneActionKind::TranscribeThenNotes => false,
             // 止める操作は**走っている間しか出ない**ので、ここで落とすと出す先が無くなる
             // （`docs/rules/slint.md`。取り消しと窓を開くのは残すのと同じ理由）。途中結果を
             // 開く操作は、すでにディスクに在るものを見せるだけなので重ねようがない。
@@ -361,12 +363,70 @@ pub fn summary_status_text(display_status: SummaryStatus) -> &'static str {
     }
 }
 
+/// 議事録タブから見た**入力（文字起こし）の様子**（#165）。
+///
+/// **議事録タブが要るのはこれだけ**なので、`has_transcript` と状態 enum を別々に渡さず
+/// 1 つの値にまとめる（真偽値を並べると、渡し違えてもコンパイルが通る。
+/// `docs/rules/coding-conventions.md`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptInput {
+    /// 読める文字起こしが在る（作り直している最中でも、入力としては在る）。
+    Ready,
+    /// まだ無いが、いま作っている。
+    Running,
+    /// まだ無く、作ろうとして失敗した。
+    Failed,
+    /// まだ無く、作ってもいない。
+    Missing,
+}
+
+impl TranscriptInput {
+    /// 文字起こしの状態と「読める文字起こしが在るか」から、議事録タブの見方を決める（#165）。
+    ///
+    /// **読める文字起こしが在れば `Ready` が先**——作り直している最中でも、入力としては在る
+    /// （そのとき議事録を押せるかどうかは Slint 側のゲートが決める）。無いときだけ、なぜ無いのか
+    /// で言い分ける。
+    ///
+    /// **ワイルドカードを置かない**（状態を足したら扱いを書くまで通らない）。
+    pub fn of(transcript: &TranscriptPane, has_transcript: bool) -> Self {
+        if has_transcript {
+            return Self::Ready;
+        }
+        match transcript.status() {
+            TranscriptStatus::Transcribing | TranscriptStatus::Stopping => Self::Running,
+            TranscriptStatus::Failed => Self::Failed,
+            // 生成済みなのに読めない（JSON の欠落・破損）も、入力としては無い。
+            TranscriptStatus::NotTranscribed | TranscriptStatus::Done => Self::Missing,
+        }
+    }
+
+    /// 議事録がまだ無いときに出す状態（#165）。
+    ///
+    /// **本番も確認用バイナリもここを通す**（`docs/rules/testing.md` の「確認用バイナリでも、
+    /// 状態は 1 つの値から出す」）。別々に選ぶと、本番では作れない組み合わせを目視してしまう。
+    pub fn pane_when_no_notes(self, auto_on: bool) -> SummaryPane {
+        match self {
+            Self::Ready => SummaryPane::NotSummarized { auto_on },
+            Self::Running => SummaryPane::WaitingForTranscript,
+            Self::Failed => SummaryPane::TranscriptFailed,
+            Self::Missing => SummaryPane::Blocked,
+        }
+    }
+}
+
 /// 読む領域が出す議事録の状態と、そこに出す中身（#154。`TranscriptPane` と対称）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SummaryPane {
     /// **文字起こしが無いので動けない**。議事録は文字起こしを入力にするので、ここだけは
     /// 「まだ書いていない」ではなく「まだ書けない」。
     Blocked,
+    /// 文字起こしを待っている（#165）。続けて書く依頼を出した直後もここに来る——依頼は
+    /// 文字起こしジョブにぶら下がっていて、要約ワーカーにはまだ積まれていない
+    /// （だから `status()` は「未生成」のまま。取り消せる相手がいない）。
+    WaitingForTranscript,
+    /// 文字起こしが失敗したので、議事録は始まらなかった（#165）。**入力が欠けたまま
+    /// 完成品に見える議事録を作らない**という判断の結果なので、そう言う。
+    TranscriptFailed,
     /// 文字起こしはあるが、まだ書いていない。
     NotSummarized { auto_on: bool },
     Queued {
@@ -391,7 +451,13 @@ impl SummaryPane {
     /// （読む領域の説明は違うが、ボタンの活性や一覧の見え方は同じ）。
     pub fn status(&self) -> SummaryStatus {
         match self {
-            Self::Blocked | Self::NotSummarized { .. } => SummaryStatus::NotSummarized,
+            // 待っている間・入力が失敗した後も「未生成」。要約ワーカーには何も積まれて
+            // いないので、キュー待ちや生成中と同じ扱いにはできない（削除・再実行のゲートは
+            // 文字起こし側が握っている）。
+            Self::Blocked
+            | Self::WaitingForTranscript
+            | Self::TranscriptFailed
+            | Self::NotSummarized { .. } => SummaryStatus::NotSummarized,
             Self::Queued { .. } => SummaryStatus::Queued,
             Self::Summarizing { .. } => SummaryStatus::Summarizing,
             Self::Done => SummaryStatus::Done,
@@ -407,7 +473,26 @@ impl SummaryPane {
                 "Notes are written from the transcript, and this recording has none. \
                  Transcribing it first will let notes run.",
             )
-            .with_primary("Transcribe now", PaneActionKind::Transcribe)
+            // **1 回の操作で議事録まで行く**（#165）。ここまで来た人が欲しいのは議事録で、
+            // 文字起こしはその途中でしかない（文字起こしだけ回す口は Transcript タブ）。
+            .with_primary(
+                "Transcribe, then write notes",
+                PaneActionKind::TranscribeThenNotes,
+            )
+            .with_secondary("Open transcription", PaneActionKind::OpenTranscription),
+            Self::WaitingForTranscript => PaneMessage::new(
+                "Waiting for the transcript",
+                "Notes are written from the transcript, so they start once it finishes. \
+                 The Transcript tab shows its progress.",
+            ),
+            // **押せる手を出す**。入力から作り直すしかないので、行き先は続けて書く依頼と同じ。
+            Self::TranscriptFailed => PaneMessage::new(
+                "No notes yet",
+                "The transcription did not finish, so notes did not start. Notes are written \
+                 from the transcript, and an incomplete one would leave the notes incomplete \
+                 too.",
+            )
+            .with_primary("Try again", PaneActionKind::TranscribeThenNotes)
             .with_secondary("Open transcription", PaneActionKind::OpenTranscription),
             Self::NotSummarized { auto_on: false } => PaneMessage::new(
                 "No notes yet",
