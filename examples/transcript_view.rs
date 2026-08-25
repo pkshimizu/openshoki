@@ -49,14 +49,6 @@ fn flag(name: &str) -> bool {
     std::env::args().any(|arg| arg == name)
 }
 
-/// 最後まで行かなかった音源 1 本（#164）。
-fn failed_source(name: &str, kept_upto: Option<Duration>) -> reading_pane::FailedSource {
-    reading_pane::FailedSource {
-        name: name.to_owned(),
-        kept_upto,
-    }
-}
-
 /// 引数で件数を指定しなかったときのセグメント件数。
 const DEFAULT_SEGMENT_COUNT: usize = 30;
 
@@ -106,10 +98,10 @@ fn transcript_pane(has_transcript: bool) -> reading_pane::TranscriptPane {
         return reading_pane::TranscriptPane::Failed {
             reason: reading_pane::TranscribeFailure::Files {
                 failed: vec![
-                    failed_source("mic.mp3", None),
-                    failed_source("system.mp3", None),
+                    reading_pane::FailedSource::new("mic.mp3", None),
+                    reading_pane::FailedSource::new("system.mp3", None),
                 ],
-                completed: 0,
+                kept_other_sources: false,
             },
         };
     }
@@ -118,8 +110,11 @@ fn transcript_pane(has_transcript: bool) -> reading_pane::TranscriptPane {
         // この空表示が出る。
         return reading_pane::TranscriptPane::Failed {
             reason: reading_pane::TranscribeFailure::Files {
-                failed: vec![failed_source("mic.mp3", Some(Duration::from_secs(252)))],
-                completed: 0,
+                failed: vec![reading_pane::FailedSource::new(
+                    "mic.mp3",
+                    Some(Duration::from_secs(252)),
+                )],
+                kept_other_sources: false,
             },
         };
     }

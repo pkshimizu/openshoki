@@ -9,6 +9,8 @@
 //! （`TranscriptStatus` / `SummaryStatus` / `PaneAction` / `PaneActionKind`）と std だけ。
 //! 失敗の種別（`TranscribeFailure` / `SummarizeFailure`）をここに置いているのもそのため——
 //! 種別は「読む領域が説明できることの語彙」で、文言表の網羅 match のすぐ隣にある。
+//! 時計表記（`format_elapsed`）も同じ理由でここに住んでいる。読む領域だけのものではないが、
+//! **依存を持てないこのモジュールが、実装を 1 つに保てる唯一の置き場所**だった（#164）。
 
 use std::time::Duration;
 
@@ -34,13 +36,17 @@ pub enum TranscribeFailure {
     /// 音源の文字起こしが最後まで行かなかった。
     ///
     /// **`failed` は空にならない**——構築するのは `run_job` の 1 箇所で、1 本以上が最後まで
-    /// 行かなかったときにしか作らない（空だと文が 1 つも出ない）。
+    /// 行かなかったときにしか作らない（空だと、理由が 1 文も出ないまま
+    /// `kept_other_sources` の 1 文だけが残る）。
     Files {
         /// 最後まで行かなかった音源。
         failed: Vec<FailedSource>,
-        /// 同じ実行で**最後まで**文字起こしできた音源の本数。`Show partial` を出すかの判断に
-        /// 使う（失敗した音源の途中結果が 1 つも無くても、こちらが残っていれば読める）。
-        completed: usize,
+        /// 同じ実行で、**読める文字起こしを残した音源が他にあるか**。失敗した音源から
+        /// 何も残らなくても、こちらが残っていれば読める（`kept_partial`）。
+        ///
+        /// **件数では持たない**——0 か否かしか意味を持たないので、数で持つと「何本？」を
+        /// 表示できる値だと誤解させる。
+        kept_other_sources: bool,
     },
     /// ワーカーがパニックした（**なぜかは分からない**）。
     Panicked,
@@ -52,18 +58,34 @@ pub struct FailedSource {
     /// 音源の**ファイル名だけ**（パスは持たない。`docs/rules/security.md`）。名前を作るのは
     /// `transcribe::audio_display_name` だけで、そこが保証する。
     pub name: String,
-    /// 読めた範囲を保存できたなら、その終わり（#164）。1 サンプルも読めなければ `None`
-    /// （＝この音源からは何も残っていない）。
+    /// 読めた範囲を保存できたなら、その終わり（#164）。**この音源から読めるものが残らな
+    /// かったときは `None`**——1 サンプルも読めなかった・推論や保存で落ちた・残す価値が
+    /// なくて保存しなかった（`transcribe::partial_is_worth_keeping`）のいずれでも `None`
+    /// になる。理由は分けず、「残っていない」だけを表す。
     pub kept_upto: Option<Duration>,
+}
+
+impl FailedSource {
+    /// 音源 1 本ぶんの記録を組む。**確認用バイナリとテストも同じものを使う**（それぞれで
+    /// 組み立てを書くと、フィールドを足した日に片方だけ古くなる）。
+    pub fn new(name: impl Into<String>, kept_upto: Option<Duration>) -> Self {
+        Self {
+            name: name.into(),
+            kept_upto,
+        }
+    }
 }
 
 impl TranscribeFailure {
     /// この失敗が、読める文字起こしを残したか（#164）。読む領域はこれで `Show partial` を
-    /// 出すかどうかを決める。
+    /// 出すかどうかを決める。**この判断の理由の正はここ**（他は参照だけを置く）。
     ///
     /// **この実行が書いたものだけを数える**。前回の完成した文字起こしがディスクに残っている
     /// だけのとき（モデルのロードに失敗した再実行など）に「途中結果」と言うと、完成品を
     /// 途中結果として隠すことになる。
+    ///
+    /// **残っている＝読む行がある**。保存したのに 1 件も認識できていなければ、開いても何も
+    /// 出ない（そういう音源は保存しない。`transcribe::partial_is_worth_keeping`）。
     ///
     /// **ワイルドカードを置かない**（種別を足したら扱いを書くまで通らない）。
     pub fn kept_partial(&self) -> bool {
@@ -72,9 +94,10 @@ impl TranscribeFailure {
             Self::ModelDownload | Self::ModelMissing | Self::ModelUnreadable | Self::ModelLoad => {
                 false
             }
-            Self::Files { failed, completed } => {
-                *completed > 0 || failed.iter().any(|source| source.kept_upto.is_some())
-            }
+            Self::Files {
+                failed,
+                kept_other_sources,
+            } => *kept_other_sources || failed.iter().any(|source| source.kept_upto.is_some()),
             // どこで落ちたか分からないので、残っていると言い切らない。
             Self::Panicked => false,
         }
@@ -199,9 +222,10 @@ impl TranscriptPane {
     /// いま読めるものが**途中結果**か（#164）。読む領域は、これが立っている間だけ一覧を
     /// 伏せて失敗の理由を先に出し、`Show partial` で開かせる。
     ///
-    /// **失敗した実行が残したものだけを数える**（`TranscribeFailure::kept_partial`）。前回の
-    /// 完成した文字起こしが残っているだけの失敗（モデルのロードに失敗した再実行など）で
-    /// 伏せると、完成品を途中結果として隠すことになる。
+    /// 何を「残した」と数えるかは `TranscribeFailure::kept_partial` が正（理由もそちら）。
+    ///
+    /// **走っている間は立たない**。次に出るのは別の結果なので、前回開いた同意を引き継がない
+    /// （畳むのは `main::apply_detail_transcript_status`）。
     ///
     /// **ワイルドカードを置かない**（状態を足したら扱いを書くまで通らない）。
     pub fn shows_partial(&self) -> bool {
@@ -439,6 +463,7 @@ pub fn transcribe_failure_text(reason: &TranscribeFailure) -> String {
         TranscribeFailure::ModelLoad => "The transcription model could not be loaded.".to_owned(),
         // **件数で文の形は変えない**（`docs/rules/messages.md`）ので、1 本でも複数でも音源
         // ごとに 1 文ずつ並べる。どこまで読めたかは、読めた音源だけが言う（#164）。
+        // 最後の 1 文は `kept_other_sources` も見る（`kept_partial`）ので、ここで束ねない。
         TranscribeFailure::Files { failed, .. } => {
             let mut text = failed
                 .iter()
@@ -453,7 +478,12 @@ pub fn transcribe_failure_text(reason: &TranscribeFailure) -> String {
                 .collect::<Vec<_>>()
                 .join(" ");
             if reason.kept_partial() {
-                text.push_str(" Everything that was read is kept.");
+                // `failed` が空のときに先頭が空白にならないようにする（型では空を禁止でき
+                // ないので、文の組み立て側で壊れないようにしておく）。
+                if !text.is_empty() {
+                    text.push(' ');
+                }
+                text.push_str("Everything that was read is kept.");
             }
             text
         }

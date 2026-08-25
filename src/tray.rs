@@ -321,9 +321,8 @@ fn decode_rgba_png(png_bytes: &[u8], what: &str) -> Option<RgbaImage> {
 mod tests {
     use super::{
         QUIT_ICON_PNG, RECORD_ICON_PNG, SETTINGS_ICON_PNG, STOP_ICON_PNG, TRAY_ICON_PNG,
-        decode_rgba_png, format_elapsed, load_menu_icon, recording_color, tinted_glyph,
+        decode_rgba_png, load_menu_icon, recording_color, tinted_glyph,
     };
-    use std::time::Duration;
 
     #[test]
     fn load_menu_icon_decodes_embedded_assets() {
@@ -461,21 +460,5 @@ mod tests {
         // 範囲外はクランプされる（色だけで表すのでアルファは持たない）。
         assert_eq!(recording_color(-1.0), [0x6a, 0x14, 0x10]);
         assert_eq!(recording_color(2.0), [0xD0, 0x21, 0x1c]);
-    }
-
-    #[test]
-    fn format_elapsed_under_hour_is_mm_ss() {
-        assert_eq!(format_elapsed(Duration::from_secs(0)), "00:00");
-        assert_eq!(format_elapsed(Duration::from_secs(65)), "01:05");
-        assert_eq!(format_elapsed(Duration::from_secs(599)), "09:59");
-        // 1 時間未満の上限。ここまでは時を出さず mm:ss のまま（分は 60 以上になりうる）。
-        assert_eq!(format_elapsed(Duration::from_secs(3599)), "59:59");
-    }
-
-    #[test]
-    fn format_elapsed_over_hour_includes_hours() {
-        assert_eq!(format_elapsed(Duration::from_secs(3661)), "1:01:01");
-        // 分は 2 桁ゼロ詰め、時は詰めない。
-        assert_eq!(format_elapsed(Duration::from_secs(3600)), "1:00:00");
     }
 }

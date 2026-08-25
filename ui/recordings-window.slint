@@ -560,8 +560,10 @@ export component RecordingsWindow inherits Window {
     // 前回の完成した文字起こしが残っているだけのことがある。判断は Rust の
     // `TranscriptPane::shows_partial` が持ち、見出し・理由・操作と同じ値から入る。
     in property <bool> detail-transcript-partial;
-    // 途中結果を開いたか（#164）。`Show partial` で立ち、録音を選び直すと Rust が畳む。
-    in-out property <bool> show-partial-transcript;
+    // 途中結果を開いたか（#164）。**書くのは Rust だけ**（`Show partial` で立ち、録音を
+    // 選び直したときと走り始めたときに畳む）。Slint 側から立てられるようにすると、Rust の
+    // 畳む経路をすり抜ける実装が混ざる。
+    in property <bool> show-partial-transcript;
     // 途中結果を伏せている間か。伏せている間は一覧ではなく失敗の理由を出す——先に一覧が
     // 出ると、欠けていることに気づかないまま完成品として読んでしまう。
     property <bool> detail-transcript-held-back: root.detail-transcript-partial
