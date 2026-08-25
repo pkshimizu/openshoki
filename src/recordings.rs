@@ -1,6 +1,6 @@
 //! 録音セッションの探索。設定の保存先（`recording_dir`）配下にある `<%Y%m%d-%H%M%S>` 形式の
 //! セッションディレクトリを列挙し、含まれる音源（mic / system）・文字起こし・議事録要約の
-//! 有無を調べて新しい順に並べる。Recordings ウィンドウの一覧表示に使う。
+//! 有無を調べて新しい順に並べる。Library ウィンドウの一覧表示に使う。
 //!
 //! 読むだけのモジュールではない: 一覧に出たセッションに取り残された一時ファイルの回収
 //! （`spawn_session_part_sweep`）も持つ。保存先のファイルを消す経路はほかにもあるが
@@ -181,7 +181,7 @@ impl RecordingSession {
     }
 
     /// 文字起こしの対象となる音源ファイル（存在する `mic.mp3` / `system.mp3`）。
-    /// 手動再実行（Recordings ウィンドウの Transcribe ボタン）の投入対象に使う。
+    /// 手動再実行（Library ウィンドウの Transcribe ボタン）の投入対象に使う。
     pub fn audio_source_paths(&self) -> Vec<PathBuf> {
         let mut paths = Vec::new();
         if self.has_mic {
@@ -345,7 +345,7 @@ pub fn list_sessions(recording_dir: &Path) -> Vec<RecordingSession> {
 }
 
 /// 一覧に出たセッションの直下に取り残された一時ファイル（`*.part.<pid>`）を回収する
-/// （Recordings ウィンドウを開くたびに、`list_sessions` の結果を渡して呼ぶ）。
+/// （Library ウィンドウを開くたびに、`list_sessions` の結果を渡して呼ぶ）。
 ///
 /// `PartFile` の Drop が走らない終わり方（`abort`・強制終了・電源喪失）で残ったものが対象。
 /// 発話由来の派生物（正規化中の音声・議事録）なので、ユーザーが気づかないまま録音フォルダに
@@ -355,7 +355,7 @@ pub fn list_sessions(recording_dir: &Path) -> Vec<RecordingSession> {
 /// **名前だけを頼りに走査して消す唯一の経路**なので（ほかの削除経路はモジュール doc）、
 /// 範囲を 3 重に絞る:
 ///
-/// 1. **時期**: ユーザーが Recordings ウィンドウを開いたときだけ（常駐の起動時には走らない。
+/// 1. **時期**: ユーザーが Library ウィンドウを開いたときだけ（常駐の起動時には走らない。
 ///    #130 で「起動時にユーザーの選んだ保存先を走査するリスクは取らない」と見送った判断を、
 ///    「保存先を**丸ごと**走査しない」に狭めて保つ）。
 /// 2. **場所**: `list_sessions` が返したセッション（日時形式の名前で音源を持つディレクトリ）の

@@ -111,7 +111,7 @@ export global Style {
     }
 
     // --- タイポグラフィ ---
-    out property <length> detail-title-size: 16px; // 詳細見出し（Recordings の日時）
+    out property <length> detail-title-size: 16px; // 詳細見出し（Library の日時）
     // セクション見出し（大文字・字間広め）。本文より小さく、色と字間で見出しだと分かるようにする。
     out property <length> section-size: 11px;
     out property <length> section-tracking: 1.4px;
@@ -138,7 +138,7 @@ export global Style {
     out property <length> mark-width: 4px;
 
     // **濃い塗りの上に載せる白**。用途は 2 つある:
-    // OS のアクセント色の上（`recordings-window.slint` の選択行）と、`danger` の上
+    // OS のアクセント色の上（`library-window.slint` の選択行）と、`danger` の上
     // （`controls.slint` の `DangerButton` の塗り）。どちらもライト／ダークで白のままでよいので
     // テーマ分岐を持たない。朱（`seal`）の上に文字を載せる用途はまだ無い（必要になったら
     // そのとき `on-seal` を足す）。

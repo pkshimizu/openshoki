@@ -16,8 +16,8 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 /// ラベルは固定で切り替えない。
 pub const SETTINGS_LABEL: &str = "Settings";
 
-/// 録音一覧ウィンドウを開く項目のラベル。押すと Recordings ウィンドウを表示する（固定）。
-pub const RECORDINGS_LABEL: &str = "Recordings…";
+/// 録音一覧ウィンドウを開く項目のラベル。押すと Library ウィンドウを表示する（固定）。
+pub const LIBRARY_LABEL: &str = "Library…";
 
 /// 録音トグル項目のラベル。START=待機中に押すと開始、STOP=録音中に押すと停止。
 pub const RECORD_LABEL_START: &str = "Start Recording";
@@ -33,7 +33,7 @@ const TOOLTIP_RECORDING: &str = "shoki — Recording…";
 const RECORD_ICON_PNG: &[u8] = include_bytes!("../assets/menu/record.png");
 const STOP_ICON_PNG: &[u8] = include_bytes!("../assets/menu/stop.png");
 const SETTINGS_ICON_PNG: &[u8] = include_bytes!("../assets/menu/settings.png");
-const RECORDINGS_ICON_PNG: &[u8] = include_bytes!("../assets/menu/recordings.png");
+const LIBRARY_ICON_PNG: &[u8] = include_bytes!("../assets/menu/library.png");
 const QUIT_ICON_PNG: &[u8] = include_bytes!("../assets/menu/quit.png");
 
 /// メニューバー常駐アイコンの PNG 素材（36x36・8bit RGBA。`scripts/generate-icons.sh` が
@@ -49,7 +49,7 @@ pub struct Tray {
     pub icon: Rc<TrayIcon>,
     /// 設定画面（ウィンドウ）を開く項目。ラベル・アイコンは固定（歯車）。
     pub toggle_item: IconMenuItem,
-    /// 録音一覧（Recordings）ウィンドウを開く項目。ラベル・アイコンは固定。
+    /// 録音一覧（Library）ウィンドウを開く項目。ラベル・アイコンは固定。
     pub recordings_item: IconMenuItem,
     /// 録音の開始/停止を切り替える項目。録音状態に応じてラベルとアイコンを更新する。
     pub record_item: IconMenuItem,
@@ -73,12 +73,8 @@ impl Tray {
             load_menu_icon(SETTINGS_ICON_PNG),
             None,
         );
-        let recordings_item = IconMenuItem::new(
-            RECORDINGS_LABEL,
-            true,
-            load_menu_icon(RECORDINGS_ICON_PNG),
-            None,
-        );
+        let recordings_item =
+            IconMenuItem::new(LIBRARY_LABEL, true, load_menu_icon(LIBRARY_ICON_PNG), None);
         let quit_item = IconMenuItem::new("Quit", true, load_menu_icon(QUIT_ICON_PNG), None);
 
         let menu = Menu::new();
@@ -162,7 +158,7 @@ fn recording_color(level: f32) -> [u8; 3] {
 }
 
 /// 経過時間を表示用文字列にする（`mm:ss` / 1 時間以上は `h:mm:ss`）。録音中のメニューバー
-/// 表示と Recordings の再生時間表示で共用する。
+/// 表示と Library の再生時間表示で共用する。
 ///
 /// **実装は `crate::reading_pane::format_elapsed`**。読む領域も同じ表記を使うので（#164 の
 /// 「どこまで読めたか」）、あちらへ寄せてある——理由はそちらの doc。ここは呼び名を変えない

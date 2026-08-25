@@ -161,7 +161,7 @@ impl TranscribeProgress {
     }
 }
 
-/// セッション単位の文字起こしの進行状況。Recordings ウィンドウの状態表示に使う。
+/// セッション単位の文字起こしの進行状況。Library ウィンドウの状態表示に使う。
 /// マップに載らないセッションの表示は「JSON の有無」で解決する（`docs/plans/done/` の #69 プラン）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TranscribeStatus {
@@ -178,7 +178,7 @@ pub enum TranscribeStatus {
 
 /// 文字起こしのバックグラウンドワーカー。`submit` されたジョブを 1 本のスレッドで逐次処理する
 /// （whisper は CPU 集約のため、録音が連続してもスレッドを増やさない）。
-/// `Clone` で共有できる（後処理ワーカーからの自動投入と、Recordings ウィンドウからの
+/// `Clone` で共有できる（後処理ワーカーからの自動投入と、Library ウィンドウからの
 /// 手動再実行・状態表示が同じワーカー・同じ状態マップを使う）。
 #[derive(Clone)]
 pub struct TranscribeWorker {
@@ -374,7 +374,7 @@ impl TranscribeWorker {
                     }
                     // 文字起こし中のパニックでワーカースレッドを殺さない。死ぬと状態が
                     // `Transcribing` のまま残り、そのセッションは再起動まで Transcribe /
-                    // Summarize / Delete がすべて無効になる（Recordings ウィンドウの
+                    // Summarize / Delete がすべて無効になる（Library ウィンドウの
                     // `detail-files-in-use` / `detail-jobs-pending`）。失敗として記録し、
                     // 次のジョブは受け続ける（`SummarizeWorker` と同じ扱い）。
                     let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(

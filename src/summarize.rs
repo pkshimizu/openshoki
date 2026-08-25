@@ -94,12 +94,12 @@ pub struct SummarizeJob {
     ///
     /// 文字起こし直後の自動生成は `true`: 既存の議事録は**前の文字起こし**のものなので、生成に
     /// 失敗したときに残しておくと新しい文字起こしの議事録として読まれてしまう。
-    /// Recordings ウィンドウからの手動生成は `false`: 既存の議事録は現在の文字起こしと整合した
+    /// Library ウィンドウからの手動生成は `false`: 既存の議事録は現在の文字起こしと整合した
     /// 有効なデータなので、失敗しても失わせない（成功時は上書きされる）。
     pub existing_is_stale: bool,
 }
 
-/// セッション単位の要約の進行状況（`TranscribeWorker` と同型）。Recordings ウィンドウの
+/// セッション単位の要約の進行状況（`TranscribeWorker` と同型）。Library ウィンドウの
 /// 詳細ペインが `main::summary_display_status` で表示状態へ合成して出す。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SummarizeStatus {
@@ -743,7 +743,7 @@ fn write_summary(path: &Path, markdown: &str) -> Result<(), Box<dyn std::error::
     // 上書きすると `truncate` で**開いた時点で**既存の議事録が消え、書き込み中に失敗した場合に
     // (1) 前の議事録が失われ、(2) 途中まで書けたファイルが「生成済み」として表示される
     // （`load_summary` は非空なら返す）。失敗しても一時ファイルは番人が消す。
-    // Drop が走らない終わり方で残った `summary.md.part.<pid>` は、Recordings ウィンドウを
+    // Drop が走らない終わり方で残った `summary.md.part.<pid>` は、Library ウィンドウを
     // 開いたときに回収する（`recordings::spawn_session_part_sweep`）。
     let part = crate::atomic_replace::PartFile::for_dest(path)
         .ok_or("the summary path does not end in a file name")?;

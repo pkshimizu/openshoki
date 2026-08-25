@@ -1,6 +1,6 @@
 //! 議事録要約のオンデバイス LLM を確かめる検証プローブ（#78）。**検証専用**で、出荷バイナリには
 //! 入らない（example なので）。本実装は `src/summarize.rs` / `src/summarize/on_device.rs`
-//! （#80）で、Recordings ウィンドウでの表示・手動生成は `src/main.rs` の Summary タブまわり（#81）。
+//! （#80）で、Library ウィンドウでの表示・手動生成は `src/main.rs` の Summary タブまわり（#81）。
 //!
 //! ここに置いた `SYSTEM_JA` / `SYSTEM_EN` は **#78 当時の検証用スナップショット**で、
 //! 出荷実装のプロンプトの正は `src/summarize.rs` の `MINUTES_SYSTEM_*`（英語版は #80 で

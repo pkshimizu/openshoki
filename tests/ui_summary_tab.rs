@@ -1,4 +1,4 @@
-//! Recordings ウィンドウの Transcript / Summary タブと「Summarize」ボタンの操作テスト（#81）。
+//! Library ウィンドウの Transcript / Summary タブと「Summarize」ボタンの操作テスト（#81）。
 //!
 //! 見た目は `examples/transcript_view.rs` で目視するが、**クリックが配線されているか**は
 //! ビルドでも目視でも分からない（自作の `ViewTab` は `TouchArea` を重ねる構造で、レイアウトを
@@ -17,15 +17,15 @@ use slint::platform::PointerEventButton;
 
 slint::include_modules!();
 
-/// ウィンドウ寸法（実アプリと同じ。`src/main.rs` の RECORDINGS_WIDTH/HEIGHT）。要素の座標を
+/// ウィンドウ寸法（実アプリと同じ。`src/main.rs` の LIBRARY_WIDTH/HEIGHT）。要素の座標を
 /// 出すために必要で、この値自体はアサートに使わない。
 const WINDOW_WIDTH: f32 = 720.0;
 const WINDOW_HEIGHT: f32 = 540.0;
 
 /// 詳細ペイン（`if root.has-selection` の中）を出した状態のウィンドウ。
-fn open_window() -> RecordingsWindow {
+fn open_window() -> LibraryWindow {
     ui_support::init_backend();
-    let window = RecordingsWindow::new().expect("create the recordings window");
+    let window = LibraryWindow::new().expect("create the library window");
     window
         .window()
         .set_size(slint::LogicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT));
@@ -34,13 +34,13 @@ fn open_window() -> RecordingsWindow {
 }
 
 /// 表示切替タブ（宣言順に Transcript → Summary）。
-fn tabs(window: &RecordingsWindow) -> Vec<ElementHandle> {
+fn tabs(window: &LibraryWindow) -> Vec<ElementHandle> {
     ElementHandle::find_by_element_type_name(window, "ViewTab").collect()
 }
 
 /// ラベルで詳細ペインのボタンを引く。対象は std-widgets の `Button` のみ（自作の
 /// `DangerButton` は accessible-role/enabled を持たないので `accessible_enabled` が取れない）。
-fn button(window: &RecordingsWindow, label: &str) -> ElementHandle {
+fn button(window: &LibraryWindow, label: &str) -> ElementHandle {
     ElementHandle::find_by_accessible_label(window, label)
         .next()
         .unwrap_or_else(|| panic!("the detail pane should have a {label} button"))
@@ -48,7 +48,7 @@ fn button(window: &RecordingsWindow, label: &str) -> ElementHandle {
 
 /// 議事録のボタン。**文言は状態で変わる**（まだ無ければ `Write notes`、あれば
 /// `Regenerate notes`）ので、どちらかを引く——押す動機が違うので語を変えている（#128）。
-fn notes_button(window: &RecordingsWindow) -> ElementHandle {
+fn notes_button(window: &LibraryWindow) -> ElementHandle {
     ["Regenerate notes", "Write notes"]
         .into_iter()
         .find_map(|label| ElementHandle::find_by_accessible_label(window, label).next())
@@ -56,7 +56,7 @@ fn notes_button(window: &RecordingsWindow) -> ElementHandle {
 }
 
 /// 文字起こしのボタン（同じ理由で `Transcribe` / `Re-transcribe` のどちらか）。
-fn transcribe_button(window: &RecordingsWindow) -> ElementHandle {
+fn transcribe_button(window: &LibraryWindow) -> ElementHandle {
     ["Re-transcribe", "Transcribe"]
         .into_iter()
         .find_map(|label| ElementHandle::find_by_accessible_label(window, label).next())
@@ -174,7 +174,7 @@ fn the_summary_state_decides_which_actions_are_offered() {
 }
 
 /// キュー待ちの取り消しは、状態行の隣に出る専用のボタンから行う
-/// （Summarize と差し替えない理由は `ui/recordings-window.slint` の状態行のコメント）。
+/// （Summarize と差し替えない理由は `ui/library-window.slint` の状態行のコメント）。
 #[test]
 #[cfg_attr(
     not(slint_debug_info),
@@ -254,7 +254,7 @@ fn stopping_a_running_transcription_reports_the_index() {
 )]
 fn stop_is_offered_only_while_the_transcription_is_running() {
     let window = open_window();
-    let stop_buttons = |window: &RecordingsWindow| {
+    let stop_buttons = |window: &LibraryWindow| {
         ElementHandle::find_by_accessible_label(window, "Stop transcription").count()
     };
 
@@ -304,7 +304,7 @@ fn a_partial_transcript_stays_behind_the_failure_until_it_is_asked_for() {
         },
     ]))));
     window.set_detail_transcript_status(TranscriptStatus::Failed);
-    let lists = |window: &RecordingsWindow| {
+    let lists = |window: &LibraryWindow| {
         ElementHandle::find_by_element_type_name(window, "TranscriptList").count()
     };
 

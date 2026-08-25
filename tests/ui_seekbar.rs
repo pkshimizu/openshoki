@@ -1,4 +1,4 @@
-//! シークバー（`ui/recordings-window.slint` の `SeekBar`）の操作を、実際のポインタイベントで
+//! シークバー（`ui/library-window.slint` の `SeekBar`）の操作を、実際のポインタイベントで
 //! 検証する。ビルド・clippy・純粋関数の単体テストでは「TouchArea の配線」を検証できないため、
 //! Slint のテストバックエンドでクリック・ドラッグを流して振る舞いを固定する。
 //!
@@ -21,7 +21,7 @@ use slint::ComponentHandle;
 use slint::LogicalPosition;
 use slint::platform::{PointerEventButton, WindowEvent};
 
-/// テスト用のウィンドウサイズ（`src/main.rs` の RECORDINGS_WIDTH/HEIGHT と同じ）。要素の座標は
+/// テスト用のウィンドウサイズ（`src/main.rs` の LIBRARY_WIDTH/HEIGHT と同じ）。要素の座標は
 /// レイアウト結果から解決するので、この値自体はアサートに使わない。
 const WINDOW_WIDTH: f32 = 720.0;
 const WINDOW_HEIGHT: f32 = 540.0;
@@ -39,9 +39,9 @@ struct Preview {
     scrubbing: bool,
 }
 
-/// Recordings ウィンドウと、シークバーのコールバックの記録。
+/// Library ウィンドウと、シークバーのコールバックの記録。
 struct Probe {
-    window: RecordingsWindow,
+    window: LibraryWindow,
     /// `scrub-preview`（ドラッグ中のプレビュー通知）の記録。
     previews: Rc<RefCell<Vec<Preview>>>,
     /// `seek-to-ratio`（クリック確定・ドラッグ終了）で渡された比率。
@@ -61,7 +61,7 @@ impl Probe {
 
     fn new(seekable: bool) -> Self {
         ui_support::init_backend();
-        let window = RecordingsWindow::new().expect("creating the window should succeed");
+        let window = LibraryWindow::new().expect("creating the window should succeed");
         window
             .window()
             .set_size(slint::LogicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT));

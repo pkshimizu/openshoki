@@ -95,7 +95,7 @@ export component ModelList inherits Rectangle {
     property <length> action-column-width: root.width < 520px ? 120px : 176px;
 
     // 削除の確認モーダルの表示状態。Delete 押下で開き、Cancel / 確定で閉じる（Slint 内で完結。
-    // Recordings ウィンドウと同じ作り）。
+    // Library ウィンドウと同じ作り）。
     in-out property <bool> show-delete-confirm: false;
     // 確認中の行。モーダルは対象の名前・サイズをここから引く（`delete-model` に渡す値でもある）。
     // `in-out` なのは確認用バイナリ（`examples/models_view.rs`）がモーダルの見た目を出すため。
@@ -336,7 +336,7 @@ export component ModelList inherits Rectangle {
         }
     }
 
-    // 削除の確認モーダル。Recordings ウィンドウと同じ作り（ウィンドウ内オーバーレイ、スクリムが
+    // 削除の確認モーダル。Library ウィンドウと同じ作り（ウィンドウ内オーバーレイ、スクリムが
     // クリックを吸収し、閉じる操作は Cancel か確定のみ）。
     if root.show-delete-confirm: Rectangle {
         background: #000000.transparentize(0.65);

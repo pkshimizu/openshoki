@@ -1,4 +1,4 @@
-//! 読む領域（Recordings ウィンドウの Transcript / Notes タブ）に出す文言と操作（#154 / #160）。
+//! 読む領域（Library ウィンドウの Transcript / Notes タブ）に出す文言と操作（#154 / #160）。
 //!
 //! **確認用バイナリと共有するために切り出してある**。`examples/transcript_view.rs` は
 //! `#[path]` でこのファイルを取り込む——複製していたときは実際にずれた（#161 で
@@ -263,7 +263,7 @@ impl TranscriptPane {
                 ),
             )
             // 空表示側の Stop。詳細ヘッダの状態行にも同じ操作があり
-            // （`ui/recordings-window.slint`）、こちらはセグメントが 0 行のときだけ出る。
+            // （`ui/library-window.slint`）、こちらはセグメントが 0 行のときだけ出る。
             // **主操作にはしない**——押しに来る人より、進み具合を見に来る人のほうが多い。
             .with_secondary("Stop", PaneActionKind::StopTranscription),
             // **言えることだけを言う**。「何も保存されない」は嘘（音源は 1 本ずつ保存されるので、
