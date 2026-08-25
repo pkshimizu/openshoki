@@ -351,3 +351,32 @@ fn asking_for_the_partial_transcript_is_wired_to_the_pane_action() {
     button(&window, "Show partial").mock_single_click(PointerEventButton::Left);
     assert_eq!(*calls.borrow(), vec![PaneActionKind::ShowPartialTranscript]);
 }
+
+/// Notes タブの「Transcribe, then write notes」が、**続けて書く操作として**押せること（#165）。
+///
+/// 振り分け（種別 → `transcribe-then-notes`）は Rust の網羅 match が持つので、ここで見るのは
+/// 「ボタンが在って、押すと続けて書く種別が届く」まで。ラベルで分岐させていないことも兼ねる。
+#[test]
+#[cfg_attr(
+    not(slint_debug_info),
+    ignore = "needs Slint debug info (SLINT_EMIT_DEBUG_INFO=1)"
+)]
+fn writing_notes_from_scratch_is_offered_as_one_action() {
+    let window = open_window();
+    window.set_showing_summary(true);
+    window.set_detail_summary_heading("No notes yet".into());
+    window.set_detail_summary_actions(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+        PaneAction {
+            label: "Transcribe, then write notes".into(),
+            kind: PaneActionKind::TranscribeThenNotes,
+            primary: true,
+        },
+    ]))));
+
+    let calls: Rc<RefCell<Vec<PaneActionKind>>> = Rc::new(RefCell::new(Vec::new()));
+    let recorded = Rc::clone(&calls);
+    window.on_pane_action(move |kind| recorded.borrow_mut().push(kind));
+
+    button(&window, "Transcribe, then write notes").mock_single_click(PointerEventButton::Left);
+    assert_eq!(*calls.borrow(), vec![PaneActionKind::TranscribeThenNotes]);
+}

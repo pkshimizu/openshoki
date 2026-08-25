@@ -29,8 +29,8 @@ mod whisper_model;
 mod windows;
 
 use reading_pane::{
-    SummaryPane, TranscriptPane, actions_allowed_while_busy, elapsed_text, session_transcript_word,
-    summary_status_text, transcript_status_text,
+    SummaryPane, TranscriptInput, TranscriptPane, actions_allowed_while_busy, elapsed_text,
+    session_transcript_word, summary_status_text, transcript_status_text,
 };
 
 use std::cell::{Cell, RefCell};
@@ -562,7 +562,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 詳細ペインの Transcribe ボタン: 選択中セッションの文字起こしを（再）実行する。
     // 完了済みでも上書きで再実行できる（設定 `auto_transcribe` とは独立。#69 プラン）。
-    // 設定値はここでスナップショットし、処理中の設定変更の影響を受けない。
     {
         let sessions = Rc::clone(&sessions);
         let config = Rc::clone(&config);
@@ -575,23 +574,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let Some(session) = usize::try_from(index).ok().and_then(|i| sessions.get(i)) else {
                 return;
             };
-            let audio_paths = session.audio_source_paths();
-            if audio_paths.is_empty() {
-                return;
+            submit_transcription(session, &config, &transcriber, ChainNotes::FollowTheSetting);
+            if let Some(rec) = rec_weak.upgrade() {
+                refresh_detail_panes(&rec, &transcriber, &summarizer, session, &config);
             }
-            let config_ref = config.borrow();
-            transcriber.submit(transcribe::TranscribeJob {
-                session_dir: session.dir.clone(),
-                audio_paths,
-                model_id: config_ref.whisper_model.clone(),
-                model_override: config_ref.whisper_model_path.clone(),
-                language: config_ref.transcribe_language.clone(),
-                // 手動の再実行でも、設定 ON なら要約を作り直す（作り直さないと `summary.md` が
-                // 古い文字起こしのまま残り、内容が食い違う）。
-                summarize: auto_summarize_job(&config_ref, &session.dir),
-            });
-            // 投入結果（通常は「文字起こし中」）を詳細ペインへ即反映し、次の tick を待つ間の
-            // 2 連クリックによる多重投入を防ぐ。一覧行のドットは tick の差分更新に任せる。
+        });
+    }
+
+    // Notes タブの「Transcribe, then write notes」: 文字起こしを走らせ、**全音源成功したときだけ**
+    // 続けて議事録を書く（#165）。続けるかどうかの判断は `TranscribeWorker` が持っていて、
+    // ここは依頼を添えるだけ（`TranscribeJob.summarize` の doc）。
+    {
+        let sessions = Rc::clone(&sessions);
+        let config = Rc::clone(&config);
+        let transcriber = transcriber.clone();
+        let summarizer = summarizer.clone();
+        let rec_weak = recordings_ui.as_weak();
+        recordings_ui.on_transcribe_then_notes(move |index| {
+            let sessions = sessions.borrow();
+            let Some(session) = usize::try_from(index).ok().and_then(|i| sessions.get(i)) else {
+                return;
+            };
+            submit_transcription(session, &config, &transcriber, ChainNotes::Always);
             if let Some(rec) = rec_weak.upgrade() {
                 refresh_detail_panes(&rec, &transcriber, &summarizer, session, &config);
             }
@@ -769,6 +773,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 PaneActionKind::WriteNotes => rec.invoke_summarize_session(index),
                 PaneActionKind::CancelNotes => rec.invoke_cancel_summary(index),
                 PaneActionKind::StopTranscription => rec.invoke_stop_transcription(index),
+                PaneActionKind::TranscribeThenNotes => rec.invoke_transcribe_then_notes(index),
                 PaneActionKind::OpenTranscription => {
                     if let Some(ui) = app_weak.upgrade() {
                         ui.invoke_open_transcription_window();
@@ -2416,6 +2421,54 @@ fn submit_post_processing(
     });
 }
 
+/// 文字起こしのあと議事録まで続けるか（#165）。
+///
+/// **真偽値で渡さない**——呼び出し側が 2 つあり、`true` / `false` だけだと、どちらが「続ける」
+/// なのかが呼び出し行から読めない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChainNotes {
+    /// 押されたら必ず続ける（Notes タブの「Transcribe, then write notes」）。
+    Always,
+    /// 設定 `auto_summarize` に従う（Transcript タブの Transcribe / Re-transcribe）。
+    ///
+    /// 手動の再実行でも設定 ON なら要約を作り直す——作り直さないと `summary.md` が古い
+    /// 文字起こしのまま残り、内容が食い違う。
+    FollowTheSetting,
+}
+
+/// 選択中セッションの文字起こしを（再）実行する。
+///
+/// **2 つのボタンで同じ関数を通す**（#165）。違うのは議事録まで続けるかどうかだけで、別々に
+/// 組むと片方だけ設定のスナップショットや音源の選び方を落とす。設定値はここでスナップショット
+/// し、処理中の設定変更の影響を受けない。
+///
+/// 音源が 1 つも無いセッションには投げない（`run_job` も空を弾くが、状態を「文字起こし中」に
+/// してから何もしないのを避ける）。
+fn submit_transcription(
+    session: &recordings::RecordingSession,
+    config: &RefCell<Config>,
+    transcriber: &transcribe::TranscribeWorker,
+    chain: ChainNotes,
+) {
+    let audio_paths = session.audio_source_paths();
+    if audio_paths.is_empty() {
+        return;
+    }
+    let config_ref = config.borrow();
+    let summarize = match chain {
+        ChainNotes::Always => Some(chained_summarize_job(&config_ref, &session.dir)),
+        ChainNotes::FollowTheSetting => auto_summarize_job(&config_ref, &session.dir),
+    };
+    transcriber.submit(transcribe::TranscribeJob {
+        session_dir: session.dir.clone(),
+        audio_paths,
+        model_id: config_ref.whisper_model.clone(),
+        model_override: config_ref.whisper_model_path.clone(),
+        language: config_ref.transcribe_language.clone(),
+        summarize,
+    });
+}
+
 /// 手動（Recordings ウィンドウの Summarize）の議事録生成の依頼を組み立てる。設定値
 /// （モデル・言語）は**ここでスナップショット**し、処理中の設定変更の影響を受けない。
 /// エンジンはいまオンデバイスのみ。
@@ -2446,10 +2499,25 @@ fn auto_summarize_job(
     config: &Config,
     session_dir: &std::path::Path,
 ) -> Option<summarize::SummarizeJob> {
-    config.auto_summarize.then(|| summarize::SummarizeJob {
+    config
+        .auto_summarize
+        .then(|| chained_summarize_job(config, session_dir))
+}
+
+/// 文字起こしジョブへぶら下げる議事録生成の依頼（設定は見ない）。
+///
+/// **`existing_is_stale` を立てるのはここ 1 箇所**。この経路では既存の `summary.md` は
+/// **前の文字起こし**の議事録なので、新しい文字起こしができた時点で古い。設定 ON の自動投入
+/// （`auto_summarize_job`）と、Notes タブの「Transcribe, then write notes」（#165）が同じ
+/// ものを使う——別々に組むと、片方だけ `existing_is_stale` を落とす事故が起きる。
+fn chained_summarize_job(
+    config: &Config,
+    session_dir: &std::path::Path,
+) -> summarize::SummarizeJob {
+    summarize::SummarizeJob {
         existing_is_stale: true,
         ..manual_summarize_job(config, session_dir)
-    })
+    }
 }
 
 /// 録音セッションを開始する。手動トグルと自動開始（登録アプリのマイク使用検知）で共用する。
@@ -2769,7 +2837,7 @@ fn refresh_detail_panes(
         (config.auto_transcribe, config.auto_summarize)
     };
     let transcript = transcript_pane(transcriber, session, auto_transcribe);
-    let summary = summary_pane(summarizer, session, auto_summarize);
+    let summary = summary_pane(summarizer, session, &transcript, auto_summarize);
     // **両方を見てからボタンを決める**。走っているジョブは片方の状態にしか出ないので、
     // タブごとに判断すると、もう一方で走っているジョブを見落としたボタンが出る。
     let jobs_pending = jobs_pending(&transcript, &summary);
@@ -2882,21 +2950,38 @@ fn apply_detail_summary_status(rec: &RecordingsWindow, pane: &SummaryPane, jobs_
 fn summary_pane(
     summarizer: &summarize::SummarizeWorker,
     session: &recordings::RecordingSession,
+    transcript: &TranscriptPane,
     auto_on: bool,
 ) -> SummaryPane {
     summary_pane_of(
         summarizer.state_of(&session.dir),
         session.has_summary,
-        session.has_transcript,
+        transcript_input(transcript, session.has_transcript),
         auto_on,
     )
+}
+
+/// 議事録タブから見た入力（文字起こし）の様子（#165）。
+///
+/// **読める文字起こしが在れば `Ready`**——作り直している最中でも、入力としては在る
+/// （そのとき議事録を押せるかどうかは Slint 側のゲートが決める）。無いときだけ、なぜ無いのかで
+/// 言い分ける。
+fn transcript_input(transcript: &TranscriptPane, has_transcript: bool) -> TranscriptInput {
+    if has_transcript {
+        return TranscriptInput::Ready;
+    }
+    match transcript.status() {
+        TranscriptStatus::Transcribing | TranscriptStatus::Stopping => TranscriptInput::Running,
+        TranscriptStatus::Failed => TranscriptInput::Failed,
+        TranscriptStatus::NotTranscribed | TranscriptStatus::Done => TranscriptInput::Missing,
+    }
 }
 
 /// どの状態に落とすかを決める純関数（`transcript_pane_of` と対称。理由もあちらと同じ）。
 fn summary_pane_of(
     state: Option<summarize::SummarizeState>,
     has_summary: bool,
-    has_transcript: bool,
+    input: TranscriptInput,
     auto_on: bool,
 ) -> SummaryPane {
     match state {
@@ -2914,9 +2999,14 @@ fn summary_pane_of(
         Some(summarize::SummarizeState::Failed { reason }) => SummaryPane::Failed { reason },
         None if has_summary => SummaryPane::Done,
         // 文字起こしが無いと議事録は動かせない。**「まだ書いていない」ではなく「まだ書けない」**
-        // と言い分けるのは、押しても何も起きないボタンを出さないため。
-        None if !has_transcript => SummaryPane::Blocked,
-        None => SummaryPane::NotSummarized { auto_on },
+        // と言い分けるのは、押しても何も起きないボタンを出さないため。無いときは、なぜ無いのか
+        // で 3 つに割れる（#165。待っている／失敗した／まだ何もしていない）。
+        None => match input {
+            TranscriptInput::Ready => SummaryPane::NotSummarized { auto_on },
+            TranscriptInput::Running => SummaryPane::WaitingForTranscript,
+            TranscriptInput::Failed => SummaryPane::TranscriptFailed,
+            TranscriptInput::Missing => SummaryPane::Blocked,
+        },
     }
 }
 
@@ -3231,8 +3321,8 @@ mod tests {
         came_off_the_worker, jobs_pending, model_downloads_on_select, model_status_line,
         playback_progress, search_summary_text, seek_position_from_ratio, session_matches,
         summary_display_status, summary_model_status_line, summary_pane_of, summary_rows,
-        summary_status_text, transcript_display_status, transcript_pane_of, transcript_status_text,
-        whisper_model_status_line,
+        summary_status_text, transcript_display_status, transcript_input, transcript_pane_of,
+        transcript_status_text, whisper_model_status_line,
     };
     use super::{elapsed_text, recordings, summarize, transcribe};
     use chrono::{Datelike as _, Timelike as _};
@@ -3945,29 +4035,101 @@ mod tests {
         );
     }
 
-    /// 議事録側の選び方。**`Blocked` に落ちる条件はここでしか決まらない**。
+    /// 議事録側の選び方。**入力（文字起こし）の様子で 3 つに割れる条件はここでしか決まらない**。
     #[test]
-    fn summary_pane_of_blocks_only_when_there_is_no_transcript() {
+    fn summary_pane_of_reads_the_state_of_its_input() {
+        use crate::reading_pane::TranscriptInput as I;
+
         let queued = Some(summarize::SummarizeState::Queued { position: 2 });
 
         // ワーカーの状態があれば、`summary.md` の有無より優先する。
         assert_eq!(
-            summary_pane_of(queued, true, true, false),
+            summary_pane_of(queued, true, I::Ready, false),
             SummaryPane::Queued { position: 2 }
         );
 
         // 文字起こしが無ければ「まだ書けない」。ただし**既にある議事録は読ませる**ので、
         // 有無の判定はそちらが先。
         assert_eq!(
-            summary_pane_of(None, false, false, false),
+            summary_pane_of(None, false, I::Missing, false),
             SummaryPane::Blocked
         );
-        assert_eq!(summary_pane_of(None, true, false, false), SummaryPane::Done);
+        assert_eq!(
+            summary_pane_of(None, true, I::Missing, false),
+            SummaryPane::Done
+        );
         // 文字起こしがあれば「まだ書いていない」。自動の状態が pane まで届く。
         assert_eq!(
-            summary_pane_of(None, false, true, true),
+            summary_pane_of(None, false, I::Ready, true),
             SummaryPane::NotSummarized { auto_on: true }
         );
+        // 続けて書く依頼の待ち時間（#165）。**「まだ書けない」とは言い分ける**——待っていれば
+        // 始まるので、押す手を出さない。
+        assert_eq!(
+            summary_pane_of(None, false, I::Running, false),
+            SummaryPane::WaitingForTranscript
+        );
+        assert!(
+            SummaryPane::WaitingForTranscript
+                .message()
+                .actions
+                .is_empty()
+        );
+        // 入力が失敗したら議事録は始まらない。そう言って、やり直す手を出す。
+        assert_eq!(
+            summary_pane_of(None, false, I::Failed, false),
+            SummaryPane::TranscriptFailed
+        );
+        assert_eq!(
+            SummaryPane::TranscriptFailed
+                .message()
+                .actions
+                .iter()
+                .map(|action| action.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                PaneActionKind::TranscribeThenNotes,
+                PaneActionKind::OpenTranscription,
+            ]
+        );
+    }
+
+    /// 入力の様子は、**読める文字起こしが在るかどうかが先**（#165）。作り直している最中でも
+    /// 入力としては在るので、Notes タブが「待っている」に落ちない。
+    #[test]
+    fn transcript_input_prefers_what_is_readable_now() {
+        use crate::reading_pane::TranscriptInput as I;
+
+        let running = TranscriptPane::Transcribing {
+            model: "Medium".to_owned(),
+            percent: None,
+        };
+        assert_eq!(transcript_input(&running, true), I::Ready);
+        assert_eq!(transcript_input(&running, false), I::Running);
+        assert_eq!(
+            transcript_input(
+                &TranscriptPane::Stopping {
+                    model: "Medium".to_owned()
+                },
+                false
+            ),
+            I::Running
+        );
+        assert_eq!(
+            transcript_input(
+                &TranscriptPane::Failed {
+                    reason: TranscribeFailure::Panicked
+                },
+                false
+            ),
+            I::Failed
+        );
+        assert_eq!(
+            transcript_input(&TranscriptPane::NotTranscribed { auto_on: false }, false),
+            I::Missing
+        );
+        // JSON が読めなかった `Done`。中身が無いので入力にはならない。
+        assert_eq!(transcript_input(&TranscriptPane::Done, false), I::Missing);
     }
 
     /// 走っているジョブがある間は、中身を作り直す操作を出さない（取り消しと窓は残す）。
@@ -4136,6 +4298,8 @@ mod tests {
             SummaryPane::Failed {
                 reason: SummarizeFailure::ModelRun,
             },
+            SummaryPane::WaitingForTranscript,
+            SummaryPane::TranscriptFailed,
         ];
         for pane in &panes {
             let message = pane.message();
@@ -4148,7 +4312,8 @@ mod tests {
         }
 
         // **入力待ちは「書けない理由」を言う**。ここを「まだ書いていない」と同じ文にすると、
-        // なぜ押せないのかが画面から分からなくなる。
+        // なぜ押せないのかが画面から分からなくなる。主操作は**議事録まで続ける**もの（#165）
+        // ——ここまで来た人が欲しいのは議事録で、文字起こしはその途中でしかない。
         let blocked = SummaryPane::Blocked.message();
         assert!(blocked.body.contains("transcript"));
         assert_eq!(
@@ -4158,10 +4323,11 @@ mod tests {
                 .map(|action| action.kind)
                 .collect::<Vec<_>>(),
             vec![
-                PaneActionKind::Transcribe,
+                PaneActionKind::TranscribeThenNotes,
                 PaneActionKind::OpenTranscription
             ]
         );
+        assert_eq!(blocked.actions[0].label, "Transcribe, then write notes");
 
         // キュー待ちは順番まで出し、取り消しを添える。
         assert_eq!(

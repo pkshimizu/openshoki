@@ -17,6 +17,9 @@
 //! - `transcript-partial`: 途中まで読めて失敗した状態（#164）。**件数と組み合わせる**——
 //!   セグメントが在っても `Show partial` を押すまで空表示が出るところを見る
 //! - `show-partial`: その途中結果を開いた状態（一覧に切り替わるところを見る）
+//! - `waiting-for-transcript`: Notes タブを「続けて書く依頼の入力待ち」にする（#165。
+//!   `no-transcript` と組み合わせる）。`transcript-failed` を `no-transcript` と組み合わせると、
+//!   Notes タブは「入力が失敗したので始まらなかった」になる
 //! - `auto-on`: 未実施の理由を「自動は ON だがまだ回っていない」にする（両タブ）
 //! - `no-follow`: 再生位置の追従を OFF にした状態（プレイヤー帯のスイッチの確認）
 //! - `far`: 再生位置を一覧の末尾寄りに置く（追従でその行が見えているかの確認。`no-follow`
@@ -131,6 +134,13 @@ fn transcript_pane(has_transcript: bool) -> reading_pane::TranscriptPane {
 /// Notes タブに出す状態（同上）。
 fn summary_pane(status: SummaryStatus, has_transcript: bool) -> reading_pane::SummaryPane {
     if !has_transcript {
+        // 入力（文字起こし）が無いときは、なぜ無いのかで 3 つに割れる（#165）。
+        if flag("waiting-for-transcript") {
+            return reading_pane::SummaryPane::WaitingForTranscript;
+        }
+        if flag("transcript-failed") {
+            return reading_pane::SummaryPane::TranscriptFailed;
+        }
         return reading_pane::SummaryPane::Blocked;
     }
     match status {
