@@ -417,6 +417,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             refresh_detail_panes(&rec, &transcriber, &summarizer, session, &config);
             rec.set_playing(false);
             rec.set_current_segment(-1);
+            // 途中結果を開いた状態は持ち越さない（理由は `fold_partial_transcript` の doc）。
+            fold_partial_transcript(&rec);
             // **前の録音の中身を残さない**。読み込みが終わるまで空にし、読み込み中であることを
             // 出す（前の文字起こしが表示されたままだと、別の録音の内容を読んでしまう）。
             rec.set_segments(Rc::new(slint::VecModel::default()).into());
@@ -777,6 +779,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ui.invoke_open_minutes_window();
                     }
                 }
+                // 途中結果を開く（#164）。ディスクには何も起こさず、伏せてある一覧を出すだけ
+                // （畳む契機は `fold_partial_transcript` の doc）。
+                PaneActionKind::ShowPartialTranscript => rec.set_show_partial_transcript(true),
             }
         });
     }
@@ -2035,6 +2040,8 @@ fn clear_recordings_selection(
     rec.set_has_transcript(false);
     rec.set_segments(Rc::new(slint::VecModel::<TranscriptRow>::default()).into());
     rec.set_current_segment(-1);
+    // 開いた途中結果も畳む（理由は `fold_partial_transcript` の doc）。
+    fold_partial_transcript(rec);
     transcript_segments.borrow_mut().clear();
     rec.set_summary_rows(Rc::new(slint::VecModel::<SummaryRow>::default()).into());
     // 状態も未実施へ畳む（次の選択で必ず上書きされるが、`detail-files-in-use` /
@@ -2653,6 +2660,30 @@ fn apply_detail_transcript_status(
         |actions| rec.set_detail_transcript_actions(actions),
     );
     rec.set_detail_transcript_status(status);
+    // 途中結果かどうかは状態 enum から出せない（#164。`TranscriptPane::shows_partial` の doc）
+    // ので、見出し・理由・操作と**同じ値から**入れる。
+    rec.set_detail_transcript_partial(pane.shows_partial());
+    // 走り始めたら畳む（理由は `fold_partial_transcript` の doc）。**投入の経路が増えても
+    // ここを通る**——表示はすべてこの関数から入る（`docs/rules/slint.md` の「導出は 1 つの
+    // 関数に集める」）。
+    if matches!(
+        status,
+        TranscriptStatus::Transcribing | TranscriptStatus::Stopping
+    ) {
+        fold_partial_transcript(rec);
+    }
+}
+
+/// 開いた途中結果を畳む（#164）。**理由の正はここ**（呼び出し側は参照だけを置く）。
+///
+/// `Show partial` は「いま出ているこの途中結果を読む」という同意なので、対象が変わったら
+/// 引き継がない。引き継ぐと、別の録音の途中結果や、Try again で作り直された**別の**途中結果が
+/// 伏せられずにいきなり一覧で出る。
+///
+/// 畳むのは、対象が変わりうるすべての契機——録音を選び直したとき・選択を解除したとき・
+/// 文字起こしが走り始めたとき。**列挙を増やすときはここへ**（呼び出し側に条件を書かない）。
+fn fold_partial_transcript(rec: &RecordingsWindow) {
+    rec.set_show_partial_transcript(false);
 }
 
 /// 空表示のボタン列を**変わったときだけ**差し替える（0〜2 件）。
@@ -3191,7 +3222,8 @@ pub(crate) fn init_test_backend() {
 #[cfg(test)]
 mod tests {
     use super::reading_pane::{
-        SummarizeFailure, TranscribeFailure, summarize_failure_text, transcribe_failure_text,
+        FailedSource, SummarizeFailure, TranscribeFailure, summarize_failure_text,
+        transcribe_failure_text,
     };
     use super::{
         PaneAction, PaneActionKind, StatusTone, SummaryPane, SummaryStatus, TranscriptPane,
@@ -3207,6 +3239,67 @@ mod tests {
 
     use crate::transcribe::TranscribeStatus;
     use std::time::Duration;
+
+    /// 時計表記は `mm:ss`、1 時間以上だけ `h:mm:ss`（#164 で `tray` から
+    /// `reading_pane::format_elapsed` へ寄せた。実装と同じ場所で押さえる）。
+    #[test]
+    fn elapsed_is_shown_as_a_clock() {
+        use super::reading_pane::format_elapsed;
+
+        assert_eq!(format_elapsed(Duration::from_secs(0)), "00:00");
+        assert_eq!(format_elapsed(Duration::from_secs(65)), "01:05");
+        assert_eq!(format_elapsed(Duration::from_secs(599)), "09:59");
+        // 1 時間未満の上限。ここまでは時を出さず mm:ss のまま（分は 60 以上になりうる）。
+        assert_eq!(format_elapsed(Duration::from_secs(3599)), "59:59");
+        // 分は 2 桁ゼロ詰め、時は詰めない。
+        assert_eq!(format_elapsed(Duration::from_secs(3600)), "1:00:00");
+        assert_eq!(format_elapsed(Duration::from_secs(3661)), "1:01:01");
+    }
+
+    /// 途中結果かどうかが、状態と**同じ値から**ウィンドウへ届くこと（#164）。
+    ///
+    /// 決めるのは Rust（`TranscriptPane::shows_partial`）、伏せるのは Slint
+    /// （`detail-transcript-held-back`）で、どちらも単体では検査済み。**繋いでいるのはこの
+    /// setter だけ**なので、ここが抜けると両側が緑のまま途中結果が完成品として出る
+    /// （`docs/rules/testing.md` の「配線は、繋いでいる関数に継ぎ目を入れてテストする」）。
+    #[test]
+    fn the_pane_tells_the_window_whether_what_is_readable_is_partial() {
+        super::init_test_backend();
+        let rec = super::RecordingsWindow::new().expect("create the recordings window");
+
+        let partial = TranscriptPane::Failed {
+            reason: TranscribeFailure::Files {
+                failed: vec![FailedSource::new("mic.mp3", Some(Duration::from_secs(252)))],
+                kept_other_sources: false,
+            },
+        };
+        super::apply_detail_transcript_status(&rec, &partial, false);
+        assert!(rec.get_detail_transcript_partial());
+
+        // 前回の完成した文字起こしが残っているだけの失敗では伏せない。
+        let nothing_kept = TranscriptPane::Failed {
+            reason: TranscribeFailure::ModelLoad,
+        };
+        super::apply_detail_transcript_status(&rec, &nothing_kept, false);
+        assert!(!rec.get_detail_transcript_partial());
+
+        // 走り終わった文字起こしも同じ（伏せる理由が無い）。
+        super::apply_detail_transcript_status(&rec, &TranscriptPane::Done, false);
+        assert!(!rec.get_detail_transcript_partial());
+
+        // 走り始めたら、開いた途中結果は畳む（理由は `fold_partial_transcript` の doc）。
+        super::apply_detail_transcript_status(&rec, &partial, false);
+        rec.set_show_partial_transcript(true);
+        super::apply_detail_transcript_status(
+            &rec,
+            &TranscriptPane::Transcribing {
+                model: "Medium".to_owned(),
+                percent: None,
+            },
+            true,
+        );
+        assert!(!rec.get_show_partial_transcript());
+    }
 
     /// 中身を読み直しただけのときは**再生を差し替えない**。
     ///
@@ -3555,26 +3648,79 @@ mod tests {
             .body
             .contains("Large v3")
         );
-        // 失敗は種別から文を組む。**件数で形を変えない**ので、1 本でも複数でも同じ形。
+        // 失敗は種別から文を組む。**件数で形を変えない**ので、1 本でも複数でも音源ごとに
+        // 1 文ずつ並ぶ。何も残っていないので、途中結果の 1 文もボタンも出ない。
+        let nothing_kept = TranscriptPane::Failed {
+            reason: TranscribeFailure::Files {
+                failed: vec![FailedSource::new("mic.mp3", None)],
+                kept_other_sources: false,
+            },
+        };
         assert_eq!(
-            TranscriptPane::Failed {
-                reason: TranscribeFailure::Files(vec!["mic.mp3".to_owned()]),
-            }
-            .message()
-            .body,
+            nothing_kept.message().body,
             "mic.mp3 could not be transcribed."
         );
+        assert!(!nothing_kept.shows_partial());
+        assert!(
+            !nothing_kept
+                .message()
+                .actions
+                .iter()
+                .any(|action| action.kind == PaneActionKind::ShowPartialTranscript),
+            "a button that would reveal nothing is not offered"
+        );
         assert_eq!(
             TranscriptPane::Failed {
-                reason: TranscribeFailure::Files(vec![
-                    "mic.mp3".to_owned(),
-                    "system.mp3".to_owned(),
-                ]),
+                reason: TranscribeFailure::Files {
+                    failed: vec![
+                        FailedSource::new("mic.mp3", None),
+                        FailedSource::new("system.mp3", None),
+                    ],
+                    kept_other_sources: false,
+                },
             }
             .message()
             .body,
-            "mic.mp3, system.mp3 could not be transcribed."
+            "mic.mp3 could not be transcribed. system.mp3 could not be transcribed."
         );
+        // 途中まで読めた音源は、**どこまで読めたか**を言う（#164）。
+        let cut_short = TranscriptPane::Failed {
+            reason: TranscribeFailure::Files {
+                failed: vec![FailedSource::new("mic.mp3", Some(Duration::from_secs(252)))],
+                kept_other_sources: false,
+            },
+        };
+        assert_eq!(
+            cut_short.message().body,
+            "mic.mp3 could not be read past 04:12. Everything that was read is kept."
+        );
+        // もう 1 本が最後まで行っていれば、失敗した音源から何も残らなくても読める。
+        let other_source_kept = TranscriptPane::Failed {
+            reason: TranscribeFailure::Files {
+                failed: vec![FailedSource::new("system.mp3", None)],
+                kept_other_sources: true,
+            },
+        };
+        assert_eq!(
+            other_source_kept.message().body,
+            "system.mp3 could not be transcribed. Everything that was read is kept."
+        );
+        // 残っていれば、開く手を出す（#164）。**主操作はやり直しのまま**——読めるのが途中まで
+        // だと分かった人が次にしたいのは、たいてい取り直しではなく再実行。
+        for pane in [&cut_short, &other_source_kept] {
+            assert!(pane.shows_partial());
+            assert_eq!(
+                pane.message()
+                    .actions
+                    .iter()
+                    .map(|action| (action.kind, action.primary))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (PaneActionKind::Transcribe, true),
+                    (PaneActionKind::ShowPartialTranscript, false),
+                ]
+            );
+        }
         // **なぜ止まったか分からない**ときは、分かったふりをしない。
         assert_eq!(
             TranscriptPane::Failed {
@@ -3669,13 +3815,41 @@ mod tests {
             ),
             (T::ModelLoad, "The transcription model could not be loaded."),
             (
-                T::Files(vec!["mic.mp3".to_owned()]),
+                T::Files {
+                    failed: vec![FailedSource::new("mic.mp3", None)],
+                    kept_other_sources: false,
+                },
                 "mic.mp3 could not be transcribed.",
             ),
             (
-                // **件数で文の形は変えない**（`docs/rules/messages.md`）。
-                T::Files(vec!["mic.mp3".to_owned(), "system.mp3".to_owned()]),
-                "mic.mp3, system.mp3 could not be transcribed.",
+                // **件数で文の形は変えない**（`docs/rules/messages.md`）ので、音源ごとに 1 文。
+                T::Files {
+                    failed: vec![
+                        FailedSource::new("mic.mp3", None),
+                        FailedSource::new("system.mp3", None),
+                    ],
+                    kept_other_sources: false,
+                },
+                "mic.mp3 could not be transcribed. system.mp3 could not be transcribed.",
+            ),
+            (
+                // 途中まで読めた音源は、どこまで読めたかと、残っていることを言う（#164）。
+                T::Files {
+                    failed: vec![FailedSource::new(
+                        "mic.mp3",
+                        Some(Duration::from_secs(3852)),
+                    )],
+                    kept_other_sources: false,
+                },
+                "mic.mp3 could not be read past 1:04:12. Everything that was read is kept.",
+            ),
+            (
+                // 失敗した音源から何も残らなくても、もう 1 本が最後まで行っていれば読める。
+                T::Files {
+                    failed: vec![FailedSource::new("system.mp3", None)],
+                    kept_other_sources: true,
+                },
+                "system.mp3 could not be transcribed. Everything that was read is kept.",
             ),
             (
                 T::Panicked,
@@ -3727,13 +3901,19 @@ mod tests {
         assert_eq!(
             transcript_pane_of(
                 Some(transcribe::TranscribeState::Failed {
-                    reason: TranscribeFailure::Files(vec!["mic.mp3".to_owned()]),
+                    reason: TranscribeFailure::Files {
+                        failed: vec![FailedSource::new("mic.mp3", None)],
+                        kept_other_sources: false,
+                    },
                 }),
                 true,
                 false,
             ),
             TranscriptPane::Failed {
-                reason: TranscribeFailure::Files(vec!["mic.mp3".to_owned()]),
+                reason: TranscribeFailure::Files {
+                    failed: vec![FailedSource::new("mic.mp3", None)],
+                    kept_other_sources: false,
+                },
             }
         );
 

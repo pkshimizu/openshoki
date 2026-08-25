@@ -161,23 +161,13 @@ fn recording_color(level: f32) -> [u8; 3] {
     ]
 }
 
-/// 経過時間を表示用文字列にする。既定は `mm:ss`、1 時間以上は `h:mm:ss`。
-/// 録音中のメニューバー表示と Recordings の再生時間表示で共用する。
-pub fn format_elapsed(elapsed: Duration) -> String {
-    const SECS_PER_MINUTE: u64 = 60;
-    const SECS_PER_HOUR: u64 = 60 * SECS_PER_MINUTE;
-
-    let total = elapsed.as_secs();
-    let hours = total / SECS_PER_HOUR;
-    let minutes = (total % SECS_PER_HOUR) / SECS_PER_MINUTE;
-    let seconds = total % SECS_PER_MINUTE;
-
-    if hours > 0 {
-        format!("{hours}:{minutes:02}:{seconds:02}")
-    } else {
-        format!("{minutes:02}:{seconds:02}")
-    }
-}
+/// 経過時間を表示用文字列にする（`mm:ss` / 1 時間以上は `h:mm:ss`）。録音中のメニューバー
+/// 表示と Recordings の再生時間表示で共用する。
+///
+/// **実装は `crate::reading_pane::format_elapsed`**。読む領域も同じ表記を使うので（#164 の
+/// 「どこまで読めたか」）、あちらへ寄せてある——理由はそちらの doc。ここは呼び名を変えない
+/// ための再エクスポート。
+pub use crate::reading_pane::format_elapsed;
 
 /// 録音項目を待機中（押すと開始）の表示にする。テキストとアイコンを対で切り替え、
 /// 表示状態とラベル/アイコンの対応を 1 箇所で保証する（`docs/rules/coding-conventions.md`）。
@@ -331,9 +321,8 @@ fn decode_rgba_png(png_bytes: &[u8], what: &str) -> Option<RgbaImage> {
 mod tests {
     use super::{
         QUIT_ICON_PNG, RECORD_ICON_PNG, SETTINGS_ICON_PNG, STOP_ICON_PNG, TRAY_ICON_PNG,
-        decode_rgba_png, format_elapsed, load_menu_icon, recording_color, tinted_glyph,
+        decode_rgba_png, load_menu_icon, recording_color, tinted_glyph,
     };
-    use std::time::Duration;
 
     #[test]
     fn load_menu_icon_decodes_embedded_assets() {
@@ -471,21 +460,5 @@ mod tests {
         // 範囲外はクランプされる（色だけで表すのでアルファは持たない）。
         assert_eq!(recording_color(-1.0), [0x6a, 0x14, 0x10]);
         assert_eq!(recording_color(2.0), [0xD0, 0x21, 0x1c]);
-    }
-
-    #[test]
-    fn format_elapsed_under_hour_is_mm_ss() {
-        assert_eq!(format_elapsed(Duration::from_secs(0)), "00:00");
-        assert_eq!(format_elapsed(Duration::from_secs(65)), "01:05");
-        assert_eq!(format_elapsed(Duration::from_secs(599)), "09:59");
-        // 1 時間未満の上限。ここまでは時を出さず mm:ss のまま（分は 60 以上になりうる）。
-        assert_eq!(format_elapsed(Duration::from_secs(3599)), "59:59");
-    }
-
-    #[test]
-    fn format_elapsed_over_hour_includes_hours() {
-        assert_eq!(format_elapsed(Duration::from_secs(3661)), "1:01:01");
-        // 分は 2 桁ゼロ詰め、時は詰めない。
-        assert_eq!(format_elapsed(Duration::from_secs(3600)), "1:00:00");
     }
 }

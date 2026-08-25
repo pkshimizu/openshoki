@@ -9,6 +9,8 @@
 //! （`TranscriptStatus` / `SummaryStatus` / `PaneAction` / `PaneActionKind`）と std だけ。
 //! 失敗の種別（`TranscribeFailure` / `SummarizeFailure`）をここに置いているのもそのため——
 //! 種別は「読む領域が説明できることの語彙」で、文言表の網羅 match のすぐ隣にある。
+//! 時計表記（`format_elapsed`）も同じ理由でここに住んでいる。読む領域だけのものではないが、
+//! **依存を持てないこのモジュールが、実装を 1 つに保てる唯一の置き場所**だった（#164）。
 
 use std::time::Duration;
 
@@ -31,14 +33,75 @@ pub enum TranscribeFailure {
     ModelUnreadable,
     /// モデルは在るが読み込めなかった。
     ModelLoad,
-    /// 音源の文字起こしに失敗した。**ファイル名だけ**を持つ（パスは持たない。
-    /// `docs/rules/security.md`）。名前を作るのは `audio_display_name` だけで、そこが保証する。
+    /// 音源の文字起こしが最後まで行かなかった。
     ///
-    /// **空にならない**——構築するのは `run_job` の 1 箇所で、1 本以上失敗したときにしか作らない
-    /// （空だと文言が ` could not be transcribed.` になる）。
-    Files(Vec<String>),
+    /// **`failed` は空にならない**——構築するのは `run_job` の 1 箇所で、1 本以上が最後まで
+    /// 行かなかったときにしか作らない（空だと、理由が 1 文も出ないまま
+    /// `kept_other_sources` の 1 文だけが残る）。
+    Files {
+        /// 最後まで行かなかった音源。
+        failed: Vec<FailedSource>,
+        /// 同じ実行で、**読める文字起こしを残した音源が他にあるか**。失敗した音源から
+        /// 何も残らなくても、こちらが残っていれば読める（`kept_partial`）。
+        ///
+        /// **件数では持たない**——0 か否かしか意味を持たないので、数で持つと「何本？」を
+        /// 表示できる値だと誤解させる。
+        kept_other_sources: bool,
+    },
     /// ワーカーがパニックした（**なぜかは分からない**）。
     Panicked,
+}
+
+/// 最後まで文字起こしできなかった音源 1 本（#164）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailedSource {
+    /// 音源の**ファイル名だけ**（パスは持たない。`docs/rules/security.md`）。名前を作るのは
+    /// `transcribe::audio_display_name` だけで、そこが保証する。
+    pub name: String,
+    /// 読めた範囲を保存できたなら、その終わり（#164）。**この音源から読めるものが残らな
+    /// かったときは `None`**——1 サンプルも読めなかった・推論や保存で落ちた・残す価値が
+    /// なくて保存しなかった（`transcribe::partial_is_worth_keeping`）のいずれでも `None`
+    /// になる。理由は分けず、「残っていない」だけを表す。
+    pub kept_upto: Option<Duration>,
+}
+
+impl FailedSource {
+    /// 音源 1 本ぶんの記録を組む。**確認用バイナリとテストも同じものを使う**（それぞれで
+    /// 組み立てを書くと、フィールドを足した日に片方だけ古くなる）。
+    pub fn new(name: impl Into<String>, kept_upto: Option<Duration>) -> Self {
+        Self {
+            name: name.into(),
+            kept_upto,
+        }
+    }
+}
+
+impl TranscribeFailure {
+    /// この失敗が、読める文字起こしを残したか（#164）。読む領域はこれで `Show partial` を
+    /// 出すかどうかを決める。**この判断の理由の正はここ**（他は参照だけを置く）。
+    ///
+    /// **この実行が書いたものだけを数える**。前回の完成した文字起こしがディスクに残っている
+    /// だけのとき（モデルのロードに失敗した再実行など）に「途中結果」と言うと、完成品を
+    /// 途中結果として隠すことになる。
+    ///
+    /// **残っている＝読む行がある**。保存したのに 1 件も認識できていなければ、開いても何も
+    /// 出ない（そういう音源は保存しない。`transcribe::partial_is_worth_keeping`）。
+    ///
+    /// **ワイルドカードを置かない**（種別を足したら扱いを書くまで通らない）。
+    pub fn kept_partial(&self) -> bool {
+        match self {
+            // モデルを用意できていないので、1 本も処理していない。
+            Self::ModelDownload | Self::ModelMissing | Self::ModelUnreadable | Self::ModelLoad => {
+                false
+            }
+            Self::Files {
+                failed,
+                kept_other_sources,
+            } => *kept_other_sources || failed.iter().any(|source| source.kept_upto.is_some()),
+            // どこで落ちたか分からないので、残っていると言い切らない。
+            Self::Panicked => false,
+        }
+    }
 }
 
 /// 議事録の生成が失敗した理由（#159。文言は下の `summarize_failure_text` が正）。
@@ -156,6 +219,25 @@ impl TranscriptPane {
         }
     }
 
+    /// いま読めるものが**途中結果**か（#164）。読む領域は、これが立っている間だけ一覧を
+    /// 伏せて失敗の理由を先に出し、`Show partial` で開かせる。
+    ///
+    /// 何を「残した」と数えるかは `TranscribeFailure::kept_partial` が正（理由もそちら）。
+    ///
+    /// **走っている間は立たない**。開いた状態を畳むのは `main::fold_partial_transcript`
+    /// （理由もそちら）。
+    ///
+    /// **ワイルドカードを置かない**（状態を足したら扱いを書くまで通らない）。
+    pub fn shows_partial(&self) -> bool {
+        match self {
+            Self::Failed { reason } => reason.kept_partial(),
+            Self::NotTranscribed { .. }
+            | Self::Transcribing { .. }
+            | Self::Stopping { .. }
+            | Self::Done => false,
+        }
+    }
+
     /// 状態 → 読む領域の見出し・理由・次の操作。**ワイルドカードを置かない**（状態を足したら
     /// ここが割れて気づく。`docs/rules/slint.md`）。
     pub fn message(&self) -> PaneMessage {
@@ -185,7 +267,9 @@ impl TranscriptPane {
             // **主操作にはしない**——押しに来る人より、進み具合を見に来る人のほうが多い。
             .with_secondary("Stop", PaneActionKind::StopTranscription),
             // **言えることだけを言う**。「何も保存されない」は嘘（音源は 1 本ずつ保存されるので、
-            // mic を終えて system の途中で止めれば `mic.json` は残る。途中結果の扱いは #164）。
+            // mic を終えて system の途中で止めれば `mic.json` は残る。ただし止めたジョブは
+            // 失敗にしないので、#164 の途中結果としては出ない——記録ごと消えて、表示は
+            // JSON の有無ベースへ戻る）。
             // 「いま仕上げている最中」も嘘になりうる——モデルの取得や推論スロットの待ちで
             // 止めた場合、まだ何も処理していない（そこは待つだけで、降りるのは待ちが明けた
             // とき。`TranscribeState::Stopping` の doc）。
@@ -200,8 +284,16 @@ impl TranscriptPane {
             )
             .with_primary("Transcribe again", PaneActionKind::Transcribe),
             Self::Failed { reason } => {
-                PaneMessage::new("Transcription failed", transcribe_failure_text(reason))
-                    .with_primary("Try again", PaneActionKind::Transcribe)
+                let message =
+                    PaneMessage::new("Transcription failed", transcribe_failure_text(reason))
+                        .with_primary("Try again", PaneActionKind::Transcribe);
+                // 残っているときだけ開く手を出す（#164）。残っていないのに出すと、押しても
+                // 何も現れないボタンになる。
+                if reason.kept_partial() {
+                    message.with_secondary("Show partial", PaneActionKind::ShowPartialTranscript)
+                } else {
+                    message
+                }
             }
         }
     }
@@ -232,9 +324,11 @@ pub fn actions_allowed_while_busy(actions: Vec<PaneAction>, jobs_pending: bool) 
         .filter(|action| match action.kind {
             PaneActionKind::Transcribe | PaneActionKind::WriteNotes => false,
             // 止める操作は**走っている間しか出ない**ので、ここで落とすと出す先が無くなる
-            // （`docs/rules/slint.md`。取り消しと窓を開くのは残すのと同じ理由）。
+            // （`docs/rules/slint.md`。取り消しと窓を開くのは残すのと同じ理由）。途中結果を
+            // 開く操作は、すでにディスクに在るものを見せるだけなので重ねようがない。
             PaneActionKind::StopTranscription
             | PaneActionKind::CancelNotes
+            | PaneActionKind::ShowPartialTranscript
             | PaneActionKind::OpenTranscription
             | PaneActionKind::OpenNotes => true,
         })
@@ -367,10 +461,31 @@ pub fn transcribe_failure_text(reason: &TranscribeFailure) -> String {
             "The transcription model file could not be opened.".to_owned()
         }
         TranscribeFailure::ModelLoad => "The transcription model could not be loaded.".to_owned(),
-        // **件数で文の形は変えない**（`docs/rules/messages.md`）ので、1 本でも複数でも
-        // 名前を並べた同じ形にする。
-        TranscribeFailure::Files(names) => {
-            format!("{} could not be transcribed.", names.join(", "))
+        // **件数で文の形は変えない**（`docs/rules/messages.md`）ので、1 本でも複数でも音源
+        // ごとに 1 文ずつ並べる。どこまで読めたかは、読めた音源だけが言う（#164）。
+        // 最後の 1 文は `kept_other_sources` も見る（`kept_partial`）ので、ここで束ねない。
+        TranscribeFailure::Files { failed, .. } => {
+            let mut text = failed
+                .iter()
+                .map(|source| match source.kept_upto {
+                    Some(upto) => format!(
+                        "{} could not be read past {}.",
+                        source.name,
+                        format_elapsed(upto)
+                    ),
+                    None => format!("{} could not be transcribed.", source.name),
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            if reason.kept_partial() {
+                // `failed` が空のときに先頭が空白にならないようにする（型では空を禁止でき
+                // ないので、文の組み立て側で壊れないようにしておく）。
+                if !text.is_empty() {
+                    text.push(' ');
+                }
+                text.push_str("Everything that was read is kept.");
+            }
+            text
         }
         // **なぜ止まったかは分からない**ので、分かったふりをしない。
         TranscribeFailure::Panicked => {
@@ -394,6 +509,28 @@ pub fn summarize_failure_text(reason: &SummarizeFailure) -> String {
         SummarizeFailure::EmptyOutput => "The model returned nothing to write.".to_owned(),
         SummarizeFailure::Save => "The notes could not be saved.".to_owned(),
         SummarizeFailure::Panicked => "Writing notes stopped unexpectedly.".to_owned(),
+    }
+}
+
+/// 経過時間を時計表記にする。既定は `mm:ss`、1 時間以上は `h:mm:ss`。
+///
+/// **表記の正はここ 1 つ**。録音中のメニューバー表示（`tray::format_elapsed` は再エクスポート）・
+/// 再生位置・トランスクリプトの時刻・文字起こしが失敗した理由（#164）が同じ関数を通る。
+/// このモジュールに置いてあるのは、確認用バイナリと共有できる唯一の場所だから——逆向きに
+/// 依存させると、確認用バイナリが crate 全体を引き込むことになる（このファイル冒頭の doc）。
+pub fn format_elapsed(elapsed: Duration) -> String {
+    const SECS_PER_MINUTE: u64 = 60;
+    const SECS_PER_HOUR: u64 = 60 * SECS_PER_MINUTE;
+
+    let total = elapsed.as_secs();
+    let hours = total / SECS_PER_HOUR;
+    let minutes = (total % SECS_PER_HOUR) / SECS_PER_MINUTE;
+    let seconds = total % SECS_PER_MINUTE;
+
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes:02}:{seconds:02}")
     }
 }
 

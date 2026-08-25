@@ -40,6 +40,9 @@ export enum PaneActionKind {
     open-transcription,
     // 議事録の設定ウィンドウを開く。
     open-notes,
+    // 途中までの文字起こしを開く（#164）。失敗の理由を伏せて一覧に切り替えるだけで、
+    // ディスクには何も起こさない。
+    show-partial-transcript,
 }
 
 // 空表示に並べるボタン 1 つ分。**ラベルも Rust が組む**（状態→文言の対応表は Rust の
@@ -553,6 +556,18 @@ export component RecordingsWindow inherits Window {
     // 止められる状態か（#163）。**`detail-transcribing` と違い stopping を含まない**——
     // 止めるよう伝えた後に押しても何も変わらないので、そこでは出さない。
     property <bool> detail-transcript-stoppable: root.detail-transcript-status == TranscriptStatus.transcribing;
+    // いま読めるものが途中結果か（#164）。**状態 enum からは導出できない**——`failed` でも、
+    // 前回の完成した文字起こしが残っているだけのことがある。判断は Rust の
+    // `TranscriptPane::shows_partial` が持ち、見出し・理由・操作と同じ値から入る。
+    in property <bool> detail-transcript-partial;
+    // 途中結果を開いたか（#164）。**書くのは Rust だけ**（`Show partial` で立ち、録音を
+    // 選び直したときと走り始めたときに畳む）。Slint 側から立てられるようにすると、Rust の
+    // 畳む経路をすり抜ける実装が混ざる。
+    in property <bool> show-partial-transcript;
+    // 途中結果を伏せている間か。伏せている間は一覧ではなく失敗の理由を出す——先に一覧が
+    // 出ると、欠けていることに気づかないまま完成品として読んでしまう。
+    property <bool> detail-transcript-held-back: root.detail-transcript-partial
+        && !root.show-partial-transcript;
     // 選択中セッションの議事録要約の状態テキスト（文言の対応表は Rust 側の
     // `summary_status_text` が正）。
     in property <string> detail-summary-status-text;
@@ -1050,8 +1065,10 @@ export component RecordingsWindow inherits Window {
                                         // 空表示（#154）。JSON の欠落・破損は状態 `Done` のまま
                                         // セグメントが空になり、未実施と同じ空表示に落ちる。
                                         // 完了済みの再実行中は旧トランスクリプトが残るため、
-                                        // 一覧表示が維持される。
-                                        if root.segments.length > 0: TranscriptList {
+                                        // 一覧表示が維持される。**途中結果だけは例外**で、
+                                        // 開かれるまで空表示（失敗の理由）を出す（#164）。
+                                        if root.segments.length > 0
+                                            && !root.detail-transcript-held-back: TranscriptList {
                                             segments: root.segments;
                                             current-segment: root.current-segment;
                                             follow: root.follow-transcript;
@@ -1061,7 +1078,8 @@ export component RecordingsWindow inherits Window {
                                         }
                                         // **読み込み中はそう言う**（#152）。空白のまま待たせると、
                                         // 「文字起こしが無い」のか「まだ読んでいる」のか分からない。
-                                        if root.segments.length == 0: EmptyState {
+                                        if root.segments.length == 0
+                                            || root.detail-transcript-held-back: EmptyState {
                                             heading: root.loading
                                                 ? "Loading…"
                                                 : root.detail-transcript-heading;

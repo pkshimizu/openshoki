@@ -14,6 +14,9 @@
 //! - `transcribing` / `stopping` / `transcript-failed` / `transcript-unreadable`:
 //!   Transcript タブの空表示を、実行中／停止中／失敗／JSON が読めなかった状態にする
 //!   （見出し・理由・操作の 3 段と、最長の理由の折り返しの確認。件数 0 と組み合わせる）
+//! - `transcript-partial`: 途中まで読めて失敗した状態（#164）。**件数と組み合わせる**——
+//!   セグメントが在っても `Show partial` を押すまで空表示が出るところを見る
+//! - `show-partial`: その途中結果を開いた状態（一覧に切り替わるところを見る）
 //! - `auto-on`: 未実施の理由を「自動は ON だがまだ回っていない」にする（両タブ）
 //! - `no-follow`: 再生位置の追従を OFF にした状態（プレイヤー帯のスイッチの確認）
 //! - `far`: 再生位置を一覧の末尾寄りに置く（追従でその行が見えているかの確認。`no-follow`
@@ -37,6 +40,7 @@ mod snapshot;
 mod reading_pane;
 
 use std::rc::Rc;
+use std::time::Duration;
 
 use slint::{ModelRc, VecModel};
 
@@ -53,12 +57,15 @@ const DEFAULT_SEGMENT_COUNT: usize = 30;
 ///
 /// **タブごとに関数を分ける**——見出しと理由の setter を引数で受けると、同じ型なので取り違えても
 /// 通ってしまう（`docs/rules/coding-conventions.md`）。
-fn apply_transcript_pane(win: &RecordingsWindow, message: &reading_pane::PaneMessage) {
+fn apply_transcript_pane(win: &RecordingsWindow, pane: &reading_pane::TranscriptPane) {
+    let message = pane.message();
     win.set_detail_transcript_heading(message.heading.as_str().into());
     win.set_detail_transcript_body(message.body.as_str().into());
-    win.set_detail_transcript_actions(ModelRc::from(Rc::new(VecModel::from(
-        message.actions.clone(),
-    ))));
+    win.set_detail_transcript_actions(ModelRc::from(Rc::new(VecModel::from(message.actions))));
+    // 途中結果を伏せるかどうかも**同じ値から**出す（#164。本番の
+    // `main::apply_detail_transcript_status` と同じ）。別々に選ぶと、本番では作れない
+    // 組み合わせを目視することになる（`docs/rules/testing.md`）。
+    win.set_detail_transcript_partial(pane.shows_partial());
 }
 
 /// Notes タブの空表示を入れる（`apply_transcript_pane` と同じ理由で分けてある）。
@@ -86,12 +93,29 @@ fn transcript_pane(has_transcript: bool) -> reading_pane::TranscriptPane {
         };
     }
     if flag("transcript-failed") {
-        // ワーカーが返す中でいちばん長い理由（折り返しを見る）。
+        // ワーカーが返す中でいちばん長い理由（折り返しを見る）。何も残っていないので
+        // `Show partial` は出ない。
         return reading_pane::TranscriptPane::Failed {
-            reason: reading_pane::TranscribeFailure::Files(vec![
-                "mic.mp3".to_owned(),
-                "system.mp3".to_owned(),
-            ]),
+            reason: reading_pane::TranscribeFailure::Files {
+                failed: vec![
+                    reading_pane::FailedSource::new("mic.mp3", None),
+                    reading_pane::FailedSource::new("system.mp3", None),
+                ],
+                kept_other_sources: false,
+            },
+        };
+    }
+    if flag("transcript-partial") {
+        // 途中まで読めて失敗した状態（#164）。セグメントが在っても、開かれるまでは
+        // この空表示が出る。
+        return reading_pane::TranscriptPane::Failed {
+            reason: reading_pane::TranscribeFailure::Files {
+                failed: vec![reading_pane::FailedSource::new(
+                    "mic.mp3",
+                    Some(Duration::from_secs(252)),
+                )],
+                kept_other_sources: false,
+            },
         };
     }
     // `transcript-unreadable`（生成済みなのに中身が読めない）も、状態としては生成済み。
@@ -256,6 +280,7 @@ fn main() {
     }
     let has_transcript = !flag("no-transcript");
     win.set_has_transcript(has_transcript);
+    win.set_show_partial_transcript(flag("show-partial"));
     let transcript_pane = transcript_pane(has_transcript);
     win.set_detail_transcript_status(transcript_pane.status());
     win.set_detail_transcript_text(
@@ -264,7 +289,7 @@ fn main() {
     // 読む領域の空表示（#154）。**状態を引数で選べる**ようにする——見出し・理由・操作の 3 段が
     // 最長文言で崩れないか、ボタンが 2 つ並んだときに収まるかを目視する。文言は本番と同じ
     // `reading_pane` が組む（#160）。
-    apply_transcript_pane(&win, &transcript_pane.message());
+    apply_transcript_pane(&win, &transcript_pane);
     // `transcript-unreadable` は行を入れない——「生成済みなのに読めない」ときの空表示を見る。
     if has_transcript && !flag("transcript-unreadable") {
         win.set_segments(ModelRc::from(Rc::new(VecModel::from(rows))));

@@ -8,13 +8,16 @@
 //! whisper は CPU 集約で秒〜分オーダーかかるため、1 本のバックグラウンドワーカースレッド＋
 //! キュー（`mpsc`）で逐次処理する。メインスレッド（Slint ループ）はジョブを投げるだけで
 //! ブロックしない。モデル未指定/欠如・デコード失敗・whisper 失敗は握りつぶさずログし、
-//! 他音源・アプリ・録音を巻き込まない（`docs/rules/error-handling.md`）。
+//! 他音源・アプリ・録音を巻き込まない（`docs/rules/error-handling.md`）。音源を最後まで
+//! 読めなかったときは、**読めた範囲を文字起こしして保存する**（#164。どこまで読めたかは
+//! `TranscribeFailure::Files` に載り、読む領域が説明する）。
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{Fft, FixedSync, Resampler};
@@ -30,7 +33,7 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 /// 失敗の種別は、文言表（網羅 match）の隣に置くために `reading_pane` が持っている。
 /// ただし値を作るのはこのモジュールなので、読む人が探す場所はここでもある——同じ名前で
 /// 引けるように再エクスポートしておく。
-pub use crate::reading_pane::TranscribeFailure;
+pub use crate::reading_pane::{FailedSource, TranscribeFailure};
 
 /// whisper が入力に取るサンプルレート（Hz）。これ以外のレートの音声はここへリサンプルする。
 const WHISPER_SAMPLE_RATE: usize = 16_000;
@@ -775,8 +778,11 @@ fn run_job(
     if cancel.load(Ordering::Relaxed) {
         return JobOutcome::Stopped;
     }
-    // 失敗した音源の名前を集める（文にするのは読む領域の仕事。`TranscribeFailure`）。
-    let mut failed_names: Vec<String> = Vec::new();
+    // 最後まで行かなかった音源を集める（文にするのは読む領域の仕事。`TranscribeFailure`）。
+    let mut failed: Vec<FailedSource> = Vec::new();
+    // **読める文字起こしを残せたか**を覚える（本数ではない。`TranscribeFailure::Files`）。
+    // 1 件も認識できなかった音源は数えない——残っていると言っても、開く行が無い。
+    let mut kept_other_sources = false;
     let total = job.audio_paths.len();
     for (index, path) in job.audio_paths.iter().enumerate() {
         // 音源の切れ目でも降りる。whisper の推論に入る前（デコード・リサンプル）で止められた
@@ -795,28 +801,86 @@ fn run_job(
         match transcribe_file(&ctx, path, &model_path, job, progress, cancel) {
             Ok(FileOutcome::Transcribed(segments)) => {
                 println!("Transcribed {name} ({segments} segments)");
+                kept_other_sources |= segments > 0;
             }
+            // 音源を最後まで読めなかった（#164）。読めた範囲は保存済みだが、**この音源は
+            // 最後まで行っていない**ので失敗として数える。どこまで読めたかは理由に載る。
+            Ok(FileOutcome::Partial { segments, upto }) => {
+                eprintln!(
+                    "Keeping only the first {} of {name} ({segments} segments) because it could \
+                     not be read further",
+                    crate::reading_pane::format_elapsed(upto)
+                );
+                failed.push(FailedSource::new(name, Some(upto)));
+            }
+            // 読めた範囲があっても残さなかった（`partial_is_worth_keeping` が理由を持つ）。
+            // この音源からは何も残らないので、途中結果としては数えない。
+            Ok(FileOutcome::NotKept) => failed.push(FailedSource::new(name, None)),
             Ok(FileOutcome::Stopped) => return JobOutcome::Stopped,
             Err(err) => {
                 eprintln!("Skipping transcription of {name} because it failed: {err}");
-                failed_names.push(name);
+                failed.push(FailedSource::new(name, None));
             }
         }
     }
-    if failed_names.is_empty() {
+    if failed.is_empty() {
         JobOutcome::Done
     } else {
-        JobOutcome::Failed(TranscribeFailure::Files(failed_names))
+        JobOutcome::Failed(TranscribeFailure::Files {
+            failed,
+            kept_other_sources,
+        })
     }
 }
 
 /// 1 音源の処理結果。**「止められた」を `Err` に混ぜない**——混ぜると、止めたことが失敗の
 /// 一覧（`TranscribeFailure::Files`）へ載って赤く出る。
 enum FileOutcome {
-    /// 文字起こしして保存した（セグメント数）。
+    /// 音源を最後まで文字起こしして保存した（セグメント数）。
     Transcribed(usize),
+    /// 音源を**最後まで読めず**、読めた範囲だけを文字起こしして保存した（#164）。
+    Partial {
+        segments: usize,
+        /// 保存した範囲の終わり。**失敗の理由に出る**（`FailedSource::kept_upto`）。
+        upto: Duration,
+    },
+    /// 音源を最後まで読めず、**保存もしなかった**（#164。理由は
+    /// `partial_is_worth_keeping`）。この音源からは何も残らない。
+    NotKept,
     /// 止められたので保存せずに降りた。
     Stopped,
+}
+
+/// 最後まで読めなかった音源の途中結果を、保存する価値があるか（#164）。
+///
+/// **保存しない条件をここ 1 箇所に置く**ので、呼び出し側は理由を数え上げずに済む。
+///
+/// - 1 件も認識できていなければ、書いても読む行が無い。それでも「残っている」と言うと、
+///   押しても何も現れない `Show partial` を出すことになる（`TranscribeFailure::kept_partial`）。
+/// - すでに在るものが**これより先まで**の音源から作られているなら置き換えない。前の実行が
+///   最後まで読めていればそれは完成品で、音源がもう最後まで読めない以上、上書きは取り返しが
+///   つかない。
+///
+/// **「在るかどうか」ではなく「どこまでか」で見る**。存在だけで弾くと、同じ音源をやり直す
+/// たびに `NotKept` へ落ちて、途中結果を伏せる仕組み（`kept_partial`）が Try again 一発で
+/// 外れてしまう。長さで比べれば、同じところまでしか読めなければ同じ中身で置き換わり、
+/// 前より先まで読めれば良いほうが残る。
+///
+/// **比べるのは JSON へ書く値そのもの**（`read_upto_secs`）。表示用に秒へ丸めた値
+/// （`FileOutcome::Partial::upto`）で比べると、同じ音源をやり直しても端数のぶんだけ
+/// 「前のほうが長い」と判定され、上の保証が丸ごと効かなくなる。
+///
+/// **完成品と途中結果は長さでしか見分けていない**。JSON に印を残すのは #175 の領分で、
+/// それまでは「前のほうが長ければ残す」で近似する。
+fn partial_is_worth_keeping(segments: usize, transcript_path: &Path, read_upto_secs: f64) -> bool {
+    if segments == 0 {
+        return false;
+    }
+    match crate::transcript::transcribed_duration_secs(transcript_path) {
+        // まだ何も無い（または読めない）ので、書いて困るものが無い。
+        None => true,
+        Some(existing) => existing <= read_upto_secs,
+    }
 }
 
 /// whisper の推論ループから降りるための abort コールバック。`true` を返すと whisper.cpp が
@@ -855,8 +919,11 @@ fn audio_display_name(path: &Path) -> String {
         .unwrap_or_else(|| "audio".to_owned())
 }
 
-/// 1 音源を文字起こしして `<音源名>.json` に保存する。成功時はセグメント数を返す。
+/// 1 音源を文字起こしして `<音源名>.json` に保存する。
 /// `model_path` は `run_job` で解決済みのモデル（JSON の `model` フィールド用）。
+///
+/// **音源を最後まで読めたかどうかで戻り値が分かれる**（#164）。読めた範囲だけを保存した
+/// ときは `Partial` を返し、呼び出し側がそれを失敗として数える。
 fn transcribe_file(
     ctx: &WhisperContext,
     audio_path: &Path,
@@ -878,6 +945,7 @@ fn transcribe_file(
         samples,
         sample_rate,
         channels,
+        complete,
     } = decode_mp3(audio_path)?;
     let mono = downmix_to_mono(samples, channels);
     let pcm = resample_to_whisper_rate(mono, sample_rate)?;
@@ -947,8 +1015,29 @@ fn transcribe_file(
         segments,
     };
     let json_path = audio_path.with_extension("json");
+    let segments = result.segments.len();
+    if complete {
+        write_transcription(&json_path, &result)?;
+        return Ok(FileOutcome::Transcribed(segments));
+    }
+    // 最後まで読めなかった音源（#164）。**残す価値があるときだけ**保存する。判断に渡すのは
+    // **JSON へ書く値そのもの**——表示用に丸めた値で比べると、やり直しが必ず「前のほうが
+    // 長い」に転ぶ（`partial_is_worth_keeping` の doc）。
+    if !partial_is_worth_keeping(segments, &json_path, duration_secs) {
+        eprintln!(
+            "Not saving the partial transcript of {} because what is already there reaches at \
+             least as far",
+            audio_display_name(audio_path)
+        );
+        return Ok(FileOutcome::NotKept);
+    }
     write_transcription(&json_path, &result)?;
-    Ok(FileOutcome::Transcribed(result.segments.len()))
+    // 読む領域に出すのは秒まで（`format_elapsed`）。**サンプル数から整数で出す**ので、
+    // 保存の可否を決める `duration_secs` とは別の値になる（用途が違うので分けてある）。
+    Ok(FileOutcome::Partial {
+        segments,
+        upto: Duration::from_secs(pcm.len() as u64 / WHISPER_SAMPLE_RATE as u64),
+    })
 }
 
 /// 文字起こし結果の保存形式。録音一覧ビュー（`src/transcript.rs`）が読む契約なので、`segments` の
@@ -961,7 +1050,10 @@ struct Transcription {
     model: String,
     /// 認識言語。自動判定は `auto`。
     language: String,
-    /// 音声全体の長さ（秒）。
+    /// **どこまでの音源から作られたか**（秒）。最後まで読めた音源では音声全体の長さになり、
+    /// 途中で読めなくなった音源では**その打ち切り位置**になる（#164）。読む側
+    /// （`transcript::transcribed_duration_secs`）は、途中結果を上書きしてよいかの判断に
+    /// この値を使う。
     duration_secs: f64,
     /// 発話セグメント（時刻順）。
     segments: Vec<Segment>,
@@ -1002,6 +1094,8 @@ struct DecodedAudio {
     samples: Vec<f32>,
     sample_rate: u32,
     channels: usize,
+    /// 音源を最後まで読めたか（#164）。`false` は読めるところまでで打ち切った。
+    complete: bool,
 }
 
 /// MP3 をデコードしてインターリーブ f32 PCM を得る。
@@ -1009,9 +1103,26 @@ struct DecodedAudio {
 /// 対象は自アプリが保存した録音ファイルだが、保存後にユーザーが差し替え・破損させる可能性は
 /// あるため、途中のパケットのデコード失敗はスキップして読める部分だけを使う（symphonia の
 /// 推奨に従う）。1 サンプルも得られなければエラー。
+///
+/// **途中で読めなくなっても、そこまでを捨てない**（#164）。読めた範囲を返し、最後まで読めた
+/// かどうかを `complete` で伝える。1 時間の会議が 55 分目で読めなくなっているとき、55 分ぶんを
+/// 捨てる理由は無い。
 fn decode_mp3(path: &Path) -> Result<DecodedAudio, Box<dyn std::error::Error>> {
     let file = std::fs::File::open(path)?;
     let stream = MediaSourceStream::new(Box::new(file), Default::default());
+    decode_mp3_stream(stream, &audio_display_name(path))
+}
+
+/// `decode_mp3` の本体。**入力ストリームを引数で受ける**のは、「途中で読めなくなった」を
+/// 決定的に作れるようにするため（`docs/rules/testing.md` の「重い処理そのものを引数で受ける」）。
+/// 実ファイルでは再現できない——MP3 は末尾を切っても symphonia がストリーム終端として扱い、
+/// 短い音源として正常にデコードされる。
+///
+/// `name` はログに出す**ファイル名だけ**（`docs/rules/security.md`）。
+fn decode_mp3_stream(
+    stream: MediaSourceStream,
+    name: &str,
+) -> Result<DecodedAudio, Box<dyn std::error::Error>> {
     let mut hint = Hint::new();
     hint.with_extension("mp3");
 
@@ -1037,10 +1148,26 @@ fn decode_mp3(path: &Path) -> Result<DecodedAudio, Box<dyn std::error::Error>> {
     let mut samples: Vec<f32> = Vec::new();
     let mut sample_rate = 0u32;
     let mut channels = 0usize;
+    let mut complete = true;
+    // 壊れていて読み飛ばしたパケットの数（下の `continue` の doc）。
+    let mut skipped_packets = 0usize;
     loop {
         let packet = match format.next_packet() {
             Ok(Some(packet)) => packet,
             Ok(None) => break, // ストリーム終端。
+            // **「そこから先が読めなかった」と言い切れる種別だけ**を打ち切りにする（#164）。
+            // 正常な終端は `Ok(None)` で来るので、ここへ来る `IoError` は本当に読めなかった
+            // とき（途中で切れた・デバイスが応答しない）。読む領域に出るのも
+            // `could not be read past 04:12` で、原因まで断定はしていない。
+            //
+            // 他の種別（`Unsupported` / `LimitError` など）は「音源がそこで終わった」ではない
+            // ので従来どおり伝播する。**理由は捨てない**（`docs/rules/error-handling.md`）——
+            // これが唯一の痕跡になる。
+            Err(SymphoniaError::IoError(err)) => {
+                eprintln!("Stopping the decode of {name} because it could not be read on: {err}");
+                complete = false;
+                break;
+            }
             Err(err) => return Err(err.into()),
         };
         if packet.track_id != track_id {
@@ -1055,8 +1182,13 @@ fn decode_mp3(path: &Path) -> Result<DecodedAudio, Box<dyn std::error::Error>> {
                     channels = spec.channels().count();
                 } else if spec.rate() != sample_rate || spec.channels().count() != channels {
                     // 途中でレート/チャンネル数が変わるファイルは、無検知で連結すると
-                    // フレーム境界がずれて壊れた音声になるため、正直に失敗させる。
-                    return Err("audio parameters changed mid-stream".into());
+                    // フレーム境界がずれて壊れた音声になる。ここまでを返して打ち切る（#164）。
+                    eprintln!(
+                        "Stopping the decode of {name} because the audio parameters changed \
+                         mid-stream"
+                    );
+                    complete = false;
+                    break;
                 }
                 // 中間バッファを介さず samples の末尾へ直接書き、全量の二重コピーを避ける。
                 let base = samples.len();
@@ -1064,9 +1196,23 @@ fn decode_mp3(path: &Path) -> Result<DecodedAudio, Box<dyn std::error::Error>> {
                 buffer.copy_to_slice_interleaved(&mut samples[base..]);
             }
             // 壊れたパケットはスキップして続行（symphonia の推奨ハンドリング）。
-            Err(SymphoniaError::DecodeError(_)) | Err(SymphoniaError::IoError(_)) => continue,
+            //
+            // **これは `complete` を落とさない**（#164）。落とすと読む領域は
+            // 「could not be read past ◯◯」と言うが、実際は最後まで読めていて途中が抜けて
+            // いるだけなので、事実と違う。ただし抜けたぶん以降のサンプルは前へ詰まるため、
+            // 静かに欠けた文字起こしにはなる。数だけ数えて後でまとめてログに出す
+            // （パケットごとには出さない。1 音源で数千回になりうる）。
+            Err(SymphoniaError::DecodeError(_)) | Err(SymphoniaError::IoError(_)) => {
+                skipped_packets += 1;
+                continue;
+            }
             Err(err) => return Err(err.into()),
         }
+    }
+    if skipped_packets > 0 {
+        eprintln!(
+            "Continuing with {name} because {skipped_packets} broken packets could be skipped"
+        );
     }
     if samples.is_empty() || channels == 0 || sample_rate == 0 {
         return Err("no audio samples could be decoded".into());
@@ -1075,6 +1221,7 @@ fn decode_mp3(path: &Path) -> Result<DecodedAudio, Box<dyn std::error::Error>> {
         samples,
         sample_rate,
         channels,
+        complete,
     })
 }
 
@@ -1597,6 +1744,16 @@ mod tests {
             !JobOutcome::Failed(TranscribeFailure::Panicked).keeps_summary(),
             "a partial transcription would make an incomplete summary look finished"
         );
+        // 途中まで読めた音源も同じ（#164）。読める結果が残っていても、欠けたものを入力に
+        // すると「欠けたまま完成品に見える議事録」ができる。
+        assert!(
+            !JobOutcome::Failed(TranscribeFailure::Files {
+                failed: vec![FailedSource::new("mic.mp3", Some(Duration::from_secs(252)))],
+                kept_other_sources: true,
+            })
+            .keeps_summary(),
+            "notes must not be written from a transcript that stops partway"
+        );
     }
 
     /// 止めた後に本物の失敗が重なっても、失敗としては出さない（#163）。**全結果を網羅**で
@@ -1912,6 +2069,182 @@ mod tests {
         );
     }
 
+    /// 指定のレート・秒数の 440Hz サイン波（モノラル）を MP3 にエンコードする。デコードの
+    /// テストは実データが要る（合成 PCM を直接渡すと MP3 のフレーム構造を通らない）。
+    fn sine_mp3(sample_rate: u32, seconds: u32) -> Vec<u8> {
+        let pcm: Vec<i16> = (0..(sample_rate * seconds) as usize)
+            .map(|i| {
+                let t = i as f32 / sample_rate as f32;
+                ((2.0 * std::f32::consts::PI * 440.0 * t).sin() * 8000.0) as i16
+            })
+            .collect();
+        let mut builder =
+            mp3lame_encoder::Builder::new().expect("creating the LAME builder should succeed");
+        builder.set_num_channels(1).expect("channels");
+        builder.set_sample_rate(sample_rate).expect("sample rate");
+        let mut encoder = builder
+            .build()
+            .expect("building the encoder should succeed");
+        let mut mp3 = Vec::with_capacity(mp3lame_encoder::max_required_buffer_size(pcm.len()));
+        encoder
+            .encode_to_vec(mp3lame_encoder::MonoPcm(&pcm), &mut mp3)
+            .expect("encoding should succeed");
+        mp3.reserve(mp3lame_encoder::max_required_buffer_size(0));
+        encoder
+            .flush_to_vec::<mp3lame_encoder::FlushNoGap>(&mut mp3)
+            .expect("flushing should succeed");
+        mp3
+    }
+
+    /// 途中から読めなくなるストリーム。`limit` バイトを渡したあとは I/O エラーを返す。
+    ///
+    /// 実ファイルでは「途中で読めなくなった」を作れない（`decode_mp3_stream` の doc）ので、
+    /// 継ぎ目にこれを流し込む。
+    struct StopsReadingAfter {
+        bytes: std::io::Cursor<Vec<u8>>,
+        /// これ以上は渡さないバイト数。**ちょうどここで切る**——1 ブロックぶん超えて渡すと、
+        /// 名前と挙動がずれる。
+        limit: u64,
+    }
+
+    impl std::io::Read for StopsReadingAfter {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let left = self.limit.saturating_sub(self.bytes.position());
+            if left == 0 {
+                return Err(std::io::Error::other("the audio could not be read further"));
+            }
+            let allowed = usize::try_from(left).unwrap_or(usize::MAX).min(buf.len());
+            self.bytes.read(&mut buf[..allowed])
+        }
+    }
+
+    impl std::io::Seek for StopsReadingAfter {
+        /// `is_seekable()` が false なので symphonia はここを呼ばない
+        /// （`MediaSourceStream` が自前のバッファ内で巻き戻す）。呼ばれたら、渡した
+        /// バイト数を数えている `limit` の意味が崩れるので、素直に断る。
+        fn seek(&mut self, _pos: std::io::SeekFrom) -> std::io::Result<u64> {
+            Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+        }
+    }
+
+    impl symphonia::core::io::MediaSource for StopsReadingAfter {
+        fn is_seekable(&self) -> bool {
+            false
+        }
+
+        fn byte_len(&self) -> Option<u64> {
+            None
+        }
+    }
+
+    /// 途中結果を保存してよいかの判断（#164）。**すでに在るもののほうが先まで読めていれば
+    /// 置き換えない**のと、**開いても何も出ない途中結果を作らない**の 2 つを固定する。
+    ///
+    /// 前者が破れると、音源がもう最後まで読めない状況で前回の完成品が失われる（取り返しが
+    /// つかない）。後者が破れると、押しても何も現れない `Show partial` が出る。
+    ///
+    /// **同じところまでしか読めなかったときは置き換える**——ここを「在るかどうか」で弾くと、
+    /// Try again 一発で途中結果を伏せる仕組みが外れる（`FileOutcome::NotKept` に落ちて
+    /// `kept_upto` が消えるため）。
+    #[test]
+    fn a_partial_transcript_is_only_kept_when_it_adds_something() {
+        let dir = std::env::temp_dir().join(format!("shoki-worth-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("creating the temp dir should succeed");
+        let json_path = dir.join("mic.json");
+        // **端数のある実長を使う**——書き込み経路が作るのは `pcm.len() / 16000` の f64 で、
+        // 整数秒になるのはサンプル数が 16000 の倍数のときだけ。整数で試すと、表示用に
+        // 丸めた値で比べてしまう間違いを見逃す。
+        let read_upto_secs = 252.3125_f64;
+
+        assert!(
+            partial_is_worth_keeping(3, &json_path, read_upto_secs),
+            "the first partial transcript of a source is worth keeping"
+        );
+        assert!(
+            !partial_is_worth_keeping(0, &json_path, read_upto_secs),
+            "a transcript with no lines would leave nothing to open"
+        );
+
+        // 同じところまでしか読めなかったやり直し（Try again）。中身は同じなので置き換える
+        // ——ここが false に転ぶと、途中結果を伏せる仕組みが Try again 一発で外れる。
+        std::fs::write(
+            &json_path,
+            format!(r#"{{"duration_secs":{read_upto_secs},"segments":[]}}"#),
+        )
+        .expect("writing the existing transcript should succeed");
+        assert!(
+            partial_is_worth_keeping(3, &json_path, read_upto_secs),
+            "re-running on the same audio replaces what it produced last time"
+        );
+
+        // 前の実行のほうが先まで読めている（最後まで読めた完成品を含む）。置き換えない。
+        std::fs::write(&json_path, br#"{"duration_secs":3600.0,"segments":[]}"#)
+            .expect("writing the existing transcript should succeed");
+        assert!(
+            !partial_is_worth_keeping(3, &json_path, read_upto_secs),
+            "what reaches further is never replaced by a shorter partial run"
+        );
+
+        // 長さが読めない（壊れている・古い形式）なら、残して困るものが無いので書く。
+        std::fs::write(&json_path, b"{ this is not json").expect("writing should succeed");
+        assert!(
+            partial_is_worth_keeping(3, &json_path, read_upto_secs),
+            "a transcript that cannot be read is not worth protecting"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn decode_mp3_keeps_what_it_read_when_it_cannot_read_further() {
+        let whole = sine_mp3(48_000, 4);
+        let readable = decode_mp3_stream(
+            MediaSourceStream::new(
+                Box::new(StopsReadingAfter {
+                    bytes: std::io::Cursor::new(whole.clone()),
+                    // 打ち切らない（最後まで読める側）。
+                    limit: u64::MAX,
+                }),
+                Default::default(),
+            ),
+            "mic.mp3",
+        )
+        .expect("the whole stream should decode");
+        assert!(readable.complete, "a stream that ends cleanly is complete");
+
+        let limit = whole.len() as u64 / 3;
+        let cut = decode_mp3_stream(
+            MediaSourceStream::new(
+                Box::new(StopsReadingAfter {
+                    bytes: std::io::Cursor::new(whole),
+                    limit,
+                }),
+                Default::default(),
+            ),
+            "mic.mp3",
+        )
+        .expect("the readable part should still decode");
+
+        assert!(
+            !cut.complete,
+            "a stream that cannot be read further is not complete"
+        );
+        assert!(
+            !cut.samples.is_empty(),
+            "the part that could be read is kept"
+        );
+        assert!(
+            cut.samples.len() < readable.samples.len(),
+            "only the part that could be read is kept: {} of {}",
+            cut.samples.len(),
+            readable.samples.len()
+        );
+        // 形式は最初に読めたパケットで決まるので、途中で降りても変わらない。
+        assert_eq!(cut.sample_rate, readable.sample_rate);
+        assert_eq!(cut.channels, readable.channels);
+    }
+
     #[test]
     fn decode_mp3_fails_on_empty_file() {
         // 壊れた/空の入力ではエラーを返す（黙って空の音声にしない）。
@@ -1969,28 +2302,7 @@ mod tests {
             .expect("SHOKI_WHISPER_MODEL must point to a ggml whisper model");
 
         // 2 秒の 440Hz サイン波（48kHz モノラル）を MP3 にエンコードする。
-        let sample_rate = 48_000u32;
-        let pcm: Vec<i16> = (0..(sample_rate * 2) as usize)
-            .map(|i| {
-                let t = i as f32 / sample_rate as f32;
-                ((2.0 * std::f32::consts::PI * 440.0 * t).sin() * 8000.0) as i16
-            })
-            .collect();
-        let mut builder =
-            mp3lame_encoder::Builder::new().expect("creating the LAME builder should succeed");
-        builder.set_num_channels(1).expect("channels");
-        builder.set_sample_rate(sample_rate).expect("sample rate");
-        let mut encoder = builder
-            .build()
-            .expect("building the encoder should succeed");
-        let mut mp3 = Vec::with_capacity(mp3lame_encoder::max_required_buffer_size(pcm.len()));
-        encoder
-            .encode_to_vec(mp3lame_encoder::MonoPcm(&pcm), &mut mp3)
-            .expect("encoding should succeed");
-        mp3.reserve(mp3lame_encoder::max_required_buffer_size(0));
-        encoder
-            .flush_to_vec::<mp3lame_encoder::FlushNoGap>(&mut mp3)
-            .expect("flushing should succeed");
+        let mp3 = sine_mp3(48_000, 2);
 
         let dir =
             std::env::temp_dir().join(format!("shoki-transcribe-test-{}", std::process::id()));
