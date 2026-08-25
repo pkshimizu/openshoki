@@ -3221,6 +3221,38 @@ mod tests {
     use crate::transcribe::TranscribeStatus;
     use std::time::Duration;
 
+    /// 途中結果かどうかが、状態と**同じ値から**ウィンドウへ届くこと（#164）。
+    ///
+    /// 決めるのは Rust（`TranscriptPane::shows_partial`）、伏せるのは Slint
+    /// （`detail-transcript-held-back`）で、どちらも単体では検査済み。**繋いでいるのはこの
+    /// setter だけ**なので、ここが抜けると両側が緑のまま途中結果が完成品として出る
+    /// （`docs/rules/testing.md` の「配線は、繋いでいる関数に継ぎ目を入れてテストする」）。
+    #[test]
+    fn the_pane_tells_the_window_whether_what_is_readable_is_partial() {
+        super::init_test_backend();
+        let rec = super::RecordingsWindow::new().expect("create the recordings window");
+
+        let partial = TranscriptPane::Failed {
+            reason: TranscribeFailure::Files {
+                failed: vec![failed_source("mic.mp3", Some(Duration::from_secs(252)))],
+                completed: 0,
+            },
+        };
+        super::apply_detail_transcript_status(&rec, &partial, false);
+        assert!(rec.get_detail_transcript_partial());
+
+        // 前回の完成した文字起こしが残っているだけの失敗では伏せない。
+        let nothing_kept = TranscriptPane::Failed {
+            reason: TranscribeFailure::ModelLoad,
+        };
+        super::apply_detail_transcript_status(&rec, &nothing_kept, false);
+        assert!(!rec.get_detail_transcript_partial());
+
+        // 走り終わった文字起こしも同じ（伏せる理由が無い）。
+        super::apply_detail_transcript_status(&rec, &TranscriptPane::Done, false);
+        assert!(!rec.get_detail_transcript_partial());
+    }
+
     /// 最後まで行かなかった音源 1 本（#164）。テスト表を短くするためだけの組み立て。
     fn failed_source(name: &str, kept_upto: Option<Duration>) -> FailedSource {
         FailedSource {
