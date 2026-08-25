@@ -281,3 +281,73 @@ fn stop_is_offered_only_while_the_transcription_is_running() {
         assert_eq!(stop_buttons(&window), 0, "{status:?} has nothing to stop");
     }
 }
+
+/// 途中結果は、**開かれるまで伏せる**（#164）。先に一覧が出ると、欠けていることに気づかない
+/// まま完成品として読んでしまう。
+///
+/// 逆に、完成した文字起こしが残っているだけの失敗（モデルのロードに失敗した再実行など）で
+/// 伏せると、完成品を途中結果として隠すことになる。だから伏せる条件は状態 `Failed` ではなく
+/// `detail-transcript-partial`（Rust の `TranscriptPane::shows_partial` が決める）。
+#[test]
+#[cfg_attr(
+    not(slint_debug_info),
+    ignore = "needs Slint debug info (SLINT_EMIT_DEBUG_INFO=1)"
+)]
+fn a_partial_transcript_stays_behind_the_failure_until_it_is_asked_for() {
+    let window = open_window();
+    window.set_segments(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+        TranscriptRow {
+            speaker: "Mic".into(),
+            is_mic: true,
+            time: "00:00".into(),
+            text: "hello".into(),
+        },
+    ]))));
+    window.set_detail_transcript_status(TranscriptStatus::Failed);
+    let lists = |window: &RecordingsWindow| {
+        ElementHandle::find_by_element_type_name(window, "TranscriptList").count()
+    };
+
+    // 失敗しても、残っているのが完成品なら読める。
+    window.set_detail_transcript_partial(false);
+    assert_eq!(lists(&window), 1, "a complete transcript is not held back");
+
+    // 途中結果は、押されるまで失敗の理由を出す。
+    window.set_detail_transcript_partial(true);
+    assert_eq!(
+        lists(&window),
+        0,
+        "a partial transcript waits behind the failure"
+    );
+
+    window.set_show_partial_transcript(true);
+    assert_eq!(lists(&window), 1, "asking for it shows what was kept");
+}
+
+/// 途中結果を開く操作が、空表示のボタンから配線されていること（#164）。**ラベルの一致で
+/// 分岐させない**ので、押した結果として届くのは種別。
+#[test]
+#[cfg_attr(
+    not(slint_debug_info),
+    ignore = "needs Slint debug info (SLINT_EMIT_DEBUG_INFO=1)"
+)]
+fn asking_for_the_partial_transcript_is_wired_to_the_pane_action() {
+    let window = open_window();
+    window.set_detail_transcript_status(TranscriptStatus::Failed);
+    window.set_detail_transcript_partial(true);
+    window.set_detail_transcript_heading("Transcription failed".into());
+    window.set_detail_transcript_actions(slint::ModelRc::from(Rc::new(slint::VecModel::from(
+        vec![PaneAction {
+            label: "Show partial".into(),
+            kind: PaneActionKind::ShowPartialTranscript,
+            primary: false,
+        }],
+    ))));
+
+    let calls: Rc<RefCell<Vec<PaneActionKind>>> = Rc::new(RefCell::new(Vec::new()));
+    let recorded = Rc::clone(&calls);
+    window.on_pane_action(move |kind| recorded.borrow_mut().push(kind));
+
+    button(&window, "Show partial").mock_single_click(PointerEventButton::Left);
+    assert_eq!(*calls.borrow(), vec![PaneActionKind::ShowPartialTranscript]);
+}
