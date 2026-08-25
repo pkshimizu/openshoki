@@ -2,10 +2,10 @@ import { ScrollView } from "std-widgets.slint";
 import { Style, StatusTone } from "style.slint";
 import { SectionHeading, Card, CardDivider, CardBlock, StatusLine, Badge, ActionButton, ButtonRole, Toggle, Stepper, Select, Door } from "controls.slint";
 
-// Recordings ウィンドウは別ファイルで定義し、ここから再エクスポートして 1 つのエントリ
+// Library ウィンドウは別ファイルで定義し、ここから再エクスポートして 1 つのエントリ
 // （build.rs は app-window.slint のみコンパイル）に含める。Rust 側は include_modules! で
-// RecordingsWindow / SessionRow を得る。
-export { RecordingsWindow, SessionRow } from "recordings-window.slint";
+// LibraryWindow / SessionRow を得る。
+export { LibraryWindow, SessionRow } from "library-window.slint";
 // モデル一覧ウィンドウ（#117）。同じく再エクスポートするだけで `build.rs` の変更は要らない。
 export { TranscriptionWindow, ModelRow, ModelStatus } from "transcription-window.slint";
 export { MinutesWindow } from "minutes-window.slint";
@@ -152,7 +152,7 @@ export component AppWindow inherits Window {
             padding-top: 26px;
             padding-bottom: 30px;
 
-            // --- Recordings: 保存先フォルダ ---
+            // --- Library: 保存先フォルダ ---
             VerticalLayout {
                 spacing: 12px;
                 SectionHeading {

@@ -1,5 +1,5 @@
-//! Recordings ウィンドウ（Transcript / Summary・Playback セクション）の描画確認用バイナリ
-//! （`docs/rules/slint.md` の検証手順）。ダミーの状態を流し込んで RecordingsWindow を表示する。
+//! Library ウィンドウ（Transcript / Summary・Playback セクション）の描画確認用バイナリ
+//! （`docs/rules/slint.md` の検証手順）。ダミーの状態を流し込んで LibraryWindow を表示する。
 //! 実行: `cargo run --example transcript_view [引数...]` → screencapture で目視確認。
 //!
 //! 引数（順不同・組み合わせ可）:
@@ -59,7 +59,7 @@ const DEFAULT_SEGMENT_COUNT: usize = 30;
 ///
 /// **タブごとに関数を分ける**——見出しと理由の setter を引数で受けると、同じ型なので取り違えても
 /// 通ってしまう（`docs/rules/coding-conventions.md`）。
-fn apply_transcript_pane(win: &RecordingsWindow, pane: &reading_pane::TranscriptPane) {
+fn apply_transcript_pane(win: &LibraryWindow, pane: &reading_pane::TranscriptPane) {
     let message = pane.message();
     win.set_detail_transcript_heading(message.heading.as_str().into());
     win.set_detail_transcript_body(message.body.as_str().into());
@@ -71,7 +71,7 @@ fn apply_transcript_pane(win: &RecordingsWindow, pane: &reading_pane::Transcript
 }
 
 /// Notes タブの空表示を入れる（`apply_transcript_pane` と同じ理由で分けてある）。
-fn apply_summary_pane(win: &RecordingsWindow, message: &reading_pane::PaneMessage) {
+fn apply_summary_pane(win: &LibraryWindow, message: &reading_pane::PaneMessage) {
     win.set_detail_summary_heading(message.heading.as_str().into());
     win.set_detail_summary_body(message.body.as_str().into());
     win.set_detail_summary_actions(ModelRc::from(Rc::new(VecModel::from(
@@ -189,7 +189,7 @@ fn sample_summary_rows() -> Vec<SummaryRow> {
 }
 
 fn main() {
-    let win = RecordingsWindow::new()
+    let win = LibraryWindow::new()
         .expect("creating the window should succeed in this verification binary");
 
     // 引数はフラグと混ざるため、位置ではなく「数値として読めた最初の引数」を件数にする。

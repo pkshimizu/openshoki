@@ -507,13 +507,13 @@ component TranscriptList inherits Rectangle {
     }
 }
 
-// トレイの「Recordings…」から開く録音一覧ウィンドウ。**3 つの領域**に分かれる（#128）:
+// トレイの「Library…」から開く録音一覧ウィンドウ。**3 つの領域**に分かれる（#128）:
 // 左＝探す（300px 固定）、右＝読む（measure 640px）、下辺＝聴く（72px の常設帯）。
 // 配色・サイズ・淡色はすべて共有の Style トークンから引く（#128 で Palette 依存を外した）
 // （選択行の白文字はアクセント固定背景のため Style.on-accent-foreground）。
-export component RecordingsWindow inherits Window {
-    title: "Recordings";
-    // 幅・高さは src/main.rs の RECORDINGS_WIDTH/HEIGHT と一致させること（片方だけ変えない）。
+export component LibraryWindow inherits Window {
+    title: "Library";
+    // 幅・高さは src/main.rs の LIBRARY_WIDTH/HEIGHT と一致させること（片方だけ変えない）。
     // **読むことが主な仕事**なので広くする（#128 のデザイン）。720 幅では文字起こしが 1 行
     // 40 字ほどにしかならず、長い会議を読み返すのがつらい。
     min-width: 840px;

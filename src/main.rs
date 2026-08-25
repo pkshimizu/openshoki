@@ -1,6 +1,6 @@
 //! shoki — メニューバー／タスクバーに常駐する録音アプリのエントリポイント。
 //!
-//! 起動時はウィンドウを表示せずトレイに常駐し、トレイメニューから設定ウィンドウ・Recordings
+//! 起動時はウィンドウを表示せずトレイに常駐し、トレイメニューから設定ウィンドウ・Library
 //! ウィンドウの表示/非表示とアプリ終了を行う。録音・文字起こし・議事録生成は各モジュール
 //! （`recorder` / `transcribe` / `summarize`）が持ち、ここは UI との配線とタイマー駆動の
 //! 状態追従（メニューバー表示・再生位置・進行状況）を担う。
@@ -68,12 +68,12 @@ const WINDOW_HEIGHT: f32 = 720.0;
 const WINDOW_X: f32 = 240.0;
 const WINDOW_Y: f32 = 160.0;
 
-/// Recordings ウィンドウの初期ジオメトリ。幅・高さは `ui/recordings-window.slint` の
+/// Library ウィンドウの初期ジオメトリ。幅・高さは `ui/library-window.slint` の
 /// min/preferred と一致させること（片方だけ変えない）。設定ウィンドウと重ならない位置に出す。
-const RECORDINGS_WIDTH: f32 = 1100.0;
-const RECORDINGS_HEIGHT: f32 = 720.0;
-const RECORDINGS_X: f32 = 200.0;
-const RECORDINGS_Y: f32 = 120.0;
+const LIBRARY_WIDTH: f32 = 1100.0;
+const LIBRARY_HEIGHT: f32 = 720.0;
+const LIBRARY_X: f32 = 200.0;
+const LIBRARY_Y: f32 = 120.0;
 
 /// 文字起こしウィンドウの初期ジオメトリ。幅・高さは `ui/transcription-window.slint` の
 /// min/preferred と一致させること（片方だけ変えない）。設定ウィンドウの扉から開くので、
@@ -311,7 +311,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 録音停止後の後処理（極小音量の正規化→文字起こし投入→ミックス生成）を直列に行う
     // バックグラウンドワーカー。自動経路の文字起こしは後処理ワーカーが完了後に投入する
-    // （正規化後の音声で文字起こしさせる）。transcriber は Clone 共有で、Recordings ウィンドウの
+    // （正規化後の音声で文字起こしさせる）。transcriber は Clone 共有で、Library ウィンドウの
     // 手動再実行・状態表示も同じワーカー・同じ状態マップを使う。
     let postprocessor = mixdown::PostProcessWorker::start(transcriber.clone());
 
@@ -320,9 +320,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ui.window()
         .on_close_requested(|| slint::CloseRequestResponse::HideWindow);
 
-    // Recordings ウィンドウ（録音一覧＋再生）。設定ウィンドウと同じく起動時に生成して隠しておき、
-    // トレイの「Recordings…」で表示する。閉じても常駐を保つ。
-    let recordings_ui = RecordingsWindow::new()?;
+    // Library ウィンドウ（録音一覧＋再生）。設定ウィンドウと同じく起動時に生成して隠しておき、
+    // トレイの「Library…」で表示する。閉じても常駐を保つ。
+    let library_ui = LibraryWindow::new()?;
     // 選んだ録音の読み込み結果を UI スレッドへ返す道（#152）。**tick が受け取る**——Slint の
     // プロパティも `Rc` の共有状態も UI スレッド専有なので、読み込みスレッドからは触れない。
     let (load_sender, load_receiver) = std::sync::mpsc::channel::<LoadedSession>();
@@ -337,7 +337,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 誰も見ていない画面へ適用され、音声のハンドルと文字起こし本文を次に開くまで抱え続ける。
         let generation = Rc::clone(&load_generation);
         let search_generation = Rc::clone(&search_generation);
-        recordings_ui.window().on_close_requested(move || {
+        library_ui.window().on_close_requested(move || {
             advance_load_generation(&generation);
             // 検索も同じ理由で降ろす（走っていると、次に開いた一覧を後から絞り込む）。
             advance_search_generation(&search_generation);
@@ -362,12 +362,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Rc::new(RefCell::new(Vec::new()));
     // 一覧の Slint モデル。開いたときの再構築に加え、文字起こし状態の変化を tick が
     // 行単位で反映する（set_row_data）ため、Rc で保持し続ける。
-    // 走査で見つかった全部（検索を解除したときに戻す元。`RecordingsHandles::all_sessions`）。
+    // 走査で見つかった全部（検索を解除したときに戻す元。`LibraryHandles::all_sessions`）。
     let all_sessions: Rc<RefCell<Vec<recordings::RecordingSession>>> =
         Rc::new(RefCell::new(Vec::new()));
     let (search_sender, search_receiver) = std::sync::mpsc::channel::<SearchResult>();
     let sessions_model: Rc<slint::VecModel<SessionRow>> = Rc::new(slint::VecModel::default());
-    recordings_ui.set_sessions(sessions_model.clone().into());
+    library_ui.set_sessions(sessions_model.clone().into());
     // 選択中セッションのトランスクリプト（セグメントクリック→開始秒の解決、tick→現在セグメントの
     // 算出に使う）。選択のたびに読み直す。
     let transcript_segments: Rc<RefCell<Vec<transcript::TranscriptSegment>>> =
@@ -386,10 +386,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let transcriber = transcriber.clone();
         let summarizer = summarizer.clone();
         let config = Rc::clone(&config);
-        let rec_weak = recordings_ui.as_weak();
+        let rec_weak = library_ui.as_weak();
         let generation = Rc::clone(&load_generation);
         let load_sender = load_sender.clone();
-        recordings_ui.on_select_session(move |index| {
+        library_ui.on_select_session(move |index| {
             let Some(rec) = rec_weak.upgrade() else {
                 return;
             };
@@ -452,8 +452,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 再生/一時停止トグル。
     {
         let player = Rc::clone(&player);
-        let rec_weak = recordings_ui.as_weak();
-        recordings_ui.on_play_pause(move || {
+        let rec_weak = library_ui.as_weak();
+        library_ui.on_play_pause(move || {
             let Some(rec) = rec_weak.upgrade() else {
                 return;
             };
@@ -467,8 +467,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 停止（先頭へ戻す）。
     {
         let player = Rc::clone(&player);
-        let rec_weak = recordings_ui.as_weak();
-        recordings_ui.on_stop(move || {
+        let rec_weak = library_ui.as_weak();
+        library_ui.on_stop(move || {
             let Some(rec) = rec_weak.upgrade() else {
                 return;
             };
@@ -484,8 +484,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let player = Rc::clone(&player);
         let transcript_segments = Rc::clone(&transcript_segments);
-        let rec_weak = recordings_ui.as_weak();
-        recordings_ui.on_seek_to_segment(move |index| {
+        let rec_weak = library_ui.as_weak();
+        library_ui.on_seek_to_segment(move |index| {
             let Some(rec) = rec_weak.upgrade() else {
                 return;
             };
@@ -515,8 +515,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // （分担は `.slint` の `SeekBar` の doc コメント参照）。
     {
         let player = Rc::clone(&player);
-        let rec_weak = recordings_ui.as_weak();
-        recordings_ui.on_scrub_preview(move |ratio| {
+        let rec_weak = library_ui.as_weak();
+        library_ui.on_scrub_preview(move |ratio| {
             let Some(rec) = rec_weak.upgrade() else {
                 return;
             };
@@ -536,8 +536,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 状態は変えない）。
     {
         let player = Rc::clone(&player);
-        let rec_weak = recordings_ui.as_weak();
-        recordings_ui.on_seek_to_ratio(move |ratio| {
+        let rec_weak = library_ui.as_weak();
+        library_ui.on_seek_to_ratio(move |ratio| {
             let Some(rec) = rec_weak.upgrade() else {
                 return;
             };
@@ -568,8 +568,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let transcriber = transcriber.clone();
         // 読む領域は両タブまとめて組み直すので、相手のワーカーも要る（`refresh_detail_panes`）。
         let summarizer = summarizer.clone();
-        let rec_weak = recordings_ui.as_weak();
-        recordings_ui.on_transcribe_session(move |index| {
+        let rec_weak = library_ui.as_weak();
+        library_ui.on_transcribe_session(move |index| {
             let sessions = sessions.borrow();
             let Some(session) = usize::try_from(index).ok().and_then(|i| sessions.get(i)) else {
                 return;
@@ -589,8 +589,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let config = Rc::clone(&config);
         let transcriber = transcriber.clone();
         let summarizer = summarizer.clone();
-        let rec_weak = recordings_ui.as_weak();
-        recordings_ui.on_transcribe_then_notes(move |index| {
+        let rec_weak = library_ui.as_weak();
+        library_ui.on_transcribe_then_notes(move |index| {
             let sessions = sessions.borrow();
             let Some(session) = usize::try_from(index).ok().and_then(|i| sessions.get(i)) else {
                 return;
@@ -610,8 +610,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let config = Rc::clone(&config);
         let summarizer = summarizer.clone();
         let transcriber = transcriber.clone();
-        let rec_weak = recordings_ui.as_weak();
-        recordings_ui.on_summarize_session(move |index| {
+        let rec_weak = library_ui.as_weak();
+        library_ui.on_summarize_session(move |index| {
             let sessions = sessions.borrow();
             let Some(session) = usize::try_from(index).ok().and_then(|i| sessions.get(i)) else {
                 return;
@@ -639,8 +639,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let summarizer = summarizer.clone();
         let transcriber = transcriber.clone();
         let config = Rc::clone(&config);
-        let rec_weak = recordings_ui.as_weak();
-        recordings_ui.on_cancel_summary(move |index| {
+        let rec_weak = library_ui.as_weak();
+        library_ui.on_cancel_summary(move |index| {
             let sessions = sessions.borrow();
             let Some(session) = usize::try_from(index).ok().and_then(|i| sessions.get(i)) else {
                 return;
@@ -665,8 +665,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let transcriber = transcriber.clone();
         let summarizer = summarizer.clone();
         let config = Rc::clone(&config);
-        let rec_weak = recordings_ui.as_weak();
-        recordings_ui.on_stop_transcription(move |index| {
+        let rec_weak = library_ui.as_weak();
+        library_ui.on_stop_transcription(move |index| {
             let sessions = sessions.borrow();
             let Some(session) = usize::try_from(index).ok().and_then(|i| sessions.get(i)) else {
                 return;
@@ -697,8 +697,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let all_sessions = Rc::clone(&all_sessions);
         let search_generation = Rc::clone(&search_generation);
         let search_sender = search_sender.clone();
-        let rec_weak = recordings_ui.as_weak();
-        recordings_ui.on_search(move |needle| {
+        let rec_weak = library_ui.as_weak();
+        library_ui.on_search(move |needle| {
             let generation = advance_search_generation(&search_generation);
             // **入力を書き換えない**。空白だけを打っている最中（日本語入力の区切りなど）に
             // 欄の中身が消えると、何が起きたか分からない。解除は本当に空のときだけ。
@@ -734,8 +734,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let transcriber = transcriber.clone();
         let transcript_segments = Rc::clone(&transcript_segments);
         let load_generation = Rc::clone(&load_generation);
-        let rec_weak = recordings_ui.as_weak();
-        recordings_ui.on_clear_search(move || {
+        let rec_weak = library_ui.as_weak();
+        library_ui.on_clear_search(move || {
             let Some(rec) = rec_weak.upgrade() else {
                 return;
             };
@@ -760,9 +760,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Slint 側で分岐させると、操作を足したときに漏れても静かに何も起きないだけになる。
     // 行き先は既存のコールバックと同じで、押す場所が増えただけ。
     {
-        let rec_weak = recordings_ui.as_weak();
+        let rec_weak = library_ui.as_weak();
         let app_weak = ui.as_weak();
-        recordings_ui.on_pane_action(move |kind| {
+        library_ui.on_pane_action(move |kind| {
             let Some(rec) = rec_weak.upgrade() else {
                 return;
             };
@@ -804,8 +804,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let load_generation = Rc::clone(&load_generation);
         let transcriber = transcriber.clone();
         let summarizer = summarizer.clone();
-        let rec_weak = recordings_ui.as_weak();
-        recordings_ui.on_delete_session(move |index| {
+        let rec_weak = library_ui.as_weak();
+        library_ui.on_delete_session(move |index| {
             let Some(rec) = rec_weak.upgrade() else {
                 return;
             };
@@ -912,11 +912,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // 進行状況マップに残ったエントリを掃除する（削除済みセッションの記録を残さない）。
             transcriber.forget(&dir);
             summarizer.forget(&dir);
-            clear_recordings_selection(&rec, &transcript_segments, &load_generation);
+            clear_library_selection(&rec, &transcript_segments, &load_generation);
         });
     }
 
-    // 機能ごとの設定ウィンドウ（#141）。設定画面の「扉」から開く。設定・Recordings と同じく
+    // 機能ごとの設定ウィンドウ（#141）。設定画面の「扉」から開く。設定・Library と同じく
     // 起動時に生成して隠しておき、閉じても常駐を保つ。
     //
     // **走査は 2 つで共有する**（`ModelLists`）。両方開いていてもディスクを見るのは 1 回だけで、
@@ -1129,8 +1129,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         MENU_POLL_INTERVAL,
         build_menu_event_handler(
             ui.as_weak(),
-            RecordingsHandles {
-                ui: recordings_ui.as_weak(),
+            LibraryHandles {
+                ui: library_ui.as_weak(),
                 player: Rc::clone(&player),
                 load_receiver,
                 load_sender: load_sender.clone(),
@@ -1179,10 +1179,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Recordings ウィンドウの操作・再生に必要なハンドル一式。`build_menu_event_handler` の引数を
+/// Library ウィンドウの操作・再生に必要なハンドル一式。`build_menu_event_handler` の引数を
 /// 増やしすぎないためにまとめる。
-struct RecordingsHandles {
-    ui: slint::Weak<RecordingsWindow>,
+struct LibraryHandles {
+    ui: slint::Weak<LibraryWindow>,
     player: Rc<RefCell<Option<player::AudioPlayer>>>,
     /// 選んだ録音の読み込み結果の受け口（#152）。**tick が拾って反映する**——読み込みスレッドは
     /// UI スレッド専有のものに触れないので、送るだけにしてある。
@@ -1214,7 +1214,7 @@ struct RecordingsHandles {
     config: Rc<RefCell<Config>>,
 }
 
-/// 機能ウィンドウを tick で追従させるために必要なハンドル一式（`RecordingsHandles` と
+/// 機能ウィンドウを tick で追従させるために必要なハンドル一式（`LibraryHandles` と
 /// 同じ理由でまとめる）。
 struct ModelsHandles {
     transcription: slint::Weak<TranscriptionWindow>,
@@ -1242,15 +1242,15 @@ struct ModelsHandles {
 /// 実行されるため問題ない。
 fn build_menu_event_handler(
     ui: slint::Weak<AppWindow>,
-    recordings: RecordingsHandles,
+    recordings: LibraryHandles,
     models: ModelsHandles,
     tray: &Tray,
     config: Rc<RefCell<Config>>,
     postprocessor: mixdown::PostProcessWorker,
     #[cfg(target_os = "macos")] app_monitor: app_audio_monitor::AppAudioMonitor,
 ) -> impl FnMut() + 'static {
-    // Recordings ウィンドウ・再生・一覧のハンドルは RecordingsHandles にまとめたまま使う
-    // （引数の氾濫を避ける。open_recordings_window にも構造体ごと渡す）。
+    // Library ウィンドウ・再生・一覧のハンドルは LibraryHandles にまとめたまま使う
+    // （引数の氾濫を避ける。open_library_window にも構造体ごと渡す）。
     // クロージャは 'static のため &Tray を借用できない。必要な要素（各項目・ID・アイコン）
     // だけを複製して所有する。
     let toggle_id = tray.toggle_item.id().clone();
@@ -1262,7 +1262,7 @@ fn build_menu_event_handler(
     let menu_channel = MenuEvent::receiver();
     // 初回表示でジオメトリを確定させたか。2 回目以降は位置・サイズを動かさない。
     let mut geometry_committed = false;
-    // Recordings ウィンドウの初回ジオメトリを確定させたか。
+    // Library ウィンドウの初回ジオメトリを確定させたか。
     let mut rec_geometry_committed = false;
     // 再生の経過時間テキストを、秒が変わったときだけ更新するための前回値。
     let mut last_play_secs: Option<u64> = None;
@@ -1292,7 +1292,7 @@ fn build_menu_event_handler(
                 let Some(rec) = recordings.ui.upgrade() else {
                     continue;
                 };
-                open_recordings_window(
+                open_library_window(
                     &rec,
                     &recordings,
                     &config,
@@ -1367,7 +1367,7 @@ fn build_menu_event_handler(
             was_recording = false;
         }
 
-        // Recordings ウィンドウが開いている間だけ、再生の経過時間・進捗・再生状態を反映する
+        // Library ウィンドウが開いている間だけ、再生の経過時間・進捗・再生状態を反映する
         // （閉じているときは更新しない＝アイドル時の無駄な描画をしない）。再生対象が
         // ロードされていない間は駆動しない: 表示は選択時に確定済みで、上書きするとユーザーが
         // クリックしたセグメントのハイライトを 100ms 後に奪ってしまう。
@@ -1462,7 +1462,7 @@ fn build_menu_event_handler(
             }
         }
 
-        // Recordings ウィンドウが開いている間だけ、文字起こし状態の変化を一覧・詳細ペインへ
+        // Library ウィンドウが開いている間だけ、文字起こし状態の変化を一覧・詳細ペインへ
         // 反映する（変化した行だけ set_row_data して無駄な再描画を避ける）。選択中セッションが
         // 文字起こし中→完了に変わったら、トランスクリプトを読み直して表示を差し替える。
         if let Some(rec) = recordings.ui.upgrade()
@@ -1895,7 +1895,7 @@ fn advance_search_generation(generation: &Cell<u64>) -> u64 {
 ///
 /// **開く・閉じる・解除の 3 経路がここを通る**。どれかが世代を進め忘れると、走っていた検索の
 /// 結果が後から届いて、まっさらなはずの一覧を黙って絞り込む（検索欄は空なので原因が出ない）。
-fn reset_search(rec: &RecordingsWindow, generation: &Cell<u64>) {
+fn reset_search(rec: &LibraryWindow, generation: &Cell<u64>) {
     advance_search_generation(generation);
     rec.set_search_text(slint::SharedString::new());
     rec.set_search_summary(slint::SharedString::new());
@@ -1936,7 +1936,7 @@ enum PlaybackLoad {
 /// 一度に入れることだけ——段階的に入れると、文字起こしだけ出て再生がまだ、という中途半端な
 /// 表示が挟まる。
 fn apply_loaded_session(
-    rec: &RecordingsWindow,
+    rec: &LibraryWindow,
     player: &Rc<RefCell<Option<player::AudioPlayer>>>,
     segments_cell: &Rc<RefCell<Vec<transcript::TranscriptSegment>>>,
     loaded: LoadedSession,
@@ -2021,7 +2021,7 @@ fn trash_error_kind(err: &trash::Error) -> String {
     }
 }
 
-/// Recordings ウィンドウの選択・再生表示を未選択状態へ初期化する
+/// Library ウィンドウの選択・再生表示を未選択状態へ初期化する
 /// （ウィンドウを開いたとき・セッション削除後に共用する）。
 ///
 /// 表示中だった文字起こし・議事録も手放す: どちらも発話由来の機微データで、詳細ペインが
@@ -2031,8 +2031,8 @@ fn trash_error_kind(err: &trash::Error) -> String {
 ///
 /// **世代も進める**（#152）。進めないと、解除の直前に始まった読み込みがあとから届いて、選択が
 /// 無いのに中身だけ入る（削除した録音の文字起こしが残る、という形で出る）。
-fn clear_recordings_selection(
-    rec: &RecordingsWindow,
+fn clear_library_selection(
+    rec: &LibraryWindow,
     transcript_segments: &RefCell<Vec<transcript::TranscriptSegment>>,
     load_generation: &Cell<u64>,
 ) {
@@ -2146,7 +2146,7 @@ fn spawn_search(
 /// 居ないなら、他の「一覧を入れ替える」経路（開く・削除）と同じく**再生対象を手放してから**
 /// 選択を畳む（畳むだけだと、選択は無いのに音が鳴り続ける）。
 fn reselect_after_list_change(
-    rec: &RecordingsWindow,
+    rec: &LibraryWindow,
     sessions: &Rc<RefCell<Vec<recordings::RecordingSession>>>,
     next: Vec<recordings::RecordingSession>,
     player: &Rc<RefCell<Option<player::AudioPlayer>>>,
@@ -2186,14 +2186,14 @@ fn reselect_after_list_change(
             if let Some(p) = player.borrow_mut().as_mut() {
                 p.unload();
             }
-            clear_recordings_selection(rec, segments, load_generation);
+            clear_library_selection(rec, segments, load_generation);
         }
     }
 }
 
 /// 一覧の下の件数を入れる。**絞り込み中かどうかで文が変わる**ので、両方の件数を渡して
 /// ここ 1 箇所で決める（削除・検索・解除のどこから来ても同じ形になる）。
-fn apply_list_counts(rec: &RecordingsWindow, shown: usize, total: usize) {
+fn apply_list_counts(rec: &LibraryWindow, shown: usize, total: usize) {
     rec.set_library_summary(library_summary(total).into());
     rec.set_search_summary(if shown == total {
         slint::SharedString::new()
@@ -2248,11 +2248,11 @@ fn session_rows(
         .collect()
 }
 
-/// トレイの「Recordings…」で Recordings ウィンドウを開く。保存先を走査して一覧を更新し、
+/// トレイの「Library…」で Library ウィンドウを開く。保存先を走査して一覧を更新し、
 /// 選択・再生状態を初期化してから表示する（初回表示はジオメトリを明示する。`docs/rules/slint.md`）。
-fn open_recordings_window(
-    rec: &RecordingsWindow,
-    handles: &RecordingsHandles,
+fn open_library_window(
+    rec: &LibraryWindow,
+    handles: &LibraryHandles,
     config: &Rc<RefCell<Config>>,
     geometry_committed: &mut bool,
     last_play_secs: &mut Option<u64>,
@@ -2271,7 +2271,7 @@ fn open_recordings_window(
     reset_search(rec, &handles.search_generation);
     *handles.all_sessions.borrow_mut() = list.clone();
     // 開くたびに未選択・停止表示へ初期化する。
-    clear_recordings_selection(rec, &handles.transcript_segments, &handles.load_generation);
+    clear_library_selection(rec, &handles.transcript_segments, &handles.load_generation);
     *handles.sessions.borrow_mut() = list;
     *last_play_secs = None;
     // 再生ハンドルがあれば前回の再生対象を手放す（未選択表示に合わせて「何もロードされて
@@ -2283,8 +2283,8 @@ fn open_recordings_window(
     show_window(
         rec.window(),
         geometry_committed,
-        slint::LogicalPosition::new(RECORDINGS_X, RECORDINGS_Y),
-        slint::LogicalSize::new(RECORDINGS_WIDTH, RECORDINGS_HEIGHT),
+        slint::LogicalPosition::new(LIBRARY_X, LIBRARY_Y),
+        slint::LogicalSize::new(LIBRARY_WIDTH, LIBRARY_HEIGHT),
     );
 }
 
@@ -2307,7 +2307,7 @@ fn transcript_rows(segments: &[transcript::TranscriptSegment]) -> Vec<Transcript
 /// 1 箇所で保証する。個別に set するのは意図的な 2 経路だけ: 再生 tick（時刻は秒が変わった
 /// ときだけ更新して無駄な再設定を避ける）と、ドラッグ中のプレビュー（塗りは Slint 側が
 /// プレビュー比率で描くため時刻だけを更新する）。
-fn apply_playback_position(rec: &RecordingsWindow, position: Duration, duration: Option<Duration>) {
+fn apply_playback_position(rec: &LibraryWindow, position: Duration, duration: Option<Duration>) {
     rec.set_progress(playback_progress(position, duration));
     rec.set_time_text(format_playback_time(position, duration).into());
 }
@@ -2368,7 +2368,7 @@ fn toggle_recording(
 /// 録音していなければ何もしない。メニューバーのトレイアイコン／経過時間の表示はタイマー closure が
 /// 録音状態を見て駆動するため、ここではメニュー項目のラベル・アイコンを待機表示へ戻すだけにする。
 ///
-/// 保存後、（設定 ON なら）文字起こしをワーカーへ投入し、両音源が保存できていれば Recordings 用の
+/// 保存後、（設定 ON なら）文字起こしをワーカーへ投入し、両音源が保存できていれば Library 用の
 /// ミックス音声（mix.mp3）生成もワーカーへ投入する（手動・自動どちらの停止経路もここを通る）。
 fn stop_recording(
     recorder: &mut Option<Recorder>,
@@ -2469,7 +2469,7 @@ fn submit_transcription(
     });
 }
 
-/// 手動（Recordings ウィンドウの Summarize）の議事録生成の依頼を組み立てる。設定値
+/// 手動（Library ウィンドウの Summarize）の議事録生成の依頼を組み立てる。設定値
 /// （モデル・言語）は**ここでスナップショット**し、処理中の設定変更の影響を受けない。
 /// エンジンはいまオンデバイスのみ。
 ///
@@ -2545,7 +2545,7 @@ fn start_recording(
     }
 }
 
-/// ウィンドウを表示する。設定・Recordings の両ウィンドウで共用する。
+/// ウィンドウを表示する。設定・Library の両ウィンドウで共用する。
 ///
 /// 初回表示時のみジオメトリ（位置・サイズ）を明示する（`geometry_committed` で一度きりに保つ）。
 /// なぜ初回にジオメトリを明示するかは `docs/rules/slint.md` を参照。
@@ -2577,7 +2577,7 @@ fn show_window(
 /// トレイメニューのクリックではアプリ自体がアクティブ化されず、表示中のウィンドウは他アプリの
 /// 背後に残る（「メニューを押したのに反応しない」ように見える）。そこで raw-window-handle
 /// 連携で対象の NSWindow を取得し、最小化からの復元・前面化・キー化とアプリのアクティブ化を
-/// 行う。対象の NSWindow を直接キー化するため、設定・Recordings の両方が開いていても選んだ
+/// 行う。対象の NSWindow を直接キー化するため、設定・Library の両方が開いていても選んだ
 /// メニューに対応する方がキーになる。
 ///
 /// ハンドルが取得できない場合（非 AppKit バックエンド等）はログして何もしない
@@ -2689,7 +2689,7 @@ fn came_off_the_worker(previous: TranscriptStatus, status: TranscriptStatus) -> 
     on_the_worker(previous) && !on_the_worker(status)
 }
 
-/// 文字起こしの表示状態（`ui/recordings-window.slint` の `TranscriptStatus`）を合成する。
+/// 文字起こしの表示状態（`ui/library-window.slint` の `TranscriptStatus`）を合成する。
 /// ワーカーの進行状況（メモリ）があればそれを優先し、無ければ JSON の有無で解決する。
 fn transcript_display_status(
     worker_status: Option<transcribe::TranscribeStatus>,
@@ -2712,11 +2712,7 @@ fn transcript_display_status(
 /// 決める（bool を別途渡して enum と食い違う余地を作らないため。`docs/rules/slint.md`）:
 /// `detail-files-in-use`（文字起こし中・要約生成中＝ワーカーがファイルを読み書き中）が Delete を、
 /// `detail-jobs-pending`（それ＋要約のキュー待ち）が Transcribe / Summarize を止める。
-fn apply_detail_transcript_status(
-    rec: &RecordingsWindow,
-    pane: &TranscriptPane,
-    jobs_pending: bool,
-) {
+fn apply_detail_transcript_status(rec: &LibraryWindow, pane: &TranscriptPane, jobs_pending: bool) {
     let status = pane.status();
     let message = pane.message();
     rec.set_detail_transcript_text(transcript_status_text(status).into());
@@ -2750,7 +2746,7 @@ fn apply_detail_transcript_status(
 ///
 /// 畳むのは、対象が変わりうるすべての契機——録音を選び直したとき・選択を解除したとき・
 /// 文字起こしが走り始めたとき。**列挙を増やすときはここへ**（呼び出し側に条件を書かない）。
-fn fold_partial_transcript(rec: &RecordingsWindow) {
+fn fold_partial_transcript(rec: &LibraryWindow) {
     rec.set_show_partial_transcript(false);
 }
 
@@ -2826,7 +2822,7 @@ fn transcript_pane_of(
 /// `detail-jobs-pending`（それ＋要約のキュー待ち）が Transcribe / Summarize を止める。空表示の
 /// ボタンは Slint に `enabled` を持たないので、同じ条件で**出すかどうか**を Rust が決める。
 fn refresh_detail_panes(
-    rec: &RecordingsWindow,
+    rec: &LibraryWindow,
     transcriber: &transcribe::TranscribeWorker,
     summarizer: &summarize::SummarizeWorker,
     session: &recordings::RecordingSession,
@@ -2860,7 +2856,7 @@ fn jobs_pending(transcript: &TranscriptPane, summary: &SummaryPane) -> bool {
     )
 }
 
-/// 議事録生成の表示状態（`ui/recordings-window.slint` の `SummaryStatus`）を合成する。
+/// 議事録生成の表示状態（`ui/library-window.slint` の `SummaryStatus`）を合成する。
 /// ワーカーの進行状況（メモリ）があればそれを優先し、無ければ `summary.md` の有無で解決する
 /// （`transcript_display_status` と同じ流儀）。
 fn summary_display_status(
@@ -2878,7 +2874,7 @@ fn summary_display_status(
 }
 
 /// `summary.md` を Summary タブの表示行へ分ける（**Markdown をどこまで解釈するかの正はここ**。
-/// `ui/recordings-window.slint` の `SummaryRow` はこの doc を参照する）。
+/// `ui/library-window.slint` の `SummaryRow` はこの doc を参照する）。
 ///
 /// 本格的なレンダリングはしない（#81 のスコープ外）。行単位に切って、**見出し（`#` の連なりの
 /// 後ろに空白か行末が続く行）だけ**記号を落として `is_heading` を立てる。`##` 以降も同じ強調で、
@@ -2931,7 +2927,7 @@ fn heading_text(line: &str) -> Option<&str> {
 
 /// 詳細ペインの議事録生成の表示（状態テキスト・状態依存の配色・縮退ラベル）を反映する
 /// （`apply_detail_transcript_status` と対称。ボタンの活性の扱いもそちらの doc 参照）。
-fn apply_detail_summary_status(rec: &RecordingsWindow, pane: &SummaryPane, jobs_pending: bool) {
+fn apply_detail_summary_status(rec: &LibraryWindow, pane: &SummaryPane, jobs_pending: bool) {
     let status = pane.status();
     let message = pane.message();
     rec.set_detail_summary_status_text(summary_status_text(status).into());
@@ -3076,7 +3072,7 @@ fn model_path_override(
 /// - **モデルパスを上書き中**（両種別）: そのファイルが優先されるので、カタログのモデルは以後も
 ///   取得しない（`TranscribeJob::model_override` / `summarize::resolve_model`）。
 /// - **要約 OFF**（要約のみ）: 選択だけ保存する。取得は次に要約が走るとき（設定を ON にした後の
-///   初回要約、または Recordings ウィンドウの「Summarize」による手動生成）に `ensure_model` が行う。
+///   初回要約、または Library ウィンドウの「Summarize」による手動生成）に `ensure_model` が行う。
 ///
 /// 文字起こし側に「自動文字起こし OFF なら取得しない」というゲートは**置かない**。一覧の「Use」を
 /// 押すのは**先行取得の意思表示**だから（機能を OFF にしたまま準備しておく、という使い方をする）。
@@ -3141,7 +3137,7 @@ fn whisper_model_status_line(
 /// - モデルパスを上書きしている: そのファイルが使われ、カタログのモデルは取得しない
 ///   （whisper と同じ状態なので `MODEL_OVERRIDDEN_STATUS` を共用する）。
 /// - 要約 OFF: 選んでも取得は始まらない（次に要約が走るときに取得する。設定を ON にした後の
-///   初回要約か、Recordings ウィンドウからの手動生成）。
+///   初回要約か、Library ウィンドウからの手動生成）。
 fn summary_model_status_line(
     config: &Config,
     downloader: &model_download::ModelDownloader,
@@ -3336,7 +3332,7 @@ mod tests {
     #[test]
     fn the_pane_tells_the_window_whether_what_is_readable_is_partial() {
         super::init_test_backend();
-        let rec = super::RecordingsWindow::new().expect("create the recordings window");
+        let rec = super::LibraryWindow::new().expect("create the recordings window");
 
         let partial = TranscriptPane::Failed {
             reason: TranscribeFailure::Files {

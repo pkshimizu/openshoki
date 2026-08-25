@@ -200,7 +200,7 @@ pub(crate) fn is_part_file(path: &Path) -> bool {
 /// pid が数字であることまで見るのは、拡張子付きのユーザーファイル（`notes.part.txt` 等）を
 /// 誤って掴まないための最低限のふるい。これだけでは分割書庫の慣習名（`archive.zip.part.1`）を
 /// 見分けられないので、**安全性の主体は対象を限定していること**にある（`PartScope`）。掃除の
-/// 掛け先は 2 つ: モデルの保存先（`model_download::sweep_orphaned_part_files`）と、Recordings
+/// 掛け先は 2 つ: モデルの保存先（`model_download::sweep_orphaned_part_files`）と、Library
 /// ウィンドウに出たセッションの直下（`recordings::spawn_session_part_sweep`）。範囲と時期の
 /// 理由はそれぞれの doc。
 fn part_dest(path: &Path) -> Option<&str> {

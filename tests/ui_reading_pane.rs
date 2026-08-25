@@ -22,10 +22,10 @@ use slint::{ComponentHandle, ModelRc, VecModel};
 const WINDOW_WIDTH: f32 = 1100.0;
 const WINDOW_HEIGHT: f32 = 720.0;
 
-/// 選択済み・中身なしの Recordings ウィンドウ（空表示が出ている状態）。
-fn window_with_empty_pane(actions: Vec<PaneAction>) -> RecordingsWindow {
+/// 選択済み・中身なしの Library ウィンドウ（空表示が出ている状態）。
+fn window_with_empty_pane(actions: Vec<PaneAction>) -> LibraryWindow {
     ui_support::init_backend();
-    let window = RecordingsWindow::new().expect("creating the window should succeed");
+    let window = LibraryWindow::new().expect("creating the window should succeed");
     window
         .window()
         .set_size(slint::LogicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT));
