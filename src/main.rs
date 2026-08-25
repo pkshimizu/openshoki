@@ -4157,6 +4157,19 @@ mod tests {
                 kind: PaneActionKind::StopTranscription,
                 primary: false,
             },
+            // 続けて書く操作も**中身を作り直す**（#165）。いまの経路では走行中に並ばないが、
+            // ゲートは 1 箇所なので、ここが緩むと並んだ日に静かに重ね投入できる。
+            PaneAction {
+                label: "Transcribe, then write notes".into(),
+                kind: PaneActionKind::TranscribeThenNotes,
+                primary: true,
+            },
+            // 途中結果を開く操作はディスクに触らないので残す（#164）。
+            PaneAction {
+                label: "Show partial".into(),
+                kind: PaneActionKind::ShowPartialTranscript,
+                primary: false,
+            },
         ];
         assert_eq!(actions_allowed_while_busy(all.clone(), false), all);
         assert_eq!(
@@ -4168,6 +4181,7 @@ mod tests {
                 PaneActionKind::CancelNotes,
                 PaneActionKind::OpenNotes,
                 PaneActionKind::StopTranscription,
+                PaneActionKind::ShowPartialTranscript,
             ]
         );
     }
