@@ -3332,7 +3332,7 @@ mod tests {
     #[test]
     fn the_pane_tells_the_window_whether_what_is_readable_is_partial() {
         super::init_test_backend();
-        let rec = super::LibraryWindow::new().expect("create the recordings window");
+        let rec = super::LibraryWindow::new().expect("create the library window");
 
         let partial = TranscriptPane::Failed {
             reason: TranscribeFailure::Files {

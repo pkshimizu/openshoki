@@ -25,7 +25,7 @@ const WINDOW_HEIGHT: f32 = 540.0;
 /// 詳細ペイン（`if root.has-selection` の中）を出した状態のウィンドウ。
 fn open_window() -> LibraryWindow {
     ui_support::init_backend();
-    let window = LibraryWindow::new().expect("create the recordings window");
+    let window = LibraryWindow::new().expect("create the library window");
     window
         .window()
         .set_size(slint::LogicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT));
