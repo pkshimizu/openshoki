@@ -68,6 +68,11 @@ impl TranscriptSegment {
 struct TranscriptFile {
     #[serde(default)]
     segments: Vec<RawSegment>,
+    /// 元になった音源の長さ（秒）。**どこまでの音源から作られたか**を表すので、途中で
+    /// 読めなくなった音源から作った JSON では、その打ち切り位置になる（#164）。欠けている
+    /// 古い JSON は 0 として読む（`transcribed_duration_secs` が「分からない」に落とす）。
+    #[serde(default)]
+    duration_secs: f64,
 }
 
 /// JSON の 1 セグメント。`text` は欠けていても既定値で読めるようにする（前方互換）。
@@ -95,6 +100,37 @@ pub fn load_transcript(session_dir: &Path) -> Vec<TranscriptSegment> {
 /// ログにはどちらのファイルで起きたかが分かるようファイル名（`mic.json` 等）だけを含める
 /// （フルパス＝保存先や発話内容の機微情報は出さない）。
 fn load_one(path: &Path, speaker: Speaker) -> Vec<TranscriptSegment> {
+    let Some(parsed) = read_guarded(path) else {
+        return Vec::new();
+    };
+    parsed
+        .segments
+        .into_iter()
+        .map(|s| TranscriptSegment {
+            start_secs: s.start,
+            text: s.text,
+            speaker,
+        })
+        .collect()
+}
+
+/// 保存済みの文字起こしが、**どこまでの音源から作られたか**（秒。#164）。読めない・欠けて
+/// いる・壊れている・長さが入っていないときは `None`（＝分からない）。
+///
+/// 途中結果を保存してよいかの判断に使う（`transcribe::partial_is_worth_keeping`）。すでに
+/// 在るもののほうが先まで読めた音源から作られているなら、置き換えると読める範囲が減る。
+pub fn transcribed_duration_secs(path: &Path) -> Option<f64> {
+    let parsed = read_guarded(path)?;
+    // 信頼境界外の値なので、意味のある正の秒でなければ「分からない」に落とす。
+    (parsed.duration_secs.is_finite() && parsed.duration_secs > 0.0).then_some(parsed.duration_secs)
+}
+
+/// 1 つの文字起こし JSON を、信頼境界外の入力として読む共通部（読む側の唯一の入口）。
+///
+/// 欠落（未生成）は静かに、読み取り失敗・過大・破損はログして、いずれも `None` を返す
+/// （縮退。アプリは落とさない）。ログにはどちらのファイルで起きたかが分かるようファイル名
+/// （`mic.json` 等）だけを含める（フルパス＝保存先や発話内容の機微情報は出さない）。
+fn read_guarded(path: &Path) -> Option<TranscriptFile> {
     use std::io::Read;
 
     let name = path
@@ -104,11 +140,11 @@ fn load_one(path: &Path, speaker: Speaker) -> Vec<TranscriptSegment> {
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
         // 未生成（ファイルが無い）は正常な縮退。ログもしない。
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
         // 権限・I/O エラーなどは異常なので、調査の手掛かりを残す。
         Err(err) => {
             eprintln!("Skipping the transcript {name} because it could not be opened: {err}");
-            return Vec::new();
+            return None;
         }
     };
     // 信頼境界外の入力（手で置換されうる）なので、開いたハンドルの fstat で通常ファイルであることを
@@ -118,18 +154,18 @@ fn load_one(path: &Path, speaker: Speaker) -> Vec<TranscriptSegment> {
         && !meta.is_file()
     {
         eprintln!("Skipping the transcript {name} because it is not a regular file");
-        return Vec::new();
+        return None;
     }
     let mut limited = file.take(MAX_TRANSCRIPT_BYTES + 1);
     let mut text = String::new();
     if let Err(err) = limited.read_to_string(&mut text) {
         eprintln!("Skipping the transcript {name} because it could not be read: {err}");
-        return Vec::new();
+        return None;
     }
     // 上限＋1 バイトまで読み切った（limit が尽きた）なら上限超過。
     if limited.limit() == 0 {
         eprintln!("Skipping the transcript {name} because it is too large");
-        return Vec::new();
+        return None;
     }
     let parsed: TranscriptFile = match serde_json::from_str(&text) {
         Ok(parsed) => parsed,
@@ -141,18 +177,10 @@ fn load_one(path: &Path, speaker: Speaker) -> Vec<TranscriptSegment> {
                 err.line(),
                 err.column()
             );
-            return Vec::new();
+            return None;
         }
     };
-    parsed
-        .segments
-        .into_iter()
-        .map(|s| TranscriptSegment {
-            start_secs: s.start,
-            text: s.text,
-            speaker,
-        })
-        .collect()
+    Some(parsed)
 }
 
 /// 再生位置に対応するセグメントの index を返す（開始秒が再生位置以下である最後のセグメント）。

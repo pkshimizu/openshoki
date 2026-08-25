@@ -417,10 +417,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             refresh_detail_panes(&rec, &transcriber, &summarizer, session, &config);
             rec.set_playing(false);
             rec.set_current_segment(-1);
-            // 途中結果を開いた状態は持ち越さない（#164）。別の録音の途中結果まで、開くと
-            // 決めたことにしてしまう（走り始めたときに畳むのは
-            // `apply_detail_transcript_status`）。
-            rec.set_show_partial_transcript(false);
+            // 途中結果を開いた状態は持ち越さない（理由は `fold_partial_transcript` の doc）。
+            fold_partial_transcript(&rec);
             // **前の録音の中身を残さない**。読み込みが終わるまで空にし、読み込み中であることを
             // 出す（前の文字起こしが表示されたままだと、別の録音の内容を読んでしまう）。
             rec.set_segments(Rc::new(slint::VecModel::default()).into());
@@ -781,9 +779,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ui.invoke_open_minutes_window();
                     }
                 }
-                // 途中結果を開く（#164）。ディスクには何も起こさず、伏せてある一覧を出すだけ。
-                // 畳むのは録音を選び直したとき（`on_select_session` /
-                // `clear_recordings_selection`）——別の録音の途中結果まで開いたことにしない。
+                // 途中結果を開く（#164）。ディスクには何も起こさず、伏せてある一覧を出すだけ
+                // （畳む契機は `fold_partial_transcript` の doc）。
                 PaneActionKind::ShowPartialTranscript => rec.set_show_partial_transcript(true),
             }
         });
@@ -2043,8 +2040,8 @@ fn clear_recordings_selection(
     rec.set_has_transcript(false);
     rec.set_segments(Rc::new(slint::VecModel::<TranscriptRow>::default()).into());
     rec.set_current_segment(-1);
-    // 開いた途中結果も畳む（#164。`on_select_session` と対）。
-    rec.set_show_partial_transcript(false);
+    // 開いた途中結果も畳む（理由は `fold_partial_transcript` の doc）。
+    fold_partial_transcript(rec);
     transcript_segments.borrow_mut().clear();
     rec.set_summary_rows(Rc::new(slint::VecModel::<SummaryRow>::default()).into());
     // 状態も未実施へ畳む（次の選択で必ず上書きされるが、`detail-files-in-use` /
@@ -2666,15 +2663,27 @@ fn apply_detail_transcript_status(
     // 途中結果かどうかは状態 enum から出せない（#164。`TranscriptPane::shows_partial` の doc）
     // ので、見出し・理由・操作と**同じ値から**入れる。
     rec.set_detail_transcript_partial(pane.shows_partial());
-    // 走り始めたら、開いた途中結果は畳む（#164）。次に出るのは別の結果なので、前回の
-    // 「開く」という同意を引き継がない。**投入の経路が増えてもここを通る**——表示は
-    // すべてこの関数から入る（`docs/rules/slint.md` の「導出は 1 つの関数に集める」）。
+    // 走り始めたら畳む（理由は `fold_partial_transcript` の doc）。**投入の経路が増えても
+    // ここを通る**——表示はすべてこの関数から入る（`docs/rules/slint.md` の「導出は 1 つの
+    // 関数に集める」）。
     if matches!(
         status,
         TranscriptStatus::Transcribing | TranscriptStatus::Stopping
     ) {
-        rec.set_show_partial_transcript(false);
+        fold_partial_transcript(rec);
     }
+}
+
+/// 開いた途中結果を畳む（#164）。**理由の正はここ**（呼び出し側は参照だけを置く）。
+///
+/// `Show partial` は「いま出ているこの途中結果を読む」という同意なので、対象が変わったら
+/// 引き継がない。引き継ぐと、別の録音の途中結果や、Try again で作り直された**別の**途中結果が
+/// 伏せられずにいきなり一覧で出る。
+///
+/// 畳むのは、対象が変わりうるすべての契機——録音を選び直したとき・選択を解除したとき・
+/// 文字起こしが走り始めたとき。**列挙を増やすときはここへ**（呼び出し側に条件を書かない）。
+fn fold_partial_transcript(rec: &RecordingsWindow) {
+    rec.set_show_partial_transcript(false);
 }
 
 /// 空表示のボタン列を**変わったときだけ**差し替える（0〜2 件）。
@@ -3278,9 +3287,7 @@ mod tests {
         super::apply_detail_transcript_status(&rec, &TranscriptPane::Done, false);
         assert!(!rec.get_detail_transcript_partial());
 
-        // 走り始めたら、開いた途中結果は畳む（#164）。次に出るのは別の結果なので、前回の
-        // 「開く」という同意を引き継がない——引き継ぐと、同じ録音で Try again を押して
-        // また途中で失敗したときに、新しい途中結果が伏せられずいきなり一覧で出る。
+        // 走り始めたら、開いた途中結果は畳む（理由は `fold_partial_transcript` の doc）。
         super::apply_detail_transcript_status(&rec, &partial, false);
         rec.set_show_partial_transcript(true);
         super::apply_detail_transcript_status(

@@ -779,7 +779,6 @@ fn run_job(
         return JobOutcome::Stopped;
     }
     // 最後まで行かなかった音源を集める（文にするのは読む領域の仕事。`TranscribeFailure`）。
-    // 最後まで行った本数も数える——1 本でも残っていれば、読む領域は途中結果を出せる（#164）。
     let mut failed: Vec<FailedSource> = Vec::new();
     // **読める文字起こしを残せたか**を覚える（本数ではない。`TranscribeFailure::Files`）。
     // 1 件も認識できなかった音源は数えない——残っていると言っても、開く行が無い。
@@ -858,11 +857,26 @@ enum FileOutcome {
 ///
 /// - 1 件も認識できていなければ、書いても読む行が無い。それでも「残っている」と言うと、
 ///   押しても何も現れない `Show partial` を出すことになる（`TranscribeFailure::kept_partial`）。
-/// - すでに文字起こしが在るなら**置き換えない**。前の実行が最後まで読めていればそれは完成品で、
-///   同じ音源からの途中結果より必ず良い。しかも音源がもう最後まで読めない以上、上書きは
-///   取り返しがつかない。前の実行も途中結果だったなら、同じ音源から作るので中身は変わらない。
-fn partial_is_worth_keeping(segments: usize, transcript_path: &Path) -> bool {
-    segments > 0 && !transcript_path.exists()
+/// - すでに在るものが**これより先まで**の音源から作られているなら置き換えない。前の実行が
+///   最後まで読めていればそれは完成品で、音源がもう最後まで読めない以上、上書きは取り返しが
+///   つかない。
+///
+/// **「在るかどうか」ではなく「どこまでか」で見る**。存在だけで弾くと、同じ音源をやり直す
+/// たびに `NotKept` へ落ちて、途中結果を伏せる仕組み（`kept_partial`）が Try again 一発で
+/// 外れてしまう。長さで比べれば、同じところまでしか読めなければ同じ中身で置き換わり、
+/// 前より先まで読めれば良いほうが残る。
+///
+/// **完成品と途中結果は長さでしか見分けていない**。JSON に印を残すのは #175 の領分で、
+/// それまでは「前のほうが長ければ残す」で近似する。
+fn partial_is_worth_keeping(segments: usize, transcript_path: &Path, upto: Duration) -> bool {
+    if segments == 0 {
+        return false;
+    }
+    match crate::transcript::transcribed_duration_secs(transcript_path) {
+        // まだ何も無い（または読めない）ので、書いて困るものが無い。
+        None => true,
+        Some(existing) => existing <= upto.as_secs_f64(),
+    }
 }
 
 /// whisper の推論ループから降りるための abort コールバック。`true` を返すと whisper.cpp が
@@ -1002,22 +1016,20 @@ fn transcribe_file(
         write_transcription(&json_path, &result)?;
         return Ok(FileOutcome::Transcribed(segments));
     }
+    // 読めたところまで。**サンプル数から整数で出す**——`duration_secs` は同じ長さの f64 だが、
+    // 丸めの分岐（到達しない `Err`）を「どこまで読めたか」という表示に持ち込まない。
+    let upto = Duration::from_secs(pcm.len() as u64 / WHISPER_SAMPLE_RATE as u64);
     // 最後まで読めなかった音源（#164）。**残す価値があるときだけ**保存する。
-    if !partial_is_worth_keeping(segments, &json_path) {
+    if !partial_is_worth_keeping(segments, &json_path, upto) {
         eprintln!(
-            "Not saving the partial transcript of {} because it would not add anything to read",
+            "Not saving the partial transcript of {} because what is already there reaches at \
+             least as far",
             audio_display_name(audio_path)
         );
         return Ok(FileOutcome::NotKept);
     }
     write_transcription(&json_path, &result)?;
-    // 保存したのは読めたところまで。**サンプル数から整数で出す**——`duration_secs` は
-    // 同じ長さの f64 だが、丸めの分岐（到達しない `Err`）を「どこまで読めたか」という
-    // 表示に持ち込まない。
-    Ok(FileOutcome::Partial {
-        segments,
-        upto: Duration::from_secs(pcm.len() as u64 / WHISPER_SAMPLE_RATE as u64),
-    })
+    Ok(FileOutcome::Partial { segments, upto })
 }
 
 /// 文字起こし結果の保存形式。録音一覧ビュー（`src/transcript.rs`）が読む契約なので、`segments` の
@@ -1132,11 +1144,16 @@ fn decode_mp3_stream(
         let packet = match format.next_packet() {
             Ok(Some(packet)) => packet,
             Ok(None) => break, // ストリーム終端。
-            // **音源がそこで終わっていると言い切れる種別だけ**を打ち切りにする（#164）。
-            // 読む領域には `could not be read past 04:12` と出るので、デコーダが扱えない
-            // （`Unsupported` 等）ものまでここへ流すと、事実と違う理由を見せることになる。
-            Err(SymphoniaError::IoError(_) | SymphoniaError::ResetRequired) => {
-                eprintln!("Stopping the decode of {name} because the audio ends there");
+            // **「そこから先が読めなかった」と言い切れる種別だけ**を打ち切りにする（#164）。
+            // 正常な終端は `Ok(None)` で来るので、ここへ来る `IoError` は本当に読めなかった
+            // とき（途中で切れた・デバイスが応答しない）。読む領域に出るのも
+            // `could not be read past 04:12` で、原因まで断定はしていない。
+            //
+            // 他の種別（`Unsupported` / `LimitError` など）は「音源がそこで終わった」ではない
+            // ので従来どおり伝播する。**理由は捨てない**（`docs/rules/error-handling.md`）——
+            // これが唯一の痕跡になる。
+            Err(SymphoniaError::IoError(err)) => {
+                eprintln!("Stopping the decode of {name} because it could not be read on: {err}");
                 complete = false;
                 break;
             }
@@ -2109,31 +2126,53 @@ mod tests {
         }
     }
 
-    /// 途中結果を保存してよいかの判断（#164）。**完成した文字起こしを途中結果で置き換えない**
-    /// のと、**開いても何も出ない途中結果を作らない**の 2 つを固定する。
+    /// 途中結果を保存してよいかの判断（#164）。**すでに在るもののほうが先まで読めていれば
+    /// 置き換えない**のと、**開いても何も出ない途中結果を作らない**の 2 つを固定する。
     ///
     /// 前者が破れると、音源がもう最後まで読めない状況で前回の完成品が失われる（取り返しが
     /// つかない）。後者が破れると、押しても何も現れない `Show partial` が出る。
+    ///
+    /// **同じところまでしか読めなかったときは置き換える**——ここを「在るかどうか」で弾くと、
+    /// Try again 一発で途中結果を伏せる仕組みが外れる（`FileOutcome::NotKept` に落ちて
+    /// `kept_upto` が消えるため）。
     #[test]
     fn a_partial_transcript_is_only_kept_when_it_adds_something() {
         let dir = std::env::temp_dir().join(format!("shoki-worth-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("creating the temp dir should succeed");
         let json_path = dir.join("mic.json");
+        let upto = Duration::from_secs(252);
 
         assert!(
-            partial_is_worth_keeping(3, &json_path),
+            partial_is_worth_keeping(3, &json_path, upto),
             "the first partial transcript of a source is worth keeping"
         );
         assert!(
-            !partial_is_worth_keeping(0, &json_path),
+            !partial_is_worth_keeping(0, &json_path, upto),
             "a transcript with no lines would leave nothing to open"
         );
 
-        std::fs::write(&json_path, b"{}").expect("writing the existing transcript should succeed");
+        // 同じところまでしか読めなかったやり直し（Try again）。中身は同じなので置き換える。
+        std::fs::write(&json_path, br#"{"duration_secs":252.0,"segments":[]}"#)
+            .expect("writing the existing transcript should succeed");
         assert!(
-            !partial_is_worth_keeping(3, &json_path),
-            "what is already there is never replaced by a partial run"
+            partial_is_worth_keeping(3, &json_path, upto),
+            "re-running on the same audio replaces what it produced last time"
+        );
+
+        // 前の実行のほうが先まで読めている（最後まで読めた完成品を含む）。置き換えない。
+        std::fs::write(&json_path, br#"{"duration_secs":3600.0,"segments":[]}"#)
+            .expect("writing the existing transcript should succeed");
+        assert!(
+            !partial_is_worth_keeping(3, &json_path, upto),
+            "what reaches further is never replaced by a shorter partial run"
+        );
+
+        // 長さが読めない（壊れている・古い形式）なら、残して困るものが無いので書く。
+        std::fs::write(&json_path, b"{ this is not json").expect("writing should succeed");
+        assert!(
+            partial_is_worth_keeping(3, &json_path, upto),
+            "a transcript that cannot be read is not worth protecting"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

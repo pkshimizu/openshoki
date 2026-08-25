@@ -224,8 +224,8 @@ impl TranscriptPane {
     ///
     /// 何を「残した」と数えるかは `TranscribeFailure::kept_partial` が正（理由もそちら）。
     ///
-    /// **走っている間は立たない**。次に出るのは別の結果なので、前回開いた同意を引き継がない
-    /// （畳むのは `main::apply_detail_transcript_status`）。
+    /// **走っている間は立たない**。開いた状態を畳むのは `main::fold_partial_transcript`
+    /// （理由もそちら）。
     ///
     /// **ワイルドカードを置かない**（状態を足したら扱いを書くまで通らない）。
     pub fn shows_partial(&self) -> bool {
