@@ -8,7 +8,9 @@
 //! whisper は CPU 集約で秒〜分オーダーかかるため、1 本のバックグラウンドワーカースレッド＋
 //! キュー（`mpsc`）で逐次処理する。メインスレッド（Slint ループ）はジョブを投げるだけで
 //! ブロックしない。モデル未指定/欠如・デコード失敗・whisper 失敗は握りつぶさずログし、
-//! 他音源・アプリ・録音を巻き込まない（`docs/rules/error-handling.md`）。
+//! 他音源・アプリ・録音を巻き込まない（`docs/rules/error-handling.md`）。音源を最後まで
+//! 読めなかったときは、**読めた範囲を文字起こしして保存する**（#164。どこまで読めたかは
+//! `TranscribeFailure::Files` に載り、読む領域が説明する）。
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
