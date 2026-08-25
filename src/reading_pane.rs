@@ -380,6 +380,40 @@ pub enum TranscriptInput {
     Missing,
 }
 
+impl TranscriptInput {
+    /// 文字起こしの状態と「読める文字起こしが在るか」から、議事録タブの見方を決める（#165）。
+    ///
+    /// **読める文字起こしが在れば `Ready` が先**——作り直している最中でも、入力としては在る
+    /// （そのとき議事録を押せるかどうかは Slint 側のゲートが決める）。無いときだけ、なぜ無いのか
+    /// で言い分ける。
+    ///
+    /// **ワイルドカードを置かない**（状態を足したら扱いを書くまで通らない）。
+    pub fn of(transcript: &TranscriptPane, has_transcript: bool) -> Self {
+        if has_transcript {
+            return Self::Ready;
+        }
+        match transcript.status() {
+            TranscriptStatus::Transcribing | TranscriptStatus::Stopping => Self::Running,
+            TranscriptStatus::Failed => Self::Failed,
+            // 生成済みなのに読めない（JSON の欠落・破損）も、入力としては無い。
+            TranscriptStatus::NotTranscribed | TranscriptStatus::Done => Self::Missing,
+        }
+    }
+
+    /// 議事録がまだ無いときに出す状態（#165）。
+    ///
+    /// **本番も確認用バイナリもここを通す**（`docs/rules/testing.md` の「確認用バイナリでも、
+    /// 状態は 1 つの値から出す」）。別々に選ぶと、本番では作れない組み合わせを目視してしまう。
+    pub fn pane_when_no_notes(self, auto_on: bool) -> SummaryPane {
+        match self {
+            Self::Ready => SummaryPane::NotSummarized { auto_on },
+            Self::Running => SummaryPane::WaitingForTranscript,
+            Self::Failed => SummaryPane::TranscriptFailed,
+            Self::Missing => SummaryPane::Blocked,
+        }
+    }
+}
+
 /// 読む領域が出す議事録の状態と、そこに出す中身（#154。`TranscriptPane` と対称）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SummaryPane {
@@ -449,13 +483,14 @@ impl SummaryPane {
             Self::WaitingForTranscript => PaneMessage::new(
                 "Waiting for the transcript",
                 "Notes are written from the transcript, so they start once it finishes. \
-                 The Transcript tab shows how far it has got.",
+                 The Transcript tab shows its progress.",
             ),
             // **押せる手を出す**。入力から作り直すしかないので、行き先は続けて書く依頼と同じ。
             Self::TranscriptFailed => PaneMessage::new(
                 "No notes yet",
                 "The transcription did not finish, so notes did not start. Notes are written \
-                 from the transcript, and an incomplete one would leave them incomplete too.",
+                 from the transcript, and an incomplete one would leave the notes incomplete \
+                 too.",
             )
             .with_primary("Try again", PaneActionKind::TranscribeThenNotes)
             .with_secondary("Open transcription", PaneActionKind::OpenTranscription),

@@ -2956,25 +2956,9 @@ fn summary_pane(
     summary_pane_of(
         summarizer.state_of(&session.dir),
         session.has_summary,
-        transcript_input(transcript, session.has_transcript),
+        TranscriptInput::of(transcript, session.has_transcript),
         auto_on,
     )
-}
-
-/// 議事録タブから見た入力（文字起こし）の様子（#165）。
-///
-/// **読める文字起こしが在れば `Ready`**——作り直している最中でも、入力としては在る
-/// （そのとき議事録を押せるかどうかは Slint 側のゲートが決める）。無いときだけ、なぜ無いのかで
-/// 言い分ける。
-fn transcript_input(transcript: &TranscriptPane, has_transcript: bool) -> TranscriptInput {
-    if has_transcript {
-        return TranscriptInput::Ready;
-    }
-    match transcript.status() {
-        TranscriptStatus::Transcribing | TranscriptStatus::Stopping => TranscriptInput::Running,
-        TranscriptStatus::Failed => TranscriptInput::Failed,
-        TranscriptStatus::NotTranscribed | TranscriptStatus::Done => TranscriptInput::Missing,
-    }
 }
 
 /// どの状態に落とすかを決める純関数（`transcript_pane_of` と対称。理由もあちらと同じ）。
@@ -3001,12 +2985,9 @@ fn summary_pane_of(
         // 文字起こしが無いと議事録は動かせない。**「まだ書いていない」ではなく「まだ書けない」**
         // と言い分けるのは、押しても何も起きないボタンを出さないため。無いときは、なぜ無いのか
         // で 3 つに割れる（#165。待っている／失敗した／まだ何もしていない）。
-        None => match input {
-            TranscriptInput::Ready => SummaryPane::NotSummarized { auto_on },
-            TranscriptInput::Running => SummaryPane::WaitingForTranscript,
-            TranscriptInput::Failed => SummaryPane::TranscriptFailed,
-            TranscriptInput::Missing => SummaryPane::Blocked,
-        },
+        // 入力の様子で 3 つに割れる（#165。対応表の正は `TranscriptInput::pane_when_no_notes`
+        // ——確認用バイナリも同じところを通す）。
+        None => input.pane_when_no_notes(auto_on),
     }
 }
 
@@ -3321,8 +3302,8 @@ mod tests {
         came_off_the_worker, jobs_pending, model_downloads_on_select, model_status_line,
         playback_progress, search_summary_text, seek_position_from_ratio, session_matches,
         summary_display_status, summary_model_status_line, summary_pane_of, summary_rows,
-        summary_status_text, transcript_display_status, transcript_input, transcript_pane_of,
-        transcript_status_text, whisper_model_status_line,
+        summary_status_text, transcript_display_status, transcript_pane_of, transcript_status_text,
+        whisper_model_status_line,
     };
     use super::{elapsed_text, recordings, summarize, transcribe};
     use chrono::{Datelike as _, Timelike as _};
@@ -4104,10 +4085,10 @@ mod tests {
             model: "Medium".to_owned(),
             percent: None,
         };
-        assert_eq!(transcript_input(&running, true), I::Ready);
-        assert_eq!(transcript_input(&running, false), I::Running);
+        assert_eq!(I::of(&running, true), I::Ready);
+        assert_eq!(I::of(&running, false), I::Running);
         assert_eq!(
-            transcript_input(
+            I::of(
                 &TranscriptPane::Stopping {
                     model: "Medium".to_owned()
                 },
@@ -4116,7 +4097,7 @@ mod tests {
             I::Running
         );
         assert_eq!(
-            transcript_input(
+            I::of(
                 &TranscriptPane::Failed {
                     reason: TranscribeFailure::Panicked
                 },
@@ -4125,11 +4106,11 @@ mod tests {
             I::Failed
         );
         assert_eq!(
-            transcript_input(&TranscriptPane::NotTranscribed { auto_on: false }, false),
+            I::of(&TranscriptPane::NotTranscribed { auto_on: false }, false),
             I::Missing
         );
         // JSON が読めなかった `Done`。中身が無いので入力にはならない。
-        assert_eq!(transcript_input(&TranscriptPane::Done, false), I::Missing);
+        assert_eq!(I::of(&TranscriptPane::Done, false), I::Missing);
     }
 
     /// 走っているジョブがある間は、中身を作り直す操作を出さない（取り消しと窓は残す）。
