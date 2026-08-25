@@ -94,11 +94,8 @@ pub fn load_transcript(session_dir: &Path) -> Vec<TranscriptSegment> {
     segments
 }
 
-/// 1 つの文字起こし JSON を読む。欠落（未生成）は静かに、読み取り失敗・過大・破損はログして、
-/// いずれも空を返す（縮退。アプリは落とさない）。
-///
-/// ログにはどちらのファイルで起きたかが分かるようファイル名（`mic.json` 等）だけを含める
-/// （フルパス＝保存先や発話内容の機微情報は出さない）。
+/// 1 つの文字起こし JSON を、話者ラベル付きのセグメント列にする。読めなければ空
+/// （読み方と縮退の理由は `read_guarded` の doc が正）。
 fn load_one(path: &Path, speaker: Speaker) -> Vec<TranscriptSegment> {
     let Some(parsed) = read_guarded(path) else {
         return Vec::new();
