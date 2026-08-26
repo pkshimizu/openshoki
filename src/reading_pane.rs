@@ -9,7 +9,7 @@
 //! （`TranscriptStatus` / `SummaryStatus` / `PaneAction` / `PaneActionKind`）と std だけ。
 //! 失敗の種別（`TranscribeFailure` / `SummarizeFailure`）をここに置いているのもそのため——
 //! 種別は「読む領域が説明できることの語彙」で、文言表の網羅 match のすぐ隣にある。
-//! 時計表記（`format_elapsed`）も同じ理由でここに住んでいる。読む領域だけのものではないが、
+//! 時計表記（`format_elapsed`）と単複の揃え（`plural`）も同じ理由でここに住んでいる。読む領域だけのものではないが、
 //! **依存を持てないこのモジュールが、実装を 1 つに保てる唯一の置き場所**だった（#164）。
 
 use std::time::Duration;
@@ -630,8 +630,9 @@ pub fn elapsed_text(elapsed: Duration) -> String {
 }
 
 /// 数と単位を英語として揃える（`1 minute` / `3 minutes`）。**そのまま画面に出る**文なので、
-/// 単複が崩れると読みにくい（`docs/rules/messages.md`）。
-fn plural(count: u64, unit: &str) -> String {
+/// 単複が崩れると読みにくい（`docs/rules/messages.md`）。ログにも出る（#178 の
+/// `recordings::scan_sessions`）——同じ揃え方の実装を 2 つ持たない。
+pub fn plural(count: u64, unit: &str) -> String {
     if count == 1 {
         format!("1 {unit}")
     } else {

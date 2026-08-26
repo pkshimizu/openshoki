@@ -262,31 +262,148 @@ fn duration_from_size(bytes: u64, bytes_per_sec: u64) -> Option<Duration> {
     (seconds > 0).then(|| Duration::from_secs(seconds))
 }
 
-/// 音源の長さを測る。**ヘッダを 4 バイトだけ読む**——デコードはしない（1 本で数百 ms かかり、
-/// 一覧の全件では開いた瞬間に固まる。#152）。
-fn measure_duration(path: &Path) -> Option<Duration> {
-    let mut file = match std::fs::File::open(path) {
-        Ok(file) => file,
-        Err(err) => {
-            // **パスは出さない**（`docs/rules/security.md`）。長さが出ないだけなので一覧は続ける。
+/// 音源の長さを測った結果（#178）。**「測れない」を 2 つに分ける**——理由が違えば、読み手へ
+/// 言うことも変わる（片方は待てば直り、もう片方は直らない）。
+#[derive(Debug)]
+enum Measured {
+    /// 測れた。
+    Length(Duration),
+    /// **実体がこの Mac に無い**ので測れない。再生や文字起こしで実体が要るときには従来どおり
+    /// 取り寄せられ、そのあとは測れる（見分け方は `measured_from_read_error` の doc）。
+    NotDownloaded,
+    /// 長さが決められない（開けない・属性が読めない・ヘッダが MP3 でない・1 秒未満）。
+    /// **`NotDownloaded` と違って待っても直らない。**
+    Unknown,
+}
+
+/// 読み取りの失敗を、長さの結果へ分類する（#178）。**分類だけでログは出さない**——名前どおりの
+/// 純関数にしておくと、継ぎ目としても素直に読める。
+///
+/// `EDEADLK`（`Deadlock`）は「取り寄せない設定なので実体を用意できない」という macOS の返し方。
+/// **この見分け方の正はここ**（他は参照だけを置く）。実測で、退避された音源は `open` が通って
+/// `read` がこれで返る。
+///
+/// macOS 以外では `dataless::without_downloads` が何もしないので、この分岐へは来ない想定
+/// （来たとしても長さが出ないだけで、表示は `Unknown` と同じ）。
+fn measured_from_read_error(kind: std::io::ErrorKind) -> Measured {
+    if kind == std::io::ErrorKind::Deadlock {
+        Measured::NotDownloaded
+    } else {
+        Measured::Unknown
+    }
+}
+
+/// 先頭 4 バイトのフレームヘッダと全体のサイズから長さを決める。
+///
+/// **中身を読むので証（`NoDownloads`）を要求する**。ここだけ要求しないでおくと、`File::open` を
+/// 手で書いて繋ぐことで囲いの外から読めてしまう（`measure_duration` と同じ理由）。
+///
+/// **読み取りを引数で受ける**のは、退避されたファイルをテストから作れないため（クラウドの管理下に
+/// 置くしかない）。`docs/rules/testing.md` の「重い処理そのものを引数で受ける」に従って、
+/// 「読み取りが `EDEADLK` で失敗したら `NotDownloaded` になる」という**繋ぎ**をここで固定できる
+/// ようにしてある。**この理由の正はここ**（`scan_sessions` が測り方を受けるのも同じ理由）。
+fn measure_from_header(
+    mut reader: impl std::io::Read,
+    bytes: u64,
+    _downloads_off: &crate::dataless::NoDownloads,
+) -> Measured {
+    let mut header = [0u8; 4];
+    if let Err(err) = reader.read_exact(&mut header) {
+        let measured = measured_from_read_error(err.kind());
+        if matches!(measured, Measured::Unknown) {
+            // 退避は件数をまとめて 1 行にするが（`scan_sessions`）、こちらは異常なので音源ごとに
+            // 残す。**パスは出さない**（`docs/rules/security.md`）。
             eprintln!(
-                "Skipping the length of a recording because its audio could not be opened: {}",
+                "Skipping the length of a recording because its audio could not be read: {}",
                 err.kind()
             );
-            return None;
+        }
+        return measured;
+    }
+    match bytes_per_sec_from_header(header).and_then(|rate| duration_from_size(bytes, rate)) {
+        Some(length) => Measured::Length(length),
+        None => Measured::Unknown,
+    }
+}
+
+/// 音源の長さを測る。**ヘッダを 4 バイトだけ読む**——デコードはしない（1 本で数百 ms かかり、
+/// 一覧の全件では開いた瞬間に固まる。#152）。
+///
+/// 保存先の音源は差し替えられうる信頼境界外の入力なので、**開いたハンドルの `fstat` で通常
+/// ファイルであることを確かめる**（FIFO 等は読み終わらないことがある。`docs/rules/security.md`。
+/// `open` 自体が塞がる可能性までは塞げない）。
+///
+/// **証（`NoDownloads`）を要求する**のは、取り寄せを止めた中でしか読ませないため（#178）。
+/// 囲いの外から呼ぶ書き方はコンパイルを通らない（理由は `dataless::NoDownloads` の doc）。
+fn measure_duration(path: &Path, downloads_off: &crate::dataless::NoDownloads) -> Measured {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) => {
+            // 取り寄せない設定では `open` が通って `read` で返るのが実測の挙動だが、`open` 側で
+            // 返す環境もありうるので同じ見分けを通す。**パスは出さない**。
+            let measured = measured_from_read_error(err.kind());
+            if matches!(measured, Measured::Unknown) {
+                eprintln!(
+                    "Skipping the length of a recording because its audio could not be opened: {}",
+                    err.kind()
+                );
+            }
+            return measured;
         }
     };
-    let bytes = file.metadata().ok()?.len();
-    let mut header = [0u8; 4];
-    std::io::Read::read_exact(&mut file, &mut header).ok()?;
-    duration_from_size(bytes, bytes_per_sec_from_header(header)?)
+    let metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            eprintln!(
+                "Skipping the length of a recording because its attributes could not be read: {}",
+                err.kind()
+            );
+            return Measured::Unknown;
+        }
+    };
+    if !metadata.is_file() {
+        eprintln!("Skipping the length of a recording because its audio is not a regular file");
+        return Measured::Unknown;
+    }
+    measure_from_header(file, metadata.len(), downloads_off)
 }
 
 /// `recording_dir` を走査して録音セッションを新しい順（日時降順）で返す。
 ///
 /// ディレクトリが無い・読めないときは空一覧を返す（縮退。ログを残す）。名前が日時形式でない
 /// エントリ、ディレクトリでないエントリ、音源が 1 つも無いセッションはスキップする。
+///
+/// **退避された音源の中身は読まない**（#178。理由は `crate::dataless` のモジュール doc）。
+/// 取り寄せられなかった音源は `duration: None` になり、一覧は「長さが分からない録音では区切り
+/// ごと出さない」既存の形で出る（#162）。
 pub fn list_sessions(recording_dir: &Path) -> Vec<RecordingSession> {
+    crate::dataless::without_downloads(|downloads_off| scan_sessions(recording_dir, downloads_off))
+}
+
+/// 測った結果を、セッションと集計へ振り分ける（#178）。
+///
+/// **ここを切り出してあるのは、測り方を差し替えずに振り分けをテストするため**。測り方ごと
+/// 差し替えられるようにすると、証の壁を素通りする閉包を書けてしまう（`scan_sessions` の doc）。
+fn apply_measured(session: &mut RecordingSession, measured: Measured, not_downloaded: &mut u64) {
+    match measured {
+        Measured::Length(length) => session.duration = Some(length),
+        // **数えて後でまとめて言う**（#178）。音源ごとに出すと、退避された録音が並ぶ保存先で
+        // 開くたびに十数行の同じログが流れる。
+        Measured::NotDownloaded => *not_downloaded += 1,
+        Measured::Unknown => {}
+    }
+}
+
+/// 走査そのもの。
+///
+/// **測り方を差し替えられるようにしない**（#178）。閉包で受けると、その中で直接ファイルを読む
+/// 書き方ができてしまい、証（`dataless::NoDownloads`）の壁を素通りする——レビューで実際にその形の
+/// 穴が出た。差し替えたいのは「測った結果をどう振り分けるか」だけなので、そちらを
+/// `apply_measured` に切り出してテストする。
+fn scan_sessions(
+    recording_dir: &Path,
+    downloads_off: &crate::dataless::NoDownloads,
+) -> Vec<RecordingSession> {
     let entries = match std::fs::read_dir(recording_dir) {
         Ok(entries) => entries,
         Err(err) => {
@@ -297,6 +414,8 @@ pub fn list_sessions(recording_dir: &Path) -> Vec<RecordingSession> {
     };
 
     let mut sessions: Vec<RecordingSession> = Vec::new();
+    // 実体が無くて長さを測れなかった録音の数（#178。`plural` へ渡すためだけの値）。
+    let mut not_downloaded = 0u64;
     for entry in entries.flatten() {
         let dir = entry.path();
         // ディレクトリ以外（ファイル等）は対象外。
@@ -332,10 +451,23 @@ pub fn list_sessions(recording_dir: &Path) -> Vec<RecordingSession> {
         // **組み上がってから長さを入れる**（#162）。選び方を素の `bool` で受ける関数に切り出すと、
         // 引数の順序を取り違えても通ってしまう——同じ `RecordingSession` の `duration_source` を
         // 通すことで、再生対象と同じ選び方であることが構造で決まる。
-        session.duration = session
-            .duration_source()
-            .and_then(|path| measure_duration(&path));
+        if let Some(path) = session.duration_source() {
+            apply_measured(
+                &mut session,
+                measure_duration(&path, downloads_off),
+                &mut not_downloaded,
+            );
+        }
         sessions.push(session);
+    }
+
+    if not_downloaded > 0 {
+        // **黙って消さない**（#178）。長さの段が出ないのは異常ではないが、理由がどこにも無いと
+        // 「表示が壊れた」に見える。
+        eprintln!(
+            "Not showing the length of {} because the audio has not been downloaded to this Mac",
+            crate::reading_pane::plural(not_downloaded, "recording")
+        );
     }
 
     // 新しい順（日時降順）。同時刻はディレクトリ名でも安定させる必要はないが、決定的にするため
@@ -420,9 +552,10 @@ fn parse_session_datetime(name: &str) -> Option<NaiveDateTime> {
 #[cfg(test)]
 mod tests {
     use super::{
-        RecordingSession, STALE_SESSION_PART_AGE, bytes_per_sec_from_header, duration_from_size,
-        list_sessions, parse_session_datetime, session_dirs, spawn_session_part_sweep,
-        sweep_session_dirs,
+        Measured, RecordingSession, STALE_SESSION_PART_AGE, apply_measured,
+        bytes_per_sec_from_header, duration_from_size, list_sessions, measure_duration,
+        measure_from_header, measured_from_read_error, parse_session_datetime, session_dirs,
+        spawn_session_part_sweep, sweep_session_dirs,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -544,6 +677,152 @@ mod tests {
             duration_of("20260810-120200"),
             Some(Duration::from_secs(30))
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 「測れない」を理由で分ける（#178）。**実体が無いだけ**なら待てば直るので、壊れている
+    /// のと同じ扱いにしない——一覧はまとめて 1 行ログを出し、それ以外は音源ごとに出す。
+    #[test]
+    fn a_length_that_is_missing_says_why() {
+        use std::io::ErrorKind;
+
+        assert!(matches!(
+            measured_from_read_error(ErrorKind::Deadlock),
+            Measured::NotDownloaded
+        ));
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::UnexpectedEof,
+            ErrorKind::InvalidData,
+        ] {
+            let measured = measured_from_read_error(kind);
+            assert!(
+                matches!(measured, Measured::Unknown),
+                "{kind} is not a file waiting to be downloaded, got {measured:?}"
+            );
+        }
+    }
+
+    /// **読み取りの失敗がそのまま結果に流れる**（#178）。失敗する読み取りを流し込む理由は
+    /// `measure_from_header` の doc。
+    ///
+    /// ここが `Unknown` に丸まると、`Show`（長さの段）が消える理由が「壊れている」に化けて、
+    /// 一覧のまとめログも出なくなる。
+    #[test]
+    fn a_read_that_cannot_be_served_becomes_not_downloaded() {
+        /// いつも同じ失敗を返す読み取り。
+        struct AlwaysFails(std::io::ErrorKind);
+
+        impl std::io::Read for AlwaysFails {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(self.0))
+            }
+        }
+
+        crate::dataless::without_downloads(|downloads_off| {
+            let measured = measure_from_header(
+                AlwaysFails(std::io::ErrorKind::Deadlock),
+                1_000_000,
+                downloads_off,
+            );
+            assert!(
+                matches!(measured, Measured::NotDownloaded),
+                "a read the OS refuses to serve means the audio is not here, got {measured:?}"
+            );
+
+            let measured = measure_from_header(
+                AlwaysFails(std::io::ErrorKind::InvalidData),
+                1_000_000,
+                downloads_off,
+            );
+            assert!(
+                matches!(measured, Measured::Unknown),
+                "any other read failure is just a length we cannot work out, got {measured:?}"
+            );
+
+            // 読めれば、ヘッダとサイズから長さになる（128kbps = 16000 バイト/秒）。
+            let header: &[u8] = &[0xFF, 0xFB, 0x90, 0x00];
+            assert!(matches!(
+                measure_from_header(header, 16_000 * 42, downloads_off),
+                Measured::Length(length) if length == Duration::from_secs(42)
+            ));
+        });
+    }
+
+    /// 取り寄せられなかった音源は、**長さを入れずに数えるだけ**（#178）。ここが緩むと、実体が
+    /// 無いのに長さが入る（あるいは数えられず、まとめログが出ない）。
+    ///
+    /// 測り方そのものは差し替えない（差し替えられる形にすると、証の壁を素通りする閉包を書ける。
+    /// `scan_sessions` の doc）ので、**振り分けだけ**を直接呼んで固定する。
+    #[test]
+    fn audio_that_is_not_here_is_counted_instead_of_measured() {
+        let mut session = RecordingSession {
+            datetime: parse_session_datetime("20260810-140200").expect("a valid session name"),
+            dir: PathBuf::from("/does/not/matter"),
+            has_mic: true,
+            has_system: false,
+            has_mix: false,
+            has_transcript: false,
+            has_summary: false,
+            duration: None,
+        };
+        let mut not_downloaded = 0u64;
+
+        apply_measured(&mut session, Measured::NotDownloaded, &mut not_downloaded);
+        assert_eq!(
+            session.duration, None,
+            "no length is shown for audio that is not here"
+        );
+        assert_eq!(not_downloaded, 1, "it is counted for the summary line");
+
+        apply_measured(&mut session, Measured::Unknown, &mut not_downloaded);
+        assert_eq!(session.duration, None);
+        assert_eq!(
+            not_downloaded, 1,
+            "a length we cannot work out is not the same thing"
+        );
+
+        apply_measured(
+            &mut session,
+            Measured::Length(Duration::from_secs(7)),
+            &mut not_downloaded,
+        );
+        assert_eq!(session.duration, Some(Duration::from_secs(7)));
+        assert_eq!(not_downloaded, 1);
+    }
+
+    /// 読める音源は長さになり、ヘッダが壊れていれば長さ不明になる（#178 で 3 択に割った分）。
+    ///
+    /// **囲いの中でしか呼べない**（`measure_duration` が証を要求する）ので、テストも本番と同じ
+    /// 通り道になる。
+    #[test]
+    fn measuring_reads_the_header_and_falls_back_to_unknown() {
+        let root = unique_root("measure");
+        let _ = fs::remove_dir_all(&root);
+        make_sized_session(&root, "20260810-140200", &[("mic.mp3", 42)]);
+        let audio = root.join("20260810-140200").join("mic.mp3");
+
+        crate::dataless::without_downloads(|downloads_off| {
+            assert!(matches!(
+                measure_duration(&audio, downloads_off),
+                Measured::Length(length) if length == Duration::from_secs(42)
+            ));
+
+            // MP3 のフレーム同期が無いファイル（差し替え・破損）。
+            fs::write(&audio, b"not an mp3 header at all").expect("writing should succeed");
+            assert!(matches!(
+                measure_duration(&audio, downloads_off),
+                Measured::Unknown
+            ));
+
+            // そもそも開けない。
+            fs::remove_file(&audio).expect("removing should succeed");
+            assert!(matches!(
+                measure_duration(&audio, downloads_off),
+                Measured::Unknown
+            ));
+        });
 
         let _ = fs::remove_dir_all(&root);
     }
