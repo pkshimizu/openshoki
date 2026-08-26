@@ -414,10 +414,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             rec.set_detail_sources(session.source_summary().into());
             rec.set_has_transcript(session.has_transcript);
-            // **前の録音の印を持ち越さない**（#175）。`refresh_detail_panes` は `session` と
-            // 対になる読み込み結果を要求するので、状態を組む前に戻す——さもないと、前の録音が
-            // 「最後まで読めていない」だったとき、新しく選んだ完成品が一瞬伏せられる。
-            *transcript_segments.borrow_mut() = LoadedTranscript::unknown();
             // 文字起こしの状態テキストと Transcribe ボタンの活性を、ワーカーの進行状況＋
             // JSON の有無から設定する（以後の変化は tick が追従させる）。
             // 議事録側も同じ流儀で状態を設定する（中身の読み込みは下のスレッドで行う）。
@@ -457,8 +453,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 generation_id,
                 &generation,
                 &load_sender,
-                &transcript_segments,
-                load_replaces_playback(true),
+                                load_replaces_playback(true),
             );
         });
     }
@@ -1673,8 +1668,7 @@ fn build_menu_event_handler(
                         generation_id,
                         &recordings.load_generation,
                         &recordings.load_sender,
-                        &recordings.transcript_segments,
-                        load_replaces_playback(false),
+                                                load_replaces_playback(false),
                     );
                 }
             }
@@ -1850,13 +1844,9 @@ fn spawn_session_load(
     generation_id: u64,
     generation: &Rc<Cell<u64>>,
     sender: &std::sync::mpsc::Sender<LoadedSession>,
-    // 表示中の文字起こし。**始めた時点で「分からない」へ戻す**（#175。理由は `LoadedTranscript`）。
-    loaded: &RefCell<LoadedTranscript>,
     // 音声も読み直すか。**中身だけ変わった読み直しでは false**（理由は `PlaybackLoad`）。
     load_playback: bool,
 ) {
-    // **読み直しを起こす経路はここ 1 本**（この関数の doc）なので、戻すのもここだけでよい。
-    *loaded.borrow_mut() = LoadedTranscript::unknown();
     let dir = session.dir.clone();
     // 揃っているかは「在る音源ごとに JSON があるか」で決まる（#175）ので、音源の並びも渡す。
     let speakers = session.speakers();
@@ -1909,6 +1899,7 @@ fn spawn_session_load(
             // ここからは触れない（受け取って反映するのは tick）。
             let loaded = LoadedSession {
                 generation: generation_id,
+                dir: dir.clone(),
                 transcript,
                 summary,
                 summary_written: summary_written.flatten(),
@@ -1924,6 +1915,7 @@ fn spawn_session_load(
         eprintln!("Loading the recording on this thread because spawning failed: {err}");
         let _ = fallback_sender.send(LoadedSession {
             generation: generation_id,
+            dir: session.dir.clone(),
             // **揃っていないとは言わない**。読めなかっただけで、途中結果だと決めつけると
             // 資源枯渇のたびに全セッションが伏せられる（#175）。
             transcript: transcript::Transcript {
@@ -1974,22 +1966,33 @@ fn reset_search(rec: &LibraryWindow, generation: &Cell<u64>) {
 /// いま表示している文字起こし（#175）。**セグメントと「最後まで読み切れているか」を 1 つの器に
 /// 入れる**——別々に持つと、片方だけ古い組み合わせが画面に出る。
 ///
-/// **読み込みを始めた時点で `unknown()` へ戻す**（`spawn_session_load`）。中身が変わって読み
-/// 直している間に「最後まで読めていない」と決めつけると、たったいま完成した一覧を伏せてしまう
-/// （読み直しの結果は 1 tick 以上遅れて届く）。分からない間は伏せない側へ倒す。
+/// **どの録音を読んだ結果かを持つ**。持たないと「`session` と対になる結果か」を呼び出し順でしか
+/// 保証できず、順序が入れ替わった日に前の録音の印で新しい録音を伏せる。値で照合すれば、一致
+/// しないときは黙って「分からない」（＝伏せない）へ落ちる。**戻し忘れという失敗の形が消える**
+/// ので、読み込みを始めるたびに巻き戻す必要も無い。
 ///
-/// **この器自身は「分からない」と「本当に読み切れている」を区別しない**。区別しているのは
-/// 「読み込みを始めたら戻す」という 1 つの規律だけ。
+/// この照合は**別の録音**だけを弾く。同じ録音の読み直し（絞り込みの打鍵のたびに起きる）では
+/// 直前の値をそのまま使う——毎回「分からない」に戻すと、伏せてある途中結果が打鍵のたびに
+/// 1 tick 顔を出す。読み直しの間に文字起こしが完成した場合も、走らせた記録
+/// （`transcript_pane_of` の `Some(Done)`）がディスクの印より優先されるので伏せたままにならない。
 struct LoadedTranscript {
+    /// 読み込み元。まだ何も読んでいなければ `None`。
+    dir: Option<std::path::PathBuf>,
     transcript: transcript::Transcript,
 }
 
 impl LoadedTranscript {
     /// ディスクに残っている文字起こしの様子（#175）。**極性の反転と組み合わせを型の内側へ入れる**
     /// ——呼び出し側に真偽値 2 つを書かせると、渡し違えても通る形が残る。
-    fn stored(&self, has_transcript: bool) -> StoredTranscript {
-        if !has_transcript {
+    fn stored(&self, session: &recordings::RecordingSession) -> StoredTranscript {
+        if !session.has_transcript {
             return StoredTranscript::None;
+        }
+        // **別の録音の結果なら「分からない」**（#175）。伏せるのは驚く動作なので、確信が無い
+        // うちはやらない。読み直しの最中（同じ録音）は直前の値を保つ——毎回戻すと、打鍵の
+        // たびに伏せてある途中結果が 1 tick 開いてしまう。
+        if self.dir.as_deref() != Some(session.dir.as_path()) {
+            return StoredTranscript::Complete;
         }
         // **読める行が無いなら「途中で終わっている」とは言わない**。押しても何も現れない
         // `Show partial` を出すことになる——読めなかった JSON は `Done` の空表示
@@ -2004,6 +2007,7 @@ impl LoadedTranscript {
     /// 確信が無いうちはやらない）。
     fn unknown() -> Self {
         Self {
+            dir: None,
             transcript: transcript::Transcript {
                 segments: Vec::new(),
                 complete: true,
@@ -2019,6 +2023,8 @@ impl LoadedTranscript {
 struct LoadedSession {
     /// どの選択に対する結果か。**受け取る側が世代を確かめて、古い結果を捨てる**。
     generation: u64,
+    /// どの録音を読んだか（#175。`LoadedTranscript` が `session` との対応を照合するのに使う）。
+    dir: std::path::PathBuf,
     /// 読んだ文字起こし（**セグメントと「揃っているか」を 1 つの値で**。#175）。
     transcript: transcript::Transcript,
     summary: Option<String>,
@@ -2054,6 +2060,7 @@ fn apply_loaded_session(
     loaded: LoadedSession,
 ) {
     let LoadedSession {
+        dir,
         transcript,
         summary,
         summary_written,
@@ -2070,7 +2077,10 @@ fn apply_loaded_session(
     }
     // **セグメントと「最後まで読み切れているか」を同じ器に入れる**（#175。理由は
     // `LoadedTranscript` の doc）。
-    *segments_cell.borrow_mut() = LoadedTranscript { transcript };
+    *segments_cell.borrow_mut() = LoadedTranscript {
+        dir: Some(dir),
+        transcript,
+    };
     let summary_rows = summary.map(|text| summary_rows(&text)).unwrap_or_default();
     rec.set_summary_rows(Rc::new(slint::VecModel::from(summary_rows)).into());
     // 出典は**議事録の中身と一緒に**入れる。行を書くのはここだけなので、両者がずれない
@@ -2293,7 +2303,6 @@ fn reselect_after_list_change(
                     generation_id,
                     load_generation,
                     load_sender,
-                    segments,
                     load_replaces_playback(false),
                 );
             }
@@ -2954,7 +2963,7 @@ fn refresh_detail_panes(
         let config = config.borrow();
         (config.auto_transcribe, config.auto_summarize)
     };
-    let stored = loaded.borrow().stored(session.has_transcript);
+    let stored = loaded.borrow().stored(session);
     let transcript = transcript_pane(transcriber, session, stored, auto_transcribe);
     let summary = summary_pane(summarizer, session, &transcript, stored, auto_summarize);
     // **両方を見てからボタンを決める**。走っているジョブは片方の状態にしか出ないので、
@@ -3483,6 +3492,10 @@ mod tests {
         // 文字起こしが完成品として読める。
         super::apply_detail_transcript_status(&rec, &TranscriptPane::NotReadToTheEnd, false);
         assert!(rec.get_detail_transcript_partial());
+        // **状態行も同じ値から出す**。ここだけ `transcript_status_text(pane.status())` に
+        // 戻すと、途中結果を伏せたまま「Transcribed」と言う画面になる——`status()` は
+        // `NotReadToTheEnd` を `Done` へ畳むので、この一言でしか差が出ない。
+        assert_eq!(rec.get_detail_transcript_text(), "Transcribed in part");
 
         // 走り始めたら、開いた途中結果は畳む（理由は `fold_partial_transcript` の doc）。
         super::apply_detail_transcript_status(&rec, &partial, false);
@@ -4223,14 +4236,31 @@ mod tests {
     ///
     /// **読める行が無いときは「途中で終わっている」と言わない**——押しても何も現れない
     /// `Show partial` になる。そこは「読めなかった」の空表示（`TranscriptPane::Done`）が担当する。
+    ///
+    /// **読んだ元が違えば、印は使わない**。読み込みは別スレッドから 1 tick 以上遅れて届くので、
+    /// 「`session` と対になる結果か」を呼び出し順で保証すると、順序が変わった日に前の録音の印で
+    /// 新しい録音が伏せられる。ここが緩んでも画面は動き続けるぶん、テストで留める。
     #[test]
     fn the_stored_transcript_folds_both_facts() {
         use super::{LoadedTranscript, transcript};
 
-        let loaded =
-            |segments: Vec<transcript::TranscriptSegment>, complete: bool| LoadedTranscript {
+        let session = |dir: &str, has_transcript: bool| {
+            let mut session = recordings::RecordingSession::for_test(
+                chrono::NaiveDate::from_ymd_opt(2026, 8, 10)
+                    .expect("a real date")
+                    .and_hms_opt(14, 2, 0)
+                    .expect("a real time"),
+            );
+            session.dir = std::path::PathBuf::from(dir);
+            session.has_transcript = has_transcript;
+            session
+        };
+        let loaded = |dir: &str, segments: Vec<transcript::TranscriptSegment>, complete: bool| {
+            LoadedTranscript {
+                dir: Some(std::path::PathBuf::from(dir)),
                 transcript: transcript::Transcript { segments, complete },
-            };
+            }
+        };
         let line = || {
             vec![transcript::TranscriptSegment {
                 start_secs: 0.0,
@@ -4240,20 +4270,37 @@ mod tests {
         };
 
         // 文字起こしが無ければ、中身は意味を持たない。
-        assert_eq!(loaded(vec![], true).stored(false), StoredTranscript::None);
-        assert_eq!(loaded(line(), false).stored(false), StoredTranscript::None);
+        assert_eq!(
+            loaded("a", vec![], true).stored(&session("a", false)),
+            StoredTranscript::None
+        );
+        assert_eq!(
+            loaded("a", line(), false).stored(&session("a", false)),
+            StoredTranscript::None
+        );
 
         assert_eq!(
-            loaded(line(), true).stored(true),
+            loaded("a", line(), true).stored(&session("a", true)),
             StoredTranscript::Complete
         );
         assert_eq!(
-            loaded(line(), false).stored(true),
+            loaded("a", line(), false).stored(&session("a", true)),
             StoredTranscript::NotReadToTheEnd
         );
         // 読める行が無いなら、印が落ちていても「読めなかった」側。
         assert_eq!(
-            loaded(vec![], false).stored(true),
+            loaded("a", vec![], false).stored(&session("a", true)),
+            StoredTranscript::Complete
+        );
+
+        // **別の録音を読んだ結果では伏せない**。まだ読めていないのと同じ扱いにする。
+        assert_eq!(
+            loaded("a", line(), false).stored(&session("b", true)),
+            StoredTranscript::Complete
+        );
+        // 一度も読んでいないときも同じ。
+        assert_eq!(
+            LoadedTranscript::unknown().stored(&session("a", true)),
             StoredTranscript::Complete
         );
     }

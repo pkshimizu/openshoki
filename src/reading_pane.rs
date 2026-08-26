@@ -334,11 +334,12 @@ impl TranscriptPane {
     }
 }
 
-/// 文字起こしの表示状態 → 詳細ペインの状態テキスト。
+/// 文字起こしの表示状態 → 状態テキスト。
 ///
-/// **詳細ペインは `TranscriptPane::status_text` を通す**（#175）。状態 enum は一覧と共用で
-/// 「最後まで読めていない」を持てないので、そのままだと同じペインの中で状態行が `Transcribed`、
-/// 空表示が「最後まで読めていない」と食い違う。ここは一覧の行が使う。
+/// **直に呼ぶのは `TranscriptPane::status_text` だけ**（#175）。詳細ペインはそちらを通す——状態
+/// enum は一覧と共用で「揃っていない」を持てないので、直に引くと同じペインの中で状態行が
+/// `Transcribed`、空表示が「揃っていない」と食い違う。一覧の行は別の語を使う
+/// （`session_transcript_word`）。
 pub fn transcript_status_text(display_status: TranscriptStatus) -> &'static str {
     match display_status {
         TranscriptStatus::NotTranscribed => "Not transcribed",
@@ -412,9 +413,12 @@ pub fn summary_status_text(display_status: SummaryStatus) -> &'static str {
 pub enum StoredTranscript {
     /// 文字起こしが無い。
     None,
-    /// 在って、読める行があり、最後まで読み切れている（または読み直しの最中で分からない）。
+    /// 在って、**「揃っていない」とは言えない**。最後まで読み切れているか、読み直しの最中で
+    /// 分からないか、**読める行が無い**（読めなかった JSON。押しても何も現れない `Show partial`
+    /// を出さないよう、ここへ落とす。`main::LoadedTranscript::stored`）。
     Complete,
-    /// 在るが、**在る音源ぶんが揃っていない**（途中で読めなくなった・片方の音源ぶんが無い）。
+    /// 在って読める行もあるが、**在る音源ぶんが揃っていない**（途中で読めなくなった・片方の
+    /// 音源ぶんが無い）。**原因は断定しない**。
     NotReadToTheEnd,
 }
 
@@ -425,10 +429,13 @@ pub enum StoredTranscript {
 /// `docs/rules/coding-conventions.md`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TranscriptInput {
-    /// 読める文字起こしが在り、音源を最後まで読めている。
+    /// 読める文字起こしが在り、**「揃っていない」とは言えない**（`StoredTranscript::Complete`
+    /// と同じ範囲。読めなかった JSON もここへ来る——そのときは Transcript タブが
+    /// 「読めなかった」の空表示を出す）。
     Ready,
-    /// 読める文字起こしが在るが、**音源を最後まで読めていない**（#175）。議事録は書けるが、
-    /// 欠けた入力から書いたものになる。
+    /// 読める文字起こしが在るが、**在る音源ぶんが揃っていない**（#175。原因は
+    /// `StoredTranscript::NotReadToTheEnd` と同じで、断定しない）。議事録は書けるが、欠けた
+    /// 入力から書いたものになる。
     NotReadToTheEnd,
     /// まだ無いが、いま作っている。
     Running,
