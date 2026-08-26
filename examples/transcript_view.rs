@@ -28,6 +28,8 @@
 //!   と組み合わせると先頭のままになる）。**スナップショットは表示後の更新を反映しない**ので、
 //!   追従はここで見える初期表示ぶんだけを確認できる
 //! - `search` / `no-match`: 一覧を絞り込み中／0 件にする（検索欄・件数・解除の導線の確認）
+//! - `not-downloaded`: 退避されていて検索できなかった録音がある状態（#182。件数の行と
+//!   0 件の説明に理由が出る。`search` / `no-match` と組み合わせる）
 //! - `snapshot <path>`: PNG に書き出す（画面収録の許可が無い環境用）
 
 slint::include_modules!();
@@ -43,6 +45,12 @@ mod snapshot;
 #[allow(dead_code)]
 #[path = "../src/reading_pane.rs"]
 mod reading_pane;
+
+// 一覧の下端と空表示の文も同じ理由で共有する（#182）。ここを複製していたせいで、空表示に
+// 「読めなかった録音がある」を足したときに確認用バイナリだけ真っ白になった。
+#[allow(dead_code)]
+#[path = "../src/library_text.rs"]
+mod library_text;
 
 use std::rc::Rc;
 use std::time::Duration;
@@ -280,19 +288,22 @@ fn main() {
         },
     ]))));
     win.set_selected_index(0);
-    win.set_library_summary("5 recordings".into());
+    win.set_library_summary(library_text::library_summary(5).into());
     // 検索（#161）。`search` は絞り込み中、`no-match` は 0 件（解除の導線を見る）。
-    if flag("search") || flag("no-match") {
+    // **件数の文も空表示の文も本番と同じ関数で組む**（#182。ここを複製すると、目視の対象が
+    // 出荷される文言でなくなる）。
+    let searching = flag("search") || flag("no-match");
+    let not_downloaded = if flag("not-downloaded") { 2 } else { 0 };
+    let matched = if flag("no-match") { 0 } else { 3 };
+    if searching {
         win.set_search_text("recording format".into());
         win.set_search_summary(
-            if flag("no-match") {
-                "0 of 5 recordings mention it"
-            } else {
-                "3 of 5 recordings mention it"
-            }
-            .into(),
+            library_text::search_summary_text(matched, 5, not_downloaded).into(),
         );
     }
+    let (empty_heading, empty_body) = library_text::empty_list_message(searching, not_downloaded);
+    win.set_empty_heading(empty_heading.into());
+    win.set_empty_body(empty_body.into());
 
     win.set_has_selection(true);
     win.set_detail_datetime("Aug 10, 2026 · 14:02".into());

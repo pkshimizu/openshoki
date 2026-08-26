@@ -10,6 +10,7 @@ mod app_audio_monitor;
 mod atomic_replace;
 mod config;
 mod dataless;
+mod library_text;
 mod inference_slot;
 mod mixdown;
 mod model_download;
@@ -1806,15 +1807,6 @@ fn session_date_text(session: &recordings::RecordingSession) -> String {
     }
 }
 
-/// 一覧の下端に出す合計。**件数だけ**にする——容量を出すには全セッションのファイルを開く必要が
-/// あり、一覧を開くたびに走らせるには重い。
-fn library_summary(count: usize) -> String {
-    match count {
-        1 => "1 recording".to_owned(),
-        count => format!("{count} recordings"),
-    }
-}
-
 /// その読み込みで再生を差し替えるか（`PlaybackLoad` の判断を 1 か所に置く）。
 ///
 /// **選択が変わったときだけ true**。中身が変わって読み直しただけのときに差し替えると、
@@ -2454,10 +2446,10 @@ fn reselect_after_list_change(
 /// 一覧の下の件数を入れる。**絞り込み中かどうかで文が変わる**ので、両方の件数を渡して
 /// ここ 1 箇所で決める（削除・検索・解除のどこから来ても同じ形になる）。
 fn apply_list_counts(rec: &LibraryWindow, shown: usize, total: usize, not_downloaded: usize) {
-    rec.set_library_summary(library_summary(total).into());
+    rec.set_library_summary(library_text::library_summary(total).into());
     // 空表示の文も**同じ値から**決める（#182）。件数の文とは別に組み立てると、片方だけ
     // 「読めなかった」を言う画面ができる。
-    let (heading, body) = empty_list_message(!rec.get_search_text().is_empty(), not_downloaded);
+    let (heading, body) = library_text::empty_list_message(!rec.get_search_text().is_empty(), not_downloaded);
     rec.set_empty_heading(heading.into());
     rec.set_empty_body(body.into());
     // 絞り込んでいないなら件数の文は出さない（`library_summary` が出る）。**このとき
@@ -2467,41 +2459,8 @@ fn apply_list_counts(rec: &LibraryWindow, shown: usize, total: usize, not_downlo
     rec.set_search_summary(if shown == total {
         slint::SharedString::new()
     } else {
-        search_summary_text(shown, total, not_downloaded).into()
+        library_text::search_summary_text(shown, total, not_downloaded).into()
     });
-}
-
-/// 一覧が空のときに出す見出しと本文（#182 で「読めなかった」を足した）。
-///
-/// **状態から文への対応はここ 1 つ**（Slint の三項連鎖にしない。`docs/rules/slint.md`）。
-/// 空表示は**録音が無いのか、絞り込んで消えたのか**で言い分ける。同じ文にすると、検索語を
-/// 消せば戻ることが分からない。
-///
-/// **絞り込んで 0 件のときこそ理由を言う**。一覧の下端の 1 行は省略されうるので、退避されて
-/// 読めなかったことを伝える場所としてはここがいちばん見える。
-fn empty_list_message(searching: bool, not_downloaded: usize) -> (&'static str, String) {
-    if !searching {
-        return (
-            "No recordings yet",
-            "Start one from the shoki icon in the menu bar, or turn on Record automatically in \
-             Settings so meetings are captured for you."
-                .to_owned(),
-        );
-    }
-    let mut body = "No transcript or notes mention it. Recordings that have not been \
-                    transcribed are not searched."
-        .to_owned();
-    if not_downloaded > 0 {
-        // **独立した文にする**。カンマで繋ぐと、件数が直前の「文字起こしされていない録音」に
-        // 係って読める（実際は別の集合）。単複は `plural` に任せて言い回しを一覧側と揃える。
-        let recordings = reading_pane::plural(not_downloaded as u64, "recording");
-        let verb = if not_downloaded == 1 { "is" } else { "are" };
-        body.push_str(&format!(
-            " {recordings} {verb} not downloaded to this Mac, so what they say could not be \
-             searched."
-        ));
-    }
-    ("No matches", body)
 }
 
 /// いま一覧に在るもののうち、**実体が無くて検索できなかった件数**（#182）。
@@ -2521,25 +2480,6 @@ fn not_downloaded_count(
         .iter()
         .filter(|dir| alive.contains(dir.as_path()))
         .count()
-}
-
-/// 絞り込み中に一覧の下へ出す件数。**解除の手を文に入れる**（0 件のときは本文側で出す）。
-///
-/// **読めなかったぶんも言う**（#182）。黙って対象から外すと「検索に出てこない＝無い」と
-/// 読める。語は一覧側（`recordings::scan_sessions` の「has not been downloaded to this Mac」）に
-/// 揃える。出す場所が省略されうる 1 行なので、**節は短く保つ**こと。
-fn search_summary_text(matched: usize, total: usize, not_downloaded: usize) -> String {
-    // 件数で**文の形**は変えない（0 件でも同じ言い方）が、名詞の単複は揃える
-    // （`library_summary` が `1 recording` と分けているのと同じ）。
-    let mentions = if total == 1 {
-        format!("{matched} of 1 recording mentions it")
-    } else {
-        format!("{matched} of {total} recordings mention it")
-    };
-    if not_downloaded == 0 {
-        return mentions;
-    }
-    format!("{mentions} · {not_downloaded} not downloaded")
 }
 
 /// セッションの並びから一覧の行を組み立てる。**開くときと絞り込み後で同じ経路を通す**
@@ -3641,9 +3581,9 @@ mod tests {
     use super::{
         PaneAction, PaneActionKind, StatusTone, SummaryPane, SummaryStatus, TranscriptPane,
         TranscriptStatus, actions_allowed_while_busy, app_version_text, breathing_level,
-        came_off_the_worker, empty_list_message, jobs_pending, model_downloads_on_select,
+        came_off_the_worker, jobs_pending, model_downloads_on_select,
         model_status_line, not_downloaded_count, outcome_of, playback_progress,
-        search_summary_text, seek_position_from_ratio, summary_display_status,
+        seek_position_from_ratio, summary_display_status,
         summary_model_status_line, summary_pane_of, summary_rows, summary_status_text,
         transcript_display_status, transcript_pane_of, whisper_model_status_line,
     };
@@ -3927,9 +3867,9 @@ mod tests {
     /// 一覧の合計は**件数だけ**（単数形も出す）。容量は全ファイルを開かないと分からない。
     #[test]
     fn the_library_summary_counts_recordings() {
-        assert_eq!(super::library_summary(0), "0 recordings");
-        assert_eq!(super::library_summary(1), "1 recording");
-        assert_eq!(super::library_summary(148), "148 recordings");
+        assert_eq!(super::library_text::library_summary(0), "0 recordings");
+        assert_eq!(super::library_text::library_summary(1), "1 recording");
+        assert_eq!(super::library_text::library_summary(148), "148 recordings");
     }
 
     /// バージョン表記が `Cargo.toml` の `version` と一致することを確かめる。
@@ -4319,17 +4259,17 @@ mod tests {
     #[test]
     fn search_summary_text_shows_both_counts() {
         assert_eq!(
-            search_summary_text(3, 148, 0),
+            super::library_text::search_summary_text(3, 148, 0),
             "3 of 148 recordings mention it"
         );
         // 0 件でも同じ形（件数で文の形は変えない。`docs/rules/messages.md`）。
         assert_eq!(
-            search_summary_text(0, 148, 0),
+            super::library_text::search_summary_text(0, 148, 0),
             "0 of 148 recordings mention it"
         );
         // 名詞の単複は揃える（`library_summary` が `1 recording` と分けているのと同じ）。
-        assert_eq!(search_summary_text(1, 1, 0), "1 of 1 recording mentions it");
-        assert_eq!(search_summary_text(0, 1, 0), "0 of 1 recording mentions it");
+        assert_eq!(super::library_text::search_summary_text(1, 1, 0), "1 of 1 recording mentions it");
+        assert_eq!(super::library_text::search_summary_text(0, 1, 0), "0 of 1 recording mentions it");
     }
 
     /// **読めなかった録音があることを画面に出す**（#182）。黙って対象から外すと
@@ -4337,17 +4277,17 @@ mod tests {
     #[test]
     fn the_search_says_how_many_it_could_not_read() {
         assert_eq!(
-            search_summary_text(3, 11, 8),
+            super::library_text::search_summary_text(3, 11, 8),
             "3 of 11 recordings mention it · 8 not downloaded"
         );
         // 全件が読めないときも同じ形（0 件でも理由が出る）。
         assert_eq!(
-            search_summary_text(0, 11, 11),
+            super::library_text::search_summary_text(0, 11, 11),
             "0 of 11 recordings mention it · 11 not downloaded"
         );
         // 1 件でも文が壊れない（`not downloaded` は形容詞句なので単複を分けない）。
         assert_eq!(
-            search_summary_text(0, 1, 1),
+            super::library_text::search_summary_text(0, 1, 1),
             "0 of 1 recording mentions it · 1 not downloaded"
         );
     }
@@ -4402,11 +4342,11 @@ mod tests {
     /// 場所はここ**。
     #[test]
     fn an_empty_list_says_why_it_is_empty() {
-        let (heading, body) = empty_list_message(false, 0);
+        let (heading, body) = super::library_text::empty_list_message(false, 0);
         assert_eq!(heading, "No recordings yet");
         assert!(body.starts_with("Start one from the shoki icon"));
 
-        let (heading, body) = empty_list_message(true, 0);
+        let (heading, body) = super::library_text::empty_list_message(true, 0);
         assert_eq!(heading, "No matches");
         assert_eq!(
             body,
@@ -4416,7 +4356,7 @@ mod tests {
 
         // **読めなかったものが在るなら、0 件の理由に加える**。件数は独立した文にする
         // （カンマで繋ぐと、直前の「文字起こしされていない録音」に係って読める）。
-        let (_, body) = empty_list_message(true, 8);
+        let (_, body) = super::library_text::empty_list_message(true, 8);
         assert!(
             body.ends_with(
                 " 8 recordings are not downloaded to this Mac, so what they say could not be \
@@ -4425,7 +4365,7 @@ mod tests {
             "got {body:?}"
         );
         // 1 件でも文が壊れない（名詞も動詞も単数に合わせる）。
-        let (_, body) = empty_list_message(true, 1);
+        let (_, body) = super::library_text::empty_list_message(true, 1);
         assert!(
             body.ends_with(
                 " 1 recording is not downloaded to this Mac, so what they say could not be \
@@ -4435,7 +4375,7 @@ mod tests {
         );
 
         // 絞り込んでいなければ、読めなかったものの話はしない（検索していないので）。
-        let (heading, body) = empty_list_message(false, 8);
+        let (heading, body) = super::library_text::empty_list_message(false, 8);
         assert_eq!(heading, "No recordings yet");
         assert!(!body.contains("not downloaded"));
     }
