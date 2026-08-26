@@ -239,6 +239,7 @@ pub const DOWNLOADS_OFF: std::ffi::c_int = sys::IOPOL_MATERIALIZE_DATALESS_FILES
 
 #[cfg(test)]
 mod tests {
+    use super::Fetch;
     use super::without_downloads;
     #[cfg(target_os = "macos")]
     use super::{DOWNLOADS_OFF, current_policy};
@@ -272,6 +273,35 @@ mod tests {
             before,
             "the previous policy comes back anyway"
         );
+    }
+
+    /// 「実体が無い」の見分けは、**取り寄せを止めているときだけ**（#182）。
+    ///
+    /// `Allowed` でも `Deadlock` を「実体が無い」と読むと、取り寄せを頼んだ読み取りの失敗が
+    /// 黙って対象外へ落ちる（画面には「読めなかった」も出ない）。逆に `Blocked` で見分けを
+    /// やめると、退避された録音が「当たらなかった」に化けて、検索から静かに消える。
+    #[test]
+    fn only_a_blocked_read_can_blame_a_missing_body() {
+        use std::io::ErrorKind;
+
+        // 頼まれていない読み取り（囲いの中でしか作れない）。
+        without_downloads(|downloads_off| {
+            let blocked = Fetch::Blocked(downloads_off);
+            assert!(blocked.is_not_downloaded(ErrorKind::Deadlock));
+            // 他の失敗は「実体が無い」ではない（待っても直らない）。
+            assert!(!blocked.is_not_downloaded(ErrorKind::PermissionDenied));
+            assert!(!blocked.is_not_downloaded(ErrorKind::NotFound));
+            assert!(!blocked.is_not_downloaded(ErrorKind::InvalidData));
+        });
+
+        // ユーザーが頼んだ読み取りでは、どの失敗も「実体が無い」とは言わない。
+        for kind in [
+            ErrorKind::Deadlock,
+            ErrorKind::PermissionDenied,
+            ErrorKind::NotFound,
+        ] {
+            assert!(!Fetch::Allowed.is_not_downloaded(kind));
+        }
     }
 
     /// macOS 以外では止めるものが無い（設定できなくても本体は走る）。

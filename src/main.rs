@@ -2273,15 +2273,25 @@ fn session_matches(
     downloads_off: &dataless::NoDownloads,
 ) -> SearchOutcome {
     let fetch = dataless::Fetch::Blocked(downloads_off);
-    let hit = |text: &str| text.to_lowercase().contains(needle);
     let summary = summarize::load_summary(&session.dir, fetch);
-    if summary.text.is_some_and(|text| hit(&text)) {
-        return SearchOutcome::Matched;
-    }
     // **本文しか要らない**（揃っているかの判断は読む領域の仕事。#175）。
     let transcript = transcript::load_segments(&session.dir, fetch);
+    outcome_of(&summary, &transcript, needle)
+}
+
+/// 読んだ本文から、この録音の結果を決める（#182）。**読み取りを含まないので、退避された
+/// ファイルを用意できない環境でも「読めなかった」の扱いを検査できる**
+/// （`docs/rules/testing.md`。読み取りを差し替える継ぎ目は作らない——閉包の中に直接
+/// 読み取りを書けてしまい、囲いを素通りできる）。
+fn outcome_of(
+    summary: &summarize::Summary,
+    transcript: &transcript::Segments,
+    needle: &str,
+) -> SearchOutcome {
+    let hit = |text: &str| text.to_lowercase().contains(needle);
     search_outcome(
-        transcript.segments.iter().any(|segment| hit(&segment.text)),
+        summary.text.as_deref().is_some_and(hit)
+            || transcript.segments.iter().any(|segment| hit(&segment.text)),
         summary.not_downloaded || transcript.not_downloaded,
     )
 }
@@ -3561,7 +3571,7 @@ mod tests {
         PaneAction, PaneActionKind, StatusTone, SummaryPane, SummaryStatus, TranscriptPane,
         TranscriptStatus, actions_allowed_while_busy, app_version_text, breathing_level,
         came_off_the_worker, jobs_pending, model_downloads_on_select, model_status_line,
-        not_downloaded_count, playback_progress, search_outcome, search_summary_text,
+        not_downloaded_count, outcome_of, playback_progress, search_outcome, search_summary_text,
         seek_position_from_ratio, session_matches, summary_display_status,
         summary_model_status_line, summary_pane_of, summary_rows, summary_status_text,
         transcript_display_status, transcript_pane_of, whisper_model_status_line,
@@ -4260,6 +4270,33 @@ mod tests {
         );
     }
 
+    /// 読めなかった理由が**ウィンドウまで届く**こと（#182）。
+    ///
+    /// 件数の文を組む関数は単体で検査済みだが、**それを画面へ入れるかを決めているのは
+    /// `apply_list_counts` の 1 行**。ここが「絞り込まれていなければ出さない」だけを見ると、
+    /// 全件が当たって一部が退避、という組み合わせで理由が黙って消える
+    /// （`docs/rules/testing.md` の「配線は、繋いでいる関数に継ぎ目を入れてテストする」）。
+    #[test]
+    fn the_window_is_told_what_the_search_could_not_read() {
+        super::init_test_backend();
+        let rec = super::LibraryWindow::new().expect("create the library window");
+
+        // 絞り込んでおらず、読めなかったものも無い＝言うことが無い。
+        super::apply_list_counts(&rec, 11, 11, 0);
+        assert_eq!(rec.get_search_summary(), "");
+
+        // **全件が当たっていても、読めなかったものが在るなら言う**。
+        super::apply_list_counts(&rec, 11, 11, 3);
+        assert_eq!(
+            rec.get_search_summary(),
+            "11 of 11 recordings mention it · 3 not downloaded"
+        );
+
+        // 絞り込み中は従来どおり件数を出す。
+        super::apply_list_counts(&rec, 2, 11, 0);
+        assert_eq!(rec.get_search_summary(), "2 of 11 recordings mention it");
+    }
+
     /// 読めなかった録音の件数は、**いま一覧に在るものだけ**を数える（#182）。
     ///
     /// 検索結果は打鍵した時点のスナップショットなので、そのまま数えると「10 件中 11 件が
@@ -4287,6 +4324,64 @@ mod tests {
         assert_eq!(not_downloaded_count(&not_downloaded, &all), 2);
         assert_eq!(not_downloaded_count(&[], &all), 0);
         assert_eq!(not_downloaded_count(&not_downloaded, &[]), 0);
+    }
+
+    /// 読めなかった本文があることが、**読んだ結果から結果へ運ばれる**こと（#182）。
+    ///
+    /// 退避されたファイルは CI でも手元でも作れないので、`Deadlock` から
+    /// `NotDownloaded` までの繋ぎは実測でしか確かめられない。**その手前と先は繋いで検査
+    /// できる**——ここが抜けると、読み手が「読めなかった」と言っているのに検索が黙って
+    /// 「当たらなかった」に丸める形を書けてしまう。
+    #[test]
+    fn what_could_not_be_read_reaches_the_outcome() {
+        use super::SearchOutcome as O;
+
+        let summary = |text: Option<&str>, not_downloaded: bool| super::summarize::Summary {
+            text: text.map(str::to_owned),
+            not_downloaded,
+        };
+        let transcript = |text: Option<&str>, not_downloaded: bool| super::transcript::Segments {
+            segments: text
+                .map(|text| {
+                    vec![super::transcript::TranscriptSegment {
+                        start_secs: 0.0,
+                        text: text.to_owned(),
+                        speaker: super::transcript::Speaker::Mic,
+                    }]
+                })
+                .unwrap_or_default(),
+            not_downloaded,
+        };
+        let nothing = || (summary(None, false), transcript(None, false));
+
+        // 読めた本文に当たる（大小を無視する）。議事録・文字起こしのどちらでも。
+        let (s, t) = (
+            summary(Some("Release next week"), false),
+            transcript(None, false),
+        );
+        assert_eq!(outcome_of(&s, &t, "release"), O::Matched);
+        let (s, t) = (
+            summary(None, false),
+            transcript(Some("Release next week"), false),
+        );
+        assert_eq!(outcome_of(&s, &t, "release"), O::Matched);
+
+        // 何も無ければ「当たらなかった」。**読めなかったとは言わない**。
+        let (s, t) = nothing();
+        assert_eq!(outcome_of(&s, &t, "release"), O::Missed);
+
+        // **片方でも実体が無ければ、当たらなかったときに必ずそう言う**。
+        let (s, t) = (summary(None, true), transcript(None, false));
+        assert_eq!(outcome_of(&s, &t, "release"), O::NotDownloaded);
+        let (s, t) = (summary(None, false), transcript(None, true));
+        assert_eq!(outcome_of(&s, &t, "release"), O::NotDownloaded);
+
+        // 当たったなら、読めなかった本文が残っていても当たり（`search_outcome` の割り切り）。
+        let (s, t) = (
+            summary(Some("Release next week"), false),
+            transcript(None, true),
+        );
+        assert_eq!(outcome_of(&s, &t, "release"), O::Matched);
     }
 
     /// 当たった録音は「読めなかった」に数えない（#182）。**当たった事実は、読めなかった
