@@ -796,9 +796,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let Some(rec) = rec_weak.upgrade() else {
                 return;
             };
-            reset_search(&rec, &search_generation);
-            // 絞り込みを解除したら、読めなかった録音の話も消える（検索していないので）。
-            search_not_downloaded.borrow_mut().clear();
+            reset_search(&rec, &search_generation, &search_not_downloaded);
             let all = all_sessions.borrow().clone();
             let total = all.len();
             sessions_model.set_vec(session_rows(&all, &transcriber));
@@ -1984,10 +1982,18 @@ fn advance_search_generation(generation: &Cell<u64>) -> u64 {
 ///
 /// **開く・閉じる・解除の 3 経路がここを通る**。どれかが世代を進め忘れると、走っていた検索の
 /// 結果が後から届いて、まっさらなはずの一覧を黙って絞り込む（検索欄は空なので原因が出ない）。
-fn reset_search(rec: &LibraryWindow, generation: &Cell<u64>) {
+///
+/// **検索にまつわる値はここで全部落とす**（#182 で「読めなかった録音」を足した）。1 つでも
+/// 外に置くと、解除の経路を足した人が確実に落とす。
+fn reset_search(
+    rec: &LibraryWindow,
+    generation: &Cell<u64>,
+    not_downloaded_dirs: &RefCell<Vec<std::path::PathBuf>>,
+) {
     advance_search_generation(generation);
     rec.set_search_text(slint::SharedString::new());
     rec.set_search_summary(slint::SharedString::new());
+    not_downloaded_dirs.borrow_mut().clear();
 }
 
 /// いま表示している文字起こし（#175）。**セグメントと「最後まで読み切れているか」を 1 つの器に
@@ -2454,9 +2460,11 @@ fn apply_list_counts(rec: &LibraryWindow, shown: usize, total: usize, not_downlo
     let (heading, body) = empty_list_message(!rec.get_search_text().is_empty(), not_downloaded);
     rec.set_empty_heading(heading.into());
     rec.set_empty_body(body.into());
-    // **読めなかったぶんが在るなら、全件が当たっていても文を出す**（#182）。件数だけで
-    // 判断すると、全件一致かつ一部が退避という組み合わせで理由が黙って消える。
-    rec.set_search_summary(if shown == total && not_downloaded == 0 {
+    // 絞り込んでいないなら件数の文は出さない（`library_summary` が出る）。**このとき
+    // `not_downloaded` は必ず 0**——`SearchOutcome` は 1 録音につき 1 値で `Matched` と
+    // `NotDownloaded` が排他、どちらも同じ一覧で絞ってから数えるので、全件が当たったなら
+    // 読めなかったものは無い（#182）。
+    rec.set_search_summary(if shown == total {
         slint::SharedString::new()
     } else {
         search_summary_text(shown, total, not_downloaded).into()
@@ -2480,14 +2488,18 @@ fn empty_list_message(searching: bool, not_downloaded: usize) -> (&'static str, 
                 .to_owned(),
         );
     }
-    let mut body =
-        "No transcript or notes mention it. Recordings that have not been transcribed are not \
-         searched"
-            .to_owned();
-    match not_downloaded {
-        0 => body.push('.'),
-        1 => body.push_str(", and 1 is not downloaded to this Mac."),
-        n => body.push_str(&format!(", and {n} are not downloaded to this Mac.")),
+    let mut body = "No transcript or notes mention it. Recordings that have not been \
+                    transcribed are not searched."
+        .to_owned();
+    if not_downloaded > 0 {
+        // **独立した文にする**。カンマで繋ぐと、件数が直前の「文字起こしされていない録音」に
+        // 係って読める（実際は別の集合）。単複は `plural` に任せて言い回しを一覧側と揃える。
+        let recordings = reading_pane::plural(not_downloaded as u64, "recording");
+        let verb = if not_downloaded == 1 { "is" } else { "are" };
+        body.push_str(&format!(
+            " {recordings} {verb} not downloaded to this Mac, so what they say could not be \
+             searched."
+        ));
     }
     ("No matches", body)
 }
@@ -2498,12 +2510,16 @@ fn empty_list_message(searching: bool, not_downloaded: usize) -> (&'static str, 
 /// そのまま数えると、絞り込み中に 1 件消しただけで「10 件中 11 件が未ダウンロード」という
 /// 合計より多い数が出る（`matched` を `retain` しているのと同じ理由）。
 fn not_downloaded_count(
-    not_downloaded: &[std::path::PathBuf],
+    not_downloaded_dirs: &[std::path::PathBuf],
     all: &[recordings::RecordingSession],
 ) -> usize {
-    not_downloaded
+    // **一覧を 1 度だけ引ける形にする**。総当たりだと、この修正が狙う「保存先まるごと退避」
+    // （読めなかった件数＝全件）で打鍵ごとに n² 回の比較が UI スレッドに乗る。
+    let alive: std::collections::HashSet<&std::path::Path> =
+        all.iter().map(|session| session.dir.as_path()).collect();
+    not_downloaded_dirs
         .iter()
-        .filter(|dir| all.iter().any(|session| session.dir == **dir))
+        .filter(|dir| alive.contains(dir.as_path()))
         .count()
 }
 
@@ -2581,8 +2597,11 @@ fn open_library_window(
         .set_vec(session_rows(&list, &handles.transcriber));
     // 開くたびに検索は解除しておく（前に開いたときの絞り込みが残っていると、録音が消えたように
     // 見える）。**世代も進める**——走っていた検索の結果が後から届いて絞り込むのを防ぐ。
-    reset_search(rec, &handles.search_generation);
-    handles.search_not_downloaded.borrow_mut().clear();
+    reset_search(
+        rec,
+        &handles.search_generation,
+        &handles.search_not_downloaded,
+    );
     // **件数も空表示もここを通す**（`docs/rules/slint.md` の「表示値の導出は 1 つの関数に集め、
     // 起動時の初期化もその関数を通す」）。直接 set すると、開いた直後だけ空表示の文が欠ける。
     // 検索は上で解除したので、絞り込みも読めなかったものも無い。
@@ -4348,16 +4367,17 @@ mod tests {
         super::apply_list_counts(&rec, 11, 11, 0);
         assert_eq!(rec.get_search_summary(), "");
 
-        // **全件が当たっていても、読めなかったものが在るなら言う**。
-        super::apply_list_counts(&rec, 11, 11, 3);
-        assert_eq!(
-            rec.get_search_summary(),
-            "11 of 11 recordings mention it · 3 not downloaded"
-        );
-
-        // 絞り込み中は従来どおり件数を出す。
+        // 絞り込み中は件数を出す。
         super::apply_list_counts(&rec, 2, 11, 0);
         assert_eq!(rec.get_search_summary(), "2 of 11 recordings mention it");
+
+        // **読めなかったものが在るなら、件数の行にも言う**（本番で実際に出る組み合わせ。
+        // 全件一致かつ一部が退避、は `SearchOutcome` が排他なので作れない）。
+        super::apply_list_counts(&rec, 0, 11, 8);
+        assert_eq!(
+            rec.get_search_summary(),
+            "0 of 11 recordings mention it · 8 not downloaded"
+        );
 
         // **空表示の文も同じ呼び出しで入る**（別々に組むと、片方だけ「読めなかった」を
         // 言う画面ができる）。検索中かはウィンドウの検索欄から見る。
@@ -4366,7 +4386,7 @@ mod tests {
         assert_eq!(rec.get_empty_heading(), "No matches");
         assert!(
             rec.get_empty_body()
-                .ends_with(", and 8 are not downloaded to this Mac."),
+                .contains("8 recordings are not downloaded to this Mac"),
             "the empty list says what could not be searched, got {:?}",
             rec.get_empty_body()
         );
@@ -4394,16 +4414,25 @@ mod tests {
              not searched."
         );
 
-        // **読めなかったものが在るなら、0 件の理由に加える**。
+        // **読めなかったものが在るなら、0 件の理由に加える**。件数は独立した文にする
+        // （カンマで繋ぐと、直前の「文字起こしされていない録音」に係って読める）。
         let (_, body) = empty_list_message(true, 8);
-        assert_eq!(
-            body,
-            "No transcript or notes mention it. Recordings that have not been transcribed are \
-             not searched, and 8 are not downloaded to this Mac."
+        assert!(
+            body.ends_with(
+                " 8 recordings are not downloaded to this Mac, so what they say could not be \
+                 searched."
+            ),
+            "got {body:?}"
         );
-        // 1 件でも文が壊れない（動詞を単数に合わせる）。
+        // 1 件でも文が壊れない（名詞も動詞も単数に合わせる）。
         let (_, body) = empty_list_message(true, 1);
-        assert!(body.ends_with(", and 1 is not downloaded to this Mac."));
+        assert!(
+            body.ends_with(
+                " 1 recording is not downloaded to this Mac, so what they say could not be \
+                 searched."
+            ),
+            "got {body:?}"
+        );
 
         // 絞り込んでいなければ、読めなかったものの話はしない（検索していないので）。
         let (heading, body) = empty_list_message(false, 8);
