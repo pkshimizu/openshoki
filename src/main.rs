@@ -4164,6 +4164,35 @@ mod tests {
         );
     }
 
+    /// 状態行の文言は、**空表示と同じ値から出す**（#175）。一覧と共用の状態 enum は「最後まで
+    /// 読めていない」を持てないので、状態 enum から出すと同じペインの中で
+    /// 「Transcribed」と「This transcript stops partway」が並ぶ。
+    #[test]
+    fn the_status_line_says_the_same_thing_as_the_empty_state() {
+        assert_eq!(
+            TranscriptPane::NotReadToTheEnd.status_text(),
+            "Transcribed in part"
+        );
+        assert_ne!(
+            TranscriptPane::NotReadToTheEnd.status_text(),
+            TranscriptPane::Done.status_text(),
+            "a transcript that stops partway must not read as a finished one"
+        );
+        // 残りは状態 enum の表をそのまま使う（増やしたのはこの 1 つだけ）。
+        for pane in [
+            TranscriptPane::Done,
+            TranscriptPane::NotTranscribed { auto_on: false },
+            TranscriptPane::Stopping {
+                model: "Medium".to_owned(),
+            },
+            TranscriptPane::Failed {
+                reason: TranscribeFailure::Panicked,
+            },
+        ] {
+            assert_eq!(pane.status_text(), transcript_status_text(pane.status()));
+        }
+    }
+
     /// ディスクの様子は、**在るかと最後まで読めたかを 1 つの値に畳む**（#175）。真偽値を並べて
     /// 渡すと、渡し違えてもコンパイルが通る。
     #[test]
