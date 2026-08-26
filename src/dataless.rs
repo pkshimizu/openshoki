@@ -36,7 +36,7 @@
 ///   読むのは設定が戻った後になり、そこで取り寄せが起きる。
 pub fn without_downloads<T>(body: impl FnOnce(&NoDownloads) -> T) -> T {
     let _guard = MaterializationOff::for_this_thread();
-    body(&NoDownloads(()))
+    body(&NoDownloads(std::marker::PhantomData))
 }
 
 /// 「取り寄せを止めた中にいる」ことの証（#178）。**`without_downloads` の中でしか作れない**
@@ -50,7 +50,11 @@ pub fn without_downloads<T>(body: impl FnOnce(&NoDownloads) -> T) -> T {
 /// **保証するのは「頼んだこと」だけ**。OS が実際に止めたかは別で、macOS 以外や設定に失敗した
 /// ときは何も止まっていない（`MaterializationOff`）。それでも「囲いの外で読まない」という
 /// 呼び出し側の規律は、この型が守る。
-pub struct NoDownloads(());
+///
+/// **スレッドをまたげない**（`PhantomData<*const ()>` で `Send` も `Sync` も付かない）。設定は
+/// スレッド単位なので、子スレッドへ証を持ち込めると「囲いの中のつもりで、実際は止まっていない」
+/// 読み取りが書けてしまう。
+pub struct NoDownloads(std::marker::PhantomData<*const ()>);
 
 /// 取り寄せを止めている間だけ生きる番人。
 ///

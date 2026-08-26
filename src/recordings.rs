@@ -370,22 +370,32 @@ fn measure_duration(path: &Path, _downloads_off: &crate::dataless::NoDownloads) 
 /// 取り寄せられなかった音源は `duration: None` になり、一覧は「長さが分からない録音では区切り
 /// ごと出さない」既存の形で出る（#162）。
 pub fn list_sessions(recording_dir: &Path) -> Vec<RecordingSession> {
-    // **測り方を囲いの中で組む**（#178）。`measure_duration` は証を要求するので、囲いの外で測る
-    // 書き方はコンパイルを通らない——テストで守ろうとすると、テストが見る入口と本番が通る入口が
-    // ずれた瞬間に素通りする（`dataless::NoDownloads` の doc）。
-    crate::dataless::without_downloads(|downloads_off| {
-        scan_sessions(recording_dir, |path| measure_duration(path, downloads_off))
-    })
+    crate::dataless::without_downloads(|downloads_off| scan_sessions(recording_dir, downloads_off))
 }
 
-/// 走査そのもの。**長さの測り方を引数で受ける**理由は `measure_from_header` の doc（同じ
-/// 「退避されたファイルをテストから作れない」）。
+/// 測った結果を、セッションと集計へ振り分ける（#178）。
 ///
-/// 取り寄せを止めるのは呼び出し側（`list_sessions`）。ここで囲うと、囲いの外で測る書き方を
-/// 型で止められなくなる。
+/// **ここを切り出してあるのは、測り方を差し替えずに振り分けをテストするため**。測り方ごと
+/// 差し替えられるようにすると、証の壁を素通りする閉包を書けてしまう（`scan_sessions` の doc）。
+fn apply_measured(session: &mut RecordingSession, measured: Measured, not_downloaded: &mut u64) {
+    match measured {
+        Measured::Length(length) => session.duration = Some(length),
+        // **数えて後でまとめて言う**（#178）。音源ごとに出すと、退避された録音が並ぶ保存先で
+        // 開くたびに十数行の同じログが流れる。
+        Measured::NotDownloaded => *not_downloaded += 1,
+        Measured::Unknown => {}
+    }
+}
+
+/// 走査そのもの。
+///
+/// **測り方を差し替えられるようにしない**（#178）。閉包で受けると、その中で直接ファイルを読む
+/// 書き方ができてしまい、証（`dataless::NoDownloads`）の壁を素通りする——レビューで実際にその形の
+/// 穴が出た。差し替えたいのは「測った結果をどう振り分けるか」だけなので、そちらを
+/// `apply_measured` に切り出してテストする。
 fn scan_sessions(
     recording_dir: &Path,
-    measure: impl Fn(&Path) -> Measured,
+    downloads_off: &crate::dataless::NoDownloads,
 ) -> Vec<RecordingSession> {
     let entries = match std::fs::read_dir(recording_dir) {
         Ok(entries) => entries,
@@ -435,13 +445,11 @@ fn scan_sessions(
         // 引数の順序を取り違えても通ってしまう——同じ `RecordingSession` の `duration_source` を
         // 通すことで、再生対象と同じ選び方であることが構造で決まる。
         if let Some(path) = session.duration_source() {
-            match measure(&path) {
-                Measured::Length(length) => session.duration = Some(length),
-                // **数えて後でまとめて言う**（#178）。音源ごとに出すと、退避された録音が並ぶ
-                // 保存先で開くたびに十数行の同じログが流れる。
-                Measured::NotDownloaded => not_downloaded += 1,
-                Measured::Unknown => {}
-            }
+            apply_measured(
+                &mut session,
+                measure_duration(&path, downloads_off),
+                &mut not_downloaded,
+            );
         }
         sessions.push(session);
     }
@@ -537,9 +545,9 @@ fn parse_session_datetime(name: &str) -> Option<NaiveDateTime> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Measured, RecordingSession, STALE_SESSION_PART_AGE, bytes_per_sec_from_header,
-        duration_from_size, list_sessions, measure_duration, measure_from_header,
-        measured_from_read_error, parse_session_datetime, scan_sessions, session_dirs,
+        Measured, RecordingSession, STALE_SESSION_PART_AGE, apply_measured,
+        bytes_per_sec_from_header, duration_from_size, list_sessions, measure_duration,
+        measure_from_header, measured_from_read_error, parse_session_datetime, session_dirs,
         spawn_session_part_sweep, sweep_session_dirs,
     };
     use std::fs;
@@ -725,62 +733,46 @@ mod tests {
         ));
     }
 
-    /// 本番の入口（`list_sessions`）から測ると、**取り寄せを止めた状態で読んでいる**（#178）。
-    ///
-    /// 型でも守っている（`measure_duration` が証を要求するので、囲いの外で測る書き方はコンパイル
-    /// を通らない）が、**「頼んだ」だけでなく「実際に止まっている」ことはテストでしか見えない**
-    /// ——`MaterializationOff` が設定に失敗しても証は渡るため。
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn the_audio_is_measured_with_downloads_turned_off() {
-        let root = unique_root("policy");
-        let _ = fs::remove_dir_all(&root);
-        make_sized_session(&root, "20260810-140200", &[("mic.mp3", 60)]);
-
-        let seen = std::cell::Cell::new(i32::MIN);
-        let sessions = crate::dataless::without_downloads(|_| {
-            scan_sessions(&root, |_| {
-                seen.set(crate::dataless::current_policy());
-                Measured::Unknown
-            })
-        });
-        assert_eq!(sessions.len(), 1, "the session should be measured at all");
-        assert_eq!(
-            seen.get(),
-            crate::dataless::DOWNLOADS_OFF,
-            "the audio is measured with downloads turned off"
-        );
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
     /// 取り寄せられなかった音源は、**長さを入れずに数えるだけ**（#178）。ここが緩むと、実体が
-    /// 無いのに長さが入る（あるいは数えられずログが出ない）。
+    /// 無いのに長さが入る（あるいは数えられず、まとめログが出ない）。
+    ///
+    /// 測り方そのものは差し替えない（差し替えられる形にすると、証の壁を素通りする閉包を書ける。
+    /// `scan_sessions` の doc）ので、**振り分けだけ**を直接呼んで固定する。
     #[test]
-    fn a_session_whose_audio_is_not_here_gets_no_length() {
-        let root = unique_root("not-downloaded");
-        let _ = fs::remove_dir_all(&root);
-        make_sized_session(&root, "20260810-140200", &[("mic.mp3", 60)]);
-        make_sized_session(&root, "20260810-130200", &[("mic.mp3", 90)]);
+    fn audio_that_is_not_here_is_counted_instead_of_measured() {
+        let mut session = RecordingSession {
+            datetime: parse_session_datetime("20260810-140200").expect("a valid session name"),
+            dir: PathBuf::from("/does/not/matter"),
+            has_mic: true,
+            has_system: false,
+            has_mix: false,
+            has_transcript: false,
+            has_summary: false,
+            duration: None,
+        };
+        let mut not_downloaded = 0u64;
 
-        // 実体が無い状態を、測り方の差し替えで作る。
-        let sessions = scan_sessions(&root, |_| Measured::NotDownloaded);
-        assert_eq!(sessions.len(), 2, "the sessions are still listed");
-        assert!(
-            sessions.iter().all(|session| session.duration.is_none()),
+        apply_measured(&mut session, Measured::NotDownloaded, &mut not_downloaded);
+        assert_eq!(
+            session.duration, None,
             "no length is shown for audio that is not here"
         );
+        assert_eq!(not_downloaded, 1, "it is counted for the summary line");
 
-        // 測れれば入る（差し替えが効いていることの裏取り）。
-        let sessions = scan_sessions(&root, |_| Measured::Length(Duration::from_secs(7)));
-        assert!(
-            sessions
-                .iter()
-                .all(|session| session.duration == Some(Duration::from_secs(7))),
-            "a length that could be measured is shown"
+        apply_measured(&mut session, Measured::Unknown, &mut not_downloaded);
+        assert_eq!(session.duration, None);
+        assert_eq!(
+            not_downloaded, 1,
+            "a length we cannot work out is not the same thing"
         );
 
-        let _ = fs::remove_dir_all(&root);
+        apply_measured(
+            &mut session,
+            Measured::Length(Duration::from_secs(7)),
+            &mut not_downloaded,
+        );
+        assert_eq!(session.duration, Some(Duration::from_secs(7)));
+        assert_eq!(not_downloaded, 1);
     }
 
     /// 読める音源は長さになり、ヘッダが壊れていれば長さ不明になる（#178 で 3 択に割った分）。
