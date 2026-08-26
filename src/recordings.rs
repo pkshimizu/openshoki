@@ -383,86 +383,89 @@ fn scan_sessions(
     recording_dir: &Path,
     measure: impl Fn(&Path) -> Measured,
 ) -> Vec<RecordingSession> {
-    crate::dataless::without_downloads(|| scan_sessions_now(recording_dir, measure))
-}
-
-/// 走査そのもの（`scan_sessions` が取り寄せを止めた状態で呼ぶ）。
-fn scan_sessions_now(
-    recording_dir: &Path,
-    measure: impl Fn(&Path) -> Measured,
-) -> Vec<RecordingSession> {
-    let entries = match std::fs::read_dir(recording_dir) {
-        Ok(entries) => entries,
-        Err(err) => {
-            // 保存先が未作成（まだ一度も録音していない）なども含む。落とさず空一覧にする。
-            eprintln!("Skipping the recordings scan because the folder could not be read: {err}");
-            return Vec::new();
-        }
-    };
-
-    let mut sessions: Vec<RecordingSession> = Vec::new();
-    // 実体が無くて長さを測れなかった録音の数（#178。`plural` へ渡すためだけの値）。
-    let mut not_downloaded = 0u64;
-    for entry in entries.flatten() {
-        let dir = entry.path();
-        // ディレクトリ以外（ファイル等）は対象外。
-        if !dir.is_dir() {
-            continue;
-        }
-        let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        let Some(datetime) = parse_session_datetime(name) else {
-            continue; // 日時形式でない名前はスキップ。
-        };
-
-        let has_mic = dir.join(MIC_MP3).is_file();
-        let has_system = dir.join(SYSTEM_MP3).is_file();
-        // 音源が 1 つも無いディレクトリ（欠落・作りかけ）は一覧に出さない。
-        if !has_mic && !has_system {
-            continue;
-        }
-        let has_mix = dir.join(MIX_MP3).is_file();
-        let has_transcript = dir.join(MIC_JSON).is_file() || dir.join(SYSTEM_JSON).is_file();
-        let has_summary = dir.join(crate::summarize::SUMMARY_FILENAME).is_file();
-        let mut session = RecordingSession {
-            datetime,
-            dir,
-            has_mic,
-            has_system,
-            has_mix,
-            has_transcript,
-            has_summary,
-            duration: None,
-        };
-        // **組み上がってから長さを入れる**（#162）。選び方を素の `bool` で受ける関数に切り出すと、
-        // 引数の順序を取り違えても通ってしまう——同じ `RecordingSession` の `duration_source` を
-        // 通すことで、再生対象と同じ選び方であることが構造で決まる。
-        if let Some(path) = session.duration_source() {
-            match measure(&path) {
-                Measured::Length(length) => session.duration = Some(length),
-                // **数えて後でまとめて言う**（#178）。音源ごとに出すと、退避された録音が並ぶ
-                // 保存先で開くたびに十数行の同じログが流れる。
-                Measured::NotDownloaded => not_downloaded += 1,
-                Measured::Unknown => {}
+    // **走査の本体をそのまま囲う**（#178）。中身を別の関数へ出すと「番人を通らない双子」が
+    // でき、そちらを呼ぶ 1 行を書いてもコンパイルもテストも通ってしまう（レビューで実際に
+    // 2 度その形になった）。閉包の中に置けば、番人を外す手は囲いごと剥がすことだけになり、
+    // `the_audio_is_measured_with_downloads_turned_off` がそれを捕まえる。
+    //
+    // **走査 1 回を丸ごと囲う**。音源ごとに囲うと `setiopolicy_np` を往復するが、`stat` は
+    // 取り寄せを起こさないので範囲を広く取って困らない。
+    crate::dataless::without_downloads(|| {
+        let entries = match std::fs::read_dir(recording_dir) {
+            Ok(entries) => entries,
+            Err(err) => {
+                // 保存先が未作成（まだ一度も録音していない）なども含む。落とさず空一覧にする。
+                eprintln!(
+                    "Skipping the recordings scan because the folder could not be read: {err}"
+                );
+                return Vec::new();
             }
+        };
+
+        let mut sessions: Vec<RecordingSession> = Vec::new();
+        // 実体が無くて長さを測れなかった録音の数（#178。`plural` へ渡すためだけの値）。
+        let mut not_downloaded = 0u64;
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            // ディレクトリ以外（ファイル等）は対象外。
+            if !dir.is_dir() {
+                continue;
+            }
+            let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let Some(datetime) = parse_session_datetime(name) else {
+                continue; // 日時形式でない名前はスキップ。
+            };
+
+            let has_mic = dir.join(MIC_MP3).is_file();
+            let has_system = dir.join(SYSTEM_MP3).is_file();
+            // 音源が 1 つも無いディレクトリ（欠落・作りかけ）は一覧に出さない。
+            if !has_mic && !has_system {
+                continue;
+            }
+            let has_mix = dir.join(MIX_MP3).is_file();
+            let has_transcript = dir.join(MIC_JSON).is_file() || dir.join(SYSTEM_JSON).is_file();
+            let has_summary = dir.join(crate::summarize::SUMMARY_FILENAME).is_file();
+            let mut session = RecordingSession {
+                datetime,
+                dir,
+                has_mic,
+                has_system,
+                has_mix,
+                has_transcript,
+                has_summary,
+                duration: None,
+            };
+            // **組み上がってから長さを入れる**（#162）。選び方を素の `bool` で受ける関数に切り出すと、
+            // 引数の順序を取り違えても通ってしまう——同じ `RecordingSession` の `duration_source` を
+            // 通すことで、再生対象と同じ選び方であることが構造で決まる。
+            if let Some(path) = session.duration_source() {
+                match measure(&path) {
+                    Measured::Length(length) => session.duration = Some(length),
+                    // **数えて後でまとめて言う**（#178）。音源ごとに出すと、退避された録音が並ぶ
+                    // 保存先で開くたびに十数行の同じログが流れる。
+                    Measured::NotDownloaded => not_downloaded += 1,
+                    Measured::Unknown => {}
+                }
+            }
+            sessions.push(session);
         }
-        sessions.push(session);
-    }
 
-    if not_downloaded > 0 {
-        // **黙って消さない**（#178）。長さの段が出ないのは異常ではないが、理由がどこにも無いと
-        // 「表示が壊れた」に見える。
-        eprintln!(
-            "Not showing the length of {} because the audio has not been downloaded to this Mac",
-            crate::reading_pane::plural(not_downloaded, "recording")
-        );
-    }
+        if not_downloaded > 0 {
+            // **黙って消さない**（#178）。長さの段が出ないのは異常ではないが、理由がどこにも無いと
+            // 「表示が壊れた」に見える。
+            eprintln!(
+                "Not showing the length of {} because the audio has not been downloaded to this Mac",
+                crate::reading_pane::plural(not_downloaded, "recording")
+            );
+        }
 
-    // 新しい順（日時降順）。同時刻はディレクトリ名でも安定させる必要はないが、決定的にするため
-    // パスで二次ソートする。
-    sessions.sort_by(|a, b| b.datetime.cmp(&a.datetime).then_with(|| a.dir.cmp(&b.dir)));
-    sessions
+        // 新しい順（日時降順）。同時刻はディレクトリ名でも安定させる必要はないが、決定的にするため
+        // パスで二次ソートする。
+        sessions.sort_by(|a, b| b.datetime.cmp(&a.datetime).then_with(|| a.dir.cmp(&b.dir)));
+        sessions
+    })
 }
 
 /// 一覧に出たセッションの直下に取り残された一時ファイル（`*.part.<pid>`）を回収する
