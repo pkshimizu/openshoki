@@ -78,7 +78,7 @@ impl TranscriptSegment {
 }
 
 /// JSON 読み取り用。#30 の出力のうち本ビューが使う `segments` だけを取り、他フィールドは無視する。
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct TranscriptFile {
     #[serde(default)]
     segments: Vec<RawSegment>,
@@ -126,7 +126,7 @@ where
 
 /// JSON の 1 セグメント。`text` は欠けていても既定値で読めるようにする（前方互換）。
 /// `end` は使わないため読まない（未知フィールドとして無視される）。
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct RawSegment {
     start: f64,
     #[serde(default)]
@@ -170,11 +170,20 @@ pub fn load_transcript(session_dir: &Path, sources: &[Speaker], fetch: Fetch) ->
 /// **`load_transcript` へ空の `sources` を渡す形にはしない**——理由は
 /// `all_sources_are_complete`。
 pub fn load_segments(session_dir: &Path, fetch: Fetch) -> Segments {
-    let read = read_all(session_dir, fetch);
+    segments_from(read_all(session_dir, fetch))
+}
+
+/// 読めたものと読めなかったものを、検索が使える 1 つの値へまとめる（#182）。
+///
+/// **繋ぎを純関数にしてある**——退避されたファイルを用意できない環境で「読めなかった」の
+/// 扱いを検査できる唯一の場所（`docs/rules/testing.md` の「テストが見ている入口と、本番が
+/// 通る入口をずらさない」）。ここが `NotDownloaded` を落とすと、検索は退避された録音を
+/// 黙って対象から外し、画面には理由も出ない。
+fn segments_from(read: Vec<(Speaker, ReadOutcome)>) -> Segments {
     Segments {
         not_downloaded: read
             .iter()
-            .any(|(_, guarded)| matches!(guarded, Guarded::NotDownloaded)),
+            .any(|(_, outcome)| matches!(outcome, ReadOutcome::NotDownloaded)),
         segments: merged_segments(read),
     }
 }
@@ -183,6 +192,10 @@ pub fn load_segments(session_dir: &Path, fetch: Fetch) -> Segments {
 ///
 /// 本文だけ見て「無い」と決めると、退避された録音を検索が黙って対象から外したことに
 /// 気づけない。2 つを 1 つの値で返して、呼び出し側が取り違えられないようにする。
+///
+/// **`Transcript` とは別物**——あちらは「在る音源ぶんが揃っているか」（#175）を持ち、
+/// 読めなかった理由は問わない。こちらは本文だけを見て「読めなかったものがあるか」を持つ。
+#[derive(Debug)]
 pub struct Segments {
     pub segments: Vec<TranscriptSegment>,
     /// この録音の JSON に、実体がこの Mac に無くて読めなかったものがあった。
@@ -193,7 +206,7 @@ pub struct Segments {
 /// 在りうる音源ぶんの JSON を読む。**在る音源ではなく全部読む**——音源を消して文字起こしだけ
 /// 残したセッションでも、読めるものは読ませるため（絞ると「検索では当たるのに開くと出て
 /// こない」という食い違いになる）。
-fn read_all(session_dir: &Path, fetch: Fetch) -> Vec<(Speaker, Guarded)> {
+fn read_all(session_dir: &Path, fetch: Fetch) -> Vec<(Speaker, ReadOutcome)> {
     ALL_SPEAKERS
         .iter()
         .map(|&speaker| {
@@ -206,12 +219,12 @@ fn read_all(session_dir: &Path, fetch: Fetch) -> Vec<(Speaker, Guarded)> {
 }
 
 /// 読めたぶんを話者ラベル付きで開始秒の昇順にマージする。
-fn merged_segments(read: Vec<(Speaker, Guarded)>) -> Vec<TranscriptSegment> {
+fn merged_segments(read: Vec<(Speaker, ReadOutcome)>) -> Vec<TranscriptSegment> {
     let mut segments: Vec<TranscriptSegment> = read
         .into_iter()
         .filter_map(|(speaker, guarded)| match guarded {
-            Guarded::Read(parsed) => Some((speaker, parsed)),
-            Guarded::Absent | Guarded::NotDownloaded => None,
+            ReadOutcome::Read(parsed) => Some((speaker, parsed)),
+            ReadOutcome::Unusable | ReadOutcome::NotDownloaded => None,
         })
         .flat_map(|(speaker, parsed)| to_segments(parsed, speaker))
         .collect();
@@ -227,15 +240,15 @@ fn merged_segments(read: Vec<(Speaker, Guarded)>) -> Vec<TranscriptSegment> {
 /// 音源を取り落とす壊れ方が「欠けた文字起こしを完成品として出す」といういちばん危険な側へ
 /// 落ちてしまう。音源ゼロのセッションは一覧に載らない（`list_sessions` が飛ばす）ので、
 /// 空が来るのは渡し間違いのときだけ——そのときは伏せる側で止める。
-fn all_sources_are_complete(read: &[(Speaker, Guarded)], sources: &[Speaker]) -> bool {
+fn all_sources_are_complete(read: &[(Speaker, ReadOutcome)], sources: &[Speaker]) -> bool {
     !sources.is_empty()
         && sources.iter().all(|source| {
             read.iter()
                 .find(|(speaker, _)| speaker == source)
                 .is_some_and(|(_, guarded)| match guarded {
-                    Guarded::Read(parsed) => parsed.complete,
+                    ReadOutcome::Read(parsed) => parsed.complete,
                     // **読めなかったものは揃っていない側**（読めない以上そうとは言えない）。
-                    Guarded::Absent | Guarded::NotDownloaded => false,
+                    ReadOutcome::Unusable | ReadOutcome::NotDownloaded => false,
                 })
         })
 }
@@ -264,7 +277,7 @@ fn to_segments(parsed: TranscriptFile, speaker: Speaker) -> Vec<TranscriptSegmen
 /// 途中結果を保存してよいかの判断に使う（`transcribe::partial_is_worth_keeping`）。長さだけでは
 /// 「最後まで読めた完成品」と「たまたま同じ長さの途中結果」を見分けられないので、印も一緒に返す。
 pub fn stored_reach(path: &Path) -> Option<StoredReach> {
-    let Guarded::Read(parsed) = read_guarded(path, Fetch::Allowed) else {
+    let ReadOutcome::Read(parsed) = read_guarded(path, Fetch::Allowed) else {
         return None;
     };
     Some(StoredReach {
@@ -290,7 +303,7 @@ pub struct StoredReach {
 /// 欠落（未生成）は静かに、読み取り失敗・過大・破損はログして、いずれも `None` を返す
 /// （縮退。アプリは落とさない）。ログにはどちらのファイルで起きたかが分かるようファイル名
 /// （`mic.json` 等）だけを含める（フルパス＝保存先や発話内容の機微情報は出さない）。
-fn read_guarded(path: &Path, fetch: Fetch) -> Guarded {
+fn read_guarded(path: &Path, fetch: Fetch) -> ReadOutcome {
     use std::io::Read;
 
     let name = path
@@ -305,7 +318,7 @@ fn read_guarded(path: &Path, fetch: Fetch) -> Guarded {
             if failure.should_report() {
                 eprintln!("Skipping the transcript {name} because it could not be opened: {err}");
             }
-            return guarded_from(failure);
+            return read_outcome_from(failure);
         }
     };
     // 信頼境界外の入力（手で置換されうる）なので、開いたハンドルの fstat で通常ファイルであることを
@@ -315,7 +328,7 @@ fn read_guarded(path: &Path, fetch: Fetch) -> Guarded {
         && !meta.is_file()
     {
         eprintln!("Skipping the transcript {name} because it is not a regular file");
-        return Guarded::Absent;
+        return ReadOutcome::Unusable;
     }
     let mut limited = file.take(MAX_TRANSCRIPT_BYTES + 1);
     let mut text = String::new();
@@ -325,12 +338,12 @@ fn read_guarded(path: &Path, fetch: Fetch) -> Guarded {
         if failure.should_report() {
             eprintln!("Skipping the transcript {name} because it could not be read: {err}");
         }
-        return guarded_from(failure);
+        return read_outcome_from(failure);
     }
     // 上限＋1 バイトまで読み切った（limit が尽きた）なら上限超過。
     if limited.limit() == 0 {
         eprintln!("Skipping the transcript {name} because it is too large");
-        return Guarded::Absent;
+        return ReadOutcome::Unusable;
     }
     let parsed: TranscriptFile = match serde_json::from_str(&text) {
         Ok(parsed) => parsed,
@@ -342,10 +355,10 @@ fn read_guarded(path: &Path, fetch: Fetch) -> Guarded {
                 err.line(),
                 err.column()
             );
-            return Guarded::Absent;
+            return ReadOutcome::Unusable;
         }
     };
-    Guarded::Read(parsed)
+    ReadOutcome::Read(parsed)
 }
 
 /// 読み取りに失敗したときに、何を読めたことにするか（#182）。
@@ -353,22 +366,23 @@ fn read_guarded(path: &Path, fetch: Fetch) -> Guarded {
 /// **ログを出すかは呼び出し側**（文言が開くときと読むときで違う。出すかどうかの判断は
 /// `ReadFailure::should_report` が持つ）。ここを通さずに直接組み立てると、実体が無いだけの
 /// ファイルが「読めなかった」に化けて、検索から静かに消える。
-fn guarded_from(failure: ReadFailure) -> Guarded {
+fn read_outcome_from(failure: ReadFailure) -> ReadOutcome {
     match failure {
-        // 待っても直らない（未生成・破損・権限）。
-        ReadFailure::NotCreated | ReadFailure::Failed => Guarded::Absent,
+        // どちらも「本文は無い」側（未生成・破損・権限）。
+        ReadFailure::NotCreated | ReadFailure::Failed => ReadOutcome::Unusable,
         // 取り寄せれば読める。
-        ReadFailure::NotDownloaded => Guarded::NotDownloaded,
+        ReadFailure::NotDownloaded => ReadOutcome::NotDownloaded,
     }
 }
 
 /// 1 つの JSON を読もうとした結果（#182）。**「無い・読めない」と「実体がここに無い」を
 /// 分ける**——一緒にすると、検索が黙って対象から外した録音を「本文が無い」と扱ってしまい、
 /// 「検索に出てこない＝無い」という読み違いを画面が誘発する。
-enum Guarded {
+#[derive(Debug)]
+enum ReadOutcome {
     Read(TranscriptFile),
-    /// 未生成・破損・過大・読めない（**待っても直らない**。ログ済み）。
-    Absent,
+    /// 本文が使えない（未生成・破損・過大・権限）。**待っても直らない**。
+    Unusable,
     /// 実体がこの Mac に無い（**取り寄せれば読める**。`Fetch::Blocked` のときだけ来る）。
     NotDownloaded,
 }
@@ -394,23 +408,45 @@ mod tests {
     /// 実体が無いだけのファイルを「読めなかった」に丸めないこと（#182）。
     ///
     /// 退避されたファイルは CI でも手元でも作れないので、`Deadlock` からここまでの繋ぎは
-    /// 実測でしか確かめられない。**分類から結果への対応は繋いで検査できる**——ここが
-    /// 丸まると、検索は退避された録音を黙って対象から外し、画面には理由も出ない。
+    /// 実測でしか確かめられない。**分類から結果、結果から検索が見る値まで**は繋いで検査
+    /// できる——ここが丸まると、検索は退避された録音を黙って対象から外し、画面には理由も
+    /// 出ない（`docs/rules/testing.md` の「テストが見ている入口と、本番が通る入口を
+    /// ずらさない」）。
     #[test]
     fn a_body_that_is_only_elsewhere_is_not_lost() {
-        use super::{Guarded, guarded_from};
+        use super::{ReadOutcome, read_outcome_from, segments_from};
         use crate::dataless::ReadFailure;
 
+        // 分類 → 1 つの JSON を読んだ結果。
         assert!(matches!(
-            guarded_from(ReadFailure::NotDownloaded),
-            Guarded::NotDownloaded
+            read_outcome_from(ReadFailure::NotDownloaded),
+            ReadOutcome::NotDownloaded
         ));
-        // 待っても直らないものは、どちらも「無い」側。
+        // 待っても直らないものは、どちらも「本文は無い」側。
         assert!(matches!(
-            guarded_from(ReadFailure::NotCreated),
-            Guarded::Absent
+            read_outcome_from(ReadFailure::NotCreated),
+            ReadOutcome::Unusable
         ));
-        assert!(matches!(guarded_from(ReadFailure::Failed), Guarded::Absent));
+        assert!(matches!(
+            read_outcome_from(ReadFailure::Failed),
+            ReadOutcome::Unusable
+        ));
+
+        // 読んだ結果 → 検索が見る値。**1 つでも実体が無ければそう言う**（片方の音源だけが
+        // 退避されている録音を「当たらなかった」に丸めない）。
+        let read = |first: ReadOutcome, second: ReadOutcome| {
+            vec![(Speaker::Mic, first), (Speaker::System, second)]
+        };
+        assert!(
+            segments_from(read(ReadOutcome::NotDownloaded, ReadOutcome::Unusable)).not_downloaded
+        );
+        assert!(
+            segments_from(read(ReadOutcome::Unusable, ReadOutcome::NotDownloaded)).not_downloaded
+        );
+        assert!(
+            !segments_from(read(ReadOutcome::Unusable, ReadOutcome::Unusable)).not_downloaded,
+            "nothing to read is not the same as being unable to reach it"
+        );
     }
 
     /// **音源を 1 つも渡さなければ「揃っている」とは言わない**（#175）。`all()` の空真に頼ると、
