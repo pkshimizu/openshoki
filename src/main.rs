@@ -453,7 +453,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 generation_id,
                 &generation,
                 &load_sender,
-                                load_replaces_playback(true),
+                load_replaces_playback(true),
             );
         });
     }
@@ -1668,7 +1668,7 @@ fn build_menu_event_handler(
                         generation_id,
                         &recordings.load_generation,
                         &recordings.load_sender,
-                                                load_replaces_playback(false),
+                        load_replaces_playback(false),
                     );
                 }
             }
