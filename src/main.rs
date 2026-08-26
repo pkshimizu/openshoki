@@ -3511,6 +3511,85 @@ mod tests {
         assert!(!rec.get_show_partial_transcript());
     }
 
+    /// 読み込んだ文字起こしが**画面まで届く**こと（#175）。
+    ///
+    /// `LoadedTranscript::stored` も `transcript_pane_of` も `TranscriptInput::of` も単体で
+    /// 検査済みだが、**それらを繋いでいるのは `refresh_detail_panes` の 3 行だけ**。ここを
+    /// 通らないと、`stored` を定数へ書き換えて途中結果の表示を丸ごと殺しても全部緑のままになる
+    /// （`docs/rules/testing.md` の「テストが見ている入口と、本番が通る入口をずらさない」）。
+    /// ワーカーは立てるがジョブは投げない——走らせた記録が無い状態＝ディスクの印だけが効く場面。
+    #[test]
+    fn what_was_loaded_from_disk_reaches_the_panes() {
+        super::init_test_backend();
+        let rec = super::LibraryWindow::new().expect("create the library window");
+        let summarizer = super::summarize::SummarizeWorker::start(
+            super::model_download::ModelDownloader::new(),
+            super::inference_slot::InferenceSlot::new(),
+        );
+        let transcriber = super::transcribe::TranscribeWorker::start(
+            super::model_download::ModelDownloader::new(),
+            summarizer.clone(),
+            super::inference_slot::InferenceSlot::new(),
+        );
+        let config = std::cell::RefCell::new(super::Config::default());
+
+        let dir = std::env::temp_dir().join("shoki-detail-panes");
+        let mut session = super::recordings::RecordingSession::for_test(
+            chrono::NaiveDate::from_ymd_opt(2026, 8, 10)
+                .expect("a real date")
+                .and_hms_opt(14, 2, 0)
+                .expect("a real time"),
+        );
+        session.dir = dir.clone();
+        session.has_transcript = true;
+        let partial = |dir: Option<&std::path::Path>| {
+            std::cell::RefCell::new(super::LoadedTranscript {
+                dir: dir.map(std::path::Path::to_path_buf),
+                transcript: super::transcript::Transcript {
+                    segments: vec![super::transcript::TranscriptSegment {
+                        start_secs: 0.0,
+                        text: "a".to_owned(),
+                        speaker: super::transcript::Speaker::Mic,
+                    }],
+                    complete: false,
+                },
+            })
+        };
+
+        super::refresh_detail_panes(
+            &rec,
+            &transcriber,
+            &summarizer,
+            &session,
+            &partial(Some(&dir)),
+            &config,
+        );
+        assert!(
+            rec.get_detail_transcript_partial(),
+            "a transcript that stopped short stays folded"
+        );
+        assert_eq!(rec.get_detail_transcript_text(), "Transcribed in part");
+        assert_eq!(
+            rec.get_detail_summary_heading(),
+            SummaryPane::NotesFromPartialTranscript.message().heading,
+            "notes warn that their input is missing the tail"
+        );
+
+        // **別の録音を読んだ結果は使わない**（読み込みは 1 tick 以上遅れて届く）。
+        super::refresh_detail_panes(
+            &rec,
+            &transcriber,
+            &summarizer,
+            &session,
+            &partial(Some(&dir.join("other"))),
+            &config,
+        );
+        assert!(
+            !rec.get_detail_transcript_partial(),
+            "another recording's mark must not fold this one"
+        );
+    }
+
     /// 中身を読み直しただけのときは**再生を差し替えない**。
     ///
     /// 差し替えると `adopt` が前の対象を手放し、再生中の音が止まって先頭へ巻き戻る。文字起こしの
