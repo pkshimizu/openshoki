@@ -37,9 +37,8 @@ pub fn without_downloads<T>(body: impl FnOnce() -> T) -> T {
 ///
 /// スレッド単位なので、実体が要る操作（再生・文字起こし）が別スレッドで走っている間は影響しない。
 ///
-/// **`Drop` で元の設定へ戻そうとする**。戻せなかったときはログに残すだけで、そのスレッドは以後も
-/// 取り寄せないままになる（`Drop` の分岐）——`previous` は直前に読んだ値なので、実際に起きることは
-/// まず無い。
+/// **`Drop` で元の設定へ戻そうとする**。戻せなかったときの挙動と、それがまず起きない理由は
+/// `Drop` の分岐にある。
 ///
 /// 作れなかったときは `None`（設定できないだけで、走査自体は従来どおり動く）。macOS 以外は
 /// 常に `None` ——取り寄せという概念が無いので、止めるものが無い。
@@ -145,29 +144,35 @@ impl Drop for MaterializationOff {
     }
 }
 
+/// いまのスレッドの設定を読む（テスト用）。
+///
+/// **取り寄せが止まっているかを確かめる側もここを通す**——このモジュールの外（走査が本当に
+/// 止めた状態で測っているか。`recordings`）からも要る。
+#[cfg(all(test, target_os = "macos"))]
+pub fn current_policy() -> std::ffi::c_int {
+    // Safety: 引数は定数だけで、ポインタを渡さない（`for_this_thread` と同じ）。
+    unsafe {
+        sys::getiopolicy_np(
+            sys::IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES,
+            sys::IOPOL_SCOPE_THREAD,
+        )
+    }
+}
+
+/// 取り寄せが止まっている状態の値（テストの期待値）。
+#[cfg(all(test, target_os = "macos"))]
+pub const DOWNLOADS_OFF: std::ffi::c_int = sys::IOPOL_MATERIALIZE_DATALESS_FILES_OFF;
+
 #[cfg(test)]
 mod tests {
     use super::without_downloads;
+    #[cfg(target_os = "macos")]
+    use super::{DOWNLOADS_OFF, current_policy};
 
     /// 閉包の中だけ取り寄せが止まり、**抜けると元へ戻る**。
     ///
     /// 戻らないと、同じスレッドで後から走る処理（テストランナーは 1 スレッドに複数のテストを
     /// 載せる）まで巻き込む。
-    /// いまのスレッドの設定を読む。**2 つのテストで同じものを読む**ので、片方だけ直る形に
-    /// しない。
-    #[cfg(target_os = "macos")]
-    fn current_policy() -> std::ffi::c_int {
-        use super::sys;
-
-        // Safety: 引数は定数だけで、ポインタを渡さない（`for_this_thread` と同じ）。
-        unsafe {
-            sys::getiopolicy_np(
-                sys::IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES,
-                sys::IOPOL_SCOPE_THREAD,
-            )
-        }
-    }
-
     #[cfg(target_os = "macos")]
     #[test]
     fn downloads_are_off_inside_and_back_to_normal_outside() {
@@ -175,8 +180,7 @@ mod tests {
         assert!(before >= 0, "the current policy should be readable");
         let inside = without_downloads(current_policy);
         assert_eq!(
-            inside,
-            super::sys::IOPOL_MATERIALIZE_DATALESS_FILES_OFF,
+            inside, DOWNLOADS_OFF,
             "downloads are off while the body runs"
         );
         assert_eq!(current_policy(), before, "the previous policy comes back");

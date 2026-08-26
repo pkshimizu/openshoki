@@ -298,7 +298,7 @@ fn measured_from_read_error(kind: std::io::ErrorKind) -> Measured {
 /// **読み取りを引数で受ける**のは、退避されたファイルをテストから作れないため（クラウドの管理下に
 /// 置くしかない）。`docs/rules/testing.md` の「重い処理そのものを引数で受ける」に従って、
 /// 「読み取りが `EDEADLK` で失敗したら `NotDownloaded` になる」という**繋ぎ**をここで固定できる
-/// ようにしてある。
+/// ようにしてある。**この理由の正はここ**（`scan_sessions` が測り方を受けるのも同じ理由）。
 fn measure_from_header(mut reader: impl std::io::Read, bytes: u64) -> Measured {
     let mut header = [0u8; 4];
     if let Err(err) = reader.read_exact(&mut header) {
@@ -363,20 +363,31 @@ fn measure_duration(path: &Path) -> Measured {
 /// ディレクトリが無い・読めないときは空一覧を返す（縮退。ログを残す）。名前が日時形式でない
 /// エントリ、ディレクトリでないエントリ、音源が 1 つも無いセッションはスキップする。
 ///
-/// **音源の中身は、退避されていれば読まない**（#178。理由は `crate::dataless` のモジュール doc）。
+/// **退避された音源の中身は読まない**（#178。理由は `crate::dataless` のモジュール doc）。
 /// 取り寄せられなかった音源は `duration: None` になり、一覧は「長さが分からない録音では区切り
 /// ごと出さない」既存の形で出る（#162）。
 pub fn list_sessions(recording_dir: &Path) -> Vec<RecordingSession> {
-    // **走査 1 回を丸ごと囲う**。音源ごとに囲うと `setiopolicy_np` を往復するが、`stat` は取り
-    // 寄せを起こさないので範囲を広く取って困らない。
-    crate::dataless::without_downloads(|| scan_sessions(recording_dir, measure_duration))
+    scan_sessions(recording_dir, measure_duration)
 }
 
-/// 走査の本体（`list_sessions` が取り寄せを止めた状態で呼ぶ）。
+/// 走査の本体。**取り寄せを止めるのはここ**——`list_sessions` 側に置くと、その 1 行を剥がしても
+/// どのテストも落ちない（レビューで実際に素通りした）。囲いの中に測り方が入っているので、
+/// 差し替えた測り方から「止まった状態で測っているか」を確かめられる。
 ///
-/// **長さの測り方を引数で受ける**のは、退避されたファイルをテストから作れないため（クラウドの
-/// 管理下に置くしかない）。`docs/rules/testing.md` の「重い処理そのものを引数で受ける」。
+/// **走査 1 回を丸ごと囲う**。音源ごとに囲うと `setiopolicy_np` を往復するが、`stat` は取り
+/// 寄せを起こさないので範囲を広く取って困らない。
+///
+/// **長さの測り方を引数で受ける**理由は `measure_from_header` の doc（同じ「退避されたファイルを
+/// テストから作れない」）。
 fn scan_sessions(
+    recording_dir: &Path,
+    measure: impl Fn(&Path) -> Measured,
+) -> Vec<RecordingSession> {
+    crate::dataless::without_downloads(|| scan_sessions_now(recording_dir, measure))
+}
+
+/// 走査そのもの（`scan_sessions` が取り寄せを止めた状態で呼ぶ）。
+fn scan_sessions_now(
     recording_dir: &Path,
     measure: impl Fn(&Path) -> Measured,
 ) -> Vec<RecordingSession> {
@@ -682,8 +693,8 @@ mod tests {
         }
     }
 
-    /// **読み取りの失敗がそのまま結果に流れる**（#178）。退避されたファイルはテストから作れない
-    /// （クラウドの管理下に置くしかない）ので、失敗する読み取りを流し込んで繋ぎを固定する。
+    /// **読み取りの失敗がそのまま結果に流れる**（#178）。失敗する読み取りを流し込む理由は
+    /// `measure_from_header` の doc。
     ///
     /// ここが `Unknown` に丸まると、`Show`（長さの段）が消える理由が「壊れている」に化けて、
     /// 一覧のまとめログも出なくなる。
@@ -716,6 +727,32 @@ mod tests {
             measure_from_header(header, 16_000 * 42),
             Measured::Length(length) if length == Duration::from_secs(42)
         ));
+    }
+
+    /// 走査は、**取り寄せを止めた状態で音源を測る**（#178）。ここが剥がれると、退避された
+    /// 保存先で一覧を開くたびに全件がダウンロードされる（実測 97 秒）。
+    ///
+    /// 測り方を差し替えられるので、測っている最中のスレッド設定をそのまま覗ける。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_audio_is_measured_with_downloads_turned_off() {
+        let root = unique_root("policy");
+        let _ = fs::remove_dir_all(&root);
+        make_sized_session(&root, "20260810-140200", &[("mic.mp3", 60)]);
+
+        let seen = std::cell::Cell::new(i32::MIN);
+        let sessions = scan_sessions(&root, |_| {
+            seen.set(crate::dataless::current_policy());
+            Measured::Unknown
+        });
+        assert_eq!(sessions.len(), 1, "the session should be measured at all");
+        assert_eq!(
+            seen.get(),
+            crate::dataless::DOWNLOADS_OFF,
+            "the audio is measured with downloads turned off"
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// 取り寄せられなかった音源は、**長さを入れずに数えるだけ**（#178）。ここが緩むと、実体が
