@@ -2375,6 +2375,50 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 書く側と読む側が、**同じ欄名・同じ極性**で「最後まで読めたか」を受け渡すこと（#175）。
+    ///
+    /// `Transcription::complete`（書く）と `TranscriptFile::complete`（読む）は、名前が同じと
+    /// いう約束だけで繋がっている。片方の欄名を変えても、片方の意味を反転させても、それぞれの
+    /// 単体テストは緑のまま——**再起動後に途中結果が完成品として読める**という、いちばん
+    /// 気づきにくい壊れ方になる。
+    #[test]
+    fn what_we_write_about_reaching_the_end_is_what_the_reader_sees() {
+        let dir = std::env::temp_dir().join(format!("shoki-reach-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create the session dir");
+
+        for complete in [true, false] {
+            let result = Transcription {
+                source: "mic".to_owned(),
+                model: "ggml-base.bin".to_owned(),
+                language: "ja".to_owned(),
+                duration_secs: 12.5,
+                complete,
+                segments: vec![Segment {
+                    start: 0.0,
+                    end: 3.2,
+                    text: "hello".to_owned(),
+                }],
+            };
+            let path = dir.join("mic.json");
+            write_transcription(&path, &result).expect("write the transcript");
+
+            let reach = crate::transcript::stored_reach(&path).expect("the reader can read it");
+            assert_eq!(
+                reach.complete, complete,
+                "the reader must see the same reach we wrote"
+            );
+            assert_eq!(reach.duration_secs, Some(12.5));
+            // 在る音源ぶんの判定（画面が伏せるかを決める側）まで同じ答えになること。
+            let loaded =
+                crate::transcript::load_transcript(&dir, &[crate::transcript::Speaker::Mic]);
+            assert_eq!(loaded.complete, complete);
+            assert_eq!(loaded.segments.len(), 1);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn transcription_json_shape_matches_viewer_contract() {
         // 録音一覧ビュー（src/transcript.rs）が読む契約: segments[].start/end/text（秒）。
