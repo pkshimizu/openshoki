@@ -325,7 +325,10 @@ fn measure_from_header(mut reader: impl std::io::Read, bytes: u64) -> Measured {
 /// 保存先の音源は差し替えられうる信頼境界外の入力なので、**開いたハンドルの `fstat` で通常
 /// ファイルであることを確かめる**（FIFO 等は読み終わらないことがある。`docs/rules/security.md`。
 /// `open` 自体が塞がる可能性までは塞げない）。
-fn measure_duration(path: &Path) -> Measured {
+///
+/// **証（`NoDownloads`）を要求する**のは、取り寄せを止めた中でしか読ませないため（#178）。
+/// 囲いの外から呼ぶ書き方はコンパイルを通らない（理由は `dataless::NoDownloads` の doc）。
+fn measure_duration(path: &Path, _downloads_off: &crate::dataless::NoDownloads) -> Measured {
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
         Err(err) => {
@@ -367,105 +370,95 @@ fn measure_duration(path: &Path) -> Measured {
 /// 取り寄せられなかった音源は `duration: None` になり、一覧は「長さが分からない録音では区切り
 /// ごと出さない」既存の形で出る（#162）。
 pub fn list_sessions(recording_dir: &Path) -> Vec<RecordingSession> {
-    scan_sessions(recording_dir, measure_duration)
+    // **測り方を囲いの中で組む**（#178）。`measure_duration` は証を要求するので、囲いの外で測る
+    // 書き方はコンパイルを通らない——テストで守ろうとすると、テストが見る入口と本番が通る入口が
+    // ずれた瞬間に素通りする（`dataless::NoDownloads` の doc）。
+    crate::dataless::without_downloads(|downloads_off| {
+        scan_sessions(recording_dir, |path| measure_duration(path, downloads_off))
+    })
 }
 
-/// 走査の本体。**取り寄せを止めるのはここ**——`list_sessions` 側に置くと、その 1 行を剥がしても
-/// どのテストも落ちない（レビューで実際に素通りした）。囲いの中に測り方が入っているので、
-/// 差し替えた測り方から「止まった状態で測っているか」を確かめられる。
+/// 走査そのもの。**長さの測り方を引数で受ける**理由は `measure_from_header` の doc（同じ
+/// 「退避されたファイルをテストから作れない」）。
 ///
-/// **走査 1 回を丸ごと囲う**。音源ごとに囲うと `setiopolicy_np` を往復するが、`stat` は取り
-/// 寄せを起こさないので範囲を広く取って困らない。
-///
-/// **長さの測り方を引数で受ける**理由は `measure_from_header` の doc（同じ「退避されたファイルを
-/// テストから作れない」）。
+/// 取り寄せを止めるのは呼び出し側（`list_sessions`）。ここで囲うと、囲いの外で測る書き方を
+/// 型で止められなくなる。
 fn scan_sessions(
     recording_dir: &Path,
     measure: impl Fn(&Path) -> Measured,
 ) -> Vec<RecordingSession> {
-    // **走査の本体をそのまま囲う**（#178）。中身を別の関数へ出すと「番人を通らない双子」が
-    // でき、そちらを呼ぶ 1 行を書いてもコンパイルもテストも通ってしまう（レビューで実際に
-    // 2 度その形になった）。閉包の中に置けば、番人を外す手は囲いごと剥がすことだけになり、
-    // `the_audio_is_measured_with_downloads_turned_off` がそれを捕まえる。
-    //
-    // **走査 1 回を丸ごと囲う**。音源ごとに囲うと `setiopolicy_np` を往復するが、`stat` は
-    // 取り寄せを起こさないので範囲を広く取って困らない。
-    crate::dataless::without_downloads(|| {
-        let entries = match std::fs::read_dir(recording_dir) {
-            Ok(entries) => entries,
-            Err(err) => {
-                // 保存先が未作成（まだ一度も録音していない）なども含む。落とさず空一覧にする。
-                eprintln!(
-                    "Skipping the recordings scan because the folder could not be read: {err}"
-                );
-                return Vec::new();
-            }
+    let entries = match std::fs::read_dir(recording_dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            // 保存先が未作成（まだ一度も録音していない）なども含む。落とさず空一覧にする。
+            eprintln!("Skipping the recordings scan because the folder could not be read: {err}");
+            return Vec::new();
+        }
+    };
+
+    let mut sessions: Vec<RecordingSession> = Vec::new();
+    // 実体が無くて長さを測れなかった録音の数（#178。`plural` へ渡すためだけの値）。
+    let mut not_downloaded = 0u64;
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        // ディレクトリ以外（ファイル等）は対象外。
+        if !dir.is_dir() {
+            continue;
+        }
+        let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(datetime) = parse_session_datetime(name) else {
+            continue; // 日時形式でない名前はスキップ。
         };
 
-        let mut sessions: Vec<RecordingSession> = Vec::new();
-        // 実体が無くて長さを測れなかった録音の数（#178。`plural` へ渡すためだけの値）。
-        let mut not_downloaded = 0u64;
-        for entry in entries.flatten() {
-            let dir = entry.path();
-            // ディレクトリ以外（ファイル等）は対象外。
-            if !dir.is_dir() {
-                continue;
-            }
-            let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            let Some(datetime) = parse_session_datetime(name) else {
-                continue; // 日時形式でない名前はスキップ。
-            };
-
-            let has_mic = dir.join(MIC_MP3).is_file();
-            let has_system = dir.join(SYSTEM_MP3).is_file();
-            // 音源が 1 つも無いディレクトリ（欠落・作りかけ）は一覧に出さない。
-            if !has_mic && !has_system {
-                continue;
-            }
-            let has_mix = dir.join(MIX_MP3).is_file();
-            let has_transcript = dir.join(MIC_JSON).is_file() || dir.join(SYSTEM_JSON).is_file();
-            let has_summary = dir.join(crate::summarize::SUMMARY_FILENAME).is_file();
-            let mut session = RecordingSession {
-                datetime,
-                dir,
-                has_mic,
-                has_system,
-                has_mix,
-                has_transcript,
-                has_summary,
-                duration: None,
-            };
-            // **組み上がってから長さを入れる**（#162）。選び方を素の `bool` で受ける関数に切り出すと、
-            // 引数の順序を取り違えても通ってしまう——同じ `RecordingSession` の `duration_source` を
-            // 通すことで、再生対象と同じ選び方であることが構造で決まる。
-            if let Some(path) = session.duration_source() {
-                match measure(&path) {
-                    Measured::Length(length) => session.duration = Some(length),
-                    // **数えて後でまとめて言う**（#178）。音源ごとに出すと、退避された録音が並ぶ
-                    // 保存先で開くたびに十数行の同じログが流れる。
-                    Measured::NotDownloaded => not_downloaded += 1,
-                    Measured::Unknown => {}
-                }
-            }
-            sessions.push(session);
+        let has_mic = dir.join(MIC_MP3).is_file();
+        let has_system = dir.join(SYSTEM_MP3).is_file();
+        // 音源が 1 つも無いディレクトリ（欠落・作りかけ）は一覧に出さない。
+        if !has_mic && !has_system {
+            continue;
         }
-
-        if not_downloaded > 0 {
-            // **黙って消さない**（#178）。長さの段が出ないのは異常ではないが、理由がどこにも無いと
-            // 「表示が壊れた」に見える。
-            eprintln!(
-                "Not showing the length of {} because the audio has not been downloaded to this Mac",
-                crate::reading_pane::plural(not_downloaded, "recording")
-            );
+        let has_mix = dir.join(MIX_MP3).is_file();
+        let has_transcript = dir.join(MIC_JSON).is_file() || dir.join(SYSTEM_JSON).is_file();
+        let has_summary = dir.join(crate::summarize::SUMMARY_FILENAME).is_file();
+        let mut session = RecordingSession {
+            datetime,
+            dir,
+            has_mic,
+            has_system,
+            has_mix,
+            has_transcript,
+            has_summary,
+            duration: None,
+        };
+        // **組み上がってから長さを入れる**（#162）。選び方を素の `bool` で受ける関数に切り出すと、
+        // 引数の順序を取り違えても通ってしまう——同じ `RecordingSession` の `duration_source` を
+        // 通すことで、再生対象と同じ選び方であることが構造で決まる。
+        if let Some(path) = session.duration_source() {
+            match measure(&path) {
+                Measured::Length(length) => session.duration = Some(length),
+                // **数えて後でまとめて言う**（#178）。音源ごとに出すと、退避された録音が並ぶ
+                // 保存先で開くたびに十数行の同じログが流れる。
+                Measured::NotDownloaded => not_downloaded += 1,
+                Measured::Unknown => {}
+            }
         }
+        sessions.push(session);
+    }
 
-        // 新しい順（日時降順）。同時刻はディレクトリ名でも安定させる必要はないが、決定的にするため
-        // パスで二次ソートする。
-        sessions.sort_by(|a, b| b.datetime.cmp(&a.datetime).then_with(|| a.dir.cmp(&b.dir)));
-        sessions
-    })
+    if not_downloaded > 0 {
+        // **黙って消さない**（#178）。長さの段が出ないのは異常ではないが、理由がどこにも無いと
+        // 「表示が壊れた」に見える。
+        eprintln!(
+            "Not showing the length of {} because the audio has not been downloaded to this Mac",
+            crate::reading_pane::plural(not_downloaded, "recording")
+        );
+    }
+
+    // 新しい順（日時降順）。同時刻はディレクトリ名でも安定させる必要はないが、決定的にするため
+    // パスで二次ソートする。
+    sessions.sort_by(|a, b| b.datetime.cmp(&a.datetime).then_with(|| a.dir.cmp(&b.dir)));
+    sessions
 }
 
 /// 一覧に出たセッションの直下に取り残された一時ファイル（`*.part.<pid>`）を回収する
@@ -732,10 +725,11 @@ mod tests {
         ));
     }
 
-    /// 走査は、**取り寄せを止めた状態で音源を測る**（#178）。ここが剥がれると、退避された
-    /// 保存先で一覧を開くたびに全件がダウンロードされる（実測 97 秒）。
+    /// 本番の入口（`list_sessions`）から測ると、**取り寄せを止めた状態で読んでいる**（#178）。
     ///
-    /// 測り方を差し替えられるので、測っている最中のスレッド設定をそのまま覗ける。
+    /// 型でも守っている（`measure_duration` が証を要求するので、囲いの外で測る書き方はコンパイル
+    /// を通らない）が、**「頼んだ」だけでなく「実際に止まっている」ことはテストでしか見えない**
+    /// ——`MaterializationOff` が設定に失敗しても証は渡るため。
     #[cfg(target_os = "macos")]
     #[test]
     fn the_audio_is_measured_with_downloads_turned_off() {
@@ -744,9 +738,11 @@ mod tests {
         make_sized_session(&root, "20260810-140200", &[("mic.mp3", 60)]);
 
         let seen = std::cell::Cell::new(i32::MIN);
-        let sessions = scan_sessions(&root, |_| {
-            seen.set(crate::dataless::current_policy());
-            Measured::Unknown
+        let sessions = crate::dataless::without_downloads(|_| {
+            scan_sessions(&root, |_| {
+                seen.set(crate::dataless::current_policy());
+                Measured::Unknown
+            })
         });
         assert_eq!(sessions.len(), 1, "the session should be measured at all");
         assert_eq!(
@@ -788,6 +784,9 @@ mod tests {
     }
 
     /// 読める音源は長さになり、ヘッダが壊れていれば長さ不明になる（#178 で 3 択に割った分）。
+    ///
+    /// **囲いの中でしか呼べない**（`measure_duration` が証を要求する）ので、テストも本番と同じ
+    /// 通り道になる。
     #[test]
     fn measuring_reads_the_header_and_falls_back_to_unknown() {
         let root = unique_root("measure");
@@ -795,18 +794,26 @@ mod tests {
         make_sized_session(&root, "20260810-140200", &[("mic.mp3", 42)]);
         let audio = root.join("20260810-140200").join("mic.mp3");
 
-        assert!(matches!(
-            measure_duration(&audio),
-            Measured::Length(length) if length == Duration::from_secs(42)
-        ));
+        crate::dataless::without_downloads(|downloads_off| {
+            assert!(matches!(
+                measure_duration(&audio, downloads_off),
+                Measured::Length(length) if length == Duration::from_secs(42)
+            ));
 
-        // MP3 のフレーム同期が無いファイル（差し替え・破損）。
-        fs::write(&audio, b"not an mp3 header at all").expect("writing should succeed");
-        assert!(matches!(measure_duration(&audio), Measured::Unknown));
+            // MP3 のフレーム同期が無いファイル（差し替え・破損）。
+            fs::write(&audio, b"not an mp3 header at all").expect("writing should succeed");
+            assert!(matches!(
+                measure_duration(&audio, downloads_off),
+                Measured::Unknown
+            ));
 
-        // そもそも開けない。
-        fs::remove_file(&audio).expect("removing should succeed");
-        assert!(matches!(measure_duration(&audio), Measured::Unknown));
+            // そもそも開けない。
+            fs::remove_file(&audio).expect("removing should succeed");
+            assert!(matches!(
+                measure_duration(&audio, downloads_off),
+                Measured::Unknown
+            ));
+        });
 
         let _ = fs::remove_dir_all(&root);
     }

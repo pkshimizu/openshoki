@@ -22,6 +22,9 @@
 /// その場で落ちて何も止まらず、しかもコンパイルは通る（実際、レビュー前のミューテーションで
 /// テストが素通りした）。閉包で受ければ、**効いている範囲が構造で決まる**。
 ///
+/// `body` には証（`NoDownloads`）を渡す。中身を読む関数にこれを要求させれば、囲いの外から
+/// 読む書き方がコンパイルを通らなくなる（理由は `NoDownloads` の doc）。
+///
 /// 設定できなかったときも `body` は走る（取り寄せが起きて遅いだけで、結果は正しい）。macOS 以外は
 /// 常にこの形になる。
 ///
@@ -31,10 +34,23 @@
 ///   実測で確認した）。走査を並列化するなら、各スレッドがそれぞれ通すこと。
 /// - `body` は読み取りを**中で終わらせる**こと。開いた `File` や遅延イテレータを返すと、実際に
 ///   読むのは設定が戻った後になり、そこで取り寄せが起きる。
-pub fn without_downloads<T>(body: impl FnOnce() -> T) -> T {
+pub fn without_downloads<T>(body: impl FnOnce(&NoDownloads) -> T) -> T {
     let _guard = MaterializationOff::for_this_thread();
-    body()
+    body(&NoDownloads(()))
 }
+
+/// 「取り寄せを止めた中にいる」ことの証（#178）。**`without_downloads` の中でしか作れない**
+/// （フィールドが非公開なので、このモジュールの外では構築できない）。
+///
+/// 中身を読む関数にこれを要求させると、**囲いの外から呼ぶ書き方がコンパイルを通らなくなる**。
+/// テストで守ろうとすると、テストが見る入口と本番が通る入口がずれた瞬間に素通りする——#178 の
+/// レビューでは、その形の穴が 4 度続けて残った（束縛の書き方・囲いを剥がす・番人を通らない
+/// 双子・走査の外で測る）。
+///
+/// **保証するのは「頼んだこと」だけ**。OS が実際に止めたかは別で、macOS 以外や設定に失敗した
+/// ときは何も止まっていない（`MaterializationOff`）。それでも「囲いの外で読まない」という
+/// 呼び出し側の規律は、この型が守る。
+pub struct NoDownloads(());
 
 /// 取り寄せを止めている間だけ生きる番人。
 ///
@@ -181,7 +197,7 @@ mod tests {
     fn downloads_are_off_inside_and_back_to_normal_outside() {
         let before = current_policy();
         assert!(before >= 0, "the current policy should be readable");
-        let inside = without_downloads(current_policy);
+        let inside = without_downloads(|_| current_policy());
         assert_eq!(
             inside, DOWNLOADS_OFF,
             "downloads are off while the body runs"
@@ -194,7 +210,7 @@ mod tests {
     #[test]
     fn a_panic_inside_still_restores_the_policy() {
         let before = current_policy();
-        let caught = std::panic::catch_unwind(|| without_downloads(|| panic!("boom")));
+        let caught = std::panic::catch_unwind(|| without_downloads(|_| panic!("boom")));
         assert!(caught.is_err(), "the panic should come through");
         assert_eq!(
             current_policy(),
@@ -207,6 +223,6 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn the_body_runs_even_with_nothing_to_turn_off() {
-        assert_eq!(without_downloads(|| 42), 42);
+        assert_eq!(without_downloads(|_| 42), 42);
     }
 }
