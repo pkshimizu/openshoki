@@ -528,6 +528,11 @@ export component LibraryWindow inherits Window {
     in property <string> library-summary;
     // 検索欄の中身（#161）。**Rust が絞り込みの正**を持つので、ここは入力の受け皿。
     in-out property <string> search-text;
+    // 一覧が空のときの見出しと本文（#182）。**文を組むのは Rust**（`empty_list_message`）——
+    // 「録音が無い / 絞り込んで消えた / 読めなかったものが在る」を三項で連ねない
+    // （`docs/rules/slint.md`）。
+    in property <string> empty-heading;
+    in property <string> empty-body;
     // 絞り込み中に一覧の下へ出す件数（`3 of 148 recordings mention it`）。空なら合計を出す。
     in property <string> search-summary;
     // 選択中セッションの一覧インデックス。未選択は -1。行クリックで更新し select-session を呼ぶ。
@@ -704,7 +709,7 @@ export component LibraryWindow inherits Window {
                         padding: 24px;
                         spacing: 8px;
                         Text {
-                            text: root.search-text != "" ? "No matches" : "No recordings yet";
+                            text: root.empty-heading;
                             font-size: Style.body-size;
                             font-weight: Style.semibold;
                             horizontal-alignment: center;
@@ -712,9 +717,7 @@ export component LibraryWindow inherits Window {
                         }
 
                         Text {
-                            text: root.search-text != ""
-                                ? "No transcript or notes mention it. Recordings that have not been transcribed are not searched."
-                                : "Start one from the shoki icon in the menu bar, or turn on Record automatically in Settings so meetings are captured for you.";
+                            text: root.empty-body;
                             font-size: Style.caption-size;
                             wrap: word-wrap;
                             horizontal-alignment: center;

@@ -2435,6 +2435,11 @@ fn reselect_after_list_change(
 /// ここ 1 箇所で決める（削除・検索・解除のどこから来ても同じ形になる）。
 fn apply_list_counts(rec: &LibraryWindow, shown: usize, total: usize, not_downloaded: usize) {
     rec.set_library_summary(library_summary(total).into());
+    // 空表示の文も**同じ値から**決める（#182）。件数の文とは別に組み立てると、片方だけ
+    // 「読めなかった」を言う画面ができる。
+    let (heading, body) = empty_list_message(!rec.get_search_text().is_empty(), not_downloaded);
+    rec.set_empty_heading(heading.into());
+    rec.set_empty_body(body.into());
     // **読めなかったぶんが在るなら、全件が当たっていても文を出す**（#182）。件数だけで
     // 判断すると、全件一致かつ一部が退避という組み合わせで理由が黙って消える。
     rec.set_search_summary(if shown == total && not_downloaded == 0 {
@@ -2442,6 +2447,35 @@ fn apply_list_counts(rec: &LibraryWindow, shown: usize, total: usize, not_downlo
     } else {
         search_summary_text(shown, total, not_downloaded).into()
     });
+}
+
+/// 一覧が空のときに出す見出しと本文（#182 で「読めなかった」を足した）。
+///
+/// **状態から文への対応はここ 1 つ**（Slint の三項連鎖にしない。`docs/rules/slint.md`）。
+/// 空表示は**録音が無いのか、絞り込んで消えたのか**で言い分ける。同じ文にすると、検索語を
+/// 消せば戻ることが分からない。
+///
+/// **絞り込んで 0 件のときこそ理由を言う**。一覧の下端の 1 行は省略されうるので、退避されて
+/// 読めなかったことを伝える場所としてはここがいちばん見える。
+fn empty_list_message(searching: bool, not_downloaded: usize) -> (&'static str, String) {
+    if !searching {
+        return (
+            "No recordings yet",
+            "Start one from the shoki icon in the menu bar, or turn on Record automatically in \
+             Settings so meetings are captured for you."
+                .to_owned(),
+        );
+    }
+    let mut body =
+        "No transcript or notes mention it. Recordings that have not been transcribed are not \
+         searched"
+            .to_owned();
+    match not_downloaded {
+        0 => body.push('.'),
+        1 => body.push_str(", and 1 is not downloaded to this Mac."),
+        n => body.push_str(&format!(", and {n} are not downloaded to this Mac.")),
+    }
+    ("No matches", body)
 }
 
 /// いま一覧に在るもののうち、**実体が無くて検索できなかった件数**（#182）。
@@ -2531,10 +2565,14 @@ fn open_library_window(
     handles
         .sessions_model
         .set_vec(session_rows(&list, &handles.transcriber));
-    rec.set_library_summary(library_summary(list.len()).into());
     // 開くたびに検索は解除しておく（前に開いたときの絞り込みが残っていると、録音が消えたように
     // 見える）。**世代も進める**——走っていた検索の結果が後から届いて絞り込むのを防ぐ。
     reset_search(rec, &handles.search_generation);
+    handles.search_not_downloaded.borrow_mut().clear();
+    // **件数も空表示もここを通す**（`docs/rules/slint.md` の「表示値の導出は 1 つの関数に集め、
+    // 起動時の初期化もその関数を通す」）。直接 set すると、開いた直後だけ空表示の文が欠ける。
+    // 検索は上で解除したので、絞り込みも読めなかったものも無い。
+    apply_list_counts(rec, list.len(), list.len(), 0);
     *handles.all_sessions.borrow_mut() = list.clone();
     // 開くたびに未選択・停止表示へ初期化する。
     clear_library_selection(rec, &handles.transcript_segments, &handles.load_generation);
@@ -3570,9 +3608,9 @@ mod tests {
     use super::{
         PaneAction, PaneActionKind, StatusTone, SummaryPane, SummaryStatus, TranscriptPane,
         TranscriptStatus, actions_allowed_while_busy, app_version_text, breathing_level,
-        came_off_the_worker, jobs_pending, model_downloads_on_select, model_status_line,
-        not_downloaded_count, outcome_of, playback_progress, search_outcome, search_summary_text,
-        seek_position_from_ratio, session_matches, summary_display_status,
+        came_off_the_worker, empty_list_message, jobs_pending, model_downloads_on_select,
+        model_status_line, not_downloaded_count, outcome_of, playback_progress, search_outcome,
+        search_summary_text, seek_position_from_ratio, session_matches, summary_display_status,
         summary_model_status_line, summary_pane_of, summary_rows, summary_status_text,
         transcript_display_status, transcript_pane_of, whisper_model_status_line,
     };
@@ -4295,6 +4333,57 @@ mod tests {
         // 絞り込み中は従来どおり件数を出す。
         super::apply_list_counts(&rec, 2, 11, 0);
         assert_eq!(rec.get_search_summary(), "2 of 11 recordings mention it");
+
+        // **空表示の文も同じ呼び出しで入る**（別々に組むと、片方だけ「読めなかった」を
+        // 言う画面ができる）。検索中かはウィンドウの検索欄から見る。
+        rec.set_search_text("release".into());
+        super::apply_list_counts(&rec, 0, 11, 8);
+        assert_eq!(rec.get_empty_heading(), "No matches");
+        assert!(
+            rec.get_empty_body()
+                .ends_with(", and 8 are not downloaded to this Mac."),
+            "the empty list says what could not be searched, got {:?}",
+            rec.get_empty_body()
+        );
+        rec.set_search_text("".into());
+        super::apply_list_counts(&rec, 0, 0, 0);
+        assert_eq!(rec.get_empty_heading(), "No recordings yet");
+    }
+
+    /// 一覧が空のときの文。**録音が無いのか、絞り込んで消えたのか**で言い分ける（同じ文に
+    /// すると、検索語を消せば戻ることが分からない）。#182 で「読めなかった」を足した。
+    ///
+    /// 一覧の下端の 1 行は幅が足りなければ省略されるので、**0 件のときに理由が確実に見える
+    /// 場所はここ**。
+    #[test]
+    fn an_empty_list_says_why_it_is_empty() {
+        let (heading, body) = empty_list_message(false, 0);
+        assert_eq!(heading, "No recordings yet");
+        assert!(body.starts_with("Start one from the shoki icon"));
+
+        let (heading, body) = empty_list_message(true, 0);
+        assert_eq!(heading, "No matches");
+        assert_eq!(
+            body,
+            "No transcript or notes mention it. Recordings that have not been transcribed are \
+             not searched."
+        );
+
+        // **読めなかったものが在るなら、0 件の理由に加える**。
+        let (_, body) = empty_list_message(true, 8);
+        assert_eq!(
+            body,
+            "No transcript or notes mention it. Recordings that have not been transcribed are \
+             not searched, and 8 are not downloaded to this Mac."
+        );
+        // 1 件でも文が壊れない（動詞を単数に合わせる）。
+        let (_, body) = empty_list_message(true, 1);
+        assert!(body.ends_with(", and 1 is not downloaded to this Mac."));
+
+        // 絞り込んでいなければ、読めなかったものの話はしない（検索していないので）。
+        let (heading, body) = empty_list_message(false, 8);
+        assert_eq!(heading, "No recordings yet");
+        assert!(!body.contains("not downloaded"));
     }
 
     /// 読めなかった録音の件数は、**いま一覧に在るものだけ**を数える（#182）。
