@@ -148,37 +148,16 @@ pub struct Transcript {
 
 /// セッションの文字起こしを読み、話者ラベル付きで開始秒の昇順にマージする（#175）。
 ///
-/// **本文は在る JSON を全部読む**。音源を消して文字起こしだけ残したセッションでも、読めるものは
-/// 読ませる（絞ると「検索では当たるのに開くと出てこない」という食い違いになる）。
-///
-/// **`sources` は「揃っているか」の判定にだけ使う**。このセッションに在る音源を渡すこと——
-/// 揃っているかは「在る音源ごとに、読めて最後まで読み切った JSON があるか」で決まる。
+/// **本文は在る JSON を全部読む**（`read_all`）。**`sources` は「揃っているか」の判定にだけ
+/// 使う**（`all_sources_are_complete`）。このセッションに在る音源を渡すこと——揃っているかは
+/// 「在る音源ごとに、読めて最後まで読み切った JSON があるか」で決まる。
 pub fn load_transcript(session_dir: &Path, sources: &[Speaker]) -> Transcript {
-    let read: Vec<(Speaker, Option<TranscriptFile>)> = ALL_SPEAKERS
-        .iter()
-        .map(|&speaker| {
-            (
-                speaker,
-                read_guarded(&session_dir.join(speaker.json_name())),
-            )
-        })
-        .collect();
-
-    // **読めなかった JSON も揃っていない側**（読めない以上そうとは言えない）。
-    let complete = sources.iter().all(|source| {
-        read.iter()
-            .find(|(speaker, _)| speaker == source)
-            .and_then(|(_, parsed)| parsed.as_ref())
-            .is_some_and(|parsed| parsed.complete)
-    });
-
-    let mut segments: Vec<TranscriptSegment> = read
-        .into_iter()
-        .filter_map(|(speaker, parsed)| Some((speaker, parsed?)))
-        .flat_map(|(speaker, parsed)| to_segments(parsed, speaker))
-        .collect();
-    sort_by_start(&mut segments);
-    Transcript { segments, complete }
+    let read = read_all(session_dir);
+    let complete = all_sources_are_complete(&read, sources);
+    Transcript {
+        segments: merged_segments(read),
+        complete,
+    }
 }
 
 /// 文字起こしのセグメントだけを読む（**揃っているかは見ない**）。
@@ -186,10 +165,58 @@ pub fn load_transcript(session_dir: &Path, sources: &[Speaker]) -> Transcript {
 /// 議事録の生成と検索が使う——どちらも本文しか要らない。揃っているかを判断したい呼び出し側は
 /// `load_transcript` を使うこと（#175）。
 ///
-/// **読み方は `load_transcript` と同じ 1 本**（音源の並びを渡さないぶん、揃っているかが意味を
-/// 持たないだけ）。
+/// **読み方は `load_transcript` と同じ 1 本**（`read_all` → `merged_segments`）。
+/// **`load_transcript` へ空の `sources` を渡す形にはしない**——理由は
+/// `all_sources_are_complete`。
 pub fn load_segments(session_dir: &Path) -> Vec<TranscriptSegment> {
-    load_transcript(session_dir, &[]).segments
+    merged_segments(read_all(session_dir))
+}
+
+/// 在りうる音源ぶんの JSON を読む。**在る音源ではなく全部読む**——音源を消して文字起こしだけ
+/// 残したセッションでも、読めるものは読ませるため（絞ると「検索では当たるのに開くと出て
+/// こない」という食い違いになる）。
+fn read_all(session_dir: &Path) -> Vec<(Speaker, Option<TranscriptFile>)> {
+    ALL_SPEAKERS
+        .iter()
+        .map(|&speaker| {
+            (
+                speaker,
+                read_guarded(&session_dir.join(speaker.json_name())),
+            )
+        })
+        .collect()
+}
+
+/// 読めたぶんを話者ラベル付きで開始秒の昇順にマージする。
+fn merged_segments(read: Vec<(Speaker, Option<TranscriptFile>)>) -> Vec<TranscriptSegment> {
+    let mut segments: Vec<TranscriptSegment> = read
+        .into_iter()
+        .filter_map(|(speaker, parsed)| Some((speaker, parsed?)))
+        .flat_map(|(speaker, parsed)| to_segments(parsed, speaker))
+        .collect();
+    sort_by_start(&mut segments);
+    segments
+}
+
+/// 在る音源ぶんが、すべて読めて最後まで読み切っているか（#175）。
+///
+/// **読めなかった JSON も揃っていない側**（読めない以上そうとは言えない）。
+///
+/// **音源を 1 つも渡さないときは「揃っている」と言わない**。`all()` は空だと真になるので、
+/// 音源を取り落とす壊れ方が「欠けた文字起こしを完成品として出す」といういちばん危険な側へ
+/// 落ちてしまう。音源ゼロのセッションは一覧に載らない（`list_sessions` が飛ばす）ので、
+/// 空が来るのは渡し間違いのときだけ——そのときは伏せる側で止める。
+fn all_sources_are_complete(
+    read: &[(Speaker, Option<TranscriptFile>)],
+    sources: &[Speaker],
+) -> bool {
+    !sources.is_empty()
+        && sources.iter().all(|source| {
+            read.iter()
+                .find(|(speaker, _)| speaker == source)
+                .and_then(|(_, parsed)| parsed.as_ref())
+                .is_some_and(|parsed| parsed.complete)
+        })
 }
 
 /// 開始秒で安定ソート（同秒は mic→system の追加順を保つ）。NaN は来ない想定だが total_cmp で安全に。
@@ -309,6 +336,30 @@ mod tests {
 
     fn unique_dir(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("shoki-transcript-{tag}-{}", std::process::id()))
+    }
+
+    /// **音源を 1 つも渡さなければ「揃っている」とは言わない**（#175）。`all()` の空真に頼ると、
+    /// 音源を取り落とす壊れ方が「欠けた文字起こしを完成品として出す」といういちばん危険な側へ
+    /// 落ちる。本番で空が来る経路は無い（音源ゼロのセッションは一覧に載らない）ので、これは
+    /// 壊れたときだけ効くガード——だからテストで留める。
+    #[test]
+    fn no_sources_never_counts_as_complete() {
+        let dir = unique_dir("no-sources");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("mic.json"),
+            r#"{"complete":true,"segments":[{"start":0.0,"end":1.0,"text":"hi"}]}"#,
+        )
+        .unwrap();
+
+        // 読める・最後まで読み切っている JSON が在っても、数える対象が無ければ真にしない。
+        assert!(!load_transcript(&dir, &[]).complete);
+        assert!(load_transcript(&dir, &[Speaker::Mic]).complete);
+        // 本文だけ要る呼び出しは、そもそも空の並びを渡す形にしない。
+        assert_eq!(load_segments(&dir).len(), 1);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

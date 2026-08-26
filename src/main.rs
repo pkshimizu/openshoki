@@ -1973,8 +1973,13 @@ fn reset_search(rec: &LibraryWindow, generation: &Cell<u64>) {
 ///
 /// この照合は**別の録音**だけを弾く。同じ録音の読み直し（絞り込みの打鍵のたびに起きる）では
 /// 直前の値をそのまま使う——毎回「分からない」に戻すと、伏せてある途中結果が打鍵のたびに
-/// 1 tick 顔を出す。読み直しの間に文字起こしが完成した場合も、走らせた記録
-/// （`transcript_pane_of` の `Some(Done)`）がディスクの印より優先されるので伏せたままにならない。
+/// 1 tick 顔を出す。
+///
+/// **読み直しの間、古い印が残る**。文字起こしが完成した直後の Transcript タブは、走らせた記録
+/// （`transcript_pane_of` の `Some(Done)`）がディスクの印より優先されるので揃っているが、
+/// 議事録側（`TranscriptInput::of`）はディスクを先に見るので、**その 1 tick は前の印のまま**
+/// 「途中結果から書く」と言う。ワーカーから降りた tick が必ず読み直しを起こす
+/// （`came_off_the_worker` → `reload_selected`）ので、次の結果が届いたところで揃う。
 struct LoadedTranscript {
     /// 読み込み元。まだ何も読んでいなければ `None`。
     dir: Option<std::path::PathBuf>,
@@ -2954,8 +2959,8 @@ fn refresh_detail_panes(
     summarizer: &summarize::SummarizeWorker,
     session: &recordings::RecordingSession,
     // 表示中の文字起こし。**最後まで読めたかはここからしか分からない**（#175。一覧の情報は
-    // 「在るか」までしか言えない）。**`session` を読み込んだ結果でなければならない**——別の
-    // 録音の結果を渡すと、完成品を伏せる・欠けたものを完成品として出す、のどちらかが起きる。
+    // 「在るか」までしか言えない）。`session` と対にならない結果は `LoadedTranscript::stored` が
+    // 値で弾くので、**呼び出し順で対応関係を作る必要は無い**（弾いたぶんは伏せない側へ落ちる）。
     loaded: &RefCell<LoadedTranscript>,
     config: &RefCell<Config>,
 ) {

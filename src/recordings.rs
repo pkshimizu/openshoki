@@ -101,6 +101,15 @@ pub struct RecordingSession {
     pub duration: Option<Duration>,
 }
 
+/// 音源ごとの mp3 名。**`Speaker` からファイル名を引く唯一の場所**——mp3 を書くのは録音側
+/// なので、名前の対応もこちら（`transcript` 側は JSON 名だけを知っていればよい）。
+fn audio_file_name(speaker: crate::transcript::Speaker) -> &'static str {
+    match speaker {
+        crate::transcript::Speaker::Mic => MIC_MP3,
+        crate::transcript::Speaker::System => SYSTEM_MP3,
+    }
+}
+
 impl RecordingSession {
     /// テスト用に、日時だけを持つセッションを作る（ファイルの有無は呼び出し側で足す）。
     ///
@@ -182,21 +191,21 @@ impl RecordingSession {
 
     /// 文字起こしの対象となる音源ファイル（存在する `mic.mp3` / `system.mp3`）。
     /// 手動再実行（Library ウィンドウの Transcribe ボタン）の投入対象に使う。
+    ///
+    /// **`speakers()` から導く**（#175）。「どの音源が在るか」の分岐を 2 つ持つと、片方だけ
+    /// 直した日に「文字起こしは投げるのに、揃ったかを数えない音源」が生まれる。
     pub fn audio_source_paths(&self) -> Vec<PathBuf> {
-        let mut paths = Vec::new();
-        if self.has_mic {
-            paths.push(self.dir.join(MIC_MP3));
-        }
-        if self.has_system {
-            paths.push(self.dir.join(SYSTEM_MP3));
-        }
-        paths
+        self.speakers()
+            .into_iter()
+            .map(|speaker| self.dir.join(audio_file_name(speaker)))
+            .collect()
     }
 
     /// このセッションに在る音源（#175）。**文字起こしが揃っているかの判定に使う**——在る音源
     /// ごとに、読めて最後まで読み切った JSON があるかを見る（`transcript::load_transcript`）。
     ///
-    /// 並びは `audio_source_paths` と同じ（mic → system）。
+    /// **「在る音源」を言う場所はここ 1 つ**。ここが音源を取り落とすと、欠けた文字起こしが
+    /// 完成品として画面に出る（`transcript::all_sources_are_complete` が数える対象そのもの）。
     pub fn speakers(&self) -> Vec<crate::transcript::Speaker> {
         let mut speakers = Vec::new();
         if self.has_mic {
@@ -575,6 +584,56 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime};
+
+    /// 「在る音源」を言うのはここ 1 つ（#175）。**取り落とすと、欠けた文字起こしが完成品として
+    /// 画面に出る**（`transcript::all_sources_are_complete` が数える対象そのもの）——本番では
+    /// `spawn_session_load` が渡すだけなので、壊れても症状が出るまでに何段も挟まる。
+    #[test]
+    fn the_sources_a_session_has_come_from_the_files_it_has() {
+        use crate::transcript::Speaker;
+
+        let session = |has_mic: bool, has_system: bool| {
+            let mut session = RecordingSession::for_test(
+                chrono::NaiveDate::from_ymd_opt(2026, 8, 10)
+                    .expect("a real date")
+                    .and_hms_opt(14, 2, 0)
+                    .expect("a real time"),
+            );
+            session.dir = PathBuf::from("/recordings/20260810-140200");
+            session.has_mic = has_mic;
+            session.has_system = has_system;
+            session
+        };
+
+        assert_eq!(
+            session(true, true).speakers(),
+            [Speaker::Mic, Speaker::System]
+        );
+        assert_eq!(session(true, false).speakers(), [Speaker::Mic]);
+        assert_eq!(session(false, true).speakers(), [Speaker::System]);
+        assert_eq!(session(false, false).speakers(), []);
+
+        // **投入先と数える対象は同じ並び**（`audio_source_paths` はここから導いている）。
+        for (has_mic, has_system) in [(true, true), (true, false), (false, true), (false, false)] {
+            let session = session(has_mic, has_system);
+            assert_eq!(
+                session.audio_source_paths(),
+                session
+                    .speakers()
+                    .into_iter()
+                    .map(|speaker| session.dir.join(super::audio_file_name(speaker)))
+                    .collect::<Vec<_>>(),
+                "the files we transcribe and the sources we count must line up"
+            );
+        }
+        assert_eq!(
+            session(true, true).audio_source_paths(),
+            [
+                PathBuf::from("/recordings/20260810-140200/mic.mp3"),
+                PathBuf::from("/recordings/20260810-140200/system.mp3"),
+            ]
+        );
+    }
 
     /// 長さは**サイズから割り出す**（デコードしない。#162）。
     #[test]
