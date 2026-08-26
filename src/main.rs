@@ -1485,22 +1485,10 @@ fn build_menu_event_handler(
             let Some(rec) = recordings.ui.upgrade() else {
                 continue;
             };
-            // **読めなかった録音を控える**（#182。理由は `not_downloaded_count` の doc）。
-            // 控えてから数える——削除の経路も同じ値を見るので、控え忘れるとそちらだけ古くなる。
-            *recordings.search_not_downloaded.borrow_mut() = result.not_downloaded_dirs;
-            let counted = {
+            let mut matched = {
                 let all = recordings.all_sessions.borrow();
-                count_search_result(
-                    result.matched,
-                    &recordings.search_not_downloaded.borrow(),
-                    &all,
-                )
+                apply_search_result(&rec, &recordings.search_not_downloaded, &all, result)
             };
-            let CountedSearch {
-                mut matched,
-                total,
-                not_downloaded,
-            } = counted;
             // 文字起こし・議事録の有無は**ワーカーの状態から埋め直す**。全件側から写すと、
             // それを埋めるのがこの tick の末尾なので 1 周ぶん古くなり、直後に組む行
             // （`session_rows` は現在の状態を見る）と食い違う。食い違うと行の差分が
@@ -1511,7 +1499,6 @@ fn build_menu_event_handler(
                 session.has_summary |= recordings.summarizer.status_of(&session.dir)
                     == Some(summarize::SummarizeStatus::Done);
             }
-            apply_list_counts(&rec, matched.len(), total, not_downloaded);
             recordings
                 .sessions_model
                 .set_vec(session_rows(&matched, &recordings.transcriber));
@@ -2476,6 +2463,31 @@ fn apply_list_counts(rec: &LibraryWindow, shown: usize, total: usize, not_downlo
     } else {
         library_text::search_summary_text(shown, total, not_downloaded).into()
     });
+}
+
+/// 届いた検索結果を、**控えて・数えて・画面へ入れる**（#182）。当たった録音を返す。
+///
+/// **控えるところから画面までを 1 本にしてある**。控える 1 行だけが外に残ると、そこを消した
+/// だけで「読めなかったことを伝える」機能が丸ごと死ぬのに、部品はどれも単体で緑のまま通る
+/// （`docs/rules/testing.md` の「テストが見ている入口と、本番が通る入口をずらさない」。
+/// 継ぎ目を下げるたびに穴も 1 段下がるので、**ウィンドウごと呼べる形にして止める**）。
+///
+/// 控えるのは、削除の経路が同じ値から数え直すため（`not_downloaded_count`）。
+fn apply_search_result(
+    rec: &LibraryWindow,
+    stored: &RefCell<Vec<std::path::PathBuf>>,
+    all: &[recordings::RecordingSession],
+    result: SearchResult,
+) -> Vec<recordings::RecordingSession> {
+    *stored.borrow_mut() = result.not_downloaded_dirs;
+    let counted = count_search_result(result.matched, &stored.borrow(), all);
+    apply_list_counts(
+        rec,
+        counted.matched.len(),
+        counted.total,
+        counted.not_downloaded,
+    );
+    counted.matched
 }
 
 /// 届いた検索結果を、いまの一覧に合わせて数え直す（#182）。
@@ -4484,6 +4496,84 @@ mod tests {
             result.not_downloaded_dirs,
             [std::path::PathBuf::from("away")]
         );
+    }
+
+    /// 届いた検索結果が、**控えられ・数えられ・画面へ入る**こと（#182）。
+    ///
+    /// 控える 1 行だけを外に残すと、そこを消しただけで「読めなかったことを伝える」機能が
+    /// 丸ごと死ぬのに、部品はどれも単体で緑のまま通る——実際、継ぎ目を下げるたびに同じ形の
+    /// 穴が 1 段ずつ下がった（`docs/rules/testing.md`）。**ウィンドウごと呼んで止める。**
+    #[test]
+    fn a_search_result_reaches_the_window_and_stays_for_the_next_count() {
+        super::init_test_backend();
+        let rec = super::LibraryWindow::new().expect("create the library window");
+        rec.set_search_text("release".into());
+
+        let session = |dir: &str| {
+            let mut session = recordings::RecordingSession::for_test(
+                chrono::NaiveDate::from_ymd_opt(2026, 8, 10)
+                    .expect("a real date")
+                    .and_hms_opt(14, 2, 0)
+                    .expect("a real time"),
+            );
+            session.dir = std::path::PathBuf::from(dir);
+            session
+        };
+        let all = vec![session("hit"), session("away"), session("miss")];
+        let stored = std::cell::RefCell::new(Vec::new());
+
+        let matched = super::apply_search_result(
+            &rec,
+            &stored,
+            &all,
+            super::SearchResult {
+                generation: 1,
+                matched: vec![session("hit")],
+                not_downloaded_dirs: vec![std::path::PathBuf::from("away")],
+            },
+        );
+
+        assert_eq!(matched.len(), 1, "the hit goes back to the list");
+        // **読めなかったことが画面に出る**（件数の行と、0 件のときの説明の両方）。
+        assert_eq!(
+            rec.get_search_summary(),
+            "1 of 3 recordings mention it · 1 not downloaded"
+        );
+        assert!(
+            rec.get_empty_body()
+                .contains("1 recording is not downloaded to this Mac"),
+            "got {:?}",
+            rec.get_empty_body()
+        );
+        // **控えが残る**——削除の経路はここから数え直す（残らないと、絞り込み中に 1 件消した
+        // 瞬間に理由が消える）。
+        assert_eq!(
+            *stored.borrow(),
+            [std::path::PathBuf::from("away")],
+            "the next count reads this"
+        );
+    }
+
+    /// 検索を解除したら、**検索にまつわる値が全部落ちる**こと（#182）。
+    ///
+    /// 1 つでも残ると、絞り込んでいないのに前の語の件数を出し続ける。解除の経路を足した人が
+    /// 落とさないよう、後始末はこの関数に畳んである。
+    #[test]
+    fn clearing_the_search_drops_everything_it_left() {
+        super::init_test_backend();
+        let rec = super::LibraryWindow::new().expect("create the library window");
+        rec.set_search_text("release".into());
+        rec.set_search_summary("1 of 3 recordings mention it · 1 not downloaded".into());
+        let generation = std::cell::Cell::new(4);
+        let stored = std::cell::RefCell::new(vec![std::path::PathBuf::from("away")]);
+
+        super::reset_search(&rec, &generation, &stored);
+
+        assert_eq!(rec.get_search_text(), "");
+        assert_eq!(rec.get_search_summary(), "");
+        assert!(stored.borrow().is_empty());
+        // **世代も進める**——走っていた検索の結果が後から届いて絞り直すのを防ぐ。
+        assert_ne!(generation.get(), 4);
     }
 
     /// 届いた検索結果が、**いまの一覧に合わせて数え直される**こと（#182）。
