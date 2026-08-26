@@ -288,6 +288,11 @@ fn duration_from_size(bytes: u64, bytes_per_sec: u64) -> Option<Duration> {
 
 /// 音源の長さを測った結果（#178）。**「測れない」を 2 つに分ける**——理由が違えば、読み手へ
 /// 言うことも変わる（片方は待てば直り、もう片方は直らない）。
+///
+/// **`dataless::ReadFailure` とは別系統**（#182）。あちらは本文を読む経路（検索・表示）が
+/// 「何を読めたことにするか」を決めるための分類で、ログを出すかまで持つ。こちらは長さ専用で、
+/// 読むのはヘッダ 4 バイトだけ・ログは走査の終わりにまとめて 1 行。共有しているのは見分け
+/// （`dataless::is_not_downloaded`）だけにしてある。
 #[derive(Debug)]
 enum Measured {
     /// 測れた。
@@ -303,14 +308,12 @@ enum Measured {
 /// 読み取りの失敗を、長さの結果へ分類する（#178）。**分類だけでログは出さない**——名前どおりの
 /// 純関数にしておくと、継ぎ目としても素直に読める。
 ///
-/// `EDEADLK`（`Deadlock`）は「取り寄せない設定なので実体を用意できない」という macOS の返し方。
-/// **この見分け方の正はここ**（他は参照だけを置く）。実測で、退避された音源は `open` が通って
-/// `read` がこれで返る。
+/// 見分け方の正は `dataless::is_not_downloaded`（#182 で検索側と共有した）。
 ///
 /// macOS 以外では `dataless::without_downloads` が何もしないので、この分岐へは来ない想定
 /// （来たとしても長さが出ないだけで、表示は `Unknown` と同じ）。
 fn measured_from_read_error(kind: std::io::ErrorKind) -> Measured {
-    if kind == std::io::ErrorKind::Deadlock {
+    if crate::dataless::is_not_downloaded(kind) {
         Measured::NotDownloaded
     } else {
         Measured::Unknown

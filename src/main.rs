@@ -11,6 +11,7 @@ mod atomic_replace;
 mod config;
 mod dataless;
 mod inference_slot;
+mod library_text;
 mod mixdown;
 mod model_download;
 mod player;
@@ -332,6 +333,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let load_generation = Rc::new(Cell::new(0u64));
     // 検索の世代（#161）。閉じるときにも降ろすので、閉じるハンドラより前に用意する。
     let search_generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
+    // **最後の検索で本文を読めなかった録音**（#182。理由は `not_downloaded_count` の doc）。
+    let search_not_downloaded: Rc<RefCell<Vec<std::path::PathBuf>>> =
+        Rc::new(RefCell::new(Vec::new()));
 
     {
         // 隠すときも**世代を進める**（#152）。進めないと、閉じたあとに届いた読み込み結果が
@@ -748,10 +752,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let all_sessions = Rc::clone(&all_sessions);
         let search_generation = Rc::clone(&search_generation);
+        let search_not_downloaded = Rc::clone(&search_not_downloaded);
         let search_sender = search_sender.clone();
         let rec_weak = library_ui.as_weak();
         library_ui.on_search(move |needle| {
             let generation = advance_search_generation(&search_generation);
+            // **古い語の件数を出し続けない**（#182）。結果が届くまでは 0 になるが、いま打って
+            // いる語と食い違う数を見せるより安全側（削除の経路もこの値から数え直す）。
+            search_not_downloaded.borrow_mut().clear();
             // **入力を書き換えない**。空白だけを打っている最中（日本語入力の区切りなど）に
             // 欄の中身が消えると、何が起きたか分からない。解除は本当に空のときだけ。
             if needle.is_empty() {
@@ -781,6 +789,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let sessions = Rc::clone(&sessions);
         let sessions_model = Rc::clone(&sessions_model);
         let search_generation = Rc::clone(&search_generation);
+        let search_not_downloaded = Rc::clone(&search_not_downloaded);
         let player = Rc::clone(&player);
         let load_sender = load_sender.clone();
         let transcriber = transcriber.clone();
@@ -791,11 +800,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let Some(rec) = rec_weak.upgrade() else {
                 return;
             };
-            reset_search(&rec, &search_generation);
+            reset_search(&rec, &search_generation, &search_not_downloaded);
             let all = all_sessions.borrow().clone();
             let total = all.len();
             sessions_model.set_vec(session_rows(&all, &transcriber));
-            apply_list_counts(&rec, total, total);
+            apply_list_counts(&rec, total, total, 0);
             reselect_after_list_change(
                 &rec,
                 &sessions,
@@ -851,6 +860,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let sessions_model = Rc::clone(&sessions_model);
         let all_sessions = Rc::clone(&all_sessions);
         let search_generation = Rc::clone(&search_generation);
+        let search_not_downloaded = Rc::clone(&search_not_downloaded);
         let player = Rc::clone(&player);
         let transcript_segments = Rc::clone(&transcript_segments);
         let load_generation = Rc::clone(&load_generation);
@@ -953,7 +963,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // その日の先頭を消すと繰り上がった行が見出しを引き継ぐ必要がある。
             {
                 let sessions = sessions.borrow();
-                apply_list_counts(&rec, sessions.len(), all_sessions.borrow().len());
+                let all = all_sessions.borrow();
+                apply_list_counts(
+                    &rec,
+                    sessions.len(),
+                    all.len(),
+                    // **消したぶんは落として数え直す**（#182）。絞り込みは解除されないので、
+                    // 読めなかった話も消さずに残す。
+                    not_downloaded_count(&search_not_downloaded.borrow(), &all),
+                );
                 if let Some(mut row) = sessions_model.row_data(i) {
                     row.group_heading =
                         session_group_heading(&sessions, i, chrono::Local::now().naive_local())
@@ -1191,6 +1209,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 all_sessions: Rc::clone(&all_sessions),
                 search_receiver,
                 search_generation: Rc::clone(&search_generation),
+                search_not_downloaded: Rc::clone(&search_not_downloaded),
                 sessions_model: Rc::clone(&sessions_model),
                 transcript_segments: Rc::clone(&transcript_segments),
                 transcriber: transcriber.clone(),
@@ -1256,6 +1275,8 @@ struct LibraryHandles {
     /// いま出している検索の世代。届いた結果がこれと違えば捨てる（打ち込むたびに投げるので、
     /// 古い結果が新しい入力を上書きしないように）。
     search_generation: Rc<Cell<u64>>,
+    /// 最後の検索で本文を読めなかった録音（#182。理由は `not_downloaded_count`）。
+    search_not_downloaded: Rc<RefCell<Vec<std::path::PathBuf>>>,
     sessions_model: Rc<slint::VecModel<SessionRow>>,
     transcript_segments: Rc<RefCell<LoadedTranscript>>,
     transcriber: transcribe::TranscribeWorker,
@@ -1464,14 +1485,9 @@ fn build_menu_event_handler(
             let Some(rec) = recordings.ui.upgrade() else {
                 continue;
             };
-            // 結果は**打鍵した時点のスナップショット**なので、そのままでは古い。
-            let mut matched = result.matched;
-            let total = {
+            let mut matched = {
                 let all = recordings.all_sessions.borrow();
-                // 絞り込んでいる間に消えた録音は落とす（削除は世代を進めるので通常は届かないが、
-                // 取りこぼしたときに消したはずの行を戻さない）。
-                matched.retain(|session| all.iter().any(|other| other.dir == session.dir));
-                all.len()
+                apply_search_result(&rec, &recordings.search_not_downloaded, &all, result)
             };
             // 文字起こし・議事録の有無は**ワーカーの状態から埋め直す**。全件側から写すと、
             // それを埋めるのがこの tick の末尾なので 1 周ぶん古くなり、直後に組む行
@@ -1483,7 +1499,6 @@ fn build_menu_event_handler(
                 session.has_summary |= recordings.summarizer.status_of(&session.dir)
                     == Some(summarize::SummarizeStatus::Done);
             }
-            apply_list_counts(&rec, matched.len(), total);
             recordings
                 .sessions_model
                 .set_vec(session_rows(&matched, &recordings.transcriber));
@@ -1783,15 +1798,6 @@ fn session_date_text(session: &recordings::RecordingSession) -> String {
     }
 }
 
-/// 一覧の下端に出す合計。**件数だけ**にする——容量を出すには全セッションのファイルを開く必要が
-/// あり、一覧を開くたびに走らせるには重い。
-fn library_summary(count: usize) -> String {
-    match count {
-        1 => "1 recording".to_owned(),
-        count => format!("{count} recordings"),
-    }
-}
-
 /// その読み込みで再生を差し替えるか（`PlaybackLoad` の判断を 1 か所に置く）。
 ///
 /// **選択が変わったときだけ true**。中身が変わって読み直しただけのときに差し替えると、
@@ -1871,8 +1877,16 @@ fn spawn_session_load(
         .name("session-load".to_owned())
         .spawn(move || {
             // **重い処理の前に降りられるか見る**（軽い読み込みは先に済ませてしまう）。
-            let transcript = transcript::load_transcript(&dir, &speakers);
-            let summary = summarize::load_summary(&dir);
+            // **取り寄せてよい**（#182）——録音を選んだのはユーザーなので、退避されていれば
+            // 落としてでも読む。頼まれていない読み取り（一覧の走査・検索）だけを止める。
+            //
+            // **打鍵のたびにここへ再入する**（絞り込み後も選択が残っていれば
+            // `reselect_after_list_change` が読み直しを起こす）。読むのは選んだ 1 件ぶんの
+            // JSON と `summary.md` だけで、2 回目以降は実体が落ちているので取り寄せは
+            // 走らない。全件を舐める検索とは桁が違うので、ここは止めない。
+            let transcript =
+                transcript::load_transcript(&dir, &speakers, dataless::Fetch::allowed());
+            let summary = summarize::load_summary(&dir, dataless::Fetch::allowed()).text;
             let summary_written = summary.is_some().then(|| {
                 std::fs::metadata(dir.join(summarize::SUMMARY_FILENAME))
                     .and_then(|meta| meta.modified())
@@ -1957,10 +1971,18 @@ fn advance_search_generation(generation: &Cell<u64>) -> u64 {
 ///
 /// **開く・閉じる・解除の 3 経路がここを通る**。どれかが世代を進め忘れると、走っていた検索の
 /// 結果が後から届いて、まっさらなはずの一覧を黙って絞り込む（検索欄は空なので原因が出ない）。
-fn reset_search(rec: &LibraryWindow, generation: &Cell<u64>) {
+///
+/// **検索にまつわる値はここで全部落とす**（#182 で「読めなかった録音」を足した）。1 つでも
+/// 外に置くと、解除の経路を足した人が確実に落とす。
+fn reset_search(
+    rec: &LibraryWindow,
+    generation: &Cell<u64>,
+    not_downloaded_dirs: &RefCell<Vec<std::path::PathBuf>>,
+) {
     advance_search_generation(generation);
     rec.set_search_text(slint::SharedString::new());
     rec.set_search_summary(slint::SharedString::new());
+    not_downloaded_dirs.borrow_mut().clear();
 }
 
 /// いま表示している文字起こし（#175）。**セグメントと「最後まで読み切れているか」を 1 つの器に
@@ -2200,23 +2222,136 @@ struct SearchResult {
     /// 一致したセッション（元の並び順のまま）。**件数は持たない**——絞り込んでいる間に
     /// 削除されることがあるので、合計は受け取った側が `all_sessions` から数える。
     matched: Vec<recordings::RecordingSession>,
+    /// 実体が無くて本文を読めなかった録音（#182）。**ここも件数ではなく録音そのもの**——
+    /// 理由は `not_downloaded_count` の doc（正はそこ）。
+    not_downloaded_dirs: Vec<std::path::PathBuf>,
 }
 
-/// 検索語がセッションの本文に一致するか。**大小を無視する**（打ち込むときに気にさせない）。
+/// 検索 1 件ぶんの結果（#182）。**「当たらなかった」と「読めなかった」を分ける**——
+/// 一緒にすると、退避された録音が黙って対象から外れて「検索に出てこない＝無い」と読める。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchOutcome {
+    /// 読めた本文に当たった。
+    Matched,
+    /// 読めた本文には当たらず、読めなかった本文も無かった。
+    Missed,
+    /// **読めた範囲では**当たらなかった。読めなかった本文に当たるかは分からない。
+    NotDownloaded,
+}
+
+/// 読んだ本文から、この録音の結果を決める（#182）。
+///
+/// **読み取りを含まないので、退避されたファイルを用意できない環境でも「読めなかった」の
+/// 扱いを検査できる**（`docs/rules/testing.md`。読み取りを差し替える継ぎ目は作らない——
+/// 閉包の中に直接読み取りを書けてしまい、囲いを素通りできる）。
+///
+/// **当たったら `Matched`**。読めなかった本文が残っていても、当たった事実は変わらない
+/// （当たった録音まで「読めなかった」に数えると、件数が一覧より多くなって意味を成さない）。
+/// **当たった録音の欠落は数えない**という割り切りで、その代わり当たらなかった録音では
+/// 読めなかったことを必ず言う。
+fn outcome_of(
+    summary: &summarize::Summary,
+    transcript: &transcript::Segments,
+    needle: &str,
+) -> SearchOutcome {
+    if summary_mentions(summary, needle)
+        || transcript
+            .segments
+            .iter()
+            .any(|segment| mentions(&segment.text, needle))
+    {
+        return SearchOutcome::Matched;
+    }
+    if summary.not_downloaded || transcript.not_downloaded {
+        return SearchOutcome::NotDownloaded;
+    }
+    SearchOutcome::Missed
+}
+
+/// 議事録が検索語を含むか（#182）。**短絡と `outcome_of` で同じ判定を使う**ための 1 箇所——
+/// 写しを置くと、片方だけ大小の扱いを変えた日に「当たったのに出てこない」が起きる。
+fn summary_mentions(summary: &summarize::Summary, needle: &str) -> bool {
+    summary
+        .text
+        .as_deref()
+        .is_some_and(|text| mentions(text, needle))
+}
+
+/// 本文が検索語を含むか。**大小を無視する**（打ち込むときに気にさせない）。
+fn mentions(text: &str, needle: &str) -> bool {
+    text.to_lowercase().contains(needle)
+}
+
+/// 検索を 1 周走らせる（#182）。
+///
+/// **取り寄せを止めるのはここ 1 箇所**——囲いを剥がすと証を作れず、`Fetch::blocked` も
+/// 作れないのでコンパイルが通らない（`docs/rules/testing.md`。`recordings::list_sessions` と
+/// 同じ形）。
+///
+/// `fetch` を組むのもここだけにしてあるが、**それは読みやすさのためで、守りではない**——
+/// `Fetch::allowed()` はどこからでも書けるので、読み取り 1 つだけを差し替える形は型でも
+/// 警告でも止まらない。止めているのは `Fetch::allowed` 自身で、囲いの中で作られたものは
+/// 証を持たないだけで扱いは `blocked` と同じになる（`dataless::Fetch` の doc）。
 ///
 /// 対象は**文字起こしと議事録の本文**。日時や音源は目で追えるので入れない——入れると
 /// `mic` のような語が全件に当たって絞り込みにならない。
-fn session_matches(session: &recordings::RecordingSession, needle: &str) -> bool {
-    let hit = |text: &str| text.to_lowercase().contains(needle);
-    if let Some(summary) = summarize::load_summary(&session.dir)
-        && hit(&summary)
-    {
-        return true;
+///
+/// 世代が進んでいたら**途中で降りる**（`None`）。読み切ってから捨てるのでは、打鍵のたびに
+/// 全件を読む時間を自分で積む。
+fn search_sessions(
+    sessions: Vec<recordings::RecordingSession>,
+    needle: &str,
+    live: &AtomicU64,
+    generation: u64,
+) -> Option<SearchResult> {
+    dataless::without_downloads(|downloads_off| {
+        let fetch = dataless::Fetch::blocked(downloads_off);
+        let mut judged = Vec::with_capacity(sessions.len());
+        for session in sessions {
+            // **1 件読むごとに降りられるか見る**。結果も送らない（送っても捨てられる）。
+            if live.load(Ordering::Relaxed) != generation {
+                return None;
+            }
+            let summary = summarize::load_summary(&session.dir, fetch);
+            // **議事録に当たったら文字起こしは読まない**（#182）。当たった録音の欠落は
+            // 数えないので（`outcome_of`）読んでも結果は変わらず、退避された保存先では
+            // 1 件につきファイルプロバイダへの往復が 2 回増えるだけになる。
+            let outcome = if summary_mentions(&summary, needle) {
+                SearchOutcome::Matched
+            } else {
+                // **本文しか要らない**（揃っているかの判断は読む領域の仕事。#175）。
+                let transcript = transcript::load_segments(&session.dir, fetch);
+                outcome_of(&summary, &transcript, needle)
+            };
+            judged.push((session, outcome));
+        }
+        Some(collect_findings(generation, judged))
+    })
+}
+
+/// 1 周ぶんの判定を、送る形へまとめる（#182）。
+///
+/// **繋ぎを純関数にしてある**——`SearchOutcome` から結果への振り分けは、退避されたファイルを
+/// 用意できない環境でも検査できる唯一の場所（`docs/rules/testing.md` の「テストが見ている
+/// 入口と、本番が通る入口をずらさない」）。ここが `NotDownloaded` を捨てると、読めなかった
+/// ことが画面に出なくなる。件数ではなく録音そのものを運ぶ理由は `not_downloaded_count`。
+fn collect_findings(
+    generation: u64,
+    judged: Vec<(recordings::RecordingSession, SearchOutcome)>,
+) -> SearchResult {
+    let mut result = SearchResult {
+        generation,
+        matched: Vec::new(),
+        not_downloaded_dirs: Vec::new(),
+    };
+    for (session, outcome) in judged {
+        match outcome {
+            SearchOutcome::Matched => result.matched.push(session),
+            SearchOutcome::NotDownloaded => result.not_downloaded_dirs.push(session.dir),
+            SearchOutcome::Missed => {}
+        }
     }
-    // **本文しか要らない**（揃っているかの判断は読む領域の仕事。#175）。
-    transcript::load_segments(&session.dir)
-        .iter()
-        .any(|segment| hit(&segment.text))
+    result
 }
 
 /// 検索を背景スレッドで走らせる。**本文は UI スレッドで読まない**——文字起こし JSON と
@@ -2243,23 +2378,11 @@ fn spawn_search(
         .name("session-search".to_owned())
         .spawn(move || {
             let needle = needle.to_lowercase();
-            let mut matched = Vec::new();
-            for session in sessions {
-                // **1 件読むごとに降りられるか見る**。結果も送らない（送っても捨てられる）。
-                if live.load(Ordering::Relaxed) != generation {
-                    return;
-                }
-                if session_matches(&session, &needle) {
-                    matched.push(session);
-                }
-            }
-            if sender
-                .send(SearchResult {
-                    generation,
-                    matched,
-                })
-                .is_err()
-            {
+            let Some(result) = search_sessions(sessions, &needle, &live, generation) else {
+                // 世代が進んだので降りた。結果は送らない（送っても捨てられる）。
+                return;
+            };
+            if sender.send(result).is_err() {
                 eprintln!("Skipping the search result because the app is shutting down");
             }
         });
@@ -2323,23 +2446,101 @@ fn reselect_after_list_change(
 
 /// 一覧の下の件数を入れる。**絞り込み中かどうかで文が変わる**ので、両方の件数を渡して
 /// ここ 1 箇所で決める（削除・検索・解除のどこから来ても同じ形になる）。
-fn apply_list_counts(rec: &LibraryWindow, shown: usize, total: usize) {
-    rec.set_library_summary(library_summary(total).into());
+fn apply_list_counts(rec: &LibraryWindow, shown: usize, total: usize, not_downloaded: usize) {
+    rec.set_library_summary(library_text::library_summary(total).into());
+    // 空表示の文も**同じ値から**決める（#182）。件数の文とは別に組み立てると、片方だけ
+    // 「読めなかった」を言う画面ができる。
+    let (heading, body) =
+        library_text::empty_list_message(!rec.get_search_text().is_empty(), not_downloaded);
+    rec.set_empty_heading(heading.into());
+    rec.set_empty_body(body.into());
+    // 絞り込んでいないなら件数の文は出さない（`library_summary` が出る）。**このとき
+    // `not_downloaded` は必ず 0**——`SearchOutcome` は 1 録音につき 1 値で `Matched` と
+    // `NotDownloaded` が排他、どちらも同じ一覧で絞ってから数えるので、全件が当たったなら
+    // 読めなかったものは無い（#182）。
     rec.set_search_summary(if shown == total {
         slint::SharedString::new()
     } else {
-        search_summary_text(shown, total).into()
+        library_text::search_summary_text(shown, total, not_downloaded).into()
     });
 }
 
-/// 絞り込み中に一覧の下へ出す件数。**解除の手を文に入れる**（0 件のときは本文側で出す）。
-fn search_summary_text(matched: usize, total: usize) -> String {
-    // 件数で**文の形**は変えない（0 件でも同じ言い方）が、名詞の単複は揃える
-    // （`library_summary` が `1 recording` と分けているのと同じ）。
-    if total == 1 {
-        return format!("{matched} of 1 recording mentions it");
+/// 届いた検索結果を、**控えて・数えて・画面へ入れる**（#182）。当たった録音を返す。
+///
+/// **控えるところから画面までを 1 本にしてある**。控える 1 行だけが外に残ると、そこを消した
+/// だけで「読めなかったことを伝える」機能が丸ごと死ぬのに、部品はどれも単体で緑のまま通る
+/// （`docs/rules/testing.md` の「テストが見ている入口と、本番が通る入口をずらさない」。
+/// 継ぎ目を下げるたびに穴も 1 段下がるので、**ウィンドウごと呼べる形にして止める**）。
+///
+/// 控えるのは、削除の経路が同じ値から数え直すため（`not_downloaded_count`）。
+fn apply_search_result(
+    rec: &LibraryWindow,
+    stored: &RefCell<Vec<std::path::PathBuf>>,
+    all: &[recordings::RecordingSession],
+    result: SearchResult,
+) -> Vec<recordings::RecordingSession> {
+    *stored.borrow_mut() = result.not_downloaded_dirs;
+    let counted = count_search_result(result.matched, &stored.borrow(), all);
+    apply_list_counts(
+        rec,
+        counted.matched.len(),
+        counted.total,
+        counted.not_downloaded,
+    );
+    counted.matched
+}
+
+/// 届いた検索結果を、いまの一覧に合わせて数え直す（#182）。
+///
+/// **繋ぎを純関数にしてある**——ここが「読めなかった件数」を落としても、部品はどれも単体で
+/// 緑のまま通ってしまう（`docs/rules/testing.md` の「テストが見ている入口と、本番が通る入口を
+/// ずらさない」）。この 1 式が機能そのもの: 潰すと、退避されて検索できなかったことは画面から
+/// 完全に消える。
+///
+/// 結果は**打鍵した時点のスナップショット**なので、そのままでは古い。
+fn count_search_result(
+    mut matched: Vec<recordings::RecordingSession>,
+    not_downloaded_dirs: &[std::path::PathBuf],
+    all: &[recordings::RecordingSession],
+) -> CountedSearch {
+    // 絞り込んでいる間に消えた録音は落とす（削除は世代を進めるので通常は届かないが、
+    // 取りこぼしたときに消したはずの行を戻さない）。
+    matched.retain(|session| all.iter().any(|other| other.dir == session.dir));
+    CountedSearch {
+        matched,
+        total: all.len(),
+        not_downloaded: not_downloaded_count(not_downloaded_dirs, all),
     }
-    format!("{matched} of {total} recordings mention it")
+}
+
+/// 数え直した検索結果（#182）。**3 つを 1 つの値で返す**——別々に返すと、呼び出し側で
+/// 取り違えても通る形（`usize` が 2 つ並ぶ）が残る。
+struct CountedSearch {
+    /// いまも一覧に在る、当たった録音。
+    matched: Vec<recordings::RecordingSession>,
+    /// 一覧の全件。
+    total: usize,
+    /// 実体が無くて検索できなかった件数。
+    not_downloaded: usize,
+}
+
+/// いま一覧に在るもののうち、**実体が無くて検索できなかった件数**（#182）。
+///
+/// 検索結果は打鍵した時点のスナップショットなので、**削除されたぶんを落としてから数える**。
+/// そのまま数えると、絞り込み中に 1 件消しただけで「10 件中 11 件が未ダウンロード」という
+/// 合計より多い数が出る（`matched` を `retain` しているのと同じ理由）。
+fn not_downloaded_count(
+    not_downloaded_dirs: &[std::path::PathBuf],
+    all: &[recordings::RecordingSession],
+) -> usize {
+    // **一覧を 1 度だけ引ける形にする**。総当たりだと、この修正が狙う「保存先まるごと退避」
+    // （読めなかった件数＝全件）で打鍵ごとに n² 回の比較が UI スレッドに乗る。
+    let alive: std::collections::HashSet<&std::path::Path> =
+        all.iter().map(|session| session.dir.as_path()).collect();
+    not_downloaded_dirs
+        .iter()
+        .filter(|dir| alive.contains(dir.as_path()))
+        .count()
 }
 
 /// セッションの並びから一覧の行を組み立てる。**開くときと絞り込み後で同じ経路を通す**
@@ -2395,10 +2596,17 @@ fn open_library_window(
     handles
         .sessions_model
         .set_vec(session_rows(&list, &handles.transcriber));
-    rec.set_library_summary(library_summary(list.len()).into());
     // 開くたびに検索は解除しておく（前に開いたときの絞り込みが残っていると、録音が消えたように
     // 見える）。**世代も進める**——走っていた検索の結果が後から届いて絞り込むのを防ぐ。
-    reset_search(rec, &handles.search_generation);
+    reset_search(
+        rec,
+        &handles.search_generation,
+        &handles.search_not_downloaded,
+    );
+    // **件数も空表示もここを通す**（`docs/rules/slint.md` の「表示値の導出は 1 つの関数に集め、
+    // 起動時の初期化もその関数を通す」）。直接 set すると、開いた直後だけ空表示の文が欠ける。
+    // 検索は上で解除したので、絞り込みも読めなかったものも無い。
+    apply_list_counts(rec, list.len(), list.len(), 0);
     *handles.all_sessions.borrow_mut() = list.clone();
     // 開くたびに未選択・停止表示へ初期化する。
     clear_library_selection(rec, &handles.transcript_segments, &handles.load_generation);
@@ -3435,7 +3643,7 @@ mod tests {
         PaneAction, PaneActionKind, StatusTone, SummaryPane, SummaryStatus, TranscriptPane,
         TranscriptStatus, actions_allowed_while_busy, app_version_text, breathing_level,
         came_off_the_worker, jobs_pending, model_downloads_on_select, model_status_line,
-        playback_progress, search_summary_text, seek_position_from_ratio, session_matches,
+        not_downloaded_count, outcome_of, playback_progress, seek_position_from_ratio,
         summary_display_status, summary_model_status_line, summary_pane_of, summary_rows,
         summary_status_text, transcript_display_status, transcript_pane_of,
         whisper_model_status_line,
@@ -3720,9 +3928,9 @@ mod tests {
     /// 一覧の合計は**件数だけ**（単数形も出す）。容量は全ファイルを開かないと分からない。
     #[test]
     fn the_library_summary_counts_recordings() {
-        assert_eq!(super::library_summary(0), "0 recordings");
-        assert_eq!(super::library_summary(1), "1 recording");
-        assert_eq!(super::library_summary(148), "148 recordings");
+        assert_eq!(super::library_text::library_summary(0), "0 recordings");
+        assert_eq!(super::library_text::library_summary(1), "1 recording");
+        assert_eq!(super::library_text::library_summary(148), "148 recordings");
     }
 
     /// バージョン表記が `Cargo.toml` の `version` と一致することを確かめる。
@@ -4053,7 +4261,7 @@ mod tests {
     /// 検索の一致判定。**大小を無視し、対象は文字起こしと議事録の本文だけ**（日時や音源を
     /// 入れると `mic` のような語が全件に当たって絞り込みにならない）。
     #[test]
-    fn session_matches_looks_at_the_transcript_and_the_notes() {
+    fn a_search_looks_at_the_transcript_and_the_notes() {
         // 走査はディレクトリ名が日時形式で、音源が 1 つ以上あるものだけを拾う。
         let root = std::env::temp_dir().join(format!("shoki-search-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -4079,14 +4287,31 @@ mod tests {
             .find(|session| session.dir == dir)
             .expect("the session should be listed");
 
-        // 文字起こしに一致する（大小を無視する）。
-        assert!(session_matches(&session, "recording format"));
+        // **本番と同じ入口を通す**（#182）。囲いも `Fetch` も `search_sessions` の中で組む
+        // ので、ここから呼べば読み取りから結果までの繋ぎがまるごと検査対象になる
+        // （`docs/rules/testing.md`。`#[cfg(test)]` の証コンストラクタは足さない——足した
+        // 瞬間に、囲いの外から読む書き方がテストだけ通るようになる）。
+        let live = std::sync::atomic::AtomicU64::new(7);
+        let search = |needle: &str| {
+            let result = super::search_sessions(vec![session.clone()], needle, &live, 7)
+                .expect("the search should not be cancelled");
+            (result.matched.len(), result.not_downloaded_dirs.len())
+        };
+        // 文字起こしに一致する（大小を無視する。検索語は小文字化して渡される）。
+        assert_eq!(search("recording format"), (1, 0));
         // 議事録にも当たる。
-        assert!(session_matches(&session, "リリース"));
-        // 当たらない語は落ちる。
-        assert!(!session_matches(&session, "no such phrase"));
+        assert_eq!(search("リリース"), (1, 0));
+        // 当たらない語は落ちる。**読めなかったのではなく、当たらなかった**。
+        assert_eq!(search("no such phrase"), (0, 0));
         // **日時や音源では当たらない**（`mic.json` というファイル名に引きずられない）。
-        assert!(!session_matches(&session, "mic"));
+        assert_eq!(search("mic"), (0, 0));
+
+        // **世代が進んでいたら 1 件も読まずに降りる**（打鍵のたびに全件を読む時間を積まない）。
+        let stale = std::sync::atomic::AtomicU64::new(8);
+        assert!(
+            super::search_sessions(vec![session], "recording format", &stale, 7).is_none(),
+            "a search that has been overtaken must not report"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -4095,17 +4320,368 @@ mod tests {
     #[test]
     fn search_summary_text_shows_both_counts() {
         assert_eq!(
-            search_summary_text(3, 148),
+            super::library_text::search_summary_text(3, 148, 0),
             "3 of 148 recordings mention it"
         );
         // 0 件でも同じ形（件数で文の形は変えない。`docs/rules/messages.md`）。
         assert_eq!(
-            search_summary_text(0, 148),
+            super::library_text::search_summary_text(0, 148, 0),
             "0 of 148 recordings mention it"
         );
         // 名詞の単複は揃える（`library_summary` が `1 recording` と分けているのと同じ）。
-        assert_eq!(search_summary_text(1, 1), "1 of 1 recording mentions it");
-        assert_eq!(search_summary_text(0, 1), "0 of 1 recording mentions it");
+        assert_eq!(
+            super::library_text::search_summary_text(1, 1, 0),
+            "1 of 1 recording mentions it"
+        );
+        assert_eq!(
+            super::library_text::search_summary_text(0, 1, 0),
+            "0 of 1 recording mentions it"
+        );
+    }
+
+    /// **読めなかった録音があることを画面に出す**（#182）。黙って対象から外すと
+    /// 「検索に出てこない＝無い」と読める。
+    #[test]
+    fn the_search_says_how_many_it_could_not_read() {
+        assert_eq!(
+            super::library_text::search_summary_text(3, 11, 8),
+            "3 of 11 recordings mention it · 8 not downloaded"
+        );
+        // 全件が読めないときも同じ形（0 件でも理由が出る）。
+        assert_eq!(
+            super::library_text::search_summary_text(0, 11, 11),
+            "0 of 11 recordings mention it · 11 not downloaded"
+        );
+        // 1 件でも文が壊れない（`not downloaded` は形容詞句なので単複を分けない）。
+        assert_eq!(
+            super::library_text::search_summary_text(0, 1, 1),
+            "0 of 1 recording mentions it · 1 not downloaded"
+        );
+    }
+
+    /// 読めなかった理由が**ウィンドウまで届く**こと（#182）。
+    ///
+    /// 件数の文を組む関数は単体で検査済みだが、**それを画面へ入れるかを決めているのは
+    /// `apply_list_counts` の 1 行**。ここが「絞り込まれていなければ出さない」だけを見ると、
+    /// 全件が当たって一部が退避、という組み合わせで理由が黙って消える
+    /// （`docs/rules/testing.md` の「配線は、繋いでいる関数に継ぎ目を入れてテストする」）。
+    #[test]
+    fn the_window_is_told_what_the_search_could_not_read() {
+        super::init_test_backend();
+        let rec = super::LibraryWindow::new().expect("create the library window");
+
+        // 絞り込んでおらず、読めなかったものも無い＝言うことが無い。
+        super::apply_list_counts(&rec, 11, 11, 0);
+        assert_eq!(rec.get_search_summary(), "");
+
+        // 絞り込み中は件数を出す。
+        super::apply_list_counts(&rec, 2, 11, 0);
+        assert_eq!(rec.get_search_summary(), "2 of 11 recordings mention it");
+
+        // **読めなかったものが在るなら、件数の行にも言う**（本番で実際に出る組み合わせ。
+        // 全件一致かつ一部が退避、は `SearchOutcome` が排他なので作れない）。
+        super::apply_list_counts(&rec, 0, 11, 8);
+        assert_eq!(
+            rec.get_search_summary(),
+            "0 of 11 recordings mention it · 8 not downloaded"
+        );
+
+        // **空表示の文も同じ呼び出しで入る**（別々に組むと、片方だけ「読めなかった」を
+        // 言う画面ができる）。検索中かはウィンドウの検索欄から見る。
+        rec.set_search_text("release".into());
+        super::apply_list_counts(&rec, 0, 11, 8);
+        assert_eq!(rec.get_empty_heading(), "No matches");
+        assert!(
+            rec.get_empty_body()
+                .contains("8 recordings are not downloaded to this Mac"),
+            "the empty list says what could not be searched, got {:?}",
+            rec.get_empty_body()
+        );
+        rec.set_search_text("".into());
+        super::apply_list_counts(&rec, 0, 0, 0);
+        assert_eq!(rec.get_empty_heading(), "No recordings yet");
+    }
+
+    /// 一覧が空のときの文。**録音が無いのか、絞り込んで消えたのか**で言い分ける（同じ文に
+    /// すると、検索語を消せば戻ることが分からない）。#182 で「読めなかった」を足した。
+    ///
+    /// 一覧の下端の 1 行は幅が足りなければ省略されるので、**0 件のときに理由が確実に見える
+    /// 場所はここ**。
+    #[test]
+    fn an_empty_list_says_why_it_is_empty() {
+        let (heading, body) = super::library_text::empty_list_message(false, 0);
+        assert_eq!(heading, "No recordings yet");
+        assert!(body.starts_with("Start one from the shoki icon"));
+
+        let (heading, body) = super::library_text::empty_list_message(true, 0);
+        assert_eq!(heading, "No matches");
+        assert_eq!(
+            body,
+            "No transcript or notes mention it. Recordings that have not been transcribed are \
+             not searched."
+        );
+
+        // **読めなかったものが在るなら、0 件の理由に加える**。件数は独立した文にする
+        // （カンマで繋ぐと、直前の「文字起こしされていない録音」に係って読める）。
+        let (_, body) = super::library_text::empty_list_message(true, 8);
+        assert!(
+            body.ends_with(
+                " 8 recordings are not downloaded to this Mac, so what they say could not be \
+                 searched."
+            ),
+            "got {body:?}"
+        );
+        // 1 件でも文が壊れない（名詞も動詞も単数に合わせる）。
+        let (_, body) = super::library_text::empty_list_message(true, 1);
+        assert!(
+            body.ends_with(
+                " 1 recording is not downloaded to this Mac, so what they say could not be \
+                 searched."
+            ),
+            "got {body:?}"
+        );
+
+        // 絞り込んでいなければ、読めなかったものの話はしない（検索していないので）。
+        let (heading, body) = super::library_text::empty_list_message(false, 8);
+        assert_eq!(heading, "No recordings yet");
+        assert!(!body.contains("not downloaded"));
+    }
+
+    /// 判定が**送る形へ落ちる**こと（#182）。
+    ///
+    /// 読み取りは退避されたファイルを用意できないと再現できないが、**判定から結果への
+    /// 振り分けは繋いで検査できる**——ここが `NotDownloaded` を捨てると、読めなかったことは
+    /// どこにも残らず、画面に理由が出なくなる（`docs/rules/testing.md` の「テストが見ている
+    /// 入口と、本番が通る入口をずらさない」）。
+    #[test]
+    fn every_judgement_lands_somewhere() {
+        use super::SearchOutcome as O;
+
+        let session = |dir: &str| {
+            let mut session = recordings::RecordingSession::for_test(
+                chrono::NaiveDate::from_ymd_opt(2026, 8, 10)
+                    .expect("a real date")
+                    .and_hms_opt(14, 2, 0)
+                    .expect("a real time"),
+            );
+            session.dir = std::path::PathBuf::from(dir);
+            session
+        };
+        let result = super::collect_findings(
+            42,
+            vec![
+                (session("hit"), O::Matched),
+                (session("away"), O::NotDownloaded),
+                (session("miss"), O::Missed),
+                (session("hit2"), O::Matched),
+            ],
+        );
+
+        // どの検索に対する結果かを運ぶ（受け取る側が古い結果を捨てるのに使う）。
+        assert_eq!(result.generation, 42);
+        // 当たったものは一覧へ（並びは渡した順のまま）。
+        assert_eq!(
+            result
+                .matched
+                .iter()
+                .map(|session| session.dir.clone())
+                .collect::<Vec<_>>(),
+            [
+                std::path::PathBuf::from("hit"),
+                std::path::PathBuf::from("hit2")
+            ]
+        );
+        // **読めなかったものは件数の元へ**。当たらなかっただけのものは、どちらにも入らない。
+        assert_eq!(
+            result.not_downloaded_dirs,
+            [std::path::PathBuf::from("away")]
+        );
+    }
+
+    /// 届いた検索結果が、**控えられ・数えられ・画面へ入る**こと（#182）。
+    ///
+    /// 控える 1 行だけを外に残すと、そこを消しただけで「読めなかったことを伝える」機能が
+    /// 丸ごと死ぬのに、部品はどれも単体で緑のまま通る——実際、継ぎ目を下げるたびに同じ形の
+    /// 穴が 1 段ずつ下がった（`docs/rules/testing.md`）。**ウィンドウごと呼んで止める。**
+    #[test]
+    fn a_search_result_reaches_the_window_and_stays_for_the_next_count() {
+        super::init_test_backend();
+        let rec = super::LibraryWindow::new().expect("create the library window");
+        rec.set_search_text("release".into());
+
+        let session = |dir: &str| {
+            let mut session = recordings::RecordingSession::for_test(
+                chrono::NaiveDate::from_ymd_opt(2026, 8, 10)
+                    .expect("a real date")
+                    .and_hms_opt(14, 2, 0)
+                    .expect("a real time"),
+            );
+            session.dir = std::path::PathBuf::from(dir);
+            session
+        };
+        let all = vec![session("hit"), session("away"), session("miss")];
+        let stored = std::cell::RefCell::new(Vec::new());
+
+        let matched = super::apply_search_result(
+            &rec,
+            &stored,
+            &all,
+            super::SearchResult {
+                generation: 1,
+                matched: vec![session("hit")],
+                not_downloaded_dirs: vec![std::path::PathBuf::from("away")],
+            },
+        );
+
+        assert_eq!(matched.len(), 1, "the hit goes back to the list");
+        // **読めなかったことが画面に出る**（件数の行と、0 件のときの説明の両方）。
+        assert_eq!(
+            rec.get_search_summary(),
+            "1 of 3 recordings mention it · 1 not downloaded"
+        );
+        assert!(
+            rec.get_empty_body()
+                .contains("1 recording is not downloaded to this Mac"),
+            "got {:?}",
+            rec.get_empty_body()
+        );
+        // **控えが残る**——削除の経路はここから数え直す（残らないと、絞り込み中に 1 件消した
+        // 瞬間に理由が消える）。
+        assert_eq!(
+            *stored.borrow(),
+            [std::path::PathBuf::from("away")],
+            "the next count reads this"
+        );
+    }
+
+    /// 検索を解除したら、**検索にまつわる値が全部落ちる**こと（#182）。
+    ///
+    /// 1 つでも残ると、絞り込んでいないのに前の語の件数を出し続ける。解除の経路を足した人が
+    /// 落とさないよう、後始末はこの関数に畳んである。
+    #[test]
+    fn clearing_the_search_drops_everything_it_left() {
+        super::init_test_backend();
+        let rec = super::LibraryWindow::new().expect("create the library window");
+        rec.set_search_text("release".into());
+        rec.set_search_summary("1 of 3 recordings mention it · 1 not downloaded".into());
+        let generation = std::cell::Cell::new(4);
+        let stored = std::cell::RefCell::new(vec![std::path::PathBuf::from("away")]);
+
+        super::reset_search(&rec, &generation, &stored);
+
+        assert_eq!(rec.get_search_text(), "");
+        assert_eq!(rec.get_search_summary(), "");
+        assert!(stored.borrow().is_empty());
+        // **世代も進める**——走っていた検索の結果が後から届いて絞り直すのを防ぐ。
+        assert_ne!(generation.get(), 4);
+    }
+
+    /// 届いた検索結果が、**いまの一覧に合わせて数え直される**こと（#182）。
+    ///
+    /// 検索結果は打鍵した時点のスナップショットなので、そのまま数えると「10 件中 11 件が
+    /// 未ダウンロード」という合計より多い数が出る。**この 1 式が機能そのもの**——潰すと、
+    /// 退避されて検索できなかったことは画面から完全に消えるのに、部品はどれも単体で緑の
+    /// まま通る（`docs/rules/testing.md` の「テストが見ている入口と、本番が通る入口を
+    /// ずらさない」）。
+    #[test]
+    fn the_count_drops_recordings_that_are_gone() {
+        let session = |dir: &str| {
+            let mut session = recordings::RecordingSession::for_test(
+                chrono::NaiveDate::from_ymd_opt(2026, 8, 10)
+                    .expect("a real date")
+                    .and_hms_opt(14, 2, 0)
+                    .expect("a real time"),
+            );
+            session.dir = std::path::PathBuf::from(dir);
+            session
+        };
+        let all = vec![session("a"), session("b")];
+        let not_downloaded = [
+            std::path::PathBuf::from("a"),
+            std::path::PathBuf::from("b"),
+            // 絞り込んでいる間にゴミ箱へ移された。
+            std::path::PathBuf::from("c"),
+        ];
+
+        assert_eq!(not_downloaded_count(&not_downloaded, &all), 2);
+        assert_eq!(not_downloaded_count(&[], &all), 0);
+        assert_eq!(not_downloaded_count(&not_downloaded, &[]), 0);
+
+        // **画面へ渡る 3 つが同じ一覧から出る**こと。当たった録音のうち消えたものも落ちる。
+        let counted =
+            super::count_search_result(vec![session("a"), session("gone")], &not_downloaded, &all);
+        assert_eq!(
+            counted
+                .matched
+                .iter()
+                .map(|session| session.dir.clone())
+                .collect::<Vec<_>>(),
+            [std::path::PathBuf::from("a")],
+            "a recording that has been deleted must not come back"
+        );
+        assert_eq!(counted.total, 2);
+        assert_eq!(
+            counted.not_downloaded, 2,
+            "what the search could not read must reach the window"
+        );
+    }
+
+    /// 読めなかった本文があることが、**読んだ結果から結果へ運ばれる**こと（#182）。
+    ///
+    /// 退避されたファイルは CI でも手元でも作れないので、`Deadlock` から
+    /// `NotDownloaded` までの繋ぎは実測でしか確かめられない。**その手前と先は繋いで検査
+    /// できる**——ここが抜けると、読み手が「読めなかった」と言っているのに検索が黙って
+    /// 「当たらなかった」に丸める形を書けてしまう。
+    #[test]
+    fn what_could_not_be_read_reaches_the_outcome() {
+        use super::SearchOutcome as O;
+
+        let summary = |text: Option<&str>, not_downloaded: bool| super::summarize::Summary {
+            text: text.map(str::to_owned),
+            not_downloaded,
+        };
+        let transcript = |text: Option<&str>, not_downloaded: bool| super::transcript::Segments {
+            segments: text
+                .map(|text| {
+                    vec![super::transcript::TranscriptSegment {
+                        start_secs: 0.0,
+                        text: text.to_owned(),
+                        speaker: super::transcript::Speaker::Mic,
+                    }]
+                })
+                .unwrap_or_default(),
+            not_downloaded,
+        };
+        let nothing = || (summary(None, false), transcript(None, false));
+
+        // 読めた本文に当たる（大小を無視する）。議事録・文字起こしのどちらでも。
+        let (s, t) = (
+            summary(Some("Release next week"), false),
+            transcript(None, false),
+        );
+        assert_eq!(outcome_of(&s, &t, "release"), O::Matched);
+        let (s, t) = (
+            summary(None, false),
+            transcript(Some("Release next week"), false),
+        );
+        assert_eq!(outcome_of(&s, &t, "release"), O::Matched);
+
+        // 何も無ければ「当たらなかった」。**読めなかったとは言わない**。
+        let (s, t) = nothing();
+        assert_eq!(outcome_of(&s, &t, "release"), O::Missed);
+
+        // **片方でも実体が無ければ、当たらなかったときに必ずそう言う**。
+        let (s, t) = (summary(None, true), transcript(None, false));
+        assert_eq!(outcome_of(&s, &t, "release"), O::NotDownloaded);
+        let (s, t) = (summary(None, false), transcript(None, true));
+        assert_eq!(outcome_of(&s, &t, "release"), O::NotDownloaded);
+
+        // 当たったなら、読めなかった本文が残っていても当たり（`search_outcome` の割り切り）。
+        let (s, t) = (
+            summary(Some("Release next week"), false),
+            transcript(None, true),
+        );
+        assert_eq!(outcome_of(&s, &t, "release"), O::Matched);
     }
 
     /// 失敗の理由 → 文言を**全種別で固定する**。

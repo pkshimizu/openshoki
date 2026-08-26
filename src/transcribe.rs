@@ -2410,8 +2410,11 @@ mod tests {
             );
             assert_eq!(reach.duration_secs, Some(12.5));
             // 在る音源ぶんの判定（画面が伏せるかを決める側）まで同じ答えになること。
-            let loaded =
-                crate::transcript::load_transcript(&dir, &[crate::transcript::Speaker::Mic]);
+            let loaded = crate::transcript::load_transcript(
+                &dir,
+                &[crate::transcript::Speaker::Mic],
+                crate::dataless::Fetch::allowed(),
+            );
             assert_eq!(loaded.complete, complete);
             assert_eq!(loaded.segments.len(), 1);
         }
