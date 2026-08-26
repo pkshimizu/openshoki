@@ -752,10 +752,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let all_sessions = Rc::clone(&all_sessions);
         let search_generation = Rc::clone(&search_generation);
+        let search_not_downloaded = Rc::clone(&search_not_downloaded);
         let search_sender = search_sender.clone();
         let rec_weak = library_ui.as_weak();
         library_ui.on_search(move |needle| {
             let generation = advance_search_generation(&search_generation);
+            // **古い語の件数を出し続けない**（#182）。結果が届くまでは 0 になるが、いま打って
+            // いる語と食い違う数を見せるより安全側（削除の経路もこの値から数え直す）。
+            search_not_downloaded.borrow_mut().clear();
             // **入力を書き換えない**。空白だけを打っている最中（日本語入力の区切りなど）に
             // 欄の中身が消えると、何が起きたか分からない。解除は本当に空のときだけ。
             if needle.is_empty() {

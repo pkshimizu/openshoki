@@ -518,6 +518,7 @@ pub fn load_summary(session_dir: &Path, fetch: crate::dataless::Fetch) -> Summar
 /// 読めた議事録と、**実体が無くて読めなかったか**（#182）。理由は
 /// `transcript::Segments`（本文だけ見て「無い」と決めると、検索が黙って対象から外したことに
 /// 気づけない）。
+#[derive(Debug)]
 pub struct Summary {
     /// 読めた本文。未生成・空・破損・過大は `None`。
     pub text: Option<String>,
