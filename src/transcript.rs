@@ -25,6 +25,10 @@ const SYSTEM_JSON: &str = "system.json";
 /// 実際の文字起こしは長時間録音でも高々数 MB。
 const MAX_TRANSCRIPT_BYTES: u64 = 32 * 1024 * 1024;
 
+/// 文字起こしがありうる音源。**読む側は全部見る**（音源が消えても文字起こしは読ませる）ので、
+/// 種類を足したらここに足す。
+const ALL_SPEAKERS: [Speaker; 2] = [Speaker::Mic, Speaker::System];
+
 /// セグメントの話者（どの音源の文字起こしか）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Speaker {
@@ -41,6 +45,15 @@ impl Speaker {
         match self {
             Speaker::Mic => "Mic",
             Speaker::System => "System",
+        }
+    }
+
+    /// この音源の文字起こし JSON のファイル名。`transcribe.rs` が `<音源名>.json` で保存する
+    /// 名前と一致させること。
+    fn json_name(self) -> &'static str {
+        match self {
+            Speaker::Mic => MIC_JSON,
+            Speaker::System => SYSTEM_JSON,
         }
     }
 }
@@ -70,9 +83,44 @@ struct TranscriptFile {
     segments: Vec<RawSegment>,
     /// 元になった音源の長さ（秒）。**どこまでの音源から作られたか**を表すので、途中で
     /// 読めなくなった音源から作った JSON では、その打ち切り位置になる（#164）。欠けている
-    /// 古い JSON は 0 として読む（`transcribed_duration_secs` が「分からない」に落とす）。
+    /// 古い JSON は 0 として読む（`stored_reach` が「分からない」に落とす）。
     #[serde(default)]
     duration_secs: f64,
+    /// 音源を**最後まで読めたか**（#175）。`false` は `duration_secs` までで打ち切った途中結果。
+    ///
+    /// **欠けていても・型が違っても `true` に落とす**。保存先は手編集されうる信頼境界外なので、
+    /// この 1 欄のせいで JSON 全体のパースが失敗し、セグメントごと消えるのを避ける
+    /// （`docs/rules/error-handling.md` の「寛容にデシリアライズし既定へ丸める」）。
+    ///
+    /// **`true` は「デコーダがストリーム終端まで到達した」という意味**でしかない。壊れたパケットを
+    /// 読み飛ばして中抜けした音源も `true` になる（`transcribe::decode_mp3_stream`。扱いは #176）。
+    #[serde(
+        default = "complete_by_default",
+        deserialize_with = "deserialize_complete"
+    )]
+    complete: bool,
+}
+
+/// `complete` が欠けている JSON の既定。
+///
+/// **#164 から #175 の間に書かれた途中結果は取り逃す**——その頃の出力は欄を持たないまま
+/// `complete:false` 相当を保存していた。まだ配布していない（`docs/CONTEXT.md` の配布の決定記録）
+/// ので手元のデータにしか無く、やり直せば直る。
+fn complete_by_default() -> bool {
+    true
+}
+
+/// `complete` を寛容に読む。**欄が在って読めない値なら「最後まで読めていない」へ倒す**。
+///
+/// 欠落を `true` にするのは互換の根拠がある（欄が無い＝#164 以前の出力）が、**壊れた値には
+/// その根拠が無い**。この機能は「欠けた文字起こしが完成品に見えるのを防ぐ」ためのものなので、
+/// 分からないときは守りたい側へ倒す。
+fn deserialize_complete<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value.as_bool().unwrap_or(false))
 }
 
 /// JSON の 1 セグメント。`text` は欠けていても既定値で読めるようにする（前方互換）。
@@ -84,22 +132,100 @@ struct RawSegment {
     text: String,
 }
 
-/// セッションの `mic.json` / `system.json` を読み、話者ラベル付きで開始秒の昇順にマージする。
-/// 欠落・破損の音源はスキップ（その音源のセグメントは無し）。両方無ければ空を返す。
-pub fn load_transcript(session_dir: &Path) -> Vec<TranscriptSegment> {
-    let mut segments = load_one(&session_dir.join(MIC_JSON), Speaker::Mic);
-    segments.extend(load_one(&session_dir.join(SYSTEM_JSON), Speaker::System));
-    // 開始秒で安定ソート（同秒は mic→system の追加順を保つ）。NaN は来ない想定だが total_cmp で安全に。
-    segments.sort_by(|a, b| a.start_secs.total_cmp(&b.start_secs));
+/// セッションの文字起こし（#175）。**セグメントと「揃っているか」を 1 つの値で返す**——別々に
+/// 読むと、片方だけ古い組み合わせを作れてしまう。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Transcript {
+    pub segments: Vec<TranscriptSegment>,
+    /// **在る音源ぶんの文字起こしが、すべて最後まで読めているか**（#175）。
+    ///
+    /// 音源が 2 本あって片方の JSON が無いセッション（一方だけ失敗した・途中で止めた）も
+    /// `false` になる。「読めた JSON がすべて `complete`」にすると、そこが `true` に化ける。
+    ///
+    /// 読めなかった JSON（欠落・破損・過大）も `false`。読めない以上「揃っている」とは言えない。
+    pub complete: bool,
+}
+
+/// セッションの文字起こしを読み、話者ラベル付きで開始秒の昇順にマージする（#175）。
+///
+/// **本文は在る JSON を全部読む**（`read_all`）。**`sources` は「揃っているか」の判定にだけ
+/// 使う**（`all_sources_are_complete`）。このセッションに在る音源を渡すこと——揃っているかは
+/// 「在る音源ごとに、読めて最後まで読み切った JSON があるか」で決まる。
+pub fn load_transcript(session_dir: &Path, sources: &[Speaker]) -> Transcript {
+    let read = read_all(session_dir);
+    let complete = all_sources_are_complete(&read, sources);
+    Transcript {
+        segments: merged_segments(read),
+        complete,
+    }
+}
+
+/// 文字起こしのセグメントだけを読む（**揃っているかは見ない**）。
+///
+/// 議事録の生成と検索が使う——どちらも本文しか要らない。揃っているかを判断したい呼び出し側は
+/// `load_transcript` を使うこと（#175）。
+///
+/// **読み方は `load_transcript` と同じ 1 本**（`read_all` → `merged_segments`）。
+/// **`load_transcript` へ空の `sources` を渡す形にはしない**——理由は
+/// `all_sources_are_complete`。
+pub fn load_segments(session_dir: &Path) -> Vec<TranscriptSegment> {
+    merged_segments(read_all(session_dir))
+}
+
+/// 在りうる音源ぶんの JSON を読む。**在る音源ではなく全部読む**——音源を消して文字起こしだけ
+/// 残したセッションでも、読めるものは読ませるため（絞ると「検索では当たるのに開くと出て
+/// こない」という食い違いになる）。
+fn read_all(session_dir: &Path) -> Vec<(Speaker, Option<TranscriptFile>)> {
+    ALL_SPEAKERS
+        .iter()
+        .map(|&speaker| {
+            (
+                speaker,
+                read_guarded(&session_dir.join(speaker.json_name())),
+            )
+        })
+        .collect()
+}
+
+/// 読めたぶんを話者ラベル付きで開始秒の昇順にマージする。
+fn merged_segments(read: Vec<(Speaker, Option<TranscriptFile>)>) -> Vec<TranscriptSegment> {
+    let mut segments: Vec<TranscriptSegment> = read
+        .into_iter()
+        .filter_map(|(speaker, parsed)| Some((speaker, parsed?)))
+        .flat_map(|(speaker, parsed)| to_segments(parsed, speaker))
+        .collect();
+    sort_by_start(&mut segments);
     segments
 }
 
-/// 1 つの文字起こし JSON を、話者ラベル付きのセグメント列にする。読めなければ空
-/// （読み方と縮退の理由は `read_guarded` の doc が正）。
-fn load_one(path: &Path, speaker: Speaker) -> Vec<TranscriptSegment> {
-    let Some(parsed) = read_guarded(path) else {
-        return Vec::new();
-    };
+/// 在る音源ぶんが、すべて読めて最後まで読み切っているか（#175）。
+///
+/// **読めなかった JSON も揃っていない側**（読めない以上そうとは言えない）。
+///
+/// **音源を 1 つも渡さないときは「揃っている」と言わない**。`all()` は空だと真になるので、
+/// 音源を取り落とす壊れ方が「欠けた文字起こしを完成品として出す」といういちばん危険な側へ
+/// 落ちてしまう。音源ゼロのセッションは一覧に載らない（`list_sessions` が飛ばす）ので、
+/// 空が来るのは渡し間違いのときだけ——そのときは伏せる側で止める。
+fn all_sources_are_complete(
+    read: &[(Speaker, Option<TranscriptFile>)],
+    sources: &[Speaker],
+) -> bool {
+    !sources.is_empty()
+        && sources.iter().all(|source| {
+            read.iter()
+                .find(|(speaker, _)| speaker == source)
+                .and_then(|(_, parsed)| parsed.as_ref())
+                .is_some_and(|parsed| parsed.complete)
+        })
+}
+
+/// 開始秒で安定ソート（同秒は mic→system の追加順を保つ）。NaN は来ない想定だが total_cmp で安全に。
+fn sort_by_start(segments: &mut [TranscriptSegment]) {
+    segments.sort_by(|a, b| a.start_secs.total_cmp(&b.start_secs));
+}
+
+/// 読めた JSON を話者ラベル付きのセグメント列にする。
+fn to_segments(parsed: TranscriptFile, speaker: Speaker) -> Vec<TranscriptSegment> {
     parsed
         .segments
         .into_iter()
@@ -111,15 +237,29 @@ fn load_one(path: &Path, speaker: Speaker) -> Vec<TranscriptSegment> {
         .collect()
 }
 
-/// 保存済みの文字起こしが、**どこまでの音源から作られたか**（秒。#164）。読めない・欠けて
-/// いる・壊れている・長さが入っていないときは `None`（＝分からない）。
+/// 保存済みの文字起こしが**どこまで届いているか**（#175）。読めない・欠けている・長さが入って
+/// いないときは `None`（＝分からない）。
 ///
-/// 途中結果を保存してよいかの判断に使う（`transcribe::partial_is_worth_keeping`）。すでに
-/// 在るもののほうが先まで読めた音源から作られているなら、置き換えると読める範囲が減る。
-pub fn transcribed_duration_secs(path: &Path) -> Option<f64> {
+/// 途中結果を保存してよいかの判断に使う（`transcribe::partial_is_worth_keeping`）。長さだけでは
+/// 「最後まで読めた完成品」と「たまたま同じ長さの途中結果」を見分けられないので、印も一緒に返す。
+pub fn stored_reach(path: &Path) -> Option<StoredReach> {
     let parsed = read_guarded(path)?;
-    // 信頼境界外の値なので、意味のある正の秒でなければ「分からない」に落とす。
-    (parsed.duration_secs.is_finite() && parsed.duration_secs > 0.0).then_some(parsed.duration_secs)
+    Some(StoredReach {
+        // 信頼境界外の値なので、意味のある正の秒でなければ「分からない」に落とす。
+        // **印まで一緒に捨てない**——長さが読めない古い JSON にも、最後まで読めた印はありうる。
+        duration_secs: (parsed.duration_secs.is_finite() && parsed.duration_secs > 0.0)
+            .then_some(parsed.duration_secs),
+        complete: parsed.complete,
+    })
+}
+
+/// 保存済みの文字起こしが届いている範囲（#175）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StoredReach {
+    /// どこまでの音源から作られたか（秒）。読めなければ `None`。
+    pub duration_secs: Option<f64>,
+    /// その音源を最後まで読めたか。
+    pub complete: bool,
 }
 
 /// 1 つの文字起こし JSON を、信頼境界外の入力として読む共通部（読む側の唯一の入口）。
@@ -190,12 +330,36 @@ pub fn current_index(segments: &[TranscriptSegment], pos_secs: f64) -> Option<us
 
 #[cfg(test)]
 mod tests {
-    use super::{Speaker, current_index, load_transcript};
+    use super::{Speaker, current_index, load_segments, load_transcript};
     use std::fs;
     use std::path::PathBuf;
 
     fn unique_dir(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("shoki-transcript-{tag}-{}", std::process::id()))
+    }
+
+    /// **音源を 1 つも渡さなければ「揃っている」とは言わない**（#175）。`all()` の空真に頼ると、
+    /// 音源を取り落とす壊れ方が「欠けた文字起こしを完成品として出す」といういちばん危険な側へ
+    /// 落ちる。本番で空が来る経路は無い（音源ゼロのセッションは一覧に載らない）ので、これは
+    /// 壊れたときだけ効くガード——だからテストで留める。
+    #[test]
+    fn no_sources_never_counts_as_complete() {
+        let dir = unique_dir("no-sources");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("mic.json"),
+            r#"{"complete":true,"segments":[{"start":0.0,"end":1.0,"text":"hi"}]}"#,
+        )
+        .unwrap();
+
+        // 読める・最後まで読み切っている JSON が在っても、数える対象が無ければ真にしない。
+        assert!(!load_transcript(&dir, &[]).complete);
+        assert!(load_transcript(&dir, &[Speaker::Mic]).complete);
+        // 本文だけ要る呼び出しは、そもそも空の並びを渡す形にしない。
+        assert_eq!(load_segments(&dir).len(), 1);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -218,7 +382,7 @@ mod tests {
         )
         .unwrap();
 
-        let segments = load_transcript(&dir);
+        let segments = load_segments(&dir);
         assert_eq!(segments.len(), 3);
         // 開始秒の昇順にマージされ、話者はファイル名で決まる。
         assert_eq!(segments[0].speaker, Speaker::Mic);
@@ -238,14 +402,98 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         // system.json のみ・かつ壊れた JSON → 空（落ちない）。mic.json は欠落。
         fs::write(dir.join("system.json"), b"{ this is not json").unwrap();
-        assert!(load_transcript(&dir).is_empty());
+        assert!(load_segments(&dir).is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn load_transcript_empty_when_no_files() {
         let dir = unique_dir("none").join("missing");
-        assert!(load_transcript(&dir).is_empty());
+        assert!(load_segments(&dir).is_empty());
+    }
+
+    /// **揃っているかは「在る音源ごとに、読めて最後まで読み切った JSON があるか」**（#175）。
+    ///
+    /// 「読めた JSON がすべて complete」にすると、**片方の JSON が丸ごと無いセッション**
+    /// （一方だけ失敗した・途中で止めた）が `true` に化ける。#164 の途中結果でいちばん普通の形。
+    #[test]
+    fn a_transcript_is_complete_only_when_every_source_has_one() {
+        let dir = unique_dir("complete");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let both = [Speaker::Mic, Speaker::System];
+
+        let done = r#"{"complete":true,"segments":[{"start":0.0,"text":"a"}]}"#;
+        fs::write(dir.join("mic.json"), done).unwrap();
+        fs::write(dir.join("system.json"), done).unwrap();
+        assert!(load_transcript(&dir, &both).complete);
+
+        // **片方の JSON が無い**。音源は 2 本あるので揃っていない。
+        fs::remove_file(dir.join("system.json")).unwrap();
+        assert!(
+            !load_transcript(&dir, &both).complete,
+            "a source with no transcript is missing, not complete"
+        );
+        // 音源が mic だけのセッションなら、同じディスクの中身でも揃っている。
+        assert!(load_transcript(&dir, &[Speaker::Mic]).complete);
+
+        // 最後まで読めなかった印が立っていれば、読めても揃っていない。
+        fs::write(
+            dir.join("mic.json"),
+            r#"{"complete":false,"segments":[{"start":0.0,"text":"a"}]}"#,
+        )
+        .unwrap();
+        assert!(!load_transcript(&dir, &[Speaker::Mic]).complete);
+
+        // **読めない JSON も揃っていない側**（破損・過大。読めない以上そうとは言えない）。
+        fs::write(dir.join("mic.json"), b"{ this is not json").unwrap();
+        let broken = load_transcript(&dir, &[Speaker::Mic]);
+        assert!(broken.segments.is_empty());
+        assert!(!broken.complete);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 印は**寛容に読む**（#175）。ただし**欠落と壊れた値で丸め先が違う**——欠落には互換の
+    /// 根拠がある（欄が無い＝#164 以前の出力）が、壊れた値には無いので守りたい側へ倒す。
+    ///
+    /// どちらの場合も、その 1 欄のために JSON 全体のパースが失敗してセグメントごと消える、
+    /// という形にはしない。
+    #[test]
+    fn a_missing_flag_reads_as_read_to_the_end_but_a_broken_one_does_not() {
+        let dir = unique_dir("complete-flag");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mic = [Speaker::Mic];
+
+        // 欄が無い（#164 より前の出力）。最後まで読めたものとして読む。
+        fs::write(
+            dir.join("mic.json"),
+            r#"{"segments":[{"start":0.0,"text":"a"}]}"#,
+        )
+        .unwrap();
+        let old = load_transcript(&dir, &mic);
+        assert_eq!(old.segments.len(), 1);
+        assert!(old.complete);
+
+        // 型が違う（手編集）。**セグメントは残し、印は守りたい側へ倒す**。
+        fs::write(
+            dir.join("mic.json"),
+            r#"{"complete":"yes","segments":[{"start":0.0,"text":"a"}]}"#,
+        )
+        .unwrap();
+        let edited = load_transcript(&dir, &mic);
+        assert_eq!(
+            edited.segments.len(),
+            1,
+            "one bad field must not drop the segments"
+        );
+        assert!(
+            !edited.complete,
+            "a flag we cannot read is not a promise that the audio was read to the end"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -262,7 +510,7 @@ mod tests {
             ]}"#,
         )
         .unwrap();
-        let segments = load_transcript(&dir);
+        let segments = load_segments(&dir);
 
         // 先頭セグメントより前は None、開始ちょうどからそのセグメントに対応する。
         assert_eq!(current_index(&segments, 0.5), None);

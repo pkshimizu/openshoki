@@ -506,7 +506,7 @@ impl SummarizeWorker {
 /// セッションの `summary.md` を読む（表示用）。未生成・欠落は `None`、読み取り失敗・過大・
 /// 非通常ファイルもログして `None` にする（縮退。アプリは落とさない）。
 ///
-/// ガードの理由は `transcript.rs` の `load_one` と同じ（保存先の生成物は手で置換されうる
+/// ガードの理由は `transcript.rs` の `read_guarded` と同じ（保存先の生成物は手で置換されうる
 /// 信頼境界外の入力）。ログに出すのは**セッション名（日時のディレクトリ名）とファイル名だけ**:
 /// フルパス（保存先）も本文（発話由来の議事録）も機微情報なので出さない
 /// （`docs/rules/security.md`）。
@@ -616,7 +616,8 @@ fn run_job(
     // トランスクリプトは行へ整形したら手放す（数分かかる推論の間、同じ内容を 2 重に抱えない。
     // `docs/rules/performance.md`）。
     let lines = {
-        let segments = crate::transcript::load_transcript(&job.session_dir);
+        // **本文しか要らない**（揃っているかの判断は読む領域の仕事。#175）。
+        let segments = crate::transcript::load_segments(&job.session_dir);
         transcript_lines(&segments)
     };
     if lines.is_empty() {
