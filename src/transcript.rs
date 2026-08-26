@@ -11,7 +11,7 @@
 //! （見出し・理由・次の操作の対応表は `reading_pane::TranscriptPane::message` が正。欠落・破損は状態
 //! `Done` のままセグメントだけ空になるので、未実施とは違う文が出る）。
 
-use crate::dataless::Fetch;
+use crate::dataless::{Fetch, ReadFailure};
 use std::path::Path;
 use std::time::Duration;
 
@@ -299,18 +299,20 @@ fn read_guarded(path: &Path, fetch: Fetch) -> Guarded {
         .to_string_lossy();
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
-        // 未生成（ファイルが無い）は正常な縮退。ログもしない。
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Guarded::Absent,
-        // **実体がこの Mac に無いだけ**（#182）。取り寄せを止めているときにしか来ない。
-        // ログもしない——退避された保存先では全件が該当するので、打鍵のたびにログが埋まる。
-        // 何件諦めたかは呼び出し側がまとめて 1 行にする（`recordings::scan_sessions` と同じ）。
-        Err(err) if fetch.is_not_downloaded(err.kind()) => {
-            return Guarded::NotDownloaded;
-        }
-        // 権限・I/O エラーなどは異常なので、調査の手掛かりを残す。
+        // **開くときも読むときも同じ見分けを通す**（#182。`Fetch::classify` の doc）。
         Err(err) => {
-            eprintln!("Skipping the transcript {name} because it could not be opened: {err}");
-            return Guarded::Absent;
+            return match fetch.classify(err.kind()) {
+                // 未生成・実体なしは静かな縮退（理由は `ReadFailure`）。
+                ReadFailure::NotCreated => Guarded::Absent,
+                ReadFailure::NotDownloaded => Guarded::NotDownloaded,
+                // 権限・I/O エラーなどは異常なので、調査の手掛かりを残す。
+                ReadFailure::Failed => {
+                    eprintln!(
+                        "Skipping the transcript {name} because it could not be opened: {err}"
+                    );
+                    Guarded::Absent
+                }
+            };
         }
     };
     // 信頼境界外の入力（手で置換されうる）なので、開いたハンドルの fstat で通常ファイルであることを
@@ -326,11 +328,13 @@ fn read_guarded(path: &Path, fetch: Fetch) -> Guarded {
     let mut text = String::new();
     if let Err(err) = limited.read_to_string(&mut text) {
         // 実測では、退避されたファイルは `open` が通ってここで返る（#178）。
-        if fetch.is_not_downloaded(err.kind()) {
-            return Guarded::NotDownloaded;
-        }
-        eprintln!("Skipping the transcript {name} because it could not be read: {err}");
-        return Guarded::Absent;
+        return match fetch.classify(err.kind()) {
+            ReadFailure::NotDownloaded => Guarded::NotDownloaded,
+            ReadFailure::NotCreated | ReadFailure::Failed => {
+                eprintln!("Skipping the transcript {name} because it could not be read: {err}");
+                Guarded::Absent
+            }
+        };
     }
     // 上限＋1 バイトまで読み切った（limit が尽きた）なら上限超過。
     if limited.limit() == 0 {

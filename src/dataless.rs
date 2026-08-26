@@ -75,17 +75,35 @@ pub enum Fetch<'a> {
 }
 
 impl Fetch<'_> {
-    /// この読み取りの失敗が「実体がこの Mac に無いから」か（#182）。
+    /// 読み取りの失敗を 3 つに分ける（#182）。**ログするかどうかまでここで決まる**。
     ///
-    /// **`Allowed` では常に `false`**。取り寄せが走るので、その理由では失敗しない——
-    /// 例外は `MaterializationOff` の復元に失敗したスレッドだが、そこは取り寄せを頼んだ側の
-    /// 想定外なので、従来どおり「読めなかった」として扱う（黙って対象から外さない）。
-    pub fn is_not_downloaded(self, kind: std::io::ErrorKind) -> bool {
+    /// 分けそこねると、退避された保存先で打鍵のたびに全件ぶんのログが出るか、実体が無い
+    /// ことが「読めなかった」に化けて検索から静かに消えるかの、どちらかになる。
+    ///
+    /// **`Allowed` は `NotDownloaded` を返さない**。取り寄せが走るので、その理由では失敗
+    /// しない——例外は `MaterializationOff` の復元に失敗したスレッドだが、そこは取り寄せを
+    /// 頼んだ側の想定外なので、従来どおり `Failed`（ログして諦める）で扱う。
+    pub fn classify(self, kind: std::io::ErrorKind) -> ReadFailure {
+        if kind == std::io::ErrorKind::NotFound {
+            return ReadFailure::NotCreated;
+        }
         match self {
-            Self::Allowed => false,
-            Self::Blocked(_) => is_not_downloaded(kind),
+            Self::Blocked(_) if is_not_downloaded(kind) => ReadFailure::NotDownloaded,
+            Self::Allowed | Self::Blocked(_) => ReadFailure::Failed,
         }
     }
+}
+
+/// 読み取りが失敗した理由（#182）。**「待てば読める」と「待っても直らない」を分ける**。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadFailure {
+    /// まだ作られていない（未生成。正常な縮退なのでログしない）。
+    NotCreated,
+    /// 実体がこの Mac に無い。**ログしない**——退避された保存先では全件が該当するので、
+    /// 打鍵のたびにログが埋まる。何件諦めたかは呼び出し側がまとめて 1 行にする。
+    NotDownloaded,
+    /// 権限・I/O・破損など。**ログする**（待っても直らないので、調査の手掛かりを残す）。
+    Failed,
 }
 
 /// 読み取りの失敗が「実体がこの Mac に無いから」か（#178 で見分け方を確かめ、#182 で
@@ -239,10 +257,10 @@ pub const DOWNLOADS_OFF: std::ffi::c_int = sys::IOPOL_MATERIALIZE_DATALESS_FILES
 
 #[cfg(test)]
 mod tests {
-    use super::Fetch;
     use super::without_downloads;
     #[cfg(target_os = "macos")]
     use super::{DOWNLOADS_OFF, current_policy};
+    use super::{Fetch, ReadFailure};
 
     /// 閉包の中だけ取り寄せが止まり、**抜けると元へ戻る**。
     ///
@@ -280,6 +298,8 @@ mod tests {
     /// `Allowed` でも `Deadlock` を「実体が無い」と読むと、取り寄せを頼んだ読み取りの失敗が
     /// 黙って対象外へ落ちる（画面には「読めなかった」も出ない）。逆に `Blocked` で見分けを
     /// やめると、退避された録音が「当たらなかった」に化けて、検索から静かに消える。
+    ///
+    /// **未生成はどちらでも同じ**（作っていないだけなので、ログもしない）。
     #[test]
     fn only_a_blocked_read_can_blame_a_missing_body() {
         use std::io::ErrorKind;
@@ -287,21 +307,39 @@ mod tests {
         // 頼まれていない読み取り（囲いの中でしか作れない）。
         without_downloads(|downloads_off| {
             let blocked = Fetch::Blocked(downloads_off);
-            assert!(blocked.is_not_downloaded(ErrorKind::Deadlock));
-            // 他の失敗は「実体が無い」ではない（待っても直らない）。
-            assert!(!blocked.is_not_downloaded(ErrorKind::PermissionDenied));
-            assert!(!blocked.is_not_downloaded(ErrorKind::NotFound));
-            assert!(!blocked.is_not_downloaded(ErrorKind::InvalidData));
+            assert_eq!(
+                blocked.classify(ErrorKind::Deadlock),
+                ReadFailure::NotDownloaded
+            );
+            // 他の失敗は「実体が無い」ではない（待っても直らないのでログする）。
+            assert_eq!(
+                blocked.classify(ErrorKind::PermissionDenied),
+                ReadFailure::Failed
+            );
+            assert_eq!(
+                blocked.classify(ErrorKind::InvalidData),
+                ReadFailure::Failed
+            );
+            // 未生成は静かな縮退。
+            assert_eq!(
+                blocked.classify(ErrorKind::NotFound),
+                ReadFailure::NotCreated
+            );
         });
 
         // ユーザーが頼んだ読み取りでは、どの失敗も「実体が無い」とは言わない。
-        for kind in [
-            ErrorKind::Deadlock,
-            ErrorKind::PermissionDenied,
-            ErrorKind::NotFound,
-        ] {
-            assert!(!Fetch::Allowed.is_not_downloaded(kind));
-        }
+        assert_eq!(
+            Fetch::Allowed.classify(ErrorKind::Deadlock),
+            ReadFailure::Failed
+        );
+        assert_eq!(
+            Fetch::Allowed.classify(ErrorKind::PermissionDenied),
+            ReadFailure::Failed
+        );
+        assert_eq!(
+            Fetch::Allowed.classify(ErrorKind::NotFound),
+            ReadFailure::NotCreated
+        );
     }
 
     /// macOS 以外では止めるものが無い（設定できなくても本体は走る）。

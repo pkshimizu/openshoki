@@ -18,6 +18,7 @@
 
 mod on_device;
 
+use crate::dataless::ReadFailure;
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -562,18 +563,19 @@ fn load_summary_limited(
         });
     let file = match std::fs::File::open(&path) {
         Ok(file) => file,
-        // 未生成（ファイルが無い）は正常な縮退。ログもしない。
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Summary::nothing(),
-        // **実体がこの Mac に無いだけ**（#182）。ログもしない——退避された保存先では全件が
-        // 該当するので、打鍵のたびにログが埋まる。何件諦めたかは呼び出し側がまとめて出す。
-        Err(err) if fetch.is_not_downloaded(err.kind()) => {
-            return Summary::not_downloaded();
-        }
+        // **開くときも読むときも同じ見分けを通す**（#182。`Fetch::classify` の doc）。
         Err(err) => {
-            eprintln!(
-                "Skipping the summary of {session} because {SUMMARY_FILENAME} could not be opened: {err}"
-            );
-            return Summary::nothing();
+            return match fetch.classify(err.kind()) {
+                // 未生成・実体なしは静かな縮退（理由は `dataless::ReadFailure`）。
+                ReadFailure::NotCreated => Summary::nothing(),
+                ReadFailure::NotDownloaded => Summary::not_downloaded(),
+                ReadFailure::Failed => {
+                    eprintln!(
+                        "Skipping the summary of {session} because {SUMMARY_FILENAME} could not be opened: {err}"
+                    );
+                    Summary::nothing()
+                }
+            };
         }
     };
     // 開いたハンドルの fstat で通常ファイルを確認し（FIFO 等は読み終わらないことがある）、
@@ -590,14 +592,16 @@ fn load_summary_limited(
     let mut text = String::new();
     if let Err(err) = limited.read_to_string(&mut text) {
         // 実測では、退避されたファイルは `open` が通ってここで返る（#178）。
-        if fetch.is_not_downloaded(err.kind()) {
-            return Summary::not_downloaded();
-        }
-        // UTF-8 でない（破損・別物への置換）場合もここに来る。
-        eprintln!(
-            "Skipping the summary of {session} because {SUMMARY_FILENAME} could not be read: {err}"
-        );
-        return Summary::nothing();
+        return match fetch.classify(err.kind()) {
+            ReadFailure::NotDownloaded => Summary::not_downloaded(),
+            // UTF-8 でない（破損・別物への置換）場合もここに来る。
+            ReadFailure::NotCreated | ReadFailure::Failed => {
+                eprintln!(
+                    "Skipping the summary of {session} because {SUMMARY_FILENAME} could not be read: {err}"
+                );
+                Summary::nothing()
+            }
+        };
     }
     // 上限＋1 バイトまで読み切った（limit が尽きた）なら上限超過。
     if limited.limit() == 0 {
