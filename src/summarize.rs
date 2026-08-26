@@ -616,7 +616,8 @@ fn run_job(
     // トランスクリプトは行へ整形したら手放す（数分かかる推論の間、同じ内容を 2 重に抱えない。
     // `docs/rules/performance.md`）。
     let lines = {
-        let segments = crate::transcript::load_transcript(&job.session_dir);
+        // **本文しか要らない**（揃っているかの判断は読む領域の仕事。#175）。
+        let segments = crate::transcript::load_segments(&job.session_dir);
         transcript_lines(&segments)
     };
     if lines.is_empty() {

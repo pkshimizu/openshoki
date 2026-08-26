@@ -193,6 +193,21 @@ impl RecordingSession {
         paths
     }
 
+    /// このセッションに在る音源（#175）。**文字起こしが揃っているかの判定に使う**——在る音源
+    /// ごとに、読めて最後まで読み切った JSON があるかを見る（`transcript::load_transcript`）。
+    ///
+    /// 並びは `audio_source_paths` と同じ（mic → system）。
+    pub fn speakers(&self) -> Vec<crate::transcript::Speaker> {
+        let mut speakers = Vec::new();
+        if self.has_mic {
+            speakers.push(crate::transcript::Speaker::Mic);
+        }
+        if self.has_system {
+            speakers.push(crate::transcript::Speaker::System);
+        }
+        speakers
+    }
+
     /// 含まれる音源を表す英語サマリー（右ペインのヘッダ表示用）。
     pub fn source_summary(&self) -> &'static str {
         match (self.has_mic, self.has_system) {

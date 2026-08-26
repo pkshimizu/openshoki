@@ -14,6 +14,9 @@
 //! - `transcribing` / `stopping` / `transcript-failed` / `transcript-unreadable`:
 //!   Transcript タブの空表示を、実行中／停止中／失敗／JSON が読めなかった状態にする
 //!   （見出し・理由・操作の 3 段と、最長の理由の折り返しの確認。件数 0 と組み合わせる）
+//! - `not-read-to-the-end`: 走り終わっているが音源を最後まで読めていない状態（#175。ディスクの
+//!   印から分かるので再起動しても消えない）。**件数と組み合わせる**——セグメントが在っても
+//!   `Show partial` を押すまで空表示が出る。`summary` と重ねると Notes タブの言い分も見られる
 //! - `transcript-partial`: 途中まで読めて失敗した状態（#164）。**件数と組み合わせる**——
 //!   セグメントが在っても `Show partial` を押すまで空表示が出るところを見る
 //! - `show-partial`: その途中結果を開いた状態（一覧に切り替わるところを見る）
@@ -60,6 +63,11 @@ const DEFAULT_SEGMENT_COUNT: usize = 30;
 /// **タブごとに関数を分ける**——見出しと理由の setter を引数で受けると、同じ型なので取り違えても
 /// 通ってしまう（`docs/rules/coding-conventions.md`）。
 fn apply_transcript_pane(win: &LibraryWindow, pane: &reading_pane::TranscriptPane) {
+    // **状態行も同じ値から出す**（#175）。`transcript_status_text` を直に呼ぶと、状態 enum が
+    // 持てない「最後まで読めていない」を落として、本番では作れない組み合わせを目視することに
+    // なる（本番は `main::apply_detail_transcript_status`）。
+    win.set_detail_transcript_status(pane.status());
+    win.set_detail_transcript_text(pane.status_text().into());
     let message = pane.message();
     win.set_detail_transcript_heading(message.heading.as_str().into());
     win.set_detail_transcript_body(message.body.as_str().into());
@@ -93,6 +101,11 @@ fn transcript_pane(has_transcript: bool) -> reading_pane::TranscriptPane {
         return reading_pane::TranscriptPane::Stopping {
             model: "Medium".to_owned(),
         };
+    }
+    if flag("not-read-to-the-end") {
+        // 走り終わっているが、音源を最後まで読めていない（#175。ディスクの印から分かるので
+        // 再起動しても消えない）。
+        return reading_pane::TranscriptPane::NotReadToTheEnd;
     }
     if flag("transcript-failed") {
         // ワーカーが返す中でいちばん長い理由（折り返しを見る）。何も残っていないので
@@ -293,10 +306,6 @@ fn main() {
     win.set_has_transcript(has_transcript);
     win.set_show_partial_transcript(flag("show-partial"));
     let transcript_pane = transcript_pane(has_transcript);
-    win.set_detail_transcript_status(transcript_pane.status());
-    win.set_detail_transcript_text(
-        reading_pane::transcript_status_text(transcript_pane.status()).into(),
-    );
     // 読む領域の空表示（#154）。**状態を引数で選べる**ようにする——見出し・理由・操作の 3 段が
     // 最長文言で崩れないか、ボタンが 2 つ並んだときに収まるかを目視する。文言は本番と同じ
     // `reading_pane` が組む（#160）。

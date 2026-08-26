@@ -203,6 +203,12 @@ pub enum TranscriptPane {
     /// 走り終わっている。**この空表示が出るのは JSON が読めなかったときだけ**
     /// （セグメントがあれば一覧が出るので、ここへは来ない）。
     Done,
+    /// 走り終わっているが、**音源を最後まで読めていない**（#175）。ディスクに残った印から
+    /// 分かるので、**再起動しても消えない**——`Failed` はメモリだけの記録で、再起動で消える。
+    ///
+    /// 「揃っていない」ではなく「最後まで読めていない」と言う。壊れたパケットを読み飛ばして
+    /// 中抜けした音源は印が立たない（扱いは #176）ので、揃っていることまでは保証できない。
+    NotReadToTheEnd,
     /// **理由は必ずある**（失敗の記録は理由と一緒にしか作られない。#159）。文言はここで組む。
     Failed { reason: TranscribeFailure },
 }
@@ -214,7 +220,10 @@ impl TranscriptPane {
             Self::NotTranscribed { .. } => TranscriptStatus::NotTranscribed,
             Self::Transcribing { .. } => TranscriptStatus::Transcribing,
             Self::Stopping { .. } => TranscriptStatus::Stopping,
-            Self::Done => TranscriptStatus::Done,
+            // **一覧と共用の状態は増やさない**（#175）。一覧は全セッションぶんの JSON を読めない
+            // ので、この区別を出せない（理由は `docs/CONTEXT.md`）。状態行の文言は
+            // `status_text` が pane から出す。
+            Self::Done | Self::NotReadToTheEnd => TranscriptStatus::Done,
             Self::Failed { .. } => TranscriptStatus::Failed,
         }
     }
@@ -231,10 +240,26 @@ impl TranscriptPane {
     pub fn shows_partial(&self) -> bool {
         match self {
             Self::Failed { reason } => reason.kept_partial(),
+            Self::NotReadToTheEnd => true,
             Self::NotTranscribed { .. }
             | Self::Transcribing { .. }
             | Self::Stopping { .. }
             | Self::Done => false,
+        }
+    }
+
+    /// 詳細ペインの状態行に出す文言（#175）。**状態 enum からは出せない**——一覧と共用なので
+    /// 「最後まで読めていない」を持てず、そのままだと状態行と空表示が同じペインの中で食い違う。
+    ///
+    /// **ワイルドカードを置かない**（状態を足したら文言を決めるまで通らない）。
+    pub fn status_text(&self) -> &'static str {
+        match self {
+            Self::NotReadToTheEnd => "Transcribed in part",
+            Self::NotTranscribed { .. }
+            | Self::Transcribing { .. }
+            | Self::Stopping { .. }
+            | Self::Done
+            | Self::Failed { .. } => transcript_status_text(self.status()),
         }
     }
 
@@ -283,6 +308,15 @@ impl TranscriptPane {
                  rebuild it.",
             )
             .with_primary("Transcribe again", PaneActionKind::Transcribe),
+            // **開く手を必ず添える**——伏せた一覧を出す口はこれだけなので、落とすとセグメントが
+            // 在るのに永久に読めなくなる。
+            Self::NotReadToTheEnd => PaneMessage::new(
+                "This transcript stops partway",
+                "The audio could not be read to the end, so this covers only part of the \
+                 recording. Transcribing again will try the rest.",
+            )
+            .with_primary("Transcribe again", PaneActionKind::Transcribe)
+            .with_secondary("Show partial", PaneActionKind::ShowPartialTranscript),
             Self::Failed { reason } => {
                 let message =
                     PaneMessage::new("Transcription failed", transcribe_failure_text(reason))
@@ -300,6 +334,10 @@ impl TranscriptPane {
 }
 
 /// 文字起こしの表示状態 → 詳細ペインの状態テキスト。
+///
+/// **詳細ペインは `TranscriptPane::status_text` を通す**（#175）。状態 enum は一覧と共用で
+/// 「最後まで読めていない」を持てないので、そのままだと同じペインの中で状態行が `Transcribed`、
+/// 空表示が「最後まで読めていない」と食い違う。ここは一覧の行が使う。
 pub fn transcript_status_text(display_status: TranscriptStatus) -> &'static str {
     match display_status {
         TranscriptStatus::NotTranscribed => "Not transcribed",
@@ -370,8 +408,11 @@ pub fn summary_status_text(display_status: SummaryStatus) -> &'static str {
 /// `docs/rules/coding-conventions.md`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TranscriptInput {
-    /// 読める文字起こしが在る（作り直している最中でも、入力としては在る）。
+    /// 読める文字起こしが在り、音源を最後まで読めている。
     Ready,
+    /// 読める文字起こしが在るが、**音源を最後まで読めていない**（#175）。議事録は書けるが、
+    /// 欠けた入力から書いたものになる。
+    NotReadToTheEnd,
     /// まだ無いが、いま作っている。
     Running,
     /// まだ無く、作ろうとして失敗した。
@@ -390,7 +431,12 @@ impl TranscriptInput {
     /// **ワイルドカードを置かない**（状態を足したら扱いを書くまで通らない）。
     pub fn of(transcript: &TranscriptPane, has_transcript: bool) -> Self {
         if has_transcript {
-            return Self::Ready;
+            // 最後まで読めていないことは、走り終わってからしか分からない（走っている間は
+            // 作り直している最中）。
+            return match transcript {
+                TranscriptPane::NotReadToTheEnd => Self::NotReadToTheEnd,
+                _ => Self::Ready,
+            };
         }
         match transcript.status() {
             TranscriptStatus::Transcribing | TranscriptStatus::Stopping => Self::Running,
@@ -407,6 +453,7 @@ impl TranscriptInput {
     pub fn pane_when_no_notes(self, auto_on: bool) -> SummaryPane {
         match self {
             Self::Ready => SummaryPane::NotSummarized { auto_on },
+            Self::NotReadToTheEnd => SummaryPane::NotesFromPartialTranscript,
             Self::Running => SummaryPane::WaitingForTranscript,
             Self::Failed => SummaryPane::TranscriptFailed,
             Self::Missing => SummaryPane::Blocked,
@@ -427,6 +474,9 @@ pub enum SummaryPane {
     /// 文字起こしが失敗したので、議事録は始まらなかった（#165）。**入力が欠けたまま
     /// 完成品に見える議事録を作らない**という判断の結果なので、そう言う。
     TranscriptFailed,
+    /// 入力の文字起こしが**最後まで読めていない**（#175）。書けるが、欠けたまま完成品に見える
+    /// 議事録になる——**止めはせず、そうなると先に言う**（自動・連鎖の経路は #164 が止めている）。
+    NotesFromPartialTranscript,
     /// 文字起こしはあるが、まだ書いていない。
     NotSummarized { auto_on: bool },
     Queued {
@@ -457,6 +507,7 @@ impl SummaryPane {
             Self::Blocked
             | Self::WaitingForTranscript
             | Self::TranscriptFailed
+            | Self::NotesFromPartialTranscript
             | Self::NotSummarized { .. } => SummaryStatus::NotSummarized,
             Self::Queued { .. } => SummaryStatus::Queued,
             Self::Summarizing { .. } => SummaryStatus::Summarizing,
@@ -493,6 +544,13 @@ impl SummaryPane {
                  too.",
             )
             .with_primary("Try again", PaneActionKind::TranscribeThenNotes)
+            .with_secondary("Open transcription", PaneActionKind::OpenTranscription),
+            Self::NotesFromPartialTranscript => PaneMessage::new(
+                "No notes yet",
+                "The transcript stops partway, because the audio could not be read to the end. \
+                 Notes written from it would be missing the rest.",
+            )
+            .with_primary("Write notes anyway", PaneActionKind::WriteNotes)
             .with_secondary("Open transcription", PaneActionKind::OpenTranscription),
             Self::NotSummarized { auto_on: false } => PaneMessage::new(
                 "No notes yet",

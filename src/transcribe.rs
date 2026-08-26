@@ -876,10 +876,14 @@ fn partial_is_worth_keeping(segments: usize, transcript_path: &Path, read_upto_s
     if segments == 0 {
         return false;
     }
-    match crate::transcript::transcribed_duration_secs(transcript_path) {
+    match crate::transcript::stored_reach(transcript_path) {
         // まだ何も無い（または読めない）ので、書いて困るものが無い。
         None => true,
-        Some(existing) => existing <= read_upto_secs,
+        // **最後まで読めた印が立っているなら、長さが同じでも置き換えない**（#175）。長さは
+        // 同じでも「最後まで読めた」が「途中で終わった」に変わるのは降格で、しかも音源がもう
+        // 最後まで読めない以上、やり直しでは戻らない。
+        Some(stored) if stored.complete => false,
+        Some(stored) => stored.duration_secs <= read_upto_secs,
     }
 }
 
@@ -1012,6 +1016,7 @@ fn transcribe_file(
             .unwrap_or_default(),
         language: job.language.clone(),
         duration_secs,
+        complete,
         segments,
     };
     let json_path = audio_path.with_extension("json");
@@ -1050,6 +1055,12 @@ struct Transcription {
     model: String,
     /// 認識言語。自動判定は `auto`。
     language: String,
+    /// 音源を**最後まで読めたか**（#175）。`false` は `duration_secs` までで打ち切った途中結果。
+    ///
+    /// **この欄が無い古い JSON は「最後まで読めた」として読む**（読む側の `serde(default)`）。
+    /// 打ち切って残す仕組みが入ったのは #164 なので、それ以前の出力は最後まで読めたときにしか
+    /// 作られていない。
+    complete: bool,
     /// **どこまでの音源から作られたか**（秒）。最後まで読めた音源では音声全体の長さになり、
     /// 途中で読めなくなった音源では**その打ち切り位置**になる（#164）。読む側
     /// （`transcript::transcribed_duration_secs`）は、途中結果を上書きしてよいかの判断に
@@ -2170,7 +2181,7 @@ mod tests {
         // ——ここが false に転ぶと、途中結果を伏せる仕組みが Try again 一発で外れる。
         std::fs::write(
             &json_path,
-            format!(r#"{{"duration_secs":{read_upto_secs},"segments":[]}}"#),
+            format!(r#"{{"complete":false,"duration_secs":{read_upto_secs},"segments":[]}}"#),
         )
         .expect("writing the existing transcript should succeed");
         assert!(
@@ -2178,7 +2189,19 @@ mod tests {
             "re-running on the same audio replaces what it produced last time"
         );
 
-        // 前の実行のほうが先まで読めている（最後まで読めた完成品を含む）。置き換えない。
+        // **最後まで読めた印が立っていれば、長さが同じでも置き換えない**（#175）。長さだけで
+        // 見ていると、完成品が不可逆に途中結果へ降格する。
+        std::fs::write(
+            &json_path,
+            format!(r#"{{"complete":true,"duration_secs":{read_upto_secs},"segments":[]}}"#),
+        )
+        .expect("writing the existing transcript should succeed");
+        assert!(
+            !partial_is_worth_keeping(3, &json_path, read_upto_secs),
+            "a transcript that was read to the end is never replaced by a partial one"
+        );
+
+        // 前の実行のほうが先まで読めている（印が無い古い JSON でも）。置き換えない。
         std::fs::write(&json_path, br#"{"duration_secs":3600.0,"segments":[]}"#)
             .expect("writing the existing transcript should succeed");
         assert!(
@@ -2267,6 +2290,7 @@ mod tests {
             model: "ggml-base.bin".to_owned(),
             language: "ja".to_owned(),
             duration_secs: 1.0,
+            complete: true,
             segments: vec![Segment {
                 start: 0.0,
                 end: 1.0,
@@ -2354,6 +2378,7 @@ mod tests {
             model: "ggml-base.bin".to_owned(),
             language: "auto".to_owned(),
             duration_secs: 3.21,
+            complete: true,
             segments: vec![Segment {
                 start: 0.0,
                 end: 3.2,
@@ -2367,5 +2392,7 @@ mod tests {
         assert_eq!(value["segments"][0]["start"], 0.0);
         assert_eq!(value["segments"][0]["end"], 3.2);
         assert_eq!(value["segments"][0]["text"], "hello");
+        // 最後まで読めたかは JSON に残る（#175。読む側が再起動後も途中結果を見分ける）。
+        assert_eq!(value["complete"], true);
     }
 }
