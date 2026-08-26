@@ -3569,9 +3569,11 @@ mod tests {
             "a transcript that stopped short stays folded"
         );
         assert_eq!(rec.get_detail_transcript_text(), "Transcribed in part");
+        // **本文で見る**。見出しは「まだ議事録が無い」の各状態で共通なので、そこを比べても
+        // 入力が欠けている警告が消えたことに気づけない。
         assert_eq!(
-            rec.get_detail_summary_heading(),
-            SummaryPane::NotesFromPartialTranscript.message().heading,
+            rec.get_detail_summary_body(),
+            SummaryPane::NotesFromPartialTranscript.message().body,
             "notes warn that their input is missing the tail"
         );
 
