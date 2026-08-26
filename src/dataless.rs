@@ -71,7 +71,12 @@ pub enum Fetch<'a> {
     /// **証は値としては使わない**。効くのは型で、`'a` が証の借用に縛られること自体が
     /// 「囲いの中にいる」を意味する（証は `without_downloads` の中でしか作れず、`!Send`
     /// なので子スレッドへも持ち込めない）。
-    Blocked(#[expect(dead_code, reason = "囲いの中にいることを型で示すだけ")] &'a NoDownloads),
+    Blocked(
+        // 値としては使わない（効くのは型。上の doc）。日本語は `docs/rules/messages.md` の
+        // 混入チェックに掛かるので、理由は doc に置いて reason は英語で書く。
+        #[expect(dead_code, reason = "the proof is a type-level witness, never read")]
+        &'a NoDownloads,
+    ),
 }
 
 impl Fetch<'_> {
