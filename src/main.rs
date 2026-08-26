@@ -4394,6 +4394,57 @@ mod tests {
         assert!(!body.contains("not downloaded"));
     }
 
+    /// 判定が**送る形へ落ちる**こと（#182）。
+    ///
+    /// 読み取りは退避されたファイルを用意できないと再現できないが、**判定から結果への
+    /// 振り分けは繋いで検査できる**——ここが `NotDownloaded` を捨てると、読めなかったことは
+    /// どこにも残らず、画面に理由が出なくなる（`docs/rules/testing.md` の「テストが見ている
+    /// 入口と、本番が通る入口をずらさない」）。
+    #[test]
+    fn every_judgement_lands_somewhere() {
+        use super::SearchOutcome as O;
+
+        let session = |dir: &str| {
+            let mut session = recordings::RecordingSession::for_test(
+                chrono::NaiveDate::from_ymd_opt(2026, 8, 10)
+                    .expect("a real date")
+                    .and_hms_opt(14, 2, 0)
+                    .expect("a real time"),
+            );
+            session.dir = std::path::PathBuf::from(dir);
+            session
+        };
+        let result = super::collect_findings(
+            42,
+            vec![
+                (session("hit"), O::Matched),
+                (session("away"), O::NotDownloaded),
+                (session("miss"), O::Missed),
+                (session("hit2"), O::Matched),
+            ],
+        );
+
+        // どの検索に対する結果かを運ぶ（受け取る側が古い結果を捨てるのに使う）。
+        assert_eq!(result.generation, 42);
+        // 当たったものは一覧へ（並びは渡した順のまま）。
+        assert_eq!(
+            result
+                .matched
+                .iter()
+                .map(|session| session.dir.clone())
+                .collect::<Vec<_>>(),
+            [
+                std::path::PathBuf::from("hit"),
+                std::path::PathBuf::from("hit2")
+            ]
+        );
+        // **読めなかったものは件数の元へ**。当たらなかっただけのものは、どちらにも入らない。
+        assert_eq!(
+            result.not_downloaded_dirs,
+            [std::path::PathBuf::from("away")]
+        );
+    }
+
     /// 読めなかった録音の件数は、**いま一覧に在るものだけ**を数える（#182）。
     ///
     /// 検索結果は打鍵した時点のスナップショットなので、そのまま数えると「10 件中 11 件が
