@@ -1024,7 +1024,9 @@ fn transcribe_file(
     };
     let json_path = audio_path.with_extension("json");
     let segments = result.segments.len();
-    if complete {
+    // **保存する値そのものを見て分かれる**（#175）。`complete` を別々に読むと、JSON には
+    // 「完成」と書いたのに呼び出し側へは `Partial` を返す、という食い違いを書ける。
+    if result.complete {
         write_transcription(&json_path, &result)?;
         return Ok(FileOutcome::Transcribed(segments));
     }
