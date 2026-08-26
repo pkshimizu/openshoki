@@ -354,6 +354,18 @@ mod tests {
         );
     }
 
+    /// **ログに残すのは、待っても直らないものだけ**（#182）。
+    ///
+    /// 実体が無いだけのものまでログすると、退避された保存先では打鍵のたびに全件ぶんの行が
+    /// 出て、本当に調べたい失敗が埋もれる（#178 で一覧側が同じ形になり、件数のまとめ 1 行へ
+    /// 倒した）。逆に `Failed` を黙らせると、権限や破損の手掛かりが消える。
+    #[test]
+    fn only_what_will_not_fix_itself_goes_to_the_log() {
+        assert!(ReadFailure::Failed.should_report());
+        assert!(!ReadFailure::NotDownloaded.should_report());
+        assert!(!ReadFailure::NotCreated.should_report());
+    }
+
     /// macOS 以外では止めるものが無い（設定できなくても本体は走る）。
     #[cfg(not(target_os = "macos"))]
     #[test]
