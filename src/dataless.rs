@@ -112,13 +112,19 @@ pub enum ReadFailure {
 }
 
 impl ReadFailure {
-    /// この失敗をログに残すか（#182）。**残すのは待っても直らないものだけ**——未生成は
-    /// 正常な縮退で、実体が無いのは退避された保存先では全件が該当する（打鍵のたびに
-    /// ログが埋まる）。
-    pub fn should_report(self) -> bool {
+    /// この失敗をログに残すか（#182）。
+    ///
+    /// **残すのは待っても直らないものだけ**——未生成は正常な縮退で、実体が無いのは退避された
+    /// 保存先では全件が該当する（何件諦めたかは呼び出し側がまとめて 1 行にする）。
+    ///
+    /// **頼まれていない読み取りでは、待っても直らないものも残さない**。検索は打鍵のたびに
+    /// 全件を開き直すので、壊れた JSON が 1 つあるだけでログが埋まる。同じファイルは
+    /// ユーザーがその録音を開いたときに `Fetch::Allowed` で読まれ、そこで 1 度だけ残る
+    /// ——調べたい人が見るのはそちら。
+    pub fn should_report(self, fetch: Fetch) -> bool {
         match self {
             Self::NotCreated | Self::NotDownloaded => false,
-            Self::Failed => true,
+            Self::Failed => matches!(fetch, Fetch::Allowed),
         }
     }
 }
@@ -359,16 +365,34 @@ mod tests {
         );
     }
 
-    /// **ログに残すのは、待っても直らないものだけ**（#182）。
+    /// **ログに残すのは、待っても直らないものだけ**（#182）。しかも**頼まれた読み取りだけ**。
     ///
     /// 実体が無いだけのものまでログすると、退避された保存先では打鍵のたびに全件ぶんの行が
     /// 出て、本当に調べたい失敗が埋もれる（#178 で一覧側が同じ形になり、件数のまとめ 1 行へ
-    /// 倒した）。逆に `Failed` を黙らせると、権限や破損の手掛かりが消える。
+    /// 倒した）。壊れた JSON も同じで、検索は打鍵のたびに全件を開き直すので 1 つあるだけで
+    /// ログが埋まる——そちらはユーザーがその録音を開いたときに 1 度だけ残せばよい。
+    /// 逆に `Fetch::Allowed` の `Failed` を黙らせると、権限や破損の手掛かりが消える。
     #[test]
     fn only_what_will_not_fix_itself_goes_to_the_log() {
-        assert!(ReadFailure::Failed.should_report());
-        assert!(!ReadFailure::NotDownloaded.should_report());
-        assert!(!ReadFailure::NotCreated.should_report());
+        // ユーザーが頼んだ読み取り（開いた録音・議事録の生成）。
+        assert!(ReadFailure::Failed.should_report(Fetch::Allowed));
+        assert!(!ReadFailure::NotDownloaded.should_report(Fetch::Allowed));
+        assert!(!ReadFailure::NotCreated.should_report(Fetch::Allowed));
+
+        // 頼まれていない読み取り（検索）。**1 行も出さない**。
+        without_downloads(|downloads_off| {
+            let blocked = Fetch::Blocked(downloads_off);
+            for failure in [
+                ReadFailure::Failed,
+                ReadFailure::NotDownloaded,
+                ReadFailure::NotCreated,
+            ] {
+                assert!(
+                    !failure.should_report(blocked),
+                    "a search reads every recording on every keystroke"
+                );
+            }
+        });
     }
 
     /// macOS 以外では止めるものが無い（設定できなくても本体は走る）。

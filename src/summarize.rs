@@ -559,6 +559,32 @@ fn load_summary_limited(
     max_bytes: u64,
     fetch: crate::dataless::Fetch,
 ) -> Summary {
+    // **写像はここ 1 箇所**（#182）。読み取り側が失敗の理由を返し、それを表示用の値へ
+    // 落とすのをここだけにしてある——`Summary::nothing()` を直接返す経路を読み取りの
+    // 途中に置くと、実体が無いだけのファイルが「読めなかった」に化けて検索から静かに消える。
+    match read_summary_text(session_dir, max_bytes, fetch) {
+        Ok(text) => Summary {
+            text: Some(text),
+            not_downloaded: false,
+        },
+        Err(failure) => Summary::from_failure(failure),
+    }
+}
+
+/// `summary.md` を信頼境界外の入力として読む（#182 で失敗の理由を返すようにした）。
+///
+/// **失敗はすべて `ReadFailure` で返す**。ログを出すかもここで決めるが、判断そのものは
+/// `ReadFailure::should_report` が持つ（頼まれていない読み取りでは 1 行も出さない）。
+///
+/// ガードの理由は `transcript.rs` の `read_guarded` と同じ（保存先の生成物は手で置換されうる
+/// 信頼境界外の入力）。ログに出すのは**セッション名（日時のディレクトリ名）とファイル名だけ**:
+/// フルパス（保存先）も本文（発話由来の議事録）も機微情報なので出さない
+/// （`docs/rules/security.md`）。
+fn read_summary_text(
+    session_dir: &Path,
+    max_bytes: u64,
+    fetch: crate::dataless::Fetch,
+) -> Result<String, ReadFailure> {
     use std::io::Read;
 
     let path = session_dir.join(SUMMARY_FILENAME);
@@ -570,55 +596,52 @@ fn load_summary_limited(
         .map_or(std::borrow::Cow::Borrowed("unknown"), |name| {
             name.to_string_lossy()
         });
-    let file = match std::fs::File::open(&path) {
-        Ok(file) => file,
-        // **開くときも読むときも同じ見分けを通す**（#182。`Fetch::classify` の doc）。
-        Err(err) => {
-            let failure = fetch.classify(err.kind());
-            if failure.should_report() {
-                eprintln!(
-                    "Skipping the summary of {session} because {SUMMARY_FILENAME} could not be opened: {err}"
-                );
-            }
-            return Summary::from_failure(failure);
+    // **失敗の理由とログを 1 箇所で決める**。経路ごとに `eprintln!` を書くと、頼まれて
+    // いない読み取りで黙らせる約束が片方だけ守られる。
+    let report = |failure: ReadFailure, reason: std::fmt::Arguments| {
+        if failure.should_report(fetch) {
+            eprintln!("Skipping the summary of {session} because {SUMMARY_FILENAME} {reason}");
         }
+        failure
     };
+
+    let file = std::fs::File::open(&path).map_err(|err| {
+        // **開くときも読むときも同じ見分けを通す**（`Fetch::classify` の doc）。
+        report(
+            fetch.classify(err.kind()),
+            format_args!("could not be opened: {err}"),
+        )
+    })?;
     // 開いたハンドルの fstat で通常ファイルを確認し（FIFO 等は読み終わらないことがある）、
     // サイズ上限は読み込みそのものに掛ける（事前の metadata 判定では差し替えに追従できない）。
     if let Ok(meta) = file.metadata()
         && !meta.is_file()
     {
-        eprintln!(
-            "Skipping the summary of {session} because {SUMMARY_FILENAME} is not a regular file"
-        );
-        return Summary::nothing();
+        return Err(report(
+            ReadFailure::Failed,
+            format_args!("is not a regular file"),
+        ));
     }
     let mut limited = file.take(max_bytes + 1);
     let mut text = String::new();
     if let Err(err) = limited.read_to_string(&mut text) {
-        // 実測では、退避されたファイルは `open` が通ってここで返る（#178）。
-        let failure = fetch.classify(err.kind());
-        if failure.should_report() {
-            // UTF-8 でない（破損・別物への置換）場合もここに来る。
-            eprintln!(
-                "Skipping the summary of {session} because {SUMMARY_FILENAME} could not be read: {err}"
-            );
-        }
-        return Summary::from_failure(failure);
+        // 実測では、退避されたファイルは `open` が通ってここで返る（見分けは
+        // `dataless::is_not_downloaded` の doc）。UTF-8 でない（破損・別物への置換）場合も
+        // ここに来る。
+        return Err(report(
+            fetch.classify(err.kind()),
+            format_args!("could not be read: {err}"),
+        ));
     }
     // 上限＋1 バイトまで読み切った（limit が尽きた）なら上限超過。
     if limited.limit() == 0 {
-        eprintln!("Skipping the summary of {session} because {SUMMARY_FILENAME} is too large");
-        return Summary::nothing();
+        return Err(report(ReadFailure::Failed, format_args!("is too large")));
     }
     // 空ファイル（生成が中途で終わった等）は「無い」と同じ扱いにする（縮退表示へ落とす）。
     if text.trim().is_empty() {
-        return Summary::nothing();
+        return Err(ReadFailure::NotCreated);
     }
-    Summary {
-        text: Some(text),
-        not_downloaded: false,
-    }
+    Ok(text)
 }
 
 /// 追い越されたジョブが終わったときの後始末: 表示が「生成中」のまま残っていたら

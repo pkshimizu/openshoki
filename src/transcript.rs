@@ -300,70 +300,92 @@ pub struct StoredReach {
 
 /// 1 つの文字起こし JSON を、信頼境界外の入力として読む共通部（読む側の唯一の入口）。
 ///
-/// 欠落（未生成）は静かに、読み取り失敗・過大・破損はログして、いずれも `None` を返す
-/// （縮退。アプリは落とさない）。ログにはどちらのファイルで起きたかが分かるようファイル名
-/// （`mic.json` 等）だけを含める（フルパス＝保存先や発話内容の機微情報は出さない）。
+/// **写像はここ 1 箇所**（#182）。読み取り側が失敗の理由を返し、それを読んだ結果へ落とすのを
+/// ここだけにしてある——`ReadOutcome::Unusable` を直接返す経路を読み取りの途中に置くと、
+/// 実体が無いだけのファイルが「読めなかった」に化けて検索から静かに消える。
 fn read_guarded(path: &Path, fetch: Fetch) -> ReadOutcome {
+    match read_transcript_file(path, fetch) {
+        Ok(parsed) => ReadOutcome::Read(parsed),
+        Err(failure) => read_outcome_from(failure),
+    }
+}
+
+/// `read_guarded` の読み取り本体（#182 で失敗の理由を返すようにした）。
+///
+/// **失敗はすべて `ReadFailure` で返す**。ログを出すかもここで決めるが、判断そのものは
+/// `ReadFailure::should_report` が持つ（頼まれていない読み取りでは 1 行も出さない）。
+///
+/// 欠落（未生成）は静かに、読み取り失敗・過大・破損はログして縮退する（アプリは落とさない）。
+/// ログにはどちらのファイルで起きたかが分かるようファイル名（`mic.json` 等）だけを含める
+/// （フルパス＝保存先や発話内容の機微情報は出さない。`docs/rules/security.md`）。
+fn read_transcript_file(path: &Path, fetch: Fetch) -> Result<TranscriptFile, ReadFailure> {
     use std::io::Read;
 
+    // 名前が取れない異常時も固定文字列へ落とす（`summarize::read_summary_text` と同じ理由。
+    // フルパスをログへ混ぜない）。
     let name = path
         .file_name()
-        .unwrap_or(path.as_os_str())
-        .to_string_lossy();
-    let file = match std::fs::File::open(path) {
-        Ok(file) => file,
-        // **開くときも読むときも同じ見分けを通す**（#182。`Fetch::classify` の doc）。
-        Err(err) => {
-            let failure = fetch.classify(err.kind());
-            if failure.should_report() {
-                eprintln!("Skipping the transcript {name} because it could not be opened: {err}");
-            }
-            return read_outcome_from(failure);
+        .map_or(std::borrow::Cow::Borrowed("unknown"), |name| {
+            name.to_string_lossy()
+        });
+    // **失敗の理由とログを 1 箇所で決める**。経路ごとに `eprintln!` を書くと、頼まれて
+    // いない読み取りで黙らせる約束が片方だけ守られる。
+    let report = |failure: ReadFailure, reason: std::fmt::Arguments| {
+        if failure.should_report(fetch) {
+            eprintln!("Skipping the transcript {name} because it {reason}");
         }
+        failure
     };
+
+    let file = std::fs::File::open(path).map_err(|err| {
+        // **開くときも読むときも同じ見分けを通す**（`Fetch::classify` の doc）。
+        report(
+            fetch.classify(err.kind()),
+            format_args!("could not be opened: {err}"),
+        )
+    })?;
     // 信頼境界外の入力（手で置換されうる）なので、開いたハンドルの fstat で通常ファイルであることを
     // 確認し（FIFO 等は読み終わらないことがある）、サイズ上限は読み込みそのものに掛ける
     // （事前の metadata 判定だけでは差し替えに追従できない。`docs/rules/security.md`）。
     if let Ok(meta) = file.metadata()
         && !meta.is_file()
     {
-        eprintln!("Skipping the transcript {name} because it is not a regular file");
-        return ReadOutcome::Unusable;
+        return Err(report(
+            ReadFailure::Failed,
+            format_args!("is not a regular file"),
+        ));
     }
     let mut limited = file.take(MAX_TRANSCRIPT_BYTES + 1);
     let mut text = String::new();
     if let Err(err) = limited.read_to_string(&mut text) {
-        // 実測では、退避されたファイルは `open` が通ってここで返る（#178）。
-        let failure = fetch.classify(err.kind());
-        if failure.should_report() {
-            eprintln!("Skipping the transcript {name} because it could not be read: {err}");
-        }
-        return read_outcome_from(failure);
+        // 実測では、退避されたファイルは `open` が通ってここで返る（見分けは
+        // `dataless::is_not_downloaded` の doc）。
+        return Err(report(
+            fetch.classify(err.kind()),
+            format_args!("could not be read: {err}"),
+        ));
     }
     // 上限＋1 バイトまで読み切った（limit が尽きた）なら上限超過。
     if limited.limit() == 0 {
-        eprintln!("Skipping the transcript {name} because it is too large");
-        return ReadOutcome::Unusable;
+        return Err(report(ReadFailure::Failed, format_args!("is too large")));
     }
-    let parsed: TranscriptFile = match serde_json::from_str(&text) {
-        Ok(parsed) => parsed,
-        Err(err) => {
-            // エラーの Display は JSON 中の値（＝発話テキスト）を含みうるため出さず、位置だけログする
-            // （録音由来の機微データをログへ漏らさない。`docs/rules/security.md`）。
-            eprintln!(
-                "Skipping the transcript {name} because it could not be parsed (line {}, column {})",
+    serde_json::from_str(&text).map_err(|err| {
+        // エラーの Display は JSON 中の値（＝発話テキスト）を含みうるため出さず、位置だけログする
+        // （録音由来の機微データをログへ漏らさない。`docs/rules/security.md`）。
+        report(
+            ReadFailure::Failed,
+            format_args!(
+                "could not be parsed (line {}, column {})",
                 err.line(),
                 err.column()
-            );
-            return ReadOutcome::Unusable;
-        }
-    };
-    ReadOutcome::Read(parsed)
+            ),
+        )
+    })
 }
 
 /// 読み取りに失敗したときに、何を読めたことにするか（#182）。
 ///
-/// **ログを出すかは呼び出し側**（文言が開くときと読むときで違う。出すかどうかの判断は
+/// **ログを出すかは読み取り側**（文言が経路ごとに違う。出すかどうかの判断は
 /// `ReadFailure::should_report` が持つ）。ここを通さずに直接組み立てると、実体が無いだけの
 /// ファイルが「読めなかった」に化けて、検索から静かに消える。
 fn read_outcome_from(failure: ReadFailure) -> ReadOutcome {
