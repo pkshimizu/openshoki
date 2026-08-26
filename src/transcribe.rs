@@ -2413,7 +2413,7 @@ mod tests {
             let loaded = crate::transcript::load_transcript(
                 &dir,
                 &[crate::transcript::Speaker::Mic],
-                crate::dataless::Fetch::Allowed,
+                crate::dataless::Fetch::allowed(),
             );
             assert_eq!(loaded.complete, complete);
             assert_eq!(loaded.segments.len(), 1);

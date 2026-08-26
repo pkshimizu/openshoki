@@ -1895,8 +1895,9 @@ fn spawn_session_load(
             // `reselect_after_list_change` が読み直しを起こす）。読むのは選んだ 1 件ぶんの
             // JSON と `summary.md` だけで、2 回目以降は実体が落ちているので取り寄せは
             // 走らない。全件を舐める検索とは桁が違うので、ここは止めない。
-            let transcript = transcript::load_transcript(&dir, &speakers, dataless::Fetch::Allowed);
-            let summary = summarize::load_summary(&dir, dataless::Fetch::Allowed).text;
+            let transcript =
+                transcript::load_transcript(&dir, &speakers, dataless::Fetch::allowed());
+            let summary = summarize::load_summary(&dir, dataless::Fetch::allowed()).text;
             let summary_written = summary.is_some().then(|| {
                 std::fs::metadata(dir.join(summarize::SUMMARY_FILENAME))
                     .and_then(|meta| meta.modified())
@@ -2297,7 +2298,7 @@ fn mentions(text: &str, needle: &str) -> bool {
 /// **取り寄せを止めるのはここ 1 箇所**——囲いを剥がすと証を作れず、`Fetch::Blocked` も
 /// 作れないのでコンパイルが通らない（`docs/rules/testing.md`。`recordings::list_sessions` と
 /// 同じ形）。**`fetch` を組むのもここだけ**にしてある。読み取りごとに組めるようにすると、
-/// 片方だけ `Fetch::Allowed` に書き換える形が通ってしまう（証は使われ続けるので警告も出ない）。
+/// 片方だけ `Fetch::allowed()` に書き換える形が通ってしまう（証は使われ続けるので警告も出ない）。
 ///
 /// 対象は**文字起こしと議事録の本文**。日時や音源は目で追えるので入れない——入れると
 /// `mic` のような語が全件に当たって絞り込みにならない。
@@ -2311,7 +2312,7 @@ fn search_sessions(
     generation: u64,
 ) -> Option<SearchResult> {
     dataless::without_downloads(|downloads_off| {
-        let fetch = dataless::Fetch::Blocked(downloads_off);
+        let fetch = dataless::Fetch::blocked(downloads_off);
         let mut judged = Vec::with_capacity(sessions.len());
         for session in sessions {
             // **1 件読むごとに降りられるか見る**。結果も送らない（送っても捨てられる）。

@@ -522,7 +522,7 @@ pub fn load_summary(session_dir: &Path, fetch: crate::dataless::Fetch) -> Summar
 pub struct Summary {
     /// 読めた本文。未生成・空・破損・過大は `None`。
     pub text: Option<String>,
-    /// 実体がこの Mac に無くて読めなかった。**`Fetch::Allowed` では常に `false`**。
+    /// 実体がこの Mac に無くて読めなかった。**`Fetch::allowed()` では常に `false`**。
     pub not_downloaded: bool,
 }
 
@@ -692,7 +692,7 @@ fn run_job(
         // **取り寄せてよい**（#182）——ユーザーが頼んだ生成なので、退避されていれば落として
         // でも読む。読めなければ下の空判定が縮退する。
         let segments =
-            crate::transcript::load_segments(&job.session_dir, crate::dataless::Fetch::Allowed);
+            crate::transcript::load_segments(&job.session_dir, crate::dataless::Fetch::allowed());
         transcript_lines(&segments.segments)
     };
     if lines.is_empty() {
@@ -1465,7 +1465,7 @@ mod tests {
 
         // 未生成（ファイルが無い）。
         assert!(
-            load_summary(&dir, crate::dataless::Fetch::Allowed)
+            load_summary(&dir, crate::dataless::Fetch::allowed())
                 .text
                 .is_none()
         );
@@ -1473,7 +1473,7 @@ mod tests {
         let path = dir.join(SUMMARY_FILENAME);
         std::fs::write(&path, "# 議事概要\n\n本文\n").expect("the summary should be writable");
         assert_eq!(
-            load_summary(&dir, crate::dataless::Fetch::Allowed)
+            load_summary(&dir, crate::dataless::Fetch::allowed())
                 .text
                 .as_deref(),
             Some("# 議事概要\n\n本文\n"),
@@ -1483,7 +1483,7 @@ mod tests {
         // 空・空白だけは「無い」と同じ扱い（生成が中途で終わった場合）。
         std::fs::write(&path, "   \n\n").expect("the summary should be writable");
         assert!(
-            load_summary(&dir, crate::dataless::Fetch::Allowed)
+            load_summary(&dir, crate::dataless::Fetch::allowed())
                 .text
                 .is_none()
         );
@@ -1491,7 +1491,7 @@ mod tests {
         // UTF-8 でない（別物へ置換された）ファイルは読めないものとして縮退する。
         std::fs::write(&path, [0xff, 0xfe, 0x00]).expect("the summary should be writable");
         assert!(
-            load_summary(&dir, crate::dataless::Fetch::Allowed)
+            load_summary(&dir, crate::dataless::Fetch::allowed())
                 .text
                 .is_none()
         );
@@ -1500,13 +1500,13 @@ mod tests {
         // 1 バイト超えると読まない。
         std::fs::write(&path, "abcd").expect("the summary should be writable");
         assert_eq!(
-            load_summary_limited(&dir, 4, crate::dataless::Fetch::Allowed)
+            load_summary_limited(&dir, 4, crate::dataless::Fetch::allowed())
                 .text
                 .as_deref(),
             Some("abcd")
         );
         assert!(
-            load_summary_limited(&dir, 3, crate::dataless::Fetch::Allowed)
+            load_summary_limited(&dir, 3, crate::dataless::Fetch::allowed())
                 .text
                 .is_none()
         );
@@ -1515,7 +1515,7 @@ mod tests {
         let too_large = "a".repeat(MAX_SUMMARY_BYTES as usize + 1);
         std::fs::write(&path, &too_large).expect("the summary should be writable");
         assert!(
-            load_summary(&dir, crate::dataless::Fetch::Allowed)
+            load_summary(&dir, crate::dataless::Fetch::allowed())
                 .text
                 .is_none()
         );
@@ -1526,7 +1526,7 @@ mod tests {
         std::fs::remove_file(&path).expect("the summary should be removable");
         std::fs::create_dir(&path).expect("the fixture directory should be creatable");
         assert!(
-            load_summary(&dir, crate::dataless::Fetch::Allowed)
+            load_summary(&dir, crate::dataless::Fetch::allowed())
                 .text
                 .is_none()
         );
