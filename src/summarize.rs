@@ -510,13 +510,45 @@ impl SummarizeWorker {
 /// 信頼境界外の入力）。ログに出すのは**セッション名（日時のディレクトリ名）とファイル名だけ**:
 /// フルパス（保存先）も本文（発話由来の議事録）も機微情報なので出さない
 /// （`docs/rules/security.md`）。
-pub fn load_summary(session_dir: &Path) -> Option<String> {
-    load_summary_limited(session_dir, MAX_SUMMARY_BYTES)
+pub fn load_summary(session_dir: &Path, fetch: crate::dataless::Fetch) -> Summary {
+    load_summary_limited(session_dir, MAX_SUMMARY_BYTES, fetch)
+}
+
+/// 読めた議事録と、**実体が無くて読めなかったか**（#182）。理由は
+/// `transcript::Segments`（本文だけ見て「無い」と決めると、検索が黙って対象から外したことに
+/// 気づけない）。
+pub struct Summary {
+    /// 読めた本文。未生成・空・破損・過大は `None`。
+    pub text: Option<String>,
+    /// 実体がこの Mac に無くて読めなかった。**`Fetch::Allowed` では常に `false`**。
+    pub not_downloaded: bool,
+}
+
+impl Summary {
+    /// 読めなかった（理由は問わない）。
+    fn nothing() -> Self {
+        Self {
+            text: None,
+            not_downloaded: false,
+        }
+    }
+
+    /// 実体がこの Mac に無い。
+    fn not_downloaded() -> Self {
+        Self {
+            text: None,
+            not_downloaded: true,
+        }
+    }
 }
 
 /// `load_summary` の本体。上限はテスト容易性のため引数で受ける（`write_verified` の
 /// `max_bytes` と同じ理由。境界のオフバイワンを小さな上限で検証できるようにする）。
-fn load_summary_limited(session_dir: &Path, max_bytes: u64) -> Option<String> {
+fn load_summary_limited(
+    session_dir: &Path,
+    max_bytes: u64,
+    fetch: crate::dataless::Fetch,
+) -> Summary {
     use std::io::Read;
 
     let path = session_dir.join(SUMMARY_FILENAME);
@@ -531,12 +563,17 @@ fn load_summary_limited(session_dir: &Path, max_bytes: u64) -> Option<String> {
     let file = match std::fs::File::open(&path) {
         Ok(file) => file,
         // 未生成（ファイルが無い）は正常な縮退。ログもしない。
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Summary::nothing(),
+        // **実体がこの Mac に無いだけ**（#182）。ログもしない——退避された保存先では全件が
+        // 該当するので、打鍵のたびにログが埋まる。何件諦めたかは呼び出し側がまとめて出す。
+        Err(err) if fetch.is_not_downloaded(err.kind()) => {
+            return Summary::not_downloaded();
+        }
         Err(err) => {
             eprintln!(
                 "Skipping the summary of {session} because {SUMMARY_FILENAME} could not be opened: {err}"
             );
-            return None;
+            return Summary::nothing();
         }
     };
     // 開いたハンドルの fstat で通常ファイルを確認し（FIFO 等は読み終わらないことがある）、
@@ -547,27 +584,34 @@ fn load_summary_limited(session_dir: &Path, max_bytes: u64) -> Option<String> {
         eprintln!(
             "Skipping the summary of {session} because {SUMMARY_FILENAME} is not a regular file"
         );
-        return None;
+        return Summary::nothing();
     }
     let mut limited = file.take(max_bytes + 1);
     let mut text = String::new();
     if let Err(err) = limited.read_to_string(&mut text) {
+        // 実測では、退避されたファイルは `open` が通ってここで返る（#178）。
+        if fetch.is_not_downloaded(err.kind()) {
+            return Summary::not_downloaded();
+        }
         // UTF-8 でない（破損・別物への置換）場合もここに来る。
         eprintln!(
             "Skipping the summary of {session} because {SUMMARY_FILENAME} could not be read: {err}"
         );
-        return None;
+        return Summary::nothing();
     }
     // 上限＋1 バイトまで読み切った（limit が尽きた）なら上限超過。
     if limited.limit() == 0 {
         eprintln!("Skipping the summary of {session} because {SUMMARY_FILENAME} is too large");
-        return None;
+        return Summary::nothing();
     }
     // 空ファイル（生成が中途で終わった等）は「無い」と同じ扱いにする（縮退表示へ落とす）。
     if text.trim().is_empty() {
-        return None;
+        return Summary::nothing();
     }
-    Some(text)
+    Summary {
+        text: Some(text),
+        not_downloaded: false,
+    }
 }
 
 /// 追い越されたジョブが終わったときの後始末: 表示が「生成中」のまま残っていたら
@@ -617,8 +661,11 @@ fn run_job(
     // `docs/rules/performance.md`）。
     let lines = {
         // **本文しか要らない**（揃っているかの判断は読む領域の仕事。#175）。
-        let segments = crate::transcript::load_segments(&job.session_dir);
-        transcript_lines(&segments)
+        // **取り寄せてよい**（#182）——ユーザーが頼んだ生成なので、退避されていれば落として
+        // でも読む。読めなければ下の空判定が縮退する。
+        let segments =
+            crate::transcript::load_segments(&job.session_dir, crate::dataless::Fetch::Allowed);
+        transcript_lines(&segments.segments)
     };
     if lines.is_empty() {
         // 文字起こしが未生成・欠落・破損・全行空。GB 級のモデルをロードしない防御でもある。
@@ -1370,41 +1417,72 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("the temp session dir should be creatable");
 
         // 未生成（ファイルが無い）。
-        assert!(load_summary(&dir).is_none());
+        assert!(
+            load_summary(&dir, crate::dataless::Fetch::Allowed)
+                .text
+                .is_none()
+        );
 
         let path = dir.join(SUMMARY_FILENAME);
         std::fs::write(&path, "# 議事概要\n\n本文\n").expect("the summary should be writable");
         assert_eq!(
-            load_summary(&dir).as_deref(),
+            load_summary(&dir, crate::dataless::Fetch::Allowed)
+                .text
+                .as_deref(),
             Some("# 議事概要\n\n本文\n"),
             "the file content is returned as-is (rendering is the UI's job)"
         );
 
         // 空・空白だけは「無い」と同じ扱い（生成が中途で終わった場合）。
         std::fs::write(&path, "   \n\n").expect("the summary should be writable");
-        assert!(load_summary(&dir).is_none());
+        assert!(
+            load_summary(&dir, crate::dataless::Fetch::Allowed)
+                .text
+                .is_none()
+        );
 
         // UTF-8 でない（別物へ置換された）ファイルは読めないものとして縮退する。
         std::fs::write(&path, [0xff, 0xfe, 0x00]).expect("the summary should be writable");
-        assert!(load_summary(&dir).is_none());
+        assert!(
+            load_summary(&dir, crate::dataless::Fetch::Allowed)
+                .text
+                .is_none()
+        );
 
         // 上限の境界（オフバイワン）は小さな上限で両側を見る。ちょうど上限は読め、
         // 1 バイト超えると読まない。
         std::fs::write(&path, "abcd").expect("the summary should be writable");
-        assert_eq!(load_summary_limited(&dir, 4).as_deref(), Some("abcd"));
-        assert!(load_summary_limited(&dir, 3).is_none());
+        assert_eq!(
+            load_summary_limited(&dir, 4, crate::dataless::Fetch::Allowed)
+                .text
+                .as_deref(),
+            Some("abcd")
+        );
+        assert!(
+            load_summary_limited(&dir, 3, crate::dataless::Fetch::Allowed)
+                .text
+                .is_none()
+        );
 
         // 公開入口が `MAX_SUMMARY_BYTES` を渡していること（結線）も見る。
         let too_large = "a".repeat(MAX_SUMMARY_BYTES as usize + 1);
         std::fs::write(&path, &too_large).expect("the summary should be writable");
-        assert!(load_summary(&dir).is_none());
+        assert!(
+            load_summary(&dir, crate::dataless::Fetch::Allowed)
+                .text
+                .is_none()
+        );
 
         // ディレクトリ（非通常ファイル）に置き換えられていても落ちない（macOS では読み取り
         // 自体も失敗するので、`is_file()` ガードが無くても同じ結果になる。ここで見るのは
         // 「落ちない」ことまで）。
         std::fs::remove_file(&path).expect("the summary should be removable");
         std::fs::create_dir(&path).expect("the fixture directory should be creatable");
-        assert!(load_summary(&dir).is_none());
+        assert!(
+            load_summary(&dir, crate::dataless::Fetch::Allowed)
+                .text
+                .is_none()
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

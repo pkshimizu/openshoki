@@ -303,14 +303,12 @@ enum Measured {
 /// 読み取りの失敗を、長さの結果へ分類する（#178）。**分類だけでログは出さない**——名前どおりの
 /// 純関数にしておくと、継ぎ目としても素直に読める。
 ///
-/// `EDEADLK`（`Deadlock`）は「取り寄せない設定なので実体を用意できない」という macOS の返し方。
-/// **この見分け方の正はここ**（他は参照だけを置く）。実測で、退避された音源は `open` が通って
-/// `read` がこれで返る。
+/// 見分け方の正は `dataless::is_not_downloaded`（#182 で検索側と共有した）。
 ///
 /// macOS 以外では `dataless::without_downloads` が何もしないので、この分岐へは来ない想定
 /// （来たとしても長さが出ないだけで、表示は `Unknown` と同じ）。
 fn measured_from_read_error(kind: std::io::ErrorKind) -> Measured {
-    if kind == std::io::ErrorKind::Deadlock {
+    if crate::dataless::is_not_downloaded(kind) {
         Measured::NotDownloaded
     } else {
         Measured::Unknown

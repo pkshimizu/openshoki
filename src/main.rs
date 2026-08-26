@@ -332,6 +332,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let load_generation = Rc::new(Cell::new(0u64));
     // 検索の世代（#161）。閉じるときにも降ろすので、閉じるハンドラより前に用意する。
     let search_generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
+    // **最後の検索で本文を読めなかった録音**（#182）。件数ではなく録音そのものを持つ——
+    // 削除・解除の経路も同じ値を見て数え直せるようにするため（`not_downloaded_count`）。
+    let search_not_downloaded: Rc<RefCell<Vec<std::path::PathBuf>>> =
+        Rc::new(RefCell::new(Vec::new()));
 
     {
         // 隠すときも**世代を進める**（#152）。進めないと、閉じたあとに届いた読み込み結果が
@@ -781,6 +785,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let sessions = Rc::clone(&sessions);
         let sessions_model = Rc::clone(&sessions_model);
         let search_generation = Rc::clone(&search_generation);
+        let search_not_downloaded = Rc::clone(&search_not_downloaded);
         let player = Rc::clone(&player);
         let load_sender = load_sender.clone();
         let transcriber = transcriber.clone();
@@ -792,10 +797,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return;
             };
             reset_search(&rec, &search_generation);
+            // 絞り込みを解除したら、読めなかった録音の話も消える（検索していないので）。
+            search_not_downloaded.borrow_mut().clear();
             let all = all_sessions.borrow().clone();
             let total = all.len();
             sessions_model.set_vec(session_rows(&all, &transcriber));
-            apply_list_counts(&rec, total, total);
+            apply_list_counts(&rec, total, total, 0);
             reselect_after_list_change(
                 &rec,
                 &sessions,
@@ -851,6 +858,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let sessions_model = Rc::clone(&sessions_model);
         let all_sessions = Rc::clone(&all_sessions);
         let search_generation = Rc::clone(&search_generation);
+        let search_not_downloaded = Rc::clone(&search_not_downloaded);
         let player = Rc::clone(&player);
         let transcript_segments = Rc::clone(&transcript_segments);
         let load_generation = Rc::clone(&load_generation);
@@ -953,7 +961,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // その日の先頭を消すと繰り上がった行が見出しを引き継ぐ必要がある。
             {
                 let sessions = sessions.borrow();
-                apply_list_counts(&rec, sessions.len(), all_sessions.borrow().len());
+                let all = all_sessions.borrow();
+                apply_list_counts(
+                    &rec,
+                    sessions.len(),
+                    all.len(),
+                    // **消したぶんは落として数え直す**（#182）。絞り込みは解除されないので、
+                    // 読めなかった話も消さずに残す。
+                    not_downloaded_count(&search_not_downloaded.borrow(), &all),
+                );
                 if let Some(mut row) = sessions_model.row_data(i) {
                     row.group_heading =
                         session_group_heading(&sessions, i, chrono::Local::now().naive_local())
@@ -1191,6 +1207,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 all_sessions: Rc::clone(&all_sessions),
                 search_receiver,
                 search_generation: Rc::clone(&search_generation),
+                search_not_downloaded: Rc::clone(&search_not_downloaded),
                 sessions_model: Rc::clone(&sessions_model),
                 transcript_segments: Rc::clone(&transcript_segments),
                 transcriber: transcriber.clone(),
@@ -1256,6 +1273,8 @@ struct LibraryHandles {
     /// いま出している検索の世代。届いた結果がこれと違えば捨てる（打ち込むたびに投げるので、
     /// 古い結果が新しい入力を上書きしないように）。
     search_generation: Rc<Cell<u64>>,
+    /// 最後の検索で本文を読めなかった録音（#182。理由は `not_downloaded_count`）。
+    search_not_downloaded: Rc<RefCell<Vec<std::path::PathBuf>>>,
     sessions_model: Rc<slint::VecModel<SessionRow>>,
     transcript_segments: Rc<RefCell<LoadedTranscript>>,
     transcriber: transcribe::TranscribeWorker,
@@ -1466,12 +1485,18 @@ fn build_menu_event_handler(
             };
             // 結果は**打鍵した時点のスナップショット**なので、そのままでは古い。
             let mut matched = result.matched;
-            let total = {
+            // **読めなかった録音も控える**（#182）。削除・解除の経路が同じ値から数え直せる
+            // ようにするため（件数だけ持つと、削除で合計より多い数が残る）。
+            *recordings.search_not_downloaded.borrow_mut() = result.not_downloaded;
+            let (total, not_downloaded) = {
                 let all = recordings.all_sessions.borrow();
                 // 絞り込んでいる間に消えた録音は落とす（削除は世代を進めるので通常は届かないが、
                 // 取りこぼしたときに消したはずの行を戻さない）。
                 matched.retain(|session| all.iter().any(|other| other.dir == session.dir));
-                all.len()
+                (
+                    all.len(),
+                    not_downloaded_count(&recordings.search_not_downloaded.borrow(), &all),
+                )
             };
             // 文字起こし・議事録の有無は**ワーカーの状態から埋め直す**。全件側から写すと、
             // それを埋めるのがこの tick の末尾なので 1 周ぶん古くなり、直後に組む行
@@ -1483,7 +1508,7 @@ fn build_menu_event_handler(
                 session.has_summary |= recordings.summarizer.status_of(&session.dir)
                     == Some(summarize::SummarizeStatus::Done);
             }
-            apply_list_counts(&rec, matched.len(), total);
+            apply_list_counts(&rec, matched.len(), total, not_downloaded);
             recordings
                 .sessions_model
                 .set_vec(session_rows(&matched, &recordings.transcriber));
@@ -1871,8 +1896,10 @@ fn spawn_session_load(
         .name("session-load".to_owned())
         .spawn(move || {
             // **重い処理の前に降りられるか見る**（軽い読み込みは先に済ませてしまう）。
-            let transcript = transcript::load_transcript(&dir, &speakers);
-            let summary = summarize::load_summary(&dir);
+            // **取り寄せてよい**（#182）——録音を選んだのはユーザーなので、退避されていれば
+            // 落としてでも読む。頼まれていない読み取り（一覧の走査・検索）だけを止める。
+            let transcript = transcript::load_transcript(&dir, &speakers, dataless::Fetch::Allowed);
+            let summary = summarize::load_summary(&dir, dataless::Fetch::Allowed).text;
             let summary_written = summary.is_some().then(|| {
                 std::fs::metadata(dir.join(summarize::SUMMARY_FILENAME))
                     .and_then(|meta| meta.modified())
@@ -2200,23 +2227,101 @@ struct SearchResult {
     /// 一致したセッション（元の並び順のまま）。**件数は持たない**——絞り込んでいる間に
     /// 削除されることがあるので、合計は受け取った側が `all_sessions` から数える。
     matched: Vec<recordings::RecordingSession>,
+    /// 実体が無くて本文を読めなかった録音（#182）。**ここも件数ではなく録音そのもの**——
+    /// 同じ理由で、受け取った側が削除ぶんを落としてから数える。
+    not_downloaded: Vec<std::path::PathBuf>,
+}
+
+/// 検索 1 件ぶんの結果（#182）。**「当たらなかった」と「読めなかった」を分ける**——
+/// 一緒にすると、退避された録音が黙って対象から外れて「検索に出てこない＝無い」と読める。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchOutcome {
+    /// 読めた本文に当たった。
+    Matched,
+    /// 読めた本文には当たらず、読めなかった本文も無かった。
+    Missed,
+    /// 当たらなかったが、**実体がこの Mac に無くて読めなかった本文がある**。
+    /// 当たったかどうかは分からない。
+    NotDownloaded,
+}
+
+/// 読めたものと読めなかったものから、この録音の結果を決める（#182）。
+///
+/// **当たったら `Matched`**。読めなかった本文が残っていても、当たった事実は変わらない
+/// （当たった録音まで「読めなかった」に数えると、件数が一覧より多くなって意味を成さない）。
+/// **当たった録音の欠落は数えない**という割り切りで、その代わり当たらなかった録音では
+/// 読めなかったことを必ず言う。
+fn search_outcome(hit: bool, not_downloaded: bool) -> SearchOutcome {
+    if hit {
+        return SearchOutcome::Matched;
+    }
+    if not_downloaded {
+        return SearchOutcome::NotDownloaded;
+    }
+    SearchOutcome::Missed
 }
 
 /// 検索語がセッションの本文に一致するか。**大小を無視する**（打ち込むときに気にさせない）。
 ///
 /// 対象は**文字起こしと議事録の本文**。日時や音源は目で追えるので入れない——入れると
 /// `mic` のような語が全件に当たって絞り込みにならない。
-fn session_matches(session: &recordings::RecordingSession, needle: &str) -> bool {
+///
+/// **取り寄せない**（#182）。証を要求するので、囲いの外から呼ぶ書き方はコンパイルを通らない。
+fn session_matches(
+    session: &recordings::RecordingSession,
+    needle: &str,
+    downloads_off: &dataless::NoDownloads,
+) -> SearchOutcome {
+    let fetch = dataless::Fetch::Blocked(downloads_off);
     let hit = |text: &str| text.to_lowercase().contains(needle);
-    if let Some(summary) = summarize::load_summary(&session.dir)
-        && hit(&summary)
-    {
-        return true;
+    let summary = summarize::load_summary(&session.dir, fetch);
+    if summary.text.is_some_and(|text| hit(&text)) {
+        return SearchOutcome::Matched;
     }
     // **本文しか要らない**（揃っているかの判断は読む領域の仕事。#175）。
-    transcript::load_segments(&session.dir)
-        .iter()
-        .any(|segment| hit(&segment.text))
+    let transcript = transcript::load_segments(&session.dir, fetch);
+    search_outcome(
+        transcript.segments.iter().any(|segment| hit(&segment.text)),
+        summary.not_downloaded || transcript.not_downloaded,
+    )
+}
+
+/// 検索を 1 周走らせる（#182）。**取り寄せを止めるのはここ 1 箇所**——囲いを剥がすと
+/// `session_matches` へ渡す証を作れず、コンパイルが通らない
+/// （`docs/rules/testing.md`。`recordings::list_sessions` と同じ形）。
+///
+/// 世代が進んでいたら**途中で降りる**（`None`）。読み切ってから捨てるのでは、打鍵のたびに
+/// 全件を読む時間を自分で積む。
+fn search_sessions(
+    sessions: Vec<recordings::RecordingSession>,
+    needle: &str,
+    live: &AtomicU64,
+    generation: u64,
+) -> Option<SearchFindings> {
+    dataless::without_downloads(|downloads_off| {
+        let mut findings = SearchFindings::default();
+        for session in sessions {
+            // **1 件読むごとに降りられるか見る**。結果も送らない（送っても捨てられる）。
+            if live.load(Ordering::Relaxed) != generation {
+                return None;
+            }
+            match session_matches(&session, needle, downloads_off) {
+                SearchOutcome::Matched => findings.matched.push(session),
+                SearchOutcome::NotDownloaded => findings.not_downloaded.push(session.dir),
+                SearchOutcome::Missed => {}
+            }
+        }
+        Some(findings)
+    })
+}
+
+/// 1 周ぶんの結果。**件数ではなく録音そのもの**を持つ——受け取る側が、絞り込んでいる間に
+/// 削除されたものを落としてから数え直せるようにするため（`SearchResult` の doc）。
+#[derive(Default)]
+struct SearchFindings {
+    matched: Vec<recordings::RecordingSession>,
+    /// 実体が無くて本文を読めなかった録音。**当たった録音は入らない**（`search_outcome`）。
+    not_downloaded: Vec<std::path::PathBuf>,
 }
 
 /// 検索を背景スレッドで走らせる。**本文は UI スレッドで読まない**——文字起こし JSON と
@@ -2243,20 +2348,15 @@ fn spawn_search(
         .name("session-search".to_owned())
         .spawn(move || {
             let needle = needle.to_lowercase();
-            let mut matched = Vec::new();
-            for session in sessions {
-                // **1 件読むごとに降りられるか見る**。結果も送らない（送っても捨てられる）。
-                if live.load(Ordering::Relaxed) != generation {
-                    return;
-                }
-                if session_matches(&session, &needle) {
-                    matched.push(session);
-                }
-            }
+            let Some(findings) = search_sessions(sessions, &needle, &live, generation) else {
+                // 世代が進んだので降りた。結果は送らない（送っても捨てられる）。
+                return;
+            };
             if sender
                 .send(SearchResult {
                     generation,
-                    matched,
+                    matched: findings.matched,
+                    not_downloaded: findings.not_downloaded,
                 })
                 .is_err()
             {
@@ -2323,23 +2423,49 @@ fn reselect_after_list_change(
 
 /// 一覧の下の件数を入れる。**絞り込み中かどうかで文が変わる**ので、両方の件数を渡して
 /// ここ 1 箇所で決める（削除・検索・解除のどこから来ても同じ形になる）。
-fn apply_list_counts(rec: &LibraryWindow, shown: usize, total: usize) {
+fn apply_list_counts(rec: &LibraryWindow, shown: usize, total: usize, not_downloaded: usize) {
     rec.set_library_summary(library_summary(total).into());
-    rec.set_search_summary(if shown == total {
+    // **読めなかったぶんが在るなら、全件が当たっていても文を出す**（#182）。件数だけで
+    // 判断すると、全件一致かつ一部が退避という組み合わせで理由が黙って消える。
+    rec.set_search_summary(if shown == total && not_downloaded == 0 {
         slint::SharedString::new()
     } else {
-        search_summary_text(shown, total).into()
+        search_summary_text(shown, total, not_downloaded).into()
     });
 }
 
+/// いま一覧に在るもののうち、**実体が無くて検索できなかった件数**（#182）。
+///
+/// 検索結果は打鍵した時点のスナップショットなので、**削除されたぶんを落としてから数える**。
+/// そのまま数えると、絞り込み中に 1 件消しただけで「10 件中 11 件が未ダウンロード」という
+/// 合計より多い数が出る（`matched` を `retain` しているのと同じ理由）。
+fn not_downloaded_count(
+    not_downloaded: &[std::path::PathBuf],
+    all: &[recordings::RecordingSession],
+) -> usize {
+    not_downloaded
+        .iter()
+        .filter(|dir| all.iter().any(|session| session.dir == **dir))
+        .count()
+}
+
 /// 絞り込み中に一覧の下へ出す件数。**解除の手を文に入れる**（0 件のときは本文側で出す）。
-fn search_summary_text(matched: usize, total: usize) -> String {
+///
+/// **読めなかったぶんも言う**（#182）。黙って対象から外すと「検索に出てこない＝無い」と
+/// 読める。語は一覧側（`recordings::scan_sessions` の「has not been downloaded to this Mac」）に
+/// 揃える。出す場所が省略されうる 1 行なので、**節は短く保つ**こと。
+fn search_summary_text(matched: usize, total: usize, not_downloaded: usize) -> String {
     // 件数で**文の形**は変えない（0 件でも同じ言い方）が、名詞の単複は揃える
     // （`library_summary` が `1 recording` と分けているのと同じ）。
-    if total == 1 {
-        return format!("{matched} of 1 recording mentions it");
+    let mentions = if total == 1 {
+        format!("{matched} of 1 recording mentions it")
+    } else {
+        format!("{matched} of {total} recordings mention it")
+    };
+    if not_downloaded == 0 {
+        return mentions;
     }
-    format!("{matched} of {total} recordings mention it")
+    format!("{mentions} · {not_downloaded} not downloaded")
 }
 
 /// セッションの並びから一覧の行を組み立てる。**開くときと絞り込み後で同じ経路を通す**
@@ -3435,10 +3561,10 @@ mod tests {
         PaneAction, PaneActionKind, StatusTone, SummaryPane, SummaryStatus, TranscriptPane,
         TranscriptStatus, actions_allowed_while_busy, app_version_text, breathing_level,
         came_off_the_worker, jobs_pending, model_downloads_on_select, model_status_line,
-        playback_progress, search_summary_text, seek_position_from_ratio, session_matches,
-        summary_display_status, summary_model_status_line, summary_pane_of, summary_rows,
-        summary_status_text, transcript_display_status, transcript_pane_of,
-        whisper_model_status_line,
+        not_downloaded_count, playback_progress, search_outcome, search_summary_text,
+        seek_position_from_ratio, session_matches, summary_display_status,
+        summary_model_status_line, summary_pane_of, summary_rows, summary_status_text,
+        transcript_display_status, transcript_pane_of, whisper_model_status_line,
     };
     use super::{elapsed_text, recordings, summarize, transcribe};
     use chrono::{Datelike as _, Timelike as _};
@@ -4079,14 +4205,20 @@ mod tests {
             .find(|session| session.dir == dir)
             .expect("the session should be listed");
 
-        // 文字起こしに一致する（大小を無視する）。
-        assert!(session_matches(&session, "recording format"));
-        // 議事録にも当たる。
-        assert!(session_matches(&session, "リリース"));
-        // 当たらない語は落ちる。
-        assert!(!session_matches(&session, "no such phrase"));
-        // **日時や音源では当たらない**（`mic.json` というファイル名に引きずられない）。
-        assert!(!session_matches(&session, "mic"));
+        // **囲いの中からしか呼べない**（#182）。証はここでしか作れないので、テストも本番と
+        // 同じ入口を通る（`#[cfg(test)]` の証コンストラクタは足さない——足した瞬間に、
+        // 囲いの外から読む書き方がテストだけ通るようになる）。
+        super::dataless::without_downloads(|downloads_off| {
+            let matches = |needle: &str| session_matches(&session, needle, downloads_off);
+            // 文字起こしに一致する（大小を無視する）。
+            assert_eq!(matches("recording format"), super::SearchOutcome::Matched);
+            // 議事録にも当たる。
+            assert_eq!(matches("リリース"), super::SearchOutcome::Matched);
+            // 当たらない語は落ちる。**読めなかったのではなく、当たらなかった**。
+            assert_eq!(matches("no such phrase"), super::SearchOutcome::Missed);
+            // **日時や音源では当たらない**（`mic.json` というファイル名に引きずられない）。
+            assert_eq!(matches("mic"), super::SearchOutcome::Missed);
+        });
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -4095,17 +4227,78 @@ mod tests {
     #[test]
     fn search_summary_text_shows_both_counts() {
         assert_eq!(
-            search_summary_text(3, 148),
+            search_summary_text(3, 148, 0),
             "3 of 148 recordings mention it"
         );
         // 0 件でも同じ形（件数で文の形は変えない。`docs/rules/messages.md`）。
         assert_eq!(
-            search_summary_text(0, 148),
+            search_summary_text(0, 148, 0),
             "0 of 148 recordings mention it"
         );
         // 名詞の単複は揃える（`library_summary` が `1 recording` と分けているのと同じ）。
-        assert_eq!(search_summary_text(1, 1), "1 of 1 recording mentions it");
-        assert_eq!(search_summary_text(0, 1), "0 of 1 recording mentions it");
+        assert_eq!(search_summary_text(1, 1, 0), "1 of 1 recording mentions it");
+        assert_eq!(search_summary_text(0, 1, 0), "0 of 1 recording mentions it");
+    }
+
+    /// **読めなかった録音があることを画面に出す**（#182）。黙って対象から外すと
+    /// 「検索に出てこない＝無い」と読める。
+    #[test]
+    fn the_search_says_how_many_it_could_not_read() {
+        assert_eq!(
+            search_summary_text(3, 11, 8),
+            "3 of 11 recordings mention it · 8 not downloaded"
+        );
+        // 全件が読めないときも同じ形（0 件でも理由が出る）。
+        assert_eq!(
+            search_summary_text(0, 11, 11),
+            "0 of 11 recordings mention it · 11 not downloaded"
+        );
+        // 1 件でも文が壊れない（`not downloaded` は形容詞句なので単複を分けない）。
+        assert_eq!(
+            search_summary_text(0, 1, 1),
+            "0 of 1 recording mentions it · 1 not downloaded"
+        );
+    }
+
+    /// 読めなかった録音の件数は、**いま一覧に在るものだけ**を数える（#182）。
+    ///
+    /// 検索結果は打鍵した時点のスナップショットなので、そのまま数えると「10 件中 11 件が
+    /// 未ダウンロード」という合計より多い数が出る。
+    #[test]
+    fn the_count_drops_recordings_that_are_gone() {
+        let session = |dir: &str| {
+            let mut session = recordings::RecordingSession::for_test(
+                chrono::NaiveDate::from_ymd_opt(2026, 8, 10)
+                    .expect("a real date")
+                    .and_hms_opt(14, 2, 0)
+                    .expect("a real time"),
+            );
+            session.dir = std::path::PathBuf::from(dir);
+            session
+        };
+        let all = vec![session("a"), session("b")];
+        let not_downloaded = [
+            std::path::PathBuf::from("a"),
+            std::path::PathBuf::from("b"),
+            // 絞り込んでいる間にゴミ箱へ移された。
+            std::path::PathBuf::from("c"),
+        ];
+
+        assert_eq!(not_downloaded_count(&not_downloaded, &all), 2);
+        assert_eq!(not_downloaded_count(&[], &all), 0);
+        assert_eq!(not_downloaded_count(&not_downloaded, &[]), 0);
+    }
+
+    /// 当たった録音は「読めなかった」に数えない（#182）。**当たった事実は、読めなかった
+    /// 本文が残っていても変わらない**——数えると件数が一覧より多くなって意味を成さない。
+    #[test]
+    fn a_hit_outranks_what_could_not_be_read() {
+        use super::SearchOutcome as O;
+
+        assert_eq!(search_outcome(true, false), O::Matched);
+        assert_eq!(search_outcome(true, true), O::Matched);
+        assert_eq!(search_outcome(false, true), O::NotDownloaded);
+        assert_eq!(search_outcome(false, false), O::Missed);
     }
 
     /// 失敗の理由 → 文言を**全種別で固定する**。
