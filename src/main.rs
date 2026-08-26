@@ -1485,20 +1485,22 @@ fn build_menu_event_handler(
             let Some(rec) = recordings.ui.upgrade() else {
                 continue;
             };
-            // 結果は**打鍵した時点のスナップショット**なので、そのままでは古い。
-            let mut matched = result.matched;
-            // **読めなかった録音も控える**（#182。理由は `not_downloaded_count` の doc）。
+            // **読めなかった録音を控える**（#182。理由は `not_downloaded_count` の doc）。
+            // 控えてから数える——削除の経路も同じ値を見るので、控え忘れるとそちらだけ古くなる。
             *recordings.search_not_downloaded.borrow_mut() = result.not_downloaded_dirs;
-            let (total, not_downloaded) = {
+            let counted = {
                 let all = recordings.all_sessions.borrow();
-                // 絞り込んでいる間に消えた録音は落とす（削除は世代を進めるので通常は届かないが、
-                // 取りこぼしたときに消したはずの行を戻さない）。
-                matched.retain(|session| all.iter().any(|other| other.dir == session.dir));
-                (
-                    all.len(),
-                    not_downloaded_count(&recordings.search_not_downloaded.borrow(), &all),
+                count_search_result(
+                    result.matched,
+                    &recordings.search_not_downloaded.borrow(),
+                    &all,
                 )
             };
+            let CountedSearch {
+                mut matched,
+                total,
+                not_downloaded,
+            } = counted;
             // 文字起こし・議事録の有無は**ワーカーの状態から埋め直す**。全件側から写すと、
             // それを埋めるのがこの tick の末尾なので 1 周ぶん古くなり、直後に組む行
             // （`session_rows` は現在の状態を見る）と食い違う。食い違うと行の差分が
@@ -2470,6 +2472,40 @@ fn apply_list_counts(rec: &LibraryWindow, shown: usize, total: usize, not_downlo
     } else {
         library_text::search_summary_text(shown, total, not_downloaded).into()
     });
+}
+
+/// 届いた検索結果を、いまの一覧に合わせて数え直す（#182）。
+///
+/// **繋ぎを純関数にしてある**——ここが「読めなかった件数」を落としても、部品はどれも単体で
+/// 緑のまま通ってしまう（`docs/rules/testing.md` の「テストが見ている入口と、本番が通る入口を
+/// ずらさない」）。この 1 式が機能そのもの: 潰すと、退避されて検索できなかったことは画面から
+/// 完全に消える。
+///
+/// 結果は**打鍵した時点のスナップショット**なので、そのままでは古い。
+fn count_search_result(
+    mut matched: Vec<recordings::RecordingSession>,
+    not_downloaded_dirs: &[std::path::PathBuf],
+    all: &[recordings::RecordingSession],
+) -> CountedSearch {
+    // 絞り込んでいる間に消えた録音は落とす（削除は世代を進めるので通常は届かないが、
+    // 取りこぼしたときに消したはずの行を戻さない）。
+    matched.retain(|session| all.iter().any(|other| other.dir == session.dir));
+    CountedSearch {
+        matched,
+        total: all.len(),
+        not_downloaded: not_downloaded_count(not_downloaded_dirs, all),
+    }
+}
+
+/// 数え直した検索結果（#182）。**3 つを 1 つの値で返す**——別々に返すと、呼び出し側で
+/// 取り違えても通る形（`usize` が 2 つ並ぶ）が残る。
+struct CountedSearch {
+    /// いまも一覧に在る、当たった録音。
+    matched: Vec<recordings::RecordingSession>,
+    /// 一覧の全件。
+    total: usize,
+    /// 実体が無くて検索できなかった件数。
+    not_downloaded: usize,
 }
 
 /// いま一覧に在るもののうち、**実体が無くて検索できなかった件数**（#182）。
@@ -4446,10 +4482,13 @@ mod tests {
         );
     }
 
-    /// 読めなかった録音の件数は、**いま一覧に在るものだけ**を数える（#182）。
+    /// 届いた検索結果が、**いまの一覧に合わせて数え直される**こと（#182）。
     ///
     /// 検索結果は打鍵した時点のスナップショットなので、そのまま数えると「10 件中 11 件が
-    /// 未ダウンロード」という合計より多い数が出る。
+    /// 未ダウンロード」という合計より多い数が出る。**この 1 式が機能そのもの**——潰すと、
+    /// 退避されて検索できなかったことは画面から完全に消えるのに、部品はどれも単体で緑の
+    /// まま通る（`docs/rules/testing.md` の「テストが見ている入口と、本番が通る入口を
+    /// ずらさない」）。
     #[test]
     fn the_count_drops_recordings_that_are_gone() {
         let session = |dir: &str| {
@@ -4473,6 +4512,24 @@ mod tests {
         assert_eq!(not_downloaded_count(&not_downloaded, &all), 2);
         assert_eq!(not_downloaded_count(&[], &all), 0);
         assert_eq!(not_downloaded_count(&not_downloaded, &[]), 0);
+
+        // **画面へ渡る 3 つが同じ一覧から出る**こと。当たった録音のうち消えたものも落ちる。
+        let counted =
+            super::count_search_result(vec![session("a"), session("gone")], &not_downloaded, &all);
+        assert_eq!(
+            counted
+                .matched
+                .iter()
+                .map(|session| session.dir.clone())
+                .collect::<Vec<_>>(),
+            [std::path::PathBuf::from("a")],
+            "a recording that has been deleted must not come back"
+        );
+        assert_eq!(counted.total, 2);
+        assert_eq!(
+            counted.not_downloaded, 2,
+            "what the search could not read must reach the window"
+        );
     }
 
     /// 読めなかった本文があることが、**読んだ結果から結果へ運ばれる**こと（#182）。
