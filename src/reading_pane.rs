@@ -630,8 +630,9 @@ pub fn elapsed_text(elapsed: Duration) -> String {
 }
 
 /// 数と単位を英語として揃える（`1 minute` / `3 minutes`）。**そのまま画面に出る**文なので、
-/// 単複が崩れると読みにくい（`docs/rules/messages.md`）。
-fn plural(count: u64, unit: &str) -> String {
+/// 単複が崩れると読みにくい（`docs/rules/messages.md`）。ログにも出る（#178 の
+/// `recordings::list_sessions`）——同じ揃え方の実装を 2 つ持たない。
+pub fn plural(count: u64, unit: &str) -> String {
     if count == 1 {
         format!("1 {unit}")
     } else {

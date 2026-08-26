@@ -9,6 +9,7 @@
 mod app_audio_monitor;
 mod atomic_replace;
 mod config;
+mod dataless;
 mod inference_slot;
 mod mixdown;
 mod model_download;
