@@ -295,11 +295,18 @@ fn measured_from_read_error(kind: std::io::ErrorKind) -> Measured {
 
 /// 先頭 4 バイトのフレームヘッダと全体のサイズから長さを決める。
 ///
+/// **中身を読むので証（`NoDownloads`）を要求する**。ここだけ要求しないでおくと、`File::open` を
+/// 手で書いて繋ぐことで囲いの外から読めてしまう（`measure_duration` と同じ理由）。
+///
 /// **読み取りを引数で受ける**のは、退避されたファイルをテストから作れないため（クラウドの管理下に
 /// 置くしかない）。`docs/rules/testing.md` の「重い処理そのものを引数で受ける」に従って、
 /// 「読み取りが `EDEADLK` で失敗したら `NotDownloaded` になる」という**繋ぎ**をここで固定できる
 /// ようにしてある。**この理由の正はここ**（`scan_sessions` が測り方を受けるのも同じ理由）。
-fn measure_from_header(mut reader: impl std::io::Read, bytes: u64) -> Measured {
+fn measure_from_header(
+    mut reader: impl std::io::Read,
+    bytes: u64,
+    _downloads_off: &crate::dataless::NoDownloads,
+) -> Measured {
     let mut header = [0u8; 4];
     if let Err(err) = reader.read_exact(&mut header) {
         let measured = measured_from_read_error(err.kind());
@@ -328,7 +335,7 @@ fn measure_from_header(mut reader: impl std::io::Read, bytes: u64) -> Measured {
 ///
 /// **証（`NoDownloads`）を要求する**のは、取り寄せを止めた中でしか読ませないため（#178）。
 /// 囲いの外から呼ぶ書き方はコンパイルを通らない（理由は `dataless::NoDownloads` の doc）。
-fn measure_duration(path: &Path, _downloads_off: &crate::dataless::NoDownloads) -> Measured {
+fn measure_duration(path: &Path, downloads_off: &crate::dataless::NoDownloads) -> Measured {
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
         Err(err) => {
@@ -358,7 +365,7 @@ fn measure_duration(path: &Path, _downloads_off: &crate::dataless::NoDownloads) 
         eprintln!("Skipping the length of a recording because its audio is not a regular file");
         return Measured::Unknown;
     }
-    measure_from_header(file, metadata.len())
+    measure_from_header(file, metadata.len(), downloads_off)
 }
 
 /// `recording_dir` を走査して録音セッションを新しい順（日時降順）で返す。
@@ -713,24 +720,34 @@ mod tests {
             }
         }
 
-        let measured = measure_from_header(AlwaysFails(std::io::ErrorKind::Deadlock), 1_000_000);
-        assert!(
-            matches!(measured, Measured::NotDownloaded),
-            "a read the OS refuses to serve means the audio is not here, got {measured:?}"
-        );
+        crate::dataless::without_downloads(|downloads_off| {
+            let measured = measure_from_header(
+                AlwaysFails(std::io::ErrorKind::Deadlock),
+                1_000_000,
+                downloads_off,
+            );
+            assert!(
+                matches!(measured, Measured::NotDownloaded),
+                "a read the OS refuses to serve means the audio is not here, got {measured:?}"
+            );
 
-        let measured = measure_from_header(AlwaysFails(std::io::ErrorKind::InvalidData), 1_000_000);
-        assert!(
-            matches!(measured, Measured::Unknown),
-            "any other read failure is just a length we cannot work out, got {measured:?}"
-        );
+            let measured = measure_from_header(
+                AlwaysFails(std::io::ErrorKind::InvalidData),
+                1_000_000,
+                downloads_off,
+            );
+            assert!(
+                matches!(measured, Measured::Unknown),
+                "any other read failure is just a length we cannot work out, got {measured:?}"
+            );
 
-        // 読めれば、ヘッダとサイズから長さになる（128kbps = 16000 バイト/秒）。
-        let header: &[u8] = &[0xFF, 0xFB, 0x90, 0x00];
-        assert!(matches!(
-            measure_from_header(header, 16_000 * 42),
-            Measured::Length(length) if length == Duration::from_secs(42)
-        ));
+            // 読めれば、ヘッダとサイズから長さになる（128kbps = 16000 バイト/秒）。
+            let header: &[u8] = &[0xFF, 0xFB, 0x90, 0x00];
+            assert!(matches!(
+                measure_from_header(header, 16_000 * 42, downloads_off),
+                Measured::Length(length) if length == Duration::from_secs(42)
+            ));
+        });
     }
 
     /// 取り寄せられなかった音源は、**長さを入れずに数えるだけ**（#178）。ここが緩むと、実体が
