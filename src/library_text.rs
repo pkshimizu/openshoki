@@ -65,4 +65,3 @@ pub fn empty_list_message(searching: bool, not_downloaded: usize) -> (&'static s
     }
     ("No matches", body)
 }
-

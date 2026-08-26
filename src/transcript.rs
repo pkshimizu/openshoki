@@ -385,9 +385,9 @@ fn read_transcript_file(path: &Path, fetch: Fetch) -> Result<TranscriptFile, Rea
 
 /// 読み取りに失敗したときに、何を読めたことにするか（#182）。
 ///
-/// **ログを出すかは読み取り側**（文言が経路ごとに違う。出すかどうかの判断は
-/// `ReadFailure::should_report` が持つ）。ここを通さずに直接組み立てると、実体が無いだけの
-/// ファイルが「読めなかった」に化けて、検索から静かに消える。
+/// ここを通さずに直接組み立てると、実体が無いだけのファイルが「読めなかった」に化けて、
+/// 検索から静かに消える（議事録側の対は `summarize::Summary::from_failure`。判断の正は
+/// `dataless::ReadFailure`）。
 fn read_outcome_from(failure: ReadFailure) -> ReadOutcome {
     match failure {
         // どちらも「本文は無い」側（未生成・破損・権限）。

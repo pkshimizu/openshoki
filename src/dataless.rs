@@ -64,16 +64,17 @@ pub struct NoDownloads(std::marker::PhantomData<*const ()>);
 /// `Blocked` は証を要求するので、**囲いの外からは選べない**。
 #[derive(Clone, Copy)]
 pub enum Fetch<'a> {
-    /// ユーザーが頼んだ操作（再生・文字起こし・録音を選ぶ）。退避されていれば取り寄せる。
+    /// **ユーザーが明示的に頼んだ読み取り**（＝下の `Blocked` 以外すべて）。退避されていれば
+    /// 取り寄せる。経路を数え上げないのは、増えたときに古くなるのがこの手の列挙だから。
     Allowed,
-    /// 頼まれていない読み取り（一覧の走査・検索）。退避されたものは読まずに諦める。
+    /// **頼まれていない読み取り**。退避されたものは読まずに諦める。いまは検索
+    /// （`search_sessions`）だけ——一覧の走査（`recordings::scan_sessions`）は同じ判断だが、
+    /// `Fetch` を通さず証を直接受ける（`Measured` の doc）。
     ///
     /// **証は値としては使わない**。効くのは型で、`'a` が証の借用に縛られること自体が
     /// 「囲いの中にいる」を意味する（証は `without_downloads` の中でしか作れず、`!Send`
     /// なので子スレッドへも持ち込めない）。
     Blocked(
-        // 値としては使わない（効くのは型。上の doc）。日本語は `docs/rules/messages.md` の
-        // 混入チェックに掛かるので、理由は doc に置いて reason は英語で書く。
         #[expect(dead_code, reason = "the proof is a type-level witness, never read")]
         &'a NoDownloads,
     ),

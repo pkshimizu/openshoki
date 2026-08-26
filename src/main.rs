@@ -10,8 +10,8 @@ mod app_audio_monitor;
 mod atomic_replace;
 mod config;
 mod dataless;
-mod library_text;
 mod inference_slot;
+mod library_text;
 mod mixdown;
 mod model_download;
 mod player;
@@ -333,8 +333,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let load_generation = Rc::new(Cell::new(0u64));
     // 検索の世代（#161）。閉じるときにも降ろすので、閉じるハンドラより前に用意する。
     let search_generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
-    // **最後の検索で本文を読めなかった録音**（#182）。件数ではなく録音そのものを持つ——
-    // 削除・解除の経路も同じ値を見て数え直せるようにするため（`not_downloaded_count`）。
+    // **最後の検索で本文を読めなかった録音**（#182。理由は `not_downloaded_count` の doc）。
     let search_not_downloaded: Rc<RefCell<Vec<std::path::PathBuf>>> =
         Rc::new(RefCell::new(Vec::new()));
 
@@ -1484,8 +1483,7 @@ fn build_menu_event_handler(
             };
             // 結果は**打鍵した時点のスナップショット**なので、そのままでは古い。
             let mut matched = result.matched;
-            // **読めなかった録音も控える**（#182）。削除・解除の経路が同じ値から数え直せる
-            // ようにするため（件数だけ持つと、削除で合計より多い数が残る）。
+            // **読めなかった録音も控える**（#182。理由は `not_downloaded_count` の doc）。
             *recordings.search_not_downloaded.borrow_mut() = result.not_downloaded_dirs;
             let (total, not_downloaded) = {
                 let all = recordings.all_sessions.borrow();
@@ -1888,6 +1886,11 @@ fn spawn_session_load(
             // **重い処理の前に降りられるか見る**（軽い読み込みは先に済ませてしまう）。
             // **取り寄せてよい**（#182）——録音を選んだのはユーザーなので、退避されていれば
             // 落としてでも読む。頼まれていない読み取り（一覧の走査・検索）だけを止める。
+            //
+            // **打鍵のたびにここへ再入する**（絞り込み後も選択が残っていれば
+            // `reselect_after_list_change` が読み直しを起こす）。読むのは選んだ 1 件ぶんの
+            // JSON と `summary.md` だけで、2 回目以降は実体が落ちているので取り寄せは
+            // 走らない。全件を舐める検索とは桁が違うので、ここは止めない。
             let transcript = transcript::load_transcript(&dir, &speakers, dataless::Fetch::Allowed);
             let summary = summarize::load_summary(&dir, dataless::Fetch::Allowed).text;
             let summary_written = summary.is_some().then(|| {
@@ -2226,7 +2229,7 @@ struct SearchResult {
     /// 削除されることがあるので、合計は受け取った側が `all_sessions` から数える。
     matched: Vec<recordings::RecordingSession>,
     /// 実体が無くて本文を読めなかった録音（#182）。**ここも件数ではなく録音そのもの**——
-    /// 同じ理由で、受け取った側が削除ぶんを落としてから数える（`not_downloaded_count`）。
+    /// 理由は `not_downloaded_count` の doc（正はそこ）。
     not_downloaded_dirs: Vec<std::path::PathBuf>,
 }
 
@@ -2333,7 +2336,7 @@ fn search_sessions(
 /// **繋ぎを純関数にしてある**——`SearchOutcome` から結果への振り分けは、退避されたファイルを
 /// 用意できない環境でも検査できる唯一の場所（`docs/rules/testing.md` の「テストが見ている
 /// 入口と、本番が通る入口をずらさない」）。ここが `NotDownloaded` を捨てると、読めなかった
-/// ことが画面に出なくなる。
+/// ことが画面に出なくなる。件数ではなく録音そのものを運ぶ理由は `not_downloaded_count`。
 fn collect_findings(
     generation: u64,
     judged: Vec<(recordings::RecordingSession, SearchOutcome)>,
@@ -2449,7 +2452,8 @@ fn apply_list_counts(rec: &LibraryWindow, shown: usize, total: usize, not_downlo
     rec.set_library_summary(library_text::library_summary(total).into());
     // 空表示の文も**同じ値から**決める（#182）。件数の文とは別に組み立てると、片方だけ
     // 「読めなかった」を言う画面ができる。
-    let (heading, body) = library_text::empty_list_message(!rec.get_search_text().is_empty(), not_downloaded);
+    let (heading, body) =
+        library_text::empty_list_message(!rec.get_search_text().is_empty(), not_downloaded);
     rec.set_empty_heading(heading.into());
     rec.set_empty_body(body.into());
     // 絞り込んでいないなら件数の文は出さない（`library_summary` が出る）。**このとき
@@ -3581,11 +3585,11 @@ mod tests {
     use super::{
         PaneAction, PaneActionKind, StatusTone, SummaryPane, SummaryStatus, TranscriptPane,
         TranscriptStatus, actions_allowed_while_busy, app_version_text, breathing_level,
-        came_off_the_worker, jobs_pending, model_downloads_on_select,
-        model_status_line, not_downloaded_count, outcome_of, playback_progress,
-        seek_position_from_ratio, summary_display_status,
-        summary_model_status_line, summary_pane_of, summary_rows, summary_status_text,
-        transcript_display_status, transcript_pane_of, whisper_model_status_line,
+        came_off_the_worker, jobs_pending, model_downloads_on_select, model_status_line,
+        not_downloaded_count, outcome_of, playback_progress, seek_position_from_ratio,
+        summary_display_status, summary_model_status_line, summary_pane_of, summary_rows,
+        summary_status_text, transcript_display_status, transcript_pane_of,
+        whisper_model_status_line,
     };
     use super::{elapsed_text, recordings, summarize, transcribe};
     use chrono::{Datelike as _, Timelike as _};
@@ -4268,8 +4272,14 @@ mod tests {
             "0 of 148 recordings mention it"
         );
         // 名詞の単複は揃える（`library_summary` が `1 recording` と分けているのと同じ）。
-        assert_eq!(super::library_text::search_summary_text(1, 1, 0), "1 of 1 recording mentions it");
-        assert_eq!(super::library_text::search_summary_text(0, 1, 0), "0 of 1 recording mentions it");
+        assert_eq!(
+            super::library_text::search_summary_text(1, 1, 0),
+            "1 of 1 recording mentions it"
+        );
+        assert_eq!(
+            super::library_text::search_summary_text(0, 1, 0),
+            "0 of 1 recording mentions it"
+        );
     }
 
     /// **読めなかった録音があることを画面に出す**（#182）。黙って対象から外すと
