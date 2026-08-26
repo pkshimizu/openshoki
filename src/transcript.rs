@@ -301,18 +301,11 @@ fn read_guarded(path: &Path, fetch: Fetch) -> Guarded {
         Ok(file) => file,
         // **開くときも読むときも同じ見分けを通す**（#182。`Fetch::classify` の doc）。
         Err(err) => {
-            return match fetch.classify(err.kind()) {
-                // 未生成・実体なしは静かな縮退（理由は `ReadFailure`）。
-                ReadFailure::NotCreated => Guarded::Absent,
-                ReadFailure::NotDownloaded => Guarded::NotDownloaded,
-                // 権限・I/O エラーなどは異常なので、調査の手掛かりを残す。
-                ReadFailure::Failed => {
-                    eprintln!(
-                        "Skipping the transcript {name} because it could not be opened: {err}"
-                    );
-                    Guarded::Absent
-                }
-            };
+            let failure = fetch.classify(err.kind());
+            if failure.should_report() {
+                eprintln!("Skipping the transcript {name} because it could not be opened: {err}");
+            }
+            return guarded_from(failure);
         }
     };
     // 信頼境界外の入力（手で置換されうる）なので、開いたハンドルの fstat で通常ファイルであることを
@@ -328,13 +321,11 @@ fn read_guarded(path: &Path, fetch: Fetch) -> Guarded {
     let mut text = String::new();
     if let Err(err) = limited.read_to_string(&mut text) {
         // 実測では、退避されたファイルは `open` が通ってここで返る（#178）。
-        return match fetch.classify(err.kind()) {
-            ReadFailure::NotDownloaded => Guarded::NotDownloaded,
-            ReadFailure::NotCreated | ReadFailure::Failed => {
-                eprintln!("Skipping the transcript {name} because it could not be read: {err}");
-                Guarded::Absent
-            }
-        };
+        let failure = fetch.classify(err.kind());
+        if failure.should_report() {
+            eprintln!("Skipping the transcript {name} because it could not be read: {err}");
+        }
+        return guarded_from(failure);
     }
     // 上限＋1 バイトまで読み切った（limit が尽きた）なら上限超過。
     if limited.limit() == 0 {
@@ -355,6 +346,20 @@ fn read_guarded(path: &Path, fetch: Fetch) -> Guarded {
         }
     };
     Guarded::Read(parsed)
+}
+
+/// 読み取りに失敗したときに、何を読めたことにするか（#182）。
+///
+/// **ログを出すかは呼び出し側**（文言が開くときと読むときで違う。出すかどうかの判断は
+/// `ReadFailure::should_report` が持つ）。ここを通さずに直接組み立てると、実体が無いだけの
+/// ファイルが「読めなかった」に化けて、検索から静かに消える。
+fn guarded_from(failure: ReadFailure) -> Guarded {
+    match failure {
+        // 待っても直らない（未生成・破損・権限）。
+        ReadFailure::NotCreated | ReadFailure::Failed => Guarded::Absent,
+        // 取り寄せれば読める。
+        ReadFailure::NotDownloaded => Guarded::NotDownloaded,
+    }
 }
 
 /// 1 つの JSON を読もうとした結果（#182）。**「無い・読めない」と「実体がここに無い」を
@@ -384,6 +389,28 @@ mod tests {
 
     fn unique_dir(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("shoki-transcript-{tag}-{}", std::process::id()))
+    }
+
+    /// 実体が無いだけのファイルを「読めなかった」に丸めないこと（#182）。
+    ///
+    /// 退避されたファイルは CI でも手元でも作れないので、`Deadlock` からここまでの繋ぎは
+    /// 実測でしか確かめられない。**分類から結果への対応は繋いで検査できる**——ここが
+    /// 丸まると、検索は退避された録音を黙って対象から外し、画面には理由も出ない。
+    #[test]
+    fn a_body_that_is_only_elsewhere_is_not_lost() {
+        use super::{Guarded, guarded_from};
+        use crate::dataless::ReadFailure;
+
+        assert!(matches!(
+            guarded_from(ReadFailure::NotDownloaded),
+            Guarded::NotDownloaded
+        ));
+        // 待っても直らないものは、どちらも「無い」側。
+        assert!(matches!(
+            guarded_from(ReadFailure::NotCreated),
+            Guarded::Absent
+        ));
+        assert!(matches!(guarded_from(ReadFailure::Failed), Guarded::Absent));
     }
 
     /// **音源を 1 つも渡さなければ「揃っている」とは言わない**（#175）。`all()` の空真に頼ると、

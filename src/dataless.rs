@@ -106,6 +106,18 @@ pub enum ReadFailure {
     Failed,
 }
 
+impl ReadFailure {
+    /// この失敗をログに残すか（#182）。**残すのは待っても直らないものだけ**——未生成は
+    /// 正常な縮退で、実体が無いのは退避された保存先では全件が該当する（打鍵のたびに
+    /// ログが埋まる）。
+    pub fn should_report(self) -> bool {
+        match self {
+            Self::NotCreated | Self::NotDownloaded => false,
+            Self::Failed => true,
+        }
+    }
+}
+
 /// 読み取りの失敗が「実体がこの Mac に無いから」か（#178 で見分け方を確かめ、#182 で
 /// 共有した）。**この見分け方の正はここ**（他は参照だけを置く）。
 ///

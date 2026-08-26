@@ -534,11 +534,20 @@ impl Summary {
         }
     }
 
-    /// 実体がこの Mac に無い。
-    fn not_downloaded() -> Self {
-        Self {
-            text: None,
-            not_downloaded: true,
+    /// 読み取りに失敗したときに、何を読めたことにするか（#182）。
+    ///
+    /// **ログを出すかは呼び出し側**（文言が開くときと読むときで違う。出すかどうかの判断は
+    /// `ReadFailure::should_report` が持つ）。ここを通さずに直接組み立てると、実体が無い
+    /// だけのファイルが「読めなかった」に化けて、検索から静かに消える。
+    fn from_failure(failure: ReadFailure) -> Self {
+        match failure {
+            // 待っても直らない（未生成・破損・権限）。
+            ReadFailure::NotCreated | ReadFailure::Failed => Self::nothing(),
+            // 取り寄せれば読める。
+            ReadFailure::NotDownloaded => Self {
+                text: None,
+                not_downloaded: true,
+            },
         }
     }
 }
@@ -565,17 +574,13 @@ fn load_summary_limited(
         Ok(file) => file,
         // **開くときも読むときも同じ見分けを通す**（#182。`Fetch::classify` の doc）。
         Err(err) => {
-            return match fetch.classify(err.kind()) {
-                // 未生成・実体なしは静かな縮退（理由は `dataless::ReadFailure`）。
-                ReadFailure::NotCreated => Summary::nothing(),
-                ReadFailure::NotDownloaded => Summary::not_downloaded(),
-                ReadFailure::Failed => {
-                    eprintln!(
-                        "Skipping the summary of {session} because {SUMMARY_FILENAME} could not be opened: {err}"
-                    );
-                    Summary::nothing()
-                }
-            };
+            let failure = fetch.classify(err.kind());
+            if failure.should_report() {
+                eprintln!(
+                    "Skipping the summary of {session} because {SUMMARY_FILENAME} could not be opened: {err}"
+                );
+            }
+            return Summary::from_failure(failure);
         }
     };
     // 開いたハンドルの fstat で通常ファイルを確認し（FIFO 等は読み終わらないことがある）、
@@ -592,16 +597,14 @@ fn load_summary_limited(
     let mut text = String::new();
     if let Err(err) = limited.read_to_string(&mut text) {
         // 実測では、退避されたファイルは `open` が通ってここで返る（#178）。
-        return match fetch.classify(err.kind()) {
-            ReadFailure::NotDownloaded => Summary::not_downloaded(),
+        let failure = fetch.classify(err.kind());
+        if failure.should_report() {
             // UTF-8 でない（破損・別物への置換）場合もここに来る。
-            ReadFailure::NotCreated | ReadFailure::Failed => {
-                eprintln!(
-                    "Skipping the summary of {session} because {SUMMARY_FILENAME} could not be read: {err}"
-                );
-                Summary::nothing()
-            }
-        };
+            eprintln!(
+                "Skipping the summary of {session} because {SUMMARY_FILENAME} could not be read: {err}"
+            );
+        }
+        return Summary::from_failure(failure);
     }
     // 上限＋1 バイトまで読み切った（limit が尽きた）なら上限超過。
     if limited.limit() == 0 {
@@ -1397,6 +1400,25 @@ mod tests {
         let en_notes = minutes_user_prompt("en", MinutesSource::Notes, "- note");
         assert!(en_notes.contains("notes taken from consecutive parts"));
         assert!(en_notes.contains("- note"));
+    }
+
+    /// 実体が無いだけの議事録を「読めなかった」に丸めないこと（#182）。理由と、なぜ
+    /// 分類から先しか検査できないかは `transcript` 側の
+    /// `a_body_that_is_only_elsewhere_is_not_lost` と同じ。
+    #[test]
+    fn a_summary_that_is_only_elsewhere_is_not_lost() {
+        use crate::dataless::ReadFailure;
+
+        let not_downloaded = Summary::from_failure(ReadFailure::NotDownloaded);
+        assert!(not_downloaded.not_downloaded);
+        assert!(not_downloaded.text.is_none());
+
+        // 待っても直らないものは、どちらも「無い」側（読めなかったとは数えない）。
+        for failure in [ReadFailure::NotCreated, ReadFailure::Failed] {
+            let nothing = Summary::from_failure(failure);
+            assert!(!nothing.not_downloaded);
+            assert!(nothing.text.is_none());
+        }
     }
 
     #[test]
