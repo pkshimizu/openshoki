@@ -30,8 +30,8 @@ mod whisper_model;
 mod windows;
 
 use reading_pane::{
-    SummaryPane, TranscriptInput, TranscriptPane, actions_allowed_while_busy, elapsed_text,
-    session_transcript_word, summary_status_text,
+    StoredTranscript, SummaryPane, TranscriptInput, TranscriptPane, actions_allowed_while_busy,
+    elapsed_text, session_transcript_word, summary_status_text,
 };
 
 use std::cell::{Cell, RefCell};
@@ -414,6 +414,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             rec.set_detail_sources(session.source_summary().into());
             rec.set_has_transcript(session.has_transcript);
+            // **前の録音の印を持ち越さない**（#175）。`refresh_detail_panes` は `session` と
+            // 対になる読み込み結果を要求するので、状態を組む前に戻す——さもないと、前の録音が
+            // 「最後まで読めていない」だったとき、新しく選んだ完成品が一瞬伏せられる。
+            *transcript_segments.borrow_mut() = LoadedTranscript::unknown();
             // 文字起こしの状態テキストと Transcribe ボタンの活性を、ワーカーの進行状況＋
             // JSON の有無から設定する（以後の変化は tick が追従させる）。
             // 議事録側も同じ流儀で状態を設定する（中身の読み込みは下のスレッドで行う）。
@@ -434,7 +438,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             rec.set_segments(Rc::new(slint::VecModel::default()).into());
             rec.set_summary_rows(Rc::new(slint::VecModel::default()).into());
             rec.set_loading(true);
-            *transcript_segments.borrow_mut() = LoadedTranscript::unknown();
             // **読み込みが終わるまでは再生できない**（音源をまだ開いていない）。押しても無反応、
             // にしないため、ここでは押せない状態にしておく——鳴らせるかどうかは開いてみて
             // 初めて分かるので、`apply_loaded_session` が実際の結果で入れ直す。
@@ -1968,20 +1971,35 @@ fn reset_search(rec: &LibraryWindow, generation: &Cell<u64>) {
     rec.set_search_summary(slint::SharedString::new());
 }
 
-/// 選んだ録音の**重い読み込みの結果**（別スレッドで作り、UI スレッドへ渡す）。
-///
-/// Slint の型を持たせないのは、生成をイベントループの外で行うため。UI へ入れる形への変換は
-/// `apply_loaded_session` が行う。
-/// いま表示している文字起こしと、それがどの読み込みの結果か（#175）。
+/// いま表示している文字起こし（#175）。**セグメントと「最後まで読み切れているか」を 1 つの器に
+/// 入れる**——別々に持つと、片方だけ古い組み合わせが画面に出る。
 ///
 /// **読み込みを始めた時点で `unknown()` へ戻す**（`spawn_session_load`）。中身が変わって読み
 /// 直している間に「最後まで読めていない」と決めつけると、たったいま完成した一覧を伏せてしまう
 /// （読み直しの結果は 1 tick 以上遅れて届く）。分からない間は伏せない側へ倒す。
+///
+/// **この器自身は「分からない」と「本当に読み切れている」を区別しない**。区別しているのは
+/// 「読み込みを始めたら戻す」という 1 つの規律だけ。
 struct LoadedTranscript {
     transcript: transcript::Transcript,
 }
 
 impl LoadedTranscript {
+    /// ディスクに残っている文字起こしの様子（#175）。**極性の反転と組み合わせを型の内側へ入れる**
+    /// ——呼び出し側に真偽値 2 つを書かせると、渡し違えても通る形が残る。
+    fn stored(&self, has_transcript: bool) -> StoredTranscript {
+        if !has_transcript {
+            return StoredTranscript::None;
+        }
+        // **読める行が無いなら「途中で終わっている」とは言わない**。押しても何も現れない
+        // `Show partial` を出すことになる——読めなかった JSON は `Done` の空表示
+        // （「The transcript file is missing or could not be read」）が担当する。
+        if self.transcript.complete || self.transcript.segments.is_empty() {
+            return StoredTranscript::Complete;
+        }
+        StoredTranscript::NotReadToTheEnd
+    }
+
     /// まだ読めていない状態。**「最後まで読めた」側から始める**（伏せるのは驚く動作なので、
     /// 確信が無いうちはやらない）。
     fn unknown() -> Self {
@@ -1994,6 +2012,10 @@ impl LoadedTranscript {
     }
 }
 
+/// 選んだ録音の**重い読み込みの結果**（別スレッドで作り、UI スレッドへ渡す）。
+///
+/// Slint の型を持たせないのは、生成をイベントループの外で行うため。UI へ入れる形への変換は
+/// `apply_loaded_session` が行う。
 struct LoadedSession {
     /// どの選択に対する結果か。**受け取る側が世代を確かめて、古い結果を捨てる**。
     generation: u64,
@@ -2046,8 +2068,8 @@ fn apply_loaded_session(
     if matches!(playback, PlaybackLoad::Replace(_)) {
         rec.set_current_segment(-1);
     }
-    // **セグメントと「揃っているか」を同じ器に入れる**（#175）。別々に持つと、畳む場所が割れて
-    // 片方だけ古い組み合わせが画面に出る。世代も一緒に控えて、読み直しの最中かを見分ける。
+    // **セグメントと「最後まで読み切れているか」を同じ器に入れる**（#175。理由は
+    // `LoadedTranscript` の doc）。
     *segments_cell.borrow_mut() = LoadedTranscript { transcript };
     let summary_rows = summary.map(|text| summary_rows(&text)).unwrap_or_default();
     rec.set_summary_rows(Rc::new(slint::VecModel::from(summary_rows)).into());
@@ -2876,33 +2898,6 @@ fn transcript_pane(
     transcript_pane_of(transcriber.state_of(&session.dir), stored, auto_on)
 }
 
-/// ディスクに残っている文字起こしの様子（#175）。**真偽値を並べない**——`has_transcript` と
-/// 「最後まで読めたか」を別々に渡すと、渡し違えてもコンパイルが通る
-/// （`docs/rules/coding-conventions.md`）。
-///
-/// 読み直しの最中は**分からない**ので `Complete` に倒す。伏せるのは驚く動作なので、確信が無い
-/// うちはやらない（`LoadedTranscript::is_incomplete`）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StoredTranscript {
-    /// 文字起こしが無い。
-    None,
-    /// 在って、音源を最後まで読めている（または読み直しの最中で分からない）。
-    Complete,
-    /// 在るが、音源を最後まで読めていない。
-    NotReadToTheEnd,
-}
-
-impl StoredTranscript {
-    /// 一覧の情報（在るか）と、読み込んだ中身（最後まで読めたか）から決める。
-    fn of(has_transcript: bool, is_incomplete: bool) -> Self {
-        match (has_transcript, is_incomplete) {
-            (false, _) => Self::None,
-            (true, true) => Self::NotReadToTheEnd,
-            (true, false) => Self::Complete,
-        }
-    }
-}
-
 /// どの状態に落とすかを決める純関数（`transcript_pane` はワーカーから値を取ってくるだけ）。
 /// **ここを割ってあるのは、優先順位をテストで固定するため**（ワーカーを立てずに検査できる）。
 fn transcript_pane_of(
@@ -2950,7 +2945,8 @@ fn refresh_detail_panes(
     summarizer: &summarize::SummarizeWorker,
     session: &recordings::RecordingSession,
     // 表示中の文字起こし。**最後まで読めたかはここからしか分からない**（#175。一覧の情報は
-    // 「在るか」までしか言えない）。
+    // 「在るか」までしか言えない）。**`session` を読み込んだ結果でなければならない**——別の
+    // 録音の結果を渡すと、完成品を伏せる・欠けたものを完成品として出す、のどちらかが起きる。
     loaded: &RefCell<LoadedTranscript>,
     config: &RefCell<Config>,
 ) {
@@ -2958,9 +2954,9 @@ fn refresh_detail_panes(
         let config = config.borrow();
         (config.auto_transcribe, config.auto_summarize)
     };
-    let stored = StoredTranscript::of(session.has_transcript, !loaded.borrow().transcript.complete);
+    let stored = loaded.borrow().stored(session.has_transcript);
     let transcript = transcript_pane(transcriber, session, stored, auto_transcribe);
-    let summary = summary_pane(summarizer, session, &transcript, auto_summarize);
+    let summary = summary_pane(summarizer, session, &transcript, stored, auto_summarize);
     // **両方を見てからボタンを決める**。走っているジョブは片方の状態にしか出ないので、
     // タブごとに判断すると、もう一方で走っているジョブを見落としたボタンが出る。
     let jobs_pending = jobs_pending(&transcript, &summary);
@@ -3074,12 +3070,13 @@ fn summary_pane(
     summarizer: &summarize::SummarizeWorker,
     session: &recordings::RecordingSession,
     transcript: &TranscriptPane,
+    stored: StoredTranscript,
     auto_on: bool,
 ) -> SummaryPane {
     summary_pane_of(
         summarizer.state_of(&session.dir),
         session.has_summary,
-        TranscriptInput::of(transcript, session.has_transcript),
+        TranscriptInput::of(transcript, stored),
         auto_on,
     )
 }
@@ -3415,17 +3412,18 @@ pub(crate) fn init_test_backend() {
 
 #[cfg(test)]
 mod tests {
+    use super::reading_pane::StoredTranscript;
     use super::reading_pane::{
         FailedSource, SummarizeFailure, TranscribeFailure, summarize_failure_text,
         transcribe_failure_text, transcript_status_text,
     };
     use super::{
-        PaneAction, PaneActionKind, StatusTone, StoredTranscript, SummaryPane, SummaryStatus,
-        TranscriptPane, TranscriptStatus, actions_allowed_while_busy, app_version_text,
-        breathing_level, came_off_the_worker, jobs_pending, model_downloads_on_select,
-        model_status_line, playback_progress, search_summary_text, seek_position_from_ratio,
-        session_matches, summary_display_status, summary_model_status_line, summary_pane_of,
-        summary_rows, summary_status_text, transcript_display_status, transcript_pane_of,
+        PaneAction, PaneActionKind, StatusTone, SummaryPane, SummaryStatus, TranscriptPane,
+        TranscriptStatus, actions_allowed_while_busy, app_version_text, breathing_level,
+        came_off_the_worker, jobs_pending, model_downloads_on_select, model_status_line,
+        playback_progress, search_summary_text, seek_position_from_ratio, session_matches,
+        summary_display_status, summary_model_status_line, summary_pane_of, summary_rows,
+        summary_status_text, transcript_display_status, transcript_pane_of,
         whisper_model_status_line,
     };
     use super::{elapsed_text, recordings, summarize, transcribe};
@@ -3480,6 +3478,11 @@ mod tests {
         // 走り終わった文字起こしも同じ（伏せる理由が無い）。
         super::apply_detail_transcript_status(&rec, &TranscriptPane::Done, false);
         assert!(!rec.get_detail_transcript_partial());
+
+        // **ディスクの印から立つ途中結果も伏せる**（#175）。ここが緩むと、再起動後に欠けた
+        // 文字起こしが完成品として読める。
+        super::apply_detail_transcript_status(&rec, &TranscriptPane::NotReadToTheEnd, false);
+        assert!(rec.get_detail_transcript_partial());
 
         // 走り始めたら、開いた途中結果は畳む（理由は `fold_partial_transcript` の doc）。
         super::apply_detail_transcript_status(&rec, &partial, false);
@@ -3771,6 +3774,7 @@ mod tests {
             TranscriptPane::Failed {
                 reason: TranscribeFailure::Panicked,
             },
+            TranscriptPane::NotReadToTheEnd,
         ];
         for pane in &panes {
             let message = pane.message();
@@ -3915,6 +3919,27 @@ mod tests {
                 ]
             );
         }
+        // 走り終わっているが揃っていない（#175）。**開く手を必ず添える**——伏せた一覧を出す口は
+        // これだけなので、落とすとセグメントが在るのに永久に読めなくなる。
+        let stops_partway = TranscriptPane::NotReadToTheEnd;
+        assert!(stops_partway.shows_partial());
+        assert_eq!(
+            stops_partway.message().heading,
+            "This transcript stops partway"
+        );
+        assert_eq!(
+            stops_partway
+                .message()
+                .actions
+                .iter()
+                .map(|action| (action.kind, action.primary))
+                .collect::<Vec<_>>(),
+            vec![
+                (PaneActionKind::Transcribe, true),
+                (PaneActionKind::ShowPartialTranscript, false),
+            ]
+        );
+
         // **なぜ止まったか分からない**ときは、分かったふりをしない。
         assert_eq!(
             TranscriptPane::Failed {
@@ -4193,20 +4218,43 @@ mod tests {
         }
     }
 
-    /// ディスクの様子は、**在るかと最後まで読めたかを 1 つの値に畳む**（#175）。真偽値を並べて
-    /// 渡すと、渡し違えてもコンパイルが通る。
+    /// ディスクの様子は、**在るかと読んだ中身を 1 つの値に畳む**（#175）。真偽値を並べて渡すと、
+    /// 渡し違えてもコンパイルが通る。
+    ///
+    /// **読める行が無いときは「途中で終わっている」と言わない**——押しても何も現れない
+    /// `Show partial` になる。そこは「読めなかった」の空表示（`TranscriptPane::Done`）が担当する。
     #[test]
     fn the_stored_transcript_folds_both_facts() {
-        assert_eq!(StoredTranscript::of(false, false), StoredTranscript::None);
-        // 文字起こしが無ければ、最後まで読めたかは意味を持たない。
-        assert_eq!(StoredTranscript::of(false, true), StoredTranscript::None);
+        use super::{LoadedTranscript, transcript};
+
+        let loaded =
+            |segments: Vec<transcript::TranscriptSegment>, complete: bool| LoadedTranscript {
+                transcript: transcript::Transcript { segments, complete },
+            };
+        let line = || {
+            vec![transcript::TranscriptSegment {
+                start_secs: 0.0,
+                text: "a".to_owned(),
+                speaker: transcript::Speaker::Mic,
+            }]
+        };
+
+        // 文字起こしが無ければ、中身は意味を持たない。
+        assert_eq!(loaded(vec![], true).stored(false), StoredTranscript::None);
+        assert_eq!(loaded(line(), false).stored(false), StoredTranscript::None);
+
         assert_eq!(
-            StoredTranscript::of(true, false),
+            loaded(line(), true).stored(true),
             StoredTranscript::Complete
         );
         assert_eq!(
-            StoredTranscript::of(true, true),
+            loaded(line(), false).stored(true),
             StoredTranscript::NotReadToTheEnd
+        );
+        // 読める行が無いなら、印が落ちていても「読めなかった」側。
+        assert_eq!(
+            loaded(vec![], false).stored(true),
+            StoredTranscript::Complete
         );
     }
 
@@ -4255,6 +4303,31 @@ mod tests {
             summary_pane_of(None, false, I::Failed, false),
             SummaryPane::TranscriptFailed
         );
+        // 入力が揃っていないときは、そう言う（#175）。**止めはしない**ので、書く手は出す。
+        assert_eq!(
+            summary_pane_of(None, false, I::NotReadToTheEnd, false),
+            SummaryPane::NotesFromPartialTranscript
+        );
+        let partial_input = SummaryPane::NotesFromPartialTranscript;
+        assert!(
+            partial_input
+                .message()
+                .body
+                .contains("only part of this recording")
+        );
+        assert_eq!(
+            partial_input
+                .message()
+                .actions
+                .iter()
+                .map(|action| (action.kind, action.primary))
+                .collect::<Vec<_>>(),
+            vec![
+                (PaneActionKind::WriteNotes, true),
+                (PaneActionKind::OpenTranscription, false),
+            ]
+        );
+        assert_eq!(partial_input.status(), SummaryStatus::NotSummarized);
         assert_eq!(
             SummaryPane::TranscriptFailed
                 .message()
@@ -4269,42 +4342,58 @@ mod tests {
         );
     }
 
-    /// 入力の様子は、**読める文字起こしが在るかどうかが先**（#165）。作り直している最中でも
-    /// 入力としては在るので、Notes タブが「待っている」に落ちない。
+    /// 入力の様子は、**ディスクに在るものが先**（#175）。作り直している最中でも、議事録が読むのは
+    /// ディスクに在るものなので、そこで「入力が無い」に落とさない。
+    ///
+    /// **ワーカーの記録では見分けない**——記録は再起動で消えるので、同じセッションが再起動の
+    /// 前後で違うことを言う（#175 が直したかった穴の、議事録側）。
     #[test]
-    fn transcript_input_prefers_what_is_readable_now() {
+    fn transcript_input_reads_what_is_on_disk_first() {
         use crate::reading_pane::TranscriptInput as I;
 
         let running = TranscriptPane::Transcribing {
             model: "Medium".to_owned(),
             percent: None,
         };
-        assert_eq!(I::of(&running, true), I::Ready);
-        assert_eq!(I::of(&running, false), I::Running);
+        // 作り直している最中でも、ディスクに在るものが入力。
+        assert_eq!(I::of(&running, StoredTranscript::Complete), I::Ready);
+        assert_eq!(
+            I::of(&running, StoredTranscript::NotReadToTheEnd),
+            I::NotReadToTheEnd
+        );
+        // **失敗の記録が残っていても、ディスクが答えを持つ**。
+        let failed = TranscriptPane::Failed {
+            reason: TranscribeFailure::Panicked,
+        };
+        assert_eq!(
+            I::of(&failed, StoredTranscript::NotReadToTheEnd),
+            I::NotReadToTheEnd
+        );
+        assert_eq!(I::of(&failed, StoredTranscript::Complete), I::Ready);
+
+        // 入力が無いときだけ、なぜ無いのかをワーカーの記録で言い分ける。
+        assert_eq!(I::of(&running, StoredTranscript::None), I::Running);
         assert_eq!(
             I::of(
                 &TranscriptPane::Stopping {
                     model: "Medium".to_owned()
                 },
-                false
+                StoredTranscript::None
             ),
             I::Running
         );
+        assert_eq!(I::of(&failed, StoredTranscript::None), I::Failed);
         assert_eq!(
             I::of(
-                &TranscriptPane::Failed {
-                    reason: TranscribeFailure::Panicked
-                },
-                false
+                &TranscriptPane::NotTranscribed { auto_on: false },
+                StoredTranscript::None
             ),
-            I::Failed
-        );
-        assert_eq!(
-            I::of(&TranscriptPane::NotTranscribed { auto_on: false }, false),
             I::Missing
         );
-        // JSON が読めなかった `Done`。中身が無いので入力にはならない。
-        assert_eq!(I::of(&TranscriptPane::Done, false), I::Missing);
+        assert_eq!(
+            I::of(&TranscriptPane::Done, StoredTranscript::None),
+            I::Missing
+        );
     }
 
     /// 走っているジョブがある間は、中身を作り直す操作を出さない（取り消しと窓は残す）。
@@ -4489,6 +4578,7 @@ mod tests {
             },
             SummaryPane::WaitingForTranscript,
             SummaryPane::TranscriptFailed,
+            SummaryPane::NotesFromPartialTranscript,
         ];
         for pane in &panes {
             let message = pane.message();

@@ -203,11 +203,13 @@ pub enum TranscriptPane {
     /// 走り終わっている。**この空表示が出るのは JSON が読めなかったときだけ**
     /// （セグメントがあれば一覧が出るので、ここへは来ない）。
     Done,
-    /// 走り終わっているが、**音源を最後まで読めていない**（#175）。ディスクに残った印から
-    /// 分かるので、**再起動しても消えない**——`Failed` はメモリだけの記録で、再起動で消える。
+    /// 走り終わっているが、**在る音源ぶんの文字起こしが揃っていない**（#175）。途中で読めなく
+    /// なった・片方の音源ぶんが無い（一方だけ失敗した・途中で止めた）のどちらでもここへ来る。
+    /// ディスクに残った印から分かるので、**再起動しても消えない**——`Failed` はメモリだけの
+    /// 記録で、再起動で消える。
     ///
-    /// 「揃っていない」ではなく「最後まで読めていない」と言う。壊れたパケットを読み飛ばして
-    /// 中抜けした音源は印が立たない（扱いは #176）ので、揃っていることまでは保証できない。
+    /// **原因は断定しない**（文言も同じ）。逆に「揃っている」とも言い切らない——壊れたパケットを
+    /// 読み飛ばして中抜けした音源は印が立たない（扱いは #176）。
     NotReadToTheEnd,
     /// **理由は必ずある**（失敗の記録は理由と一緒にしか作られない。#159）。文言はここで組む。
     Failed { reason: TranscribeFailure },
@@ -312,8 +314,7 @@ impl TranscriptPane {
             // 在るのに永久に読めなくなる。
             Self::NotReadToTheEnd => PaneMessage::new(
                 "This transcript stops partway",
-                "The audio could not be read to the end, so this covers only part of the \
-                 recording. Transcribing again will try the rest.",
+                "It covers only part of this recording. Transcribing again will try the rest.",
             )
             .with_primary("Transcribe again", PaneActionKind::Transcribe)
             .with_secondary("Show partial", PaneActionKind::ShowPartialTranscript),
@@ -401,6 +402,22 @@ pub fn summary_status_text(display_status: SummaryStatus) -> &'static str {
     }
 }
 
+/// ディスクに残っている文字起こしの様子（#175）。**真偽値を並べない**——「在るか」と「最後まで
+/// 読み切れているか」を別々に渡すと、渡し違えてもコンパイルが通る
+/// （`docs/rules/coding-conventions.md`）。
+///
+/// 組み立てるのは `main::LoadedTranscript::stored`（`transcript::Transcript` を見るので、
+/// crate に依存できないこのモジュールには置けない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoredTranscript {
+    /// 文字起こしが無い。
+    None,
+    /// 在って、読める行があり、最後まで読み切れている（または読み直しの最中で分からない）。
+    Complete,
+    /// 在るが、**在る音源ぶんが揃っていない**（途中で読めなくなった・片方の音源ぶんが無い）。
+    NotReadToTheEnd,
+}
+
 /// 議事録タブから見た**入力（文字起こし）の様子**（#165）。
 ///
 /// **議事録タブが要るのはこれだけ**なので、`has_transcript` と状態 enum を別々に渡さず
@@ -424,25 +441,22 @@ pub enum TranscriptInput {
 impl TranscriptInput {
     /// 文字起こしの状態と「読める文字起こしが在るか」から、議事録タブの見方を決める（#165）。
     ///
-    /// **読める文字起こしが在れば `Ready` が先**——作り直している最中でも、入力としては在る
-    /// （そのとき議事録を押せるかどうかは Slint 側のゲートが決める）。無いときだけ、なぜ無いのか
-    /// で言い分ける。
+    /// **ディスクに在るものが先**（#175）——作り直している最中でも、議事録が読むのはディスクに
+    /// 在るものだから。入力が無いときだけ、なぜ無いのかをワーカーの記録で言い分ける。
     ///
     /// **ワイルドカードを置かない**（状態を足したら扱いを書くまで通らない）。
-    pub fn of(transcript: &TranscriptPane, has_transcript: bool) -> Self {
-        if has_transcript {
-            // 最後まで読めていないことは、走り終わってからしか分からない（走っている間は
-            // 作り直している最中）。
-            return match transcript {
-                TranscriptPane::NotReadToTheEnd => Self::NotReadToTheEnd,
-                _ => Self::Ready,
-            };
-        }
-        match transcript.status() {
-            TranscriptStatus::Transcribing | TranscriptStatus::Stopping => Self::Running,
-            TranscriptStatus::Failed => Self::Failed,
-            // 生成済みなのに読めない（JSON の欠落・破損）も、入力としては無い。
-            TranscriptStatus::NotTranscribed | TranscriptStatus::Done => Self::Missing,
+    pub fn of(transcript: &TranscriptPane, stored: StoredTranscript) -> Self {
+        match stored {
+            // **ディスクが答えを持っている**（#175）。ワーカーの記録は再起動で消えるので、
+            // そちらで見分けると同じセッションが再起動の前後で違うことを言う。
+            StoredTranscript::Complete => Self::Ready,
+            StoredTranscript::NotReadToTheEnd => Self::NotReadToTheEnd,
+            // 入力が無いときだけ、なぜ無いのかをワーカーの記録で言い分ける。
+            StoredTranscript::None => match transcript.status() {
+                TranscriptStatus::Transcribing | TranscriptStatus::Stopping => Self::Running,
+                TranscriptStatus::Failed => Self::Failed,
+                TranscriptStatus::NotTranscribed | TranscriptStatus::Done => Self::Missing,
+            },
         }
     }
 
@@ -547,8 +561,8 @@ impl SummaryPane {
             .with_secondary("Open transcription", PaneActionKind::OpenTranscription),
             Self::NotesFromPartialTranscript => PaneMessage::new(
                 "No notes yet",
-                "The transcript stops partway, because the audio could not be read to the end. \
-                 Notes written from it would be missing the rest.",
+                "The transcript covers only part of this recording. Notes written from it \
+                 would be missing the rest.",
             )
             .with_primary("Write notes anyway", PaneActionKind::WriteNotes)
             .with_secondary("Open transcription", PaneActionKind::OpenTranscription),

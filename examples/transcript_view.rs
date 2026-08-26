@@ -153,7 +153,15 @@ fn summary_pane(
     transcript: &reading_pane::TranscriptPane,
     has_transcript: bool,
 ) -> reading_pane::SummaryPane {
-    let input = reading_pane::TranscriptInput::of(transcript, has_transcript);
+    // ディスクの様子も**同じ値から**出す（#175。本番は `main::LoadedTranscript::stored`）。
+    let stored = match (has_transcript, transcript) {
+        (false, _) => reading_pane::StoredTranscript::None,
+        (true, reading_pane::TranscriptPane::NotReadToTheEnd) => {
+            reading_pane::StoredTranscript::NotReadToTheEnd
+        }
+        (true, _) => reading_pane::StoredTranscript::Complete,
+    };
+    let input = reading_pane::TranscriptInput::of(transcript, stored);
     if input != reading_pane::TranscriptInput::Ready {
         return input.pane_when_no_notes(flag("auto-on"));
     }
@@ -342,7 +350,9 @@ fn main() {
     apply_summary_pane(&win, &summary_pane.message());
     win.set_detail_summary_footer("Written from the transcript · Aug 9, 2026 · 09:14".into());
     // 生成済みのときだけ行を入れる（生成中・失敗は旧議事録が無い状態＝空表示を見る）。
-    if summary_status == SummaryStatus::Done {
+    // **行も空表示も同じ値から出す**（#175）。別に選んだ状態で行を入れると、「未生成なのに
+    // 議事録が出ている」という本番では作れない画面になる（`docs/rules/testing.md`）。
+    if summary_pane.status() == SummaryStatus::Done {
         win.set_summary_rows(ModelRc::from(Rc::new(
             VecModel::from(sample_summary_rows()),
         )));
