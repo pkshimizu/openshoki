@@ -9,6 +9,18 @@
 //! `stat`（`metadata` / `is_file`）は取り寄せを起こさないので、有無やサイズの判定はそのままでよい。
 //! 止めたいのは中身を読む経路だけ。
 
+/// 退避されたファイルを取り寄せない設定で `body` を走らせる（#178）。
+///
+/// **番人を呼び出し側に持たせない**。`let _ = MaterializationOff::for_this_thread();` と書くと
+/// その場で落ちて何も止まらず、しかもコンパイルは通る（実際、レビュー前のミューテーションで
+/// テストが素通りした）。閉包で受ければ、**効いている範囲が構造で決まる**。
+///
+/// 設定できなかったときも `body` は走る（取り寄せが起きて遅いだけで、結果は正しい）。
+pub fn without_downloads<T>(body: impl FnOnce() -> T) -> T {
+    let _guard = MaterializationOff::for_this_thread();
+    body()
+}
+
 /// 取り寄せを止めている間だけ生きる番人。**落とすと元の設定へ戻る**。
 ///
 /// スレッド単位なので、実体が要る操作（再生・文字起こし）が別スレッドで走っている間は影響しない。
@@ -16,7 +28,7 @@
 ///
 /// 作れなかったときは `None`（設定できないだけで、走査自体は従来どおり動く）。macOS 以外は
 /// 常に `None` ——取り寄せという概念が無いので、止めるものが無い。
-pub struct MaterializationOff {
+struct MaterializationOff {
     #[cfg(target_os = "macos")]
     previous: std::ffi::c_int,
 }
@@ -44,7 +56,7 @@ impl MaterializationOff {
     ///
     /// **元の設定を控えてから変える**。既定へ決め打ちで戻すと、呼び出し側より外で設定されていた
     /// 値を踏み潰す。
-    pub fn for_this_thread() -> Option<Self> {
+    fn for_this_thread() -> Option<Self> {
         // Safety: 引数は上の定数だけで、ポインタを渡さない。どちらも libSystem の公開 API。
         let previous = unsafe {
             sys::getiopolicy_np(
@@ -82,7 +94,7 @@ impl MaterializationOff {
 #[cfg(not(target_os = "macos"))]
 impl MaterializationOff {
     /// 取り寄せという概念が無いので、止めるものが無い。
-    pub fn for_this_thread() -> Option<Self> {
+    fn for_this_thread() -> Option<Self> {
         None
     }
 }
@@ -111,15 +123,15 @@ impl Drop for MaterializationOff {
 
 #[cfg(test)]
 mod tests {
-    use super::MaterializationOff;
+    use super::without_downloads;
 
-    /// 番人が生きている間だけ取り寄せが止まり、**落とすと元へ戻る**。
+    /// 閉包の中だけ取り寄せが止まり、**抜けると元へ戻る**。
     ///
     /// 戻らないと、同じスレッドで後から走る処理（テストランナーは 1 スレッドに複数のテストを
     /// 載せる）まで巻き込む。
     #[cfg(target_os = "macos")]
     #[test]
-    fn the_policy_goes_back_to_what_it_was() {
+    fn downloads_are_off_inside_and_back_to_normal_outside() {
         use super::sys;
 
         let read = || unsafe {
@@ -131,22 +143,38 @@ mod tests {
 
         let before = read();
         assert!(before >= 0, "the current policy should be readable");
-        {
-            let guard = MaterializationOff::for_this_thread();
-            assert!(guard.is_some(), "the policy should be settable");
-            assert_eq!(
-                read(),
-                sys::IOPOL_MATERIALIZE_DATALESS_FILES_OFF,
-                "downloads are off while the guard is alive"
-            );
-        }
+        let inside = without_downloads(read);
+        assert_eq!(
+            inside,
+            sys::IOPOL_MATERIALIZE_DATALESS_FILES_OFF,
+            "downloads are off while the body runs"
+        );
         assert_eq!(read(), before, "the previous policy comes back");
     }
 
-    /// macOS 以外では止めるものが無い（`None` でも走査は従来どおり動く）。
+    /// 中で panic しても元へ戻す（番人が `Drop` で戻すので、巻き戻しでも効く）。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_panic_inside_still_restores_the_policy() {
+        use super::sys;
+
+        let read = || unsafe {
+            sys::getiopolicy_np(
+                sys::IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES,
+                sys::IOPOL_SCOPE_THREAD,
+            )
+        };
+
+        let before = read();
+        let caught = std::panic::catch_unwind(|| without_downloads(|| panic!("boom")));
+        assert!(caught.is_err(), "the panic should come through");
+        assert_eq!(read(), before, "the previous policy comes back anyway");
+    }
+
+    /// macOS 以外では止めるものが無い（設定できなくても本体は走る）。
     #[cfg(not(target_os = "macos"))]
     #[test]
-    fn there_is_nothing_to_turn_off() {
-        assert!(MaterializationOff::for_this_thread().is_none());
+    fn the_body_runs_even_with_nothing_to_turn_off() {
+        assert_eq!(without_downloads(|| 42), 42);
     }
 }

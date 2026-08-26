@@ -331,9 +331,11 @@ pub fn list_sessions(recording_dir: &Path) -> Vec<RecordingSession> {
     // だが、クラウド管理で実体が無いファイルではそれがファイル全体の同期ダウンロードを起こす
     // （実測 97 秒）。取り寄せられない音源は長さ不明（`duration: None`）へ縮退し、一覧は
     // 「長さが分からない録音では区切りごと出さない」既存の形で出る（#162）。
-    //
-    // **番人を名前付きで受ける**——`let _ =` にすると、その場で落ちて何も止まらない。
-    let _no_downloads = crate::dataless::MaterializationOff::for_this_thread();
+    crate::dataless::without_downloads(|| scan_sessions(recording_dir))
+}
+
+/// 走査の本体（`list_sessions` が取り寄せを止めた状態で呼ぶ）。
+fn scan_sessions(recording_dir: &Path) -> Vec<RecordingSession> {
     let entries = match std::fs::read_dir(recording_dir) {
         Ok(entries) => entries,
         Err(err) => {
