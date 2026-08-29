@@ -175,12 +175,14 @@ assert は**関数の出力**に掛ける。そして**保証を作っている�
 取り込めないが、`#[path]` でモジュールごと共有できる。
 
 ```rust
-#[path = "../src/reading_pane.rs"]
-mod reading_pane;
+#[path = "../src/slint_map.rs"]
+mod slint_map;
 ```
 
-共有するモジュールは **crate 内の何にも依存させない**（Slint の生成型は `crate::` で引けば
-bin でも example でも通る。`slint::include_modules!()` がどちらのクレートでも直下に置くため）。
+**文言そのものは共有クレートへ置くほうが強い**（#188）。`shoki-core` に移してからは、example は
+`use shoki_core::…` と普通に書けるようになり、`#[path]` で取り込むのは Slint 型への写像
+（`src/slint_map.rs`）だけになった——共有する量が 864 行から 95 行に減っている。`#[path]` が
+残るのは `shoki` が bin だけのクレートで `use shoki::…` と書けないため。
 
 #161 の時点で、複製していた `SUMMARY_QUEUED_LABEL` が実際にずれていた（`Waiting to summarize…`
 と `Waiting to write notes…`）。**「あちらを変えたらここも合わせること」という約束は守られない。**

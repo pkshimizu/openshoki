@@ -160,10 +160,10 @@ fn recording_color(level: f32) -> [u8; 3] {
 /// 経過時間を表示用文字列にする（`mm:ss` / 1 時間以上は `h:mm:ss`）。録音中のメニューバー
 /// 表示と Library の再生時間表示で共用する。
 ///
-/// **実装は `crate::reading_pane::format_elapsed`**。読む領域も同じ表記を使うので（#164 の
+/// **実装は `shoki_core::format_elapsed`**。読む領域も同じ表記を使うので（#164 の
 /// 「どこまで読めたか」）、あちらへ寄せてある——理由はそちらの doc。ここは呼び名を変えない
 /// ための再エクスポート。
-pub use crate::reading_pane::format_elapsed;
+pub use shoki_core::format_elapsed;
 
 /// 録音項目を待機中（押すと開始）の表示にする。テキストとアイコンを対で切り替え、
 /// 表示状態とラベル/アイコンの対応を 1 箇所で保証する（`docs/rules/coding-conventions.md`）。

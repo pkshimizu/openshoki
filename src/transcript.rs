@@ -8,11 +8,11 @@
 //!
 //! 文字起こしが未生成・欠落・破損のセッションは空のトランスクリプトとして扱い、落とさない
 //! （`docs/rules/error-handling.md`）。呼び出し側は空なら状態依存の空表示に落とす
-//! （見出し・理由・次の操作の対応表は `reading_pane::TranscriptPane::message` が正。欠落・破損は状態
+//! （見出し・理由・次の操作の対応表は `shoki_core::TranscriptPane::message` が正。欠落・破損は状態
 //! `Done` のままセグメントだけ空になるので、未実施とは違う文が出る）。
 
 use crate::dataless::{Fetch, ReadFailure};
-use crate::reading_pane::TranscriptShortfall;
+use shoki_core::TranscriptShortfall;
 use std::path::Path;
 use std::time::Duration;
 
@@ -122,7 +122,7 @@ impl TranscriptFile {
 }
 
 /// 文字起こし JSON に残す 2 つの印（#176）。**保存形式の語彙なのでこのモジュールが持つ**
-/// （`reading_pane` は読む領域が説明できることの語彙だけを持つ）。書く側
+/// （`shoki_core::reading_pane` は読む領域が説明できることの語彙だけを持つ）。書く側
 /// （`transcribe::Transcription`）と読む側（`TranscriptFile`）が同じ型を通る。
 ///
 /// **名前付きのフィールドで受ける**ので、位置で取り違えられない

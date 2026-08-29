@@ -493,7 +493,7 @@ fn scan_sessions(
         // 「表示が壊れた」に見える。
         eprintln!(
             "Not showing the length of {} because the audio has not been downloaded to this Mac",
-            crate::reading_pane::plural(not_downloaded, "recording")
+            shoki_core::plural(not_downloaded, "recording")
         );
     }
 

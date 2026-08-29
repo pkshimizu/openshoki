@@ -1,22 +1,83 @@
 //! 読む領域（Library ウィンドウの Transcript / Notes タブ）に出す文言と操作（#154 / #160）。
 //!
-//! **確認用バイナリと共有するために切り出してある**。`examples/transcript_view.rs` は
-//! `#[path]` でこのファイルを取り込む——複製していたときは実際にずれた（#161 で
-//! `Waiting to summarize…` と `Waiting to write notes…` に割れているのが見つかった）。
-//! 目視で確認するのが出荷される文言でなくなると、確認そのものが意味を失う。
+//! **状態から文言への対応表は、すべてここの網羅 match が正。** 失敗の種別
+//! （`TranscribeFailure` / `SummarizeFailure`）をここに置いているのもそのため——種別は
+//! 「読む領域が説明できることの語彙」で、対応表のすぐ隣にある。時計表記（`format_elapsed`）と
+//! 単複の揃え（`plural`）も、実装を 1 つに保つためにここに住んでいる（#164）。
 //!
-//! そのため**このモジュールは crate 内の何にも依存しない**。使うのは Slint の生成型
-//! （`TranscriptStatus` / `SummaryStatus` / `PaneAction` / `PaneActionKind`）と std だけ。
-//! 失敗の種別（`TranscribeFailure` / `SummarizeFailure`）をここに置いているのもそのため——
-//! 種別は「読む領域が説明できることの語彙」で、文言表の網羅 match のすぐ隣にある。
-//! 時計表記（`format_elapsed`）と単複の揃え（`plural`）も同じ理由でここに住んでいる。読む領域だけのものではないが、
-//! **依存を持てないこのモジュールが、実装を 1 つに保てる唯一の置き場所**だった（#164）。
+//! **UI の型は持たない**（#188）。`TranscriptStatus` / `SummaryStatus` / `PaneAction` /
+//! `PaneActionKind` はこのクレートが自前で定義し、Slint の生成型へ写すのは shell 側
+//! （`shoki::slint_map`）の仕事。以前は Slint の生成型を直接使っていたので、確認用バイナリと
+//! 共有するのに `#[path]` でファイルごと取り込む必要があった。
 
 use std::time::Duration;
 
-// Slint の生成型。**`crate::` で引く**——bin でも確認用バイナリでも、`slint::include_modules!()`
-// がクレート直下に置くので、同じ書き方で両方から通る。
-use crate::{PaneAction, PaneActionKind, SummaryStatus, TranscriptStatus};
+/// 文字起こしの表示状態（一覧の行と詳細ペインが共用する）。
+///
+/// **UI の型を core が持つ**（#188）。Slint の生成型（`ui/library-window.slint` の
+/// 同名 enum）へ写すのは shell の仕事（`shoki::slint_map`）。写像は網羅 match なので、
+/// 変種を足したらコンパイラが写し忘れを教える。
+///
+/// **一覧と共用なので、録音との食い違いは持てない**（一覧は全セッションぶんの JSON を
+/// 読めない。理由は `docs/CONTEXT.md`）。詳細ペインの状態行は
+/// `TranscriptPane::status_text` が出す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TranscriptStatus {
+    #[default]
+    NotTranscribed,
+    Transcribing,
+    /// 止めるよう伝えたが、ワーカーがまだ降りていない（#163）。降りたら未実施／生成済みへ戻る。
+    Stopping,
+    Done,
+    Failed,
+}
+
+/// 議事録の表示状態（`TranscriptStatus` と同じ流儀。先頭が未生成＝既定値）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SummaryStatus {
+    #[default]
+    NotSummarized,
+    /// 投入済みで、ワーカーが取り出すのを待っている（まだ CPU を使っていない）。この間だけ
+    /// 取り消せる。
+    Queued,
+    Summarizing,
+    Done,
+    Failed,
+}
+
+/// 読む領域の空表示から起こせる操作（#154）。
+///
+/// **enum で渡す**——ラベルの文字列で分岐すると、文言を直した日に操作が静かに壊れる。
+/// どれを出すかは `TranscriptPane::message` / `SummaryPane::message` の網羅 match が決める。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneActionKind {
+    /// 文字起こしを始める / やり直す。
+    Transcribe,
+    /// 議事録を書く / やり直す。
+    WriteNotes,
+    /// キュー待ちの議事録を取り消す。
+    CancelNotes,
+    /// 走っている（またはキュー待ちの）文字起こしを止める。
+    StopTranscription,
+    /// 文字起こしの設定ウィンドウを開く。
+    OpenTranscription,
+    /// 議事録の設定ウィンドウを開く。
+    OpenNotes,
+    /// 文字起こしを走らせ、成功したら続けて議事録を書く（#165）。
+    TranscribeThenNotes,
+    /// 途中までの文字起こしを開く（#164）。失敗の理由を伏せて一覧に切り替えるだけで、
+    /// ディスクには何も起こさない。
+    ShowPartialTranscript,
+}
+
+/// 空表示に並べるボタン 1 つ分。**ラベルも core が組む**（状態→文言の対応表は網羅 match が正）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneAction {
+    pub label: String,
+    pub kind: PaneActionKind,
+    /// 主操作か。並ぶのは最大 2 つで、主は 1 つだけ（`PaneMessage::with_primary` が保証する）。
+    pub primary: bool,
+}
 
 /// 文字起こしが失敗した理由（#159）。
 ///
@@ -338,7 +399,7 @@ impl TranscriptPane {
     ///
     /// 何を「残した」と数えるかは `TranscribeFailure::kept_partial` が正（理由もそちら）。
     ///
-    /// **走っている間は立たない**。開いた状態を畳むのは `main::fold_partial_transcript`
+    /// **走っている間は立たない**。開いた状態を畳むのは `shoki` 側の `fold_partial_transcript`
     /// （理由もそちら）。
     ///
     /// **ワイルドカードを置かない**（状態を足したら扱いを書くまで通らない）。
@@ -536,7 +597,7 @@ pub fn summary_status_text(display_status: SummaryStatus) -> &'static str {
 /// 読み切れているか」を別々に渡すと、渡し違えてもコンパイルが通る
 /// （`docs/rules/coding-conventions.md`）。
 ///
-/// 組み立てるのは `main::LoadedTranscript::stored`（`transcript::Transcript` を見るので、
+/// 組み立てるのは `shoki` 側の `LoadedTranscript::stored`（`transcript::Transcript` を見るので、
 /// crate に依存できないこのモジュールには置けない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoredTranscript {
@@ -545,7 +606,7 @@ pub enum StoredTranscript {
     /// 在って、**食い違いは分かっていない**（#176 で名前を意味に合わせた）。最後まで読み
     /// 切れているか、読み直しの最中で分からないか、**読める行が無い**（読めなかった JSON。
     /// 押しても何も現れない `Show partial` を出さないよう、ここへ落とす。
-    /// `main::LoadedTranscript::stored`）。「完成品と分かっている」ではない。
+    /// `shoki` 側の `LoadedTranscript::stored`）。「完成品と分かっている」ではない。
     NoKnownShortfall,
     /// 在って読める行もあるが、**録音と食い違っている**。**原因は断定しない**。
     NotWhole { shortfall: TranscriptShortfall },

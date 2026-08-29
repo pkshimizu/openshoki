@@ -16,10 +16,10 @@ mod mixdown;
 mod model_download;
 mod player;
 mod private_file;
-mod reading_pane;
 mod recorder;
 mod recordings;
 mod single_instance;
+mod slint_map;
 mod summarize;
 mod summary_model;
 #[cfg(target_os = "macos")]
@@ -30,10 +30,17 @@ mod tray;
 mod whisper_model;
 mod windows;
 
-use reading_pane::{
+use shoki_core::{
     StoredTranscript, SummaryPane, TranscriptInput, TranscriptPane, actions_allowed_while_busy,
     elapsed_text, session_transcript_word, summary_status_text,
 };
+// **core と同名の型（`TranscriptStatus` / `SummaryStatus` / `PaneAction` / `PaneActionKind`）は
+// 裸で書かない**（#188）。`slint::include_modules!()` が生成型をクレート直下に置くので、裸の
+// 名前は Slint 型を指してしまい、core の同名の型と読み分けられない。Slint 側は `Ui` 付きの
+// 別名、core 側は `shoki_core::` で修飾する。
+//
+// **衝突しない生成型（`LibraryWindow` / `SessionRow` / `StatusTone` など）はそのままでよい。**
+use slint_map::{UiPaneAction, UiPaneActionKind};
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -830,24 +837,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // 対象は常に選択中のセッション（空表示は選択中のものしか出ない）。
             let index = rec.get_selected_index();
             match kind {
-                PaneActionKind::Transcribe => rec.invoke_transcribe_session(index),
-                PaneActionKind::WriteNotes => rec.invoke_summarize_session(index),
-                PaneActionKind::CancelNotes => rec.invoke_cancel_summary(index),
-                PaneActionKind::StopTranscription => rec.invoke_stop_transcription(index),
-                PaneActionKind::TranscribeThenNotes => rec.invoke_transcribe_then_notes(index),
-                PaneActionKind::OpenTranscription => {
+                UiPaneActionKind::Transcribe => rec.invoke_transcribe_session(index),
+                UiPaneActionKind::WriteNotes => rec.invoke_summarize_session(index),
+                UiPaneActionKind::CancelNotes => rec.invoke_cancel_summary(index),
+                UiPaneActionKind::StopTranscription => rec.invoke_stop_transcription(index),
+                UiPaneActionKind::TranscribeThenNotes => rec.invoke_transcribe_then_notes(index),
+                UiPaneActionKind::OpenTranscription => {
                     if let Some(ui) = app_weak.upgrade() {
                         ui.invoke_open_transcription_window();
                     }
                 }
-                PaneActionKind::OpenNotes => {
+                UiPaneActionKind::OpenNotes => {
                     if let Some(ui) = app_weak.upgrade() {
                         ui.invoke_open_minutes_window();
                     }
                 }
                 // 途中結果を開く（#164）。ディスクには何も起こさず、伏せてある一覧を出すだけ
                 // （畳む契機は `fold_partial_transcript` の doc）。
-                PaneActionKind::ShowPartialTranscript => rec.set_show_partial_transcript(true),
+                UiPaneActionKind::ShowPartialTranscript => rec.set_show_partial_transcript(true),
             }
         });
     }
@@ -1560,7 +1567,11 @@ fn build_menu_event_handler(
                     // `Transcribing` のときだけで、それ以外は状態が同じなら文言も同じ。
                     // ここは全行を毎 tick 回す経路なので、`format!` を無条件に払うと、
                     // 確保を避けるために `progress_of` を足した意味が消える。
-                    if row.transcript_status == status && status != TranscriptStatus::Transcribing {
+                    // **入口で 1 回だけ core の語彙へ写す**。判断（走っているか・降りたか）は
+                    // すべて core の語彙なので、比較だけ Slint の語彙で書くと、行ごとにどちらの
+                    // 空間にいるかを追うことになる。
+                    let previous = slint_map::from_ui_transcript_status(row.transcript_status);
+                    if previous == status && status != shoki_core::TranscriptStatus::Transcribing {
                         continue;
                     }
                     let detail_text: slint::SharedString = session_detail_text(
@@ -1569,17 +1580,16 @@ fn build_menu_event_handler(
                         progress.and_then(transcribe::TranscribeProgress::percent),
                     )
                     .into();
-                    if row.transcript_status == status && row.detail_text == detail_text {
+                    if previous == status && row.detail_text == detail_text {
                         continue;
                     }
-                    let previous = row.transcript_status;
-                    row.transcript_status = status;
+                    row.transcript_status = slint_map::to_ui_transcript_status(status);
                     // **文言も一緒に組み直す**。行は状態を enum と文字列の 2 つで持っているので、
                     // 片方だけ更新すると「完了したのに `transcribing` のまま」が残る。
                     row.detail_text = detail_text;
                     recordings.sessions_model.set_row_data(i, row);
                     let came_off_the_worker = came_off_the_worker(previous, status);
-                    if came_off_the_worker && status == TranscriptStatus::Done {
+                    if came_off_the_worker && status == shoki_core::TranscriptStatus::Done {
                         transcribed.push(i);
                     }
                     if selected == Some(i) && came_off_the_worker {
@@ -1603,13 +1613,17 @@ fn build_menu_event_handler(
                         recordings.summarizer.status_of(&session.dir),
                         session.has_summary,
                     );
-                    let previous = rec.get_detail_summary_status();
+                    let previous =
+                        slint_map::from_ui_summary_status(rec.get_detail_summary_status());
                     if previous != status {
                         // 生成が終わった瞬間に表示を差し替える（失敗時は前の議事録を残す）。
                         // 通常は生成中を経るが、tick の間隔より短い経路もありうるので
                         // キュー待ちからの完了も拾う。
-                        if matches!(previous, SummaryStatus::Queued | SummaryStatus::Summarizing)
-                            && status == SummaryStatus::Done
+                        if matches!(
+                            previous,
+                            shoki_core::SummaryStatus::Queued
+                                | shoki_core::SummaryStatus::Summarizing
+                        ) && status == shoki_core::SummaryStatus::Done
                         {
                             // 文字起こしと同じ理由で、読み込みをやり直す（上のコメント）。
                             reload_selected = true;
@@ -1770,7 +1784,7 @@ fn session_group_heading(
 /// **行の高さを固定してある**ので、ここは 1 行に収める（溢れたらクリップされる）。
 fn session_detail_text(
     session: &recordings::RecordingSession,
-    status: TranscriptStatus,
+    status: shoki_core::TranscriptStatus,
     percent: Option<u8>,
 ) -> String {
     // 音源の語は `source_summary` の 1 箇所に持つ（詳細ヘッダと削除の確認も同じ語を使うので、
@@ -2577,7 +2591,7 @@ fn session_rows(
                     progress.and_then(transcribe::TranscribeProgress::percent),
                 )
                 .into(),
-                transcript_status: status,
+                transcript_status: slint_map::to_ui_transcript_status(status),
             }
         })
         .collect()
@@ -3021,29 +3035,33 @@ fn breathing_level(elapsed: std::time::Duration, cycle_secs: f32) -> f32 {
 ///
 /// **行き先を数え上げない**（`Failed` からもここを通る）。数え上げると、状態を足した日に
 /// 静かに漏れる。見るのは「走っていた／走っていない」の 2 つだけ。
-fn came_off_the_worker(previous: TranscriptStatus, status: TranscriptStatus) -> bool {
+fn came_off_the_worker(
+    previous: shoki_core::TranscriptStatus,
+    status: shoki_core::TranscriptStatus,
+) -> bool {
     let on_the_worker = |status| {
         matches!(
             status,
-            TranscriptStatus::Transcribing | TranscriptStatus::Stopping
+            shoki_core::TranscriptStatus::Transcribing | shoki_core::TranscriptStatus::Stopping
         )
     };
     on_the_worker(previous) && !on_the_worker(status)
 }
 
-/// 文字起こしの表示状態（`ui/library-window.slint` の `TranscriptStatus`）を合成する。
+/// 文字起こしの表示状態（`shoki_core::TranscriptStatus`。Slint へ写すのは `slint_map`）を合成する。
 /// ワーカーの進行状況（メモリ）があればそれを優先し、無ければ JSON の有無で解決する。
 fn transcript_display_status(
     worker_status: Option<transcribe::TranscribeStatus>,
     has_transcript: bool,
-) -> TranscriptStatus {
+) -> shoki_core::TranscriptStatus {
+    use shoki_core::TranscriptStatus as Status;
     match worker_status {
-        Some(transcribe::TranscribeStatus::Transcribing) => TranscriptStatus::Transcribing,
-        Some(transcribe::TranscribeStatus::Stopping) => TranscriptStatus::Stopping,
-        Some(transcribe::TranscribeStatus::Done) => TranscriptStatus::Done,
-        Some(transcribe::TranscribeStatus::Failed) => TranscriptStatus::Failed,
-        None if has_transcript => TranscriptStatus::Done,
-        None => TranscriptStatus::NotTranscribed,
+        Some(transcribe::TranscribeStatus::Transcribing) => Status::Transcribing,
+        Some(transcribe::TranscribeStatus::Stopping) => Status::Stopping,
+        Some(transcribe::TranscribeStatus::Done) => Status::Done,
+        Some(transcribe::TranscribeStatus::Failed) => Status::Failed,
+        None if has_transcript => Status::Done,
+        None => Status::NotTranscribed,
     }
 }
 
@@ -3062,10 +3080,10 @@ fn apply_detail_transcript_status(rec: &LibraryWindow, pane: &TranscriptPane, jo
     rec.set_detail_transcript_body(message.body.into());
     set_pane_actions(
         rec.get_detail_transcript_actions(),
-        actions_allowed_while_busy(message.actions, jobs_pending),
+        &actions_allowed_while_busy(message.actions, jobs_pending),
         |actions| rec.set_detail_transcript_actions(actions),
     );
-    rec.set_detail_transcript_status(status);
+    rec.set_detail_transcript_status(slint_map::to_ui_transcript_status(status));
     // 途中結果かどうかは状態 enum から出せない（#164。`TranscriptPane::shows_partial` の doc）
     // ので、見出し・理由・操作と**同じ値から**入れる。
     rec.set_detail_transcript_partial(pane.shows_partial());
@@ -3074,7 +3092,7 @@ fn apply_detail_transcript_status(rec: &LibraryWindow, pane: &TranscriptPane, jo
     // 関数に集める」）。
     if matches!(
         status,
-        TranscriptStatus::Transcribing | TranscriptStatus::Stopping
+        shoki_core::TranscriptStatus::Transcribing | shoki_core::TranscriptStatus::Stopping
     ) {
         fold_partial_transcript(rec);
     }
@@ -3098,17 +3116,25 @@ fn fold_partial_transcript(rec: &LibraryWindow) {
 /// ボタンを作り直す。tick は 100ms ごとにここを通るので、入れっぱなしにすると押している最中に
 /// ボタンが消える（文字列や enum のプロパティは Slint が値で比べるため、この心配は無い）。
 fn set_pane_actions(
-    current: slint::ModelRc<PaneAction>,
-    actions: Vec<PaneAction>,
-    set: impl FnOnce(slint::ModelRc<PaneAction>),
+    current: slint::ModelRc<UiPaneAction>,
+    actions: &[shoki_core::PaneAction],
+    set: impl FnOnce(slint::ModelRc<UiPaneAction>),
 ) {
     use slint::Model as _;
-    if current.iter().eq(actions.iter().cloned()) {
+    // **比べるのは Slint へ入れる形**（#188）。core の値のまま比べると、写像を変えたときに
+    // 差分が立たず、古いボタンが残る。
+    //
+    // **比べるために確保しない**。ここは 100ms tick を通るので、一致して早期 return する
+    // 大半のケースでも `Vec` と `SharedString` を作ることになる（実測で 1 回あたり約 78ns の差）。
+    let same = current.row_count() == actions.len()
+        && current
+            .iter()
+            .zip(actions.iter())
+            .all(|(current, next)| slint_map::ui_pane_action_matches(&current, next));
+    if same {
         return;
     }
-    set(slint::ModelRc::from(Rc::new(slint::VecModel::from(
-        actions,
-    ))));
+    set(slint_map::to_ui_pane_actions(actions));
 }
 
 /// ワーカーの状態と設定から、読む領域に出す文字起こしの状態を組み立てる。
@@ -3203,27 +3229,28 @@ fn jobs_pending(transcript: &TranscriptPane, summary: &SummaryPane) -> bool {
     matches!(
         transcript.status(),
         // 止めている最中も「積まれている」。降りるまではワーカーが JSON を触りうる。
-        TranscriptStatus::Transcribing | TranscriptStatus::Stopping
+        shoki_core::TranscriptStatus::Transcribing | shoki_core::TranscriptStatus::Stopping
     ) || matches!(
         summary.status(),
-        SummaryStatus::Queued | SummaryStatus::Summarizing
+        shoki_core::SummaryStatus::Queued | shoki_core::SummaryStatus::Summarizing
     )
 }
 
-/// 議事録生成の表示状態（`ui/library-window.slint` の `SummaryStatus`）を合成する。
+/// 議事録生成の表示状態（`shoki_core::SummaryStatus`。Slint へ写すのは `slint_map`）を合成する。
 /// ワーカーの進行状況（メモリ）があればそれを優先し、無ければ `summary.md` の有無で解決する
 /// （`transcript_display_status` と同じ流儀）。
 fn summary_display_status(
     worker_status: Option<summarize::SummarizeStatus>,
     has_summary: bool,
-) -> SummaryStatus {
+) -> shoki_core::SummaryStatus {
+    use shoki_core::SummaryStatus as Status;
     match worker_status {
-        Some(summarize::SummarizeStatus::Queued) => SummaryStatus::Queued,
-        Some(summarize::SummarizeStatus::Summarizing) => SummaryStatus::Summarizing,
-        Some(summarize::SummarizeStatus::Done) => SummaryStatus::Done,
-        Some(summarize::SummarizeStatus::Failed) => SummaryStatus::Failed,
-        None if has_summary => SummaryStatus::Done,
-        None => SummaryStatus::NotSummarized,
+        Some(summarize::SummarizeStatus::Queued) => Status::Queued,
+        Some(summarize::SummarizeStatus::Summarizing) => Status::Summarizing,
+        Some(summarize::SummarizeStatus::Done) => Status::Done,
+        Some(summarize::SummarizeStatus::Failed) => Status::Failed,
+        None if has_summary => Status::Done,
+        None => Status::NotSummarized,
     }
 }
 
@@ -3289,10 +3316,10 @@ fn apply_detail_summary_status(rec: &LibraryWindow, pane: &SummaryPane, jobs_pen
     rec.set_detail_summary_body(message.body.into());
     set_pane_actions(
         rec.get_detail_summary_actions(),
-        actions_allowed_while_busy(message.actions, jobs_pending),
+        &actions_allowed_while_busy(message.actions, jobs_pending),
         |actions| rec.set_detail_summary_actions(actions),
     );
-    rec.set_detail_summary_status(status);
+    rec.set_detail_summary_status(slint_map::to_ui_summary_status(status));
 }
 
 /// ワーカーの状態と設定から、読む領域に出す議事録の状態を組み立てる
@@ -3643,31 +3670,33 @@ pub(crate) fn init_test_backend() {
 
 #[cfg(test)]
 mod tests {
-    use super::reading_pane::StoredTranscript;
-    use super::reading_pane::{
+    use shoki_core::StoredTranscript;
+    use shoki_core::{
         FailedSource, KeptFromSource, SummarizeFailure, TranscribeFailure, TranscriptShortfall,
         summarize_failure_text, transcribe_failure_text, transcript_status_text,
     };
+    // **状態の語彙は core を指す**（#188）。同名の Slint 生成型はテストでは使わない——
+    // 使うなら `slint_map` を通す。
     use super::{
-        PaneAction, PaneActionKind, StatusTone, SummaryPane, SummaryStatus, TranscriptPane,
-        TranscriptStatus, actions_allowed_while_busy, app_version_text, breathing_level,
-        came_off_the_worker, jobs_pending, model_downloads_on_select, model_status_line,
-        not_downloaded_count, outcome_of, playback_progress, seek_position_from_ratio,
-        summary_display_status, summary_model_status_line, summary_pane_of, summary_rows,
-        summary_status_text, transcript_display_status, transcript_pane_of,
-        whisper_model_status_line,
+        StatusTone, SummaryPane, TranscriptPane, actions_allowed_while_busy, app_version_text,
+        breathing_level, came_off_the_worker, jobs_pending, model_downloads_on_select,
+        model_status_line, not_downloaded_count, outcome_of, playback_progress,
+        seek_position_from_ratio, summary_display_status, summary_model_status_line,
+        summary_pane_of, summary_rows, summary_status_text, transcript_display_status,
+        transcript_pane_of, whisper_model_status_line,
     };
     use super::{elapsed_text, recordings, summarize, transcribe};
     use chrono::{Datelike as _, Timelike as _};
+    use shoki_core::{PaneAction, PaneActionKind, SummaryStatus, TranscriptStatus};
 
     use crate::transcribe::TranscribeStatus;
     use std::time::Duration;
 
     /// 時計表記は `mm:ss`、1 時間以上だけ `h:mm:ss`（#164 で `tray` から
-    /// `reading_pane::format_elapsed` へ寄せた。実装と同じ場所で押さえる）。
+    /// `shoki_core::format_elapsed` へ寄せた。実装と同じ場所で押さえる）。
     #[test]
     fn elapsed_is_shown_as_a_clock() {
-        use super::reading_pane::format_elapsed;
+        use shoki_core::format_elapsed;
 
         assert_eq!(format_elapsed(Duration::from_secs(0)), "00:00");
         assert_eq!(format_elapsed(Duration::from_secs(65)), "01:05");
@@ -4771,7 +4800,7 @@ mod tests {
     /// `transcribe::job_model_label`）。そちらのテストが対で押さえる。
     #[test]
     fn failure_text_is_fixed_for_every_kind() {
-        use crate::reading_pane::{SummarizeFailure as S, TranscribeFailure as T};
+        use shoki_core::{SummarizeFailure as S, TranscribeFailure as T};
 
         let transcribe_cases = [
             (
@@ -5130,7 +5159,7 @@ mod tests {
     /// 議事録側の選び方。**入力（文字起こし）の様子で 3 つに割れる条件はここでしか決まらない**。
     #[test]
     fn summary_pane_of_reads_the_state_of_its_input() {
-        use crate::reading_pane::TranscriptInput as I;
+        use shoki_core::TranscriptInput as I;
 
         let queued = Some(summarize::SummarizeState::Queued { position: 2 });
 
@@ -5220,7 +5249,7 @@ mod tests {
     /// 前後で違うことを言う（#175 が直したかった穴の、議事録側）。
     #[test]
     fn transcript_input_reads_what_is_on_disk_first() {
-        use crate::reading_pane::TranscriptInput as I;
+        use shoki_core::TranscriptInput as I;
 
         let running = TranscriptPane::Transcribing {
             model: "Medium".to_owned(),
