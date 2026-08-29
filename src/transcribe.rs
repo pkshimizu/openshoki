@@ -1759,6 +1759,35 @@ mod tests {
             Some(TranscribeState::Done { shortfall: None })
         );
 
+        // **食い違いも記録に残る**（#176）。ここで落とすと、走った直後の詳細ペインが
+        // 「Transcribed」と言う——この記録はディスクの印より優先される。
+        lock_queue(&queue)
+            .status
+            .insert(dir.clone(), (5, TranscribeState::starting("Small".into())));
+        apply_outcome(
+            &queue,
+            &dir,
+            5,
+            JobOutcome::Done {
+                shortfall: Some(TranscriptShortfall::HasGaps),
+            },
+        );
+        assert_eq!(
+            lock_queue(&queue)
+                .status
+                .get(&dir)
+                .map(|(_, state)| state.clone()),
+            Some(TranscribeState::Done {
+                shortfall: Some(TranscriptShortfall::HasGaps)
+            })
+        );
+        // **記録は消さない**。消すと、一度も文字起こししていなかった録音では一覧が
+        // 「not transcribed」へ落ちて、次の走査まで戻らない。
+        assert_eq!(
+            lock_queue(&queue).status.get(&dir).map(|(_, s)| s.status()),
+            Some(TranscribeStatus::Done)
+        );
+
         // 止めたジョブは記録ごと消える（未実施／生成済みの表示へ戻す）。
         lock_queue(&queue)
             .status
@@ -1942,6 +1971,114 @@ mod tests {
             .keeps_summary(),
             "gaps warn on the Notes tab instead of dropping the request"
         );
+    }
+
+    /// 音源ごとの結果 → ジョブの結果（#176）。**繋ぎを丸ごと呼ぶ**
+    /// （`docs/rules/testing.md` の「繋いでいる関数は、呼べるなら丸ごと呼ぶ」）——`run_job` は
+    /// whisper のモデルを要求するので呼べないが、この写像はそこにしか無い判断を持っている。
+    ///
+    /// ここが緩むと、読み飛ばした音源のあるジョブが「食い違い無し」を報告し、走った直後の
+    /// 詳細ペインが「Transcribed」と言う（ディスクの印より優先されるので、次の読み直しまで
+    /// 直らない）。
+    #[test]
+    fn a_run_that_had_to_skip_packets_reports_the_gaps_without_failing() {
+        let kept = |shortfall, segments| FileOutcome::Kept {
+            segments,
+            shortfall,
+            kept_upto: Duration::from_secs(252),
+        };
+
+        // 全音源が食い違い無し。
+        assert!(matches!(
+            job_outcome(vec![
+                ("mic.mp3".to_owned(), kept(None, 3)),
+                ("system.mp3".to_owned(), kept(None, 2)),
+            ]),
+            JobOutcome::Done { shortfall: None }
+        ));
+
+        // 1 本でも読み飛ばしがあれば、ジョブは**失敗ではないが食い違いを持つ**。
+        assert!(matches!(
+            job_outcome(vec![
+                (
+                    "mic.mp3".to_owned(),
+                    kept(Some(TranscriptShortfall::HasGaps), 3)
+                ),
+                ("system.mp3".to_owned(), kept(None, 2)),
+            ]),
+            JobOutcome::Done {
+                shortfall: Some(TranscriptShortfall::HasGaps)
+            }
+        ));
+
+        // **読む行が無い音源は食い違いを言わない**——言うと、開いても何も現れない
+        // `Show partial` を出すことになる。
+        assert!(matches!(
+            job_outcome(vec![(
+                "mic.mp3".to_owned(),
+                kept(Some(TranscriptShortfall::HasGaps), 0)
+            )]),
+            JobOutcome::Done { shortfall: None }
+        ));
+
+        // 途中で終わった音源は失敗として数え、**どこまで読めたかを理由に載せる**（#164）。
+        let JobOutcome::Failed(TranscribeFailure::Files {
+            failed,
+            kept_other_sources,
+        }) = job_outcome(vec![
+            (
+                "mic.mp3".to_owned(),
+                kept(Some(TranscriptShortfall::StopsPartway), 3),
+            ),
+            ("system.mp3".to_owned(), kept(None, 2)),
+        ])
+        else {
+            panic!("a source that stopped partway is a failure");
+        };
+        assert!(kept_other_sources, "the other source kept readable lines");
+        assert_eq!(
+            failed,
+            vec![FailedSource::new(
+                "mic.mp3",
+                KeptFromSource::Upto(Duration::from_secs(252))
+            )]
+        );
+
+        // **抜けもあるなら位置を言わない**（#176）。`kept_upto` は読み飛ばしたぶん前へ
+        // 詰まっていて、音声の位置ではない。
+        let JobOutcome::Failed(TranscribeFailure::Files { failed, .. }) = job_outcome(vec![(
+            "mic.mp3".to_owned(),
+            kept(Some(TranscriptShortfall::StopsPartwayWithGaps), 3),
+        )]) else {
+            panic!("a source that stopped partway is a failure");
+        };
+        assert_eq!(
+            failed,
+            vec![FailedSource::new("mic.mp3", KeptFromSource::SomeWithGaps)]
+        );
+
+        // 保存しなかった音源からは何も残らない。
+        let JobOutcome::Failed(TranscribeFailure::Files {
+            failed,
+            kept_other_sources,
+        }) = job_outcome(vec![("mic.mp3".to_owned(), FileOutcome::NotKept)])
+        else {
+            panic!("a source that kept nothing is a failure");
+        };
+        assert!(!kept_other_sources);
+        assert_eq!(
+            failed,
+            vec![FailedSource::new("mic.mp3", KeptFromSource::Nothing)]
+        );
+
+        // **止めたのは、他の音源が何を返していても「止めた」**（#163）。
+        assert!(matches!(
+            job_outcome(vec![
+                ("mic.mp3".to_owned(), kept(None, 3)),
+                ("system.mp3".to_owned(), FileOutcome::Stopped),
+            ]),
+            JobOutcome::Stopped
+        ));
     }
 
     /// 止めた後に本物の失敗が重なっても、失敗としては出さない（#163）。**全結果を網羅**で
@@ -2487,6 +2624,49 @@ mod tests {
         // 形式は最初に読めたパケットで決まるので、途中で降りても変わらない。
         assert_eq!(cut.sample_rate, readable.sample_rate);
         assert_eq!(cut.channels, readable.channels);
+    }
+
+    /// 中身の一部を潰した MP3。**フレーム同期は壊さず、中身だけを潰す**——先頭と末尾は
+    /// そのまま残すので、デコーダはストリーム終端まで到達しつつ途中のパケットで失敗する。
+    fn mp3_with_broken_frames(mut mp3: Vec<u8>) -> Vec<u8> {
+        let start = mp3.len() / 3;
+        let end = mp3.len() * 2 / 3;
+        for byte in &mut mp3[start..end] {
+            *byte ^= 0xFF;
+        }
+        mp3
+    }
+
+    /// 壊れたパケットを読み飛ばした音源は、**最後まで読めた音源と別の食い違いになる**（#176）。
+    ///
+    /// これを固定しないと、`decode_mp3_stream` が読み飛ばしを数えるのをやめても、
+    /// `with_stop` と `with_gaps` を取り違えても緑のまま通る——どちらも「静かに欠けた
+    /// 文字起こしが完成品として残る」という、この issue が直したい壊れ方そのもの。
+    #[test]
+    fn decode_mp3_marks_a_stream_it_had_to_skip_through() {
+        let whole = sine_mp3(48_000, 4);
+        let broken = decode_mp3_stream(
+            MediaSourceStream::new(
+                Box::new(StopsReadingAfter {
+                    bytes: std::io::Cursor::new(mp3_with_broken_frames(whole)),
+                    // 打ち切らない（読めなくなるのではなく、中身が壊れている）。
+                    limit: u64::MAX,
+                }),
+                Default::default(),
+            ),
+            "mic.mp3",
+        )
+        .expect("the readable packets should still decode");
+
+        assert_eq!(
+            broken.shortfall,
+            Some(TranscriptShortfall::HasGaps),
+            "a stream that reached the end with skipped packets has gaps, not a stop"
+        );
+        assert!(
+            !broken.samples.is_empty(),
+            "the packets that could be read are kept"
+        );
     }
 
     #[test]

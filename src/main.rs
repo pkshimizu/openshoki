@@ -4861,6 +4861,21 @@ mod tests {
             transcript_pane_of(None, StoredTranscript::NoKnownShortfall, false),
             TranscriptPane::Done
         );
+        // 走り終わった記録が食い違いを持っていれば、そのまま出す（#176）。**ここを
+        // `Done` へ畳むと、走った直後だけ「Transcribed」と言う**——この記録はディスクの印
+        // より優先されるので、次の読み直しまで直らない。
+        assert_eq!(
+            transcript_pane_of(
+                Some(transcribe::TranscribeState::Done {
+                    shortfall: Some(TranscriptShortfall::HasGaps)
+                }),
+                StoredTranscript::None,
+                false
+            ),
+            TranscriptPane::NotWhole {
+                shortfall: TranscriptShortfall::HasGaps
+            }
+        );
         // **再起動しても消えない**のがメモリの失敗記録との違い（#175）。
         assert_eq!(
             transcript_pane_of(
