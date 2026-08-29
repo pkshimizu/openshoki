@@ -3116,11 +3116,19 @@ fn set_pane_actions(
     use slint::Model as _;
     // **比べるのは Slint へ入れる形**（#188）。core の値のまま比べると、写像を変えたときに
     // 差分が立たず、古いボタンが残る。
-    let next = slint_map::pane_actions(&actions);
-    if current.iter().eq(next.iter()) {
+    //
+    // **比べるために確保しない**。ここは 100ms tick を通るので、一致して早期 return する
+    // 大半のケースでも `Vec` と `SharedString` を作ることになる（実測で 1 回あたり約 78ns の差）。
+    let same = current.row_count() == actions.len()
+        && current.iter().zip(actions.iter()).all(|(current, next)| {
+            current.label.as_str() == next.label
+                && current.kind == slint_map::pane_action_kind(next.kind)
+                && current.primary == next.primary
+        });
+    if same {
         return;
     }
-    set(next);
+    set(slint_map::pane_actions(&actions));
 }
 
 /// ワーカーの状態と設定から、読む領域に出す文字起こしの状態を組み立てる。
