@@ -9,6 +9,13 @@ paths:
   - "**/Cargo.toml"
   - "scripts/**"
   - ".github/**"
+  # **守りを置いたファイルは、ここにも足すこと**（#187）。足し忘れると、その守りを外す差分で
+  # セキュリティ観点が起動せず、静かに弱められる。
+  - "**/clippy.toml"
+  - "**/.clippy.toml"
+  - ".cargo/**"
+  - "rust-toolchain.toml"
+  - "Cargo.lock"
 ---
 # レビュー観点: セキュリティ
 

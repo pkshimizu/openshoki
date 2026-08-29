@@ -10,8 +10,13 @@ publish = false
 # 立てる・時刻を取る・画面を触る・ネットワークに出るクレートは入れない。それらは `shoki` 側
 # （shell）に置き、core は値を受け取って値を返す。
 #
-# 例: `serde`（保存形式の型）・`chrono`（セッション名の日時）は足してよい。いま `shoki` にある
-# `slint` / `whisper-rs` / `llama-cpp-2` / `rodio` / `cpal` / `ureq` / `objc2` 系は足さない。
+# 例: `serde`（保存形式の型）は足してよい。`chrono` も足してよいが、**使ってよいのは型と整形
+# だけ**（`NaiveDateTime` など）——`Utc::now()` / `Local::now()` は時刻という外の事実を取るので
+# shell が呼び、`Event` に載せて渡す（`Local::now()` は環境変数と `/etc/localtime` も読む）。
+# 足すときは `clippy.toml` の `disallowed-methods` にその 2 つを同じ PR で足すこと。
+#
+# いま `shoki` にある `slint` / `whisper-rs` / `llama-cpp-2` / `rodio` / `cpal` / `ureq` /
+# `objc2` 系は足さない。
 #
 # 何が守られていて何が守られていないかは `src/lib.rs` の doc が正（`std` の I/O はクレート境界
 # では止まらないので、`clippy.toml` で入り口を塞いでいる）。
