@@ -34,9 +34,10 @@
 //! - `search` / `no-match`: 一覧を絞り込み中／0 件にする（検索欄・件数・解除の導線の確認）
 //! - `not-downloaded`: 退避されていて検索できなかった録音がある状態（#182。件数の行と
 //!   0 件の説明に理由が出る。`search` / `no-match` と組み合わせる）
-//! - `scanning`: 走査がまだ終わっていない状態（#181。0 件だが「録音が無い」とは言わない）。
-//!   **件数 0 と組み合わせる**。`search` / `no-match` と重ねても検索欄は立たない——本番は
-//!   走査を投げる前に検索を解除するので、両方が立った画面は作れない
+//! - `scanning` / `scan-failed`: 走査がまだ終わっていない／走査を始められなかった状態
+//!   （#181。どちらも 0 件だが「録音が無い」とは言わない）。**`no-match` と併せて指定する**
+//!   ——一覧を空にできるのは `no-match` だけで、空でないと空表示そのものが描画されない
+//!   （`ui/library-window.slint` の `if root.sessions.length == 0`）
 //! - `snapshot <path>`: PNG に書き出す（画面収録の許可が無い環境用）
 
 slint::include_modules!();
@@ -352,22 +353,31 @@ fn main() {
     // 検索（#161）。`search` は絞り込み中、`no-match` は 0 件（解除の導線を見る）。
     // **件数の文も空表示の文も本番と同じ関数で組む**（#182。ここを複製すると、目視の対象が
     // 出荷される文言でなくなる）。
-    let searching = flag("search") || flag("no-match");
+    // 走査中・走査失敗のときは**件数側も 0 に寄せる**（#181）。本番はまだ 1 件も数えて
+    // いないので、下端に「5 recordings」と出る画面は作れない。
+    let scanning = flag("scanning") || flag("scan-failed");
+    let searching = (flag("search") || flag("no-match")) && !scanning;
     let not_downloaded = if flag("not-downloaded") { 2 } else { 0 };
     let matched = if flag("no-match") { 0 } else { 3 };
-    if searching && !flag("scanning") {
+    if scanning {
+        win.set_library_summary(library_text::library_summary(0).into());
+    }
+    if searching {
         win.set_search_text("recording format".into());
         win.set_search_summary(
             library_text::search_summary_text(matched, 5, not_downloaded).into(),
         );
     }
     // **状態は 1 つの値から出す**（`docs/rules/testing.md`）。走査中の表示も見られるように
-    // `scanning` フラグを足してある（#181）。
+    // `scanning` / `scan-failed` フラグを足してある（#181）。
     //
-    // **走査中は絞り込みと重ならない**——`open_library_window` は走査を投げる前に検索を解除
-    // するので、本番では両方が立った画面は作れない。重ねられるようにすると、「Looking for
-    // recordings…」の下に `Clear search` が並ぶ、本番では出ない画面を目視することになる。
-    let (empty_heading, empty_body) = library_text::empty_list_message(if flag("scanning") {
+    // **走査中は絞り込みを重ねない**——重ねると「Looking for recordings…」の下に `Clear
+    // search` が並ぶ。本番でこの並びが出ないのは、走査中の空表示が絞り込みより優先されるから
+    // （`apply_list_counts`）。検索欄自体は走査中も生きているので、押せる `Clear search` が
+    // 並ぶ画面を目視しても本番の確認にならない。
+    let (empty_heading, empty_body) = library_text::empty_list_message(if flag("scan-failed") {
+        library_text::EmptyList::ScanFailed
+    } else if flag("scanning") {
         library_text::EmptyList::Scanning
     } else if searching {
         library_text::EmptyList::NoMatches { not_downloaded }
