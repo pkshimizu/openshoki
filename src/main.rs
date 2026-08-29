@@ -1930,7 +1930,7 @@ fn spawn_session_load(
         let _ = fallback_sender.send(LoadedSession {
             generation: generation_id,
             dir: session.dir.clone(),
-            // **揃っていないとは言わない**。読めなかっただけで、途中結果だと決めつけると
+            // **食い違っているとは言わない**。読めなかっただけで、途中結果だと決めつけると
             // 資源枯渇のたびに全セッションが伏せられる（#175）。
             transcript: transcript::Transcript {
                 segments: Vec::new(),
@@ -4254,7 +4254,7 @@ mod tests {
                 ]
             );
         }
-        // 走り終わっているが揃っていない（#175）。**開く手を必ず添える**——伏せた一覧を出す口は
+        // 走り終わっているが録音と食い違う（#175）。**開く手を必ず添える**——伏せた一覧を出す口は
         // これだけなので、落とすとセグメントが在るのに永久に読めなくなる。
         let stops_partway = TranscriptPane::NotWhole {
             shortfall: TranscriptShortfall::StopsPartway,
@@ -4944,7 +4944,7 @@ mod tests {
         );
 
         // **走っている記録があれば、ディスクの印より優先する**（いま作り直している最中に
-        // 「最後まで読めていない」と言わない）。
+        // 「録音と食い違っている」と言わない）。
         assert_eq!(
             transcript_pane_of(
                 Some(transcribe::TranscribeState::Transcribing {
@@ -5147,7 +5147,7 @@ mod tests {
             summary_pane_of(None, false, I::Failed, false),
             SummaryPane::TranscriptFailed
         );
-        // 入力が揃っていないときは、そう言う（#175）。**止めはしない**ので、書く手は出す。
+        // 入力が録音と食い違うときは、そう言う（#175 / #176）。**止めはしない**ので、書く手は出す。
         assert_eq!(
             summary_pane_of(None, false, I::NotWhole, false),
             SummaryPane::NotesFromPartialTranscript

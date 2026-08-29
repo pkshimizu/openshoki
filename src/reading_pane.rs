@@ -387,7 +387,7 @@ impl TranscriptPane {
     }
 
     /// 詳細ペインの状態行に出す文言（#175）。**状態 enum からは出せない**——一覧と共用なので
-    /// 「最後まで読めていない」を持てず、そのままだと状態行と空表示が同じペインの中で食い違う。
+    /// 録音との食い違いを持てず、そのままだと状態行と空表示が同じペインの中で食い違う。
     ///
     /// **ワイルドカードを置かない**（状態を足したら文言を決めるまで通らない）。
     pub fn status_text(&self) -> &'static str {
@@ -499,8 +499,8 @@ impl TranscriptPane {
 /// 文字起こしの表示状態 → 状態テキスト。
 ///
 /// **直に呼ぶのは `TranscriptPane::status_text` だけ**（#175）。詳細ペインはそちらを通す——状態
-/// enum は一覧と共用で「揃っていない」を持てないので、直に引くと同じペインの中で状態行が
-/// `Transcribed`、空表示が「揃っていない」と食い違う。一覧の行は別の語を使う
+/// enum は一覧と共用で録音との食い違いを持てないので、直に引くと同じペインの中で状態行が
+/// `Transcribed`、空表示が「録音と食い違っている」と食い違う。一覧の行は別の語を使う
 /// （`session_transcript_word`）。
 pub fn transcript_status_text(display_status: TranscriptStatus) -> &'static str {
     match display_status {
