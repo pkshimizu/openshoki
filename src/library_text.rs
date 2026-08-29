@@ -3,7 +3,7 @@
 //! **本番と確認用バイナリで同じ文を出すために切り出してある**（`docs/rules/testing.md` の
 //! 「確認用バイナリに文言を複製しない」）。`examples/transcript_view.rs` が `#[path]` で
 //! そのまま取り込むので、**crate 内の何にも依存させない**——例外は同じやり方で共有して
-//! いる `reading_pane`（単複の言い回しをそこに寄せてある）。
+//! いる `shoki_core::reading_pane`（単複の言い回しをそこに寄せてある）。
 
 /// 一覧の下端に出す合計。**件数だけ**にする——容量を出すには全セッションのファイルを開く必要が
 /// あり、一覧を開くたびに走らせるには重い。
@@ -56,7 +56,7 @@ pub fn empty_list_message(searching: bool, not_downloaded: usize) -> (&'static s
     if not_downloaded > 0 {
         // **独立した文にする**。カンマで繋ぐと、件数が直前の「文字起こしされていない録音」に
         // 係って読める（実際は別の集合）。単複は `plural` に任せて言い回しを一覧側と揃える。
-        let recordings = crate::reading_pane::plural(not_downloaded as u64, "recording");
+        let recordings = shoki_core::plural(not_downloaded as u64, "recording");
         let verb = if not_downloaded == 1 { "is" } else { "are" };
         body.push_str(&format!(
             " {recordings} {verb} not downloaded to this Mac, so what they say could not be \

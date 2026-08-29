@@ -44,11 +44,18 @@ mod snapshot;
 // **文言は複製せず、本番と同じものを使う**（#160）。複製していたときは実際にずれた
 // （#161 で `Waiting to summarize…` と `Waiting to write notes…` に割れているのが見つかった）。
 // 目視で確認するのが出荷される文言でなくなると、確認そのものが意味を失う。
-// 確認用バイナリは一部の変種しか作らないので、作らないものは「未使用」に見える。
-// **本番では全部使う**（`TranscriptPane::message` の網羅 match）ので、ここでは許可する。
+//
+// 文言と状態は `shoki-core` にあるので、普通に依存できる（#188）。**Slint 型への写像だけ**は
+// `shoki` 側にあり、`shoki` は bin だけのクレートなので `use` できない——そこは従来どおり
+// `#[path]` で取り込む（ハックは消えたのではなく、対象が `reading_pane` から `slint_map` へ
+// 移った。消すには `src/lib.rs` が要る＝段階 05 の領分）。
+use shoki_core as reading_pane;
+
+// 確認用バイナリは一部の写像しか使わないので、使わないものは「未使用」に見える。
+// **本番では全部使う**（網羅 match）ので、ここでは許可する。
 #[allow(dead_code)]
-#[path = "../src/reading_pane.rs"]
-mod reading_pane;
+#[path = "../src/slint_map.rs"]
+mod slint_map;
 
 // 一覧の下端と空表示の文も同じ理由で共有する（#182）。ここを複製していたせいで、空表示に
 // 「読めなかった録音がある」を足したときに確認用バイナリだけ真っ白になった。
@@ -78,12 +85,12 @@ fn apply_transcript_pane(win: &LibraryWindow, pane: &reading_pane::TranscriptPan
     // **状態行も同じ値から出す**（#175）。`transcript_status_text` を直に呼ぶと、状態 enum が
     // 持てない「最後まで読めていない」を落として、本番では作れない組み合わせを目視することに
     // なる（本番は `main::apply_detail_transcript_status`）。
-    win.set_detail_transcript_status(pane.status());
+    win.set_detail_transcript_status(slint_map::transcript_status(pane.status()));
     win.set_detail_transcript_text(pane.status_text().into());
     let message = pane.message();
     win.set_detail_transcript_heading(message.heading.as_str().into());
     win.set_detail_transcript_body(message.body.as_str().into());
-    win.set_detail_transcript_actions(ModelRc::from(Rc::new(VecModel::from(message.actions))));
+    win.set_detail_transcript_actions(slint_map::pane_actions(&message.actions));
     // 途中結果を伏せるかどうかも**同じ値から**出す（#164。本番の
     // `main::apply_detail_transcript_status` と同じ）。別々に選ぶと、本番では作れない
     // 組み合わせを目視することになる（`docs/rules/testing.md`）。
@@ -94,9 +101,7 @@ fn apply_transcript_pane(win: &LibraryWindow, pane: &reading_pane::TranscriptPan
 fn apply_summary_pane(win: &LibraryWindow, message: &reading_pane::PaneMessage) {
     win.set_detail_summary_heading(message.heading.as_str().into());
     win.set_detail_summary_body(message.body.as_str().into());
-    win.set_detail_summary_actions(ModelRc::from(Rc::new(VecModel::from(
-        message.actions.clone(),
-    ))));
+    win.set_detail_summary_actions(slint_map::pane_actions(&message.actions));
 }
 
 /// Transcript タブに出す状態を引数で選ぶ。**状態そのものを返す**——状態行と空表示を別々に
@@ -293,21 +298,25 @@ fn main() {
             group_heading: "Today".into(),
             time_text: "14:02".into(),
             date_text: "Aug 10, 2026 · 1:12:40".into(),
-            detail_text: detail("Mic + system", TranscriptStatus::Transcribing, Some(48)),
+            detail_text: detail(
+                "Mic + system",
+                reading_pane::TranscriptStatus::Transcribing,
+                Some(48),
+            ),
             transcript_status: TranscriptStatus::Transcribing,
         },
         SessionRow {
             group_heading: "".into(),
             time_text: "09:30".into(),
             date_text: "Aug 10, 2026 · 27:05".into(),
-            detail_text: detail("Mic only", TranscriptStatus::Done, None),
+            detail_text: detail("Mic only", reading_pane::TranscriptStatus::Done, None),
             transcript_status: TranscriptStatus::Done,
         },
         SessionRow {
             group_heading: "Yesterday".into(),
             time_text: "16:45".into(),
             date_text: "Aug 9, 2026 · 2:41:18".into(),
-            detail_text: detail("System only", TranscriptStatus::Failed, None),
+            detail_text: detail("System only", reading_pane::TranscriptStatus::Failed, None),
             transcript_status: TranscriptStatus::Failed,
         },
         SessionRow {
@@ -315,7 +324,11 @@ fn main() {
             time_text: "11:00".into(),
             // 長さが分からない録音（区切りごと出ないことを見る）。
             date_text: "Aug 9, 2026".into(),
-            detail_text: detail("Mic + system", TranscriptStatus::NotTranscribed, None),
+            detail_text: detail(
+                "Mic + system",
+                reading_pane::TranscriptStatus::NotTranscribed,
+                None,
+            ),
             transcript_status: TranscriptStatus::NotTranscribed,
         },
         SessionRow {
@@ -323,7 +336,7 @@ fn main() {
             time_text: "15:30".into(),
             // デザインの `6:20` に対して、プレイヤーへ揃えたゼロ詰めの形も見る。
             date_text: "Aug 5, 2026 · 06:20".into(),
-            detail_text: detail("Mic + system", TranscriptStatus::Done, None),
+            detail_text: detail("Mic + system", reading_pane::TranscriptStatus::Done, None),
             transcript_status: TranscriptStatus::Done,
         },
     ]))));
@@ -394,7 +407,7 @@ fn main() {
         SummaryStatus::Done
     };
     let summary_pane = summary_pane(summary_status, &transcript_pane, has_transcript);
-    win.set_detail_summary_status(summary_pane.status());
+    win.set_detail_summary_status(slint_map::summary_status(summary_pane.status()));
     win.set_detail_summary_status_text(
         reading_pane::summary_status_text(summary_pane.status()).into(),
     );
@@ -403,7 +416,7 @@ fn main() {
     // 生成済みのときだけ行を入れる（生成中・失敗は旧議事録が無い状態＝空表示を見る）。
     // **行も空表示も同じ値から出す**（#175）。別に選んだ状態で行を入れると、「未生成なのに
     // 議事録が出ている」という本番では作れない画面になる（`docs/rules/testing.md`）。
-    if summary_pane.status() == SummaryStatus::Done {
+    if summary_pane.status() == reading_pane::SummaryStatus::Done {
         win.set_summary_rows(ModelRc::from(Rc::new(
             VecModel::from(sample_summary_rows()),
         )));

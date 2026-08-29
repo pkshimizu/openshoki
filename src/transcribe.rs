@@ -30,12 +30,12 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
-/// 失敗の種別は、文言表（網羅 match）の隣に置くために `reading_pane` が持っている。
+use crate::transcript::ShortfallMarks;
+/// 失敗の種別は、文言表（網羅 match）の隣に置くために `shoki_core` が持っている。
 /// ただし値を作るのはこのモジュールなので、読む人が探す場所はここでもある——同じ名前で
 /// 引けるように再エクスポートしておく。
-pub use crate::reading_pane::{FailedSource, TranscribeFailure};
-use crate::reading_pane::{KeptFromSource, TranscriptShortfall};
-use crate::transcript::ShortfallMarks;
+pub use shoki_core::{FailedSource, TranscribeFailure};
+use shoki_core::{KeptFromSource, TranscriptShortfall};
 
 /// whisper が入力に取るサンプルレート（Hz）。これ以外のレートの音声はここへリサンプルする。
 const WHISPER_SAMPLE_RATE: usize = 16_000;
@@ -901,7 +901,7 @@ fn report_file_outcome(name: &str, outcome: &FileOutcome) {
             TranscriptShortfall::StopsPartway => eprintln!(
                 "Keeping only the first {} of {name} ({segments} segments) because it could not \
                  be read further",
-                crate::reading_pane::format_elapsed(*kept_upto)
+                shoki_core::format_elapsed(*kept_upto)
             ),
             // **位置は言わない**（#176）——読み飛ばしたぶん時刻が前へ詰まっているので、
             // 残せた長さは「そこまで読めた」を意味しない。読み飛ばしの件数は

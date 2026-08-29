@@ -26,11 +26,11 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
-/// 失敗の種別は、文言表（網羅 match）の隣に置くために `reading_pane` が持っている。
+use crate::transcript::TranscriptSegment;
+/// 失敗の種別は、文言表（網羅 match）の隣に置くために `shoki_core` が持っている。
 /// ただし値を作るのはこのモジュールなので、読む人が探す場所はここでもある——同じ名前で
 /// 引けるように再エクスポートしておく。
-pub use crate::reading_pane::SummarizeFailure;
-use crate::transcript::TranscriptSegment;
+pub use shoki_core::SummarizeFailure;
 
 /// 生成した議事録の保存ファイル名。セッションディレクトリに固定名で置く
 /// （`mic.json` / `mix.mp3` と同系統）。生成（`run_job`）・表示（`load_summary`）・
@@ -844,7 +844,7 @@ fn write_summary(path: &Path, markdown: &str) -> Result<(), Box<dyn std::error::
 /// 形式は #78 の検証サンプル（`assets/samples/meeting-*.txt`）と同じ `[mm:ss] Speaker: text`
 /// （1 時間を超える録音では `[h:mm:ss]`）。空の発話（whisper が無音区間に付けることがある）は落とす。
 ///
-/// 時刻の整形は表示側と同じ `reading_pane::format_elapsed` を使う（同じ表記の実装を 2 つ持つと、
+/// 時刻の整形は表示側と同じ `shoki_core::format_elapsed` を使う（同じ表記の実装を 2 つ持つと、
 /// 片方だけ直したときに文字起こし表示とプロンプト内の時刻がずれる）。開始秒は信頼境界外の
 /// JSON 由来なので、丸めも表示側と同じ `TranscriptSegment::start_duration` に任せる。
 fn transcript_lines(segments: &[TranscriptSegment]) -> Vec<String> {

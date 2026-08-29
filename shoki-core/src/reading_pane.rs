@@ -1,21 +1,17 @@
 //! 読む領域（Library ウィンドウの Transcript / Notes タブ）に出す文言と操作（#154 / #160）。
 //!
-//! **確認用バイナリと共有するために切り出してある**。`examples/transcript_view.rs` は
-//! `#[path]` でこのファイルを取り込む——複製していたときは実際にずれた（#161 で
-//! `Waiting to summarize…` と `Waiting to write notes…` に割れているのが見つかった）。
-//! 目視で確認するのが出荷される文言でなくなると、確認そのものが意味を失う。
+//! **状態から文言への対応表は、すべてここの網羅 match が正。** 失敗の種別
+//! （`TranscribeFailure` / `SummarizeFailure`）をここに置いているのもそのため——種別は
+//! 「読む領域が説明できることの語彙」で、対応表のすぐ隣にある。時計表記（`format_elapsed`）と
+//! 単複の揃え（`plural`）も、実装を 1 つに保つためにここに住んでいる（#164）。
 //!
-//! そのため**このモジュールは crate 内の何にも依存しない**。使うのは Slint の生成型
-//! （`TranscriptStatus` / `SummaryStatus` / `PaneAction` / `PaneActionKind`）と std だけ。
-//! 失敗の種別（`TranscribeFailure` / `SummarizeFailure`）をここに置いているのもそのため——
-//! 種別は「読む領域が説明できることの語彙」で、文言表の網羅 match のすぐ隣にある。
-//! 時計表記（`format_elapsed`）と単複の揃え（`plural`）も同じ理由でここに住んでいる。読む領域だけのものではないが、
-//! **依存を持てないこのモジュールが、実装を 1 つに保てる唯一の置き場所**だった（#164）。
+//! **UI の型は持たない**（#188）。`TranscriptStatus` / `SummaryStatus` / `PaneAction` /
+//! `PaneActionKind` はこのクレートが自前で定義し、Slint の生成型へ写すのは shell 側
+//! （`shoki::slint_map`）の仕事。以前は Slint の生成型を直接使っていたので、確認用バイナリと
+//! 共有するのに `#[path]` でファイルごと取り込む必要があった。
 
 use std::time::Duration;
 
-// Slint の生成型。**`crate::` で引く**——bin でも確認用バイナリでも、`slint::include_modules!()`
-// がクレート直下に置くので、同じ書き方で両方から通る。
 use crate::{PaneAction, PaneActionKind, SummaryStatus, TranscriptStatus};
 
 /// 文字起こしが失敗した理由（#159）。
