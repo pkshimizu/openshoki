@@ -1,7 +1,7 @@
 # core / shell の層を入れる
 
 - 作成日: 2026-08-29
-- ステータス: 確定
+- ステータス: 着手済み（段階 00〜02 は #187 / #188 / #189）
 
 ## 概要
 
@@ -258,7 +258,7 @@ fn write_decision(produced: &Transcription, existing: Option<StoredReach>) -> Wr
 
 ## 実装ステップ
 
-### 段階 00 — ワークスペース化して `shoki-core` の器だけ作る
+### 段階 00 — ワークスペース化して `shoki-core` の器だけ作る（#187）
 
 `Cargo.toml` を `[workspace]` にし、空の `shoki-core` を足して `shoki` から依存させる。
 **中身はまだ移さない。**
@@ -270,7 +270,7 @@ fn write_decision(produced: &Transcription, existing: Option<StoredReach>) -> Wr
 **完了の判定**: 挙動が一切変わらない。`cargo build` / `cargo fmt --check` /
 `cargo clippy --all-targets -- -D warnings` / `cargo test` がすべて通り、`cargo dev` が動く。
 
-### 段階 01 — 文字起こしの状態を `core` へ移す
+### 段階 01 — 文字起こしの状態を `core` へ移す（#188）
 
 **着手前に設計攻撃を 1 回入れる**（論点 4）。
 
@@ -290,7 +290,7 @@ fn write_decision(produced: &Transcription, existing: Option<StoredReach>) -> Wr
 `view_*` が唯一の経路になっている（`grep` で旧 4 関数が残っていない）。
 「`row_key` が同じなら `view_row` の出力も同じ」のテストが入っている。
 
-### 段階 02 — ジョブ実行系を統合し、`Event` を唯一の入口にする
+### 段階 02 — ジョブ実行系を統合し、`Event` を唯一の入口にする（#189）
 
 - `TranscribeWorker` と `SummarizeWorker` を 1 本のスケジューラへ。状態マップを廃し、
   `JobQueued` / `JobProgressed` / `JobFinished` だけが core へ入る形にする
