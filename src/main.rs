@@ -1947,8 +1947,12 @@ fn advance_scan_generation(generation: &Cell<u64>) -> u64 {
 /// **検索語が残っていたら絞り直す**。走査中も検索欄は生きているので、走っている間に打たれる
 /// ことがある——そのときの絞り込みは空の `all_sessions` に対して行われて 0 件になっており、
 /// ここで全件を入れると「検索語が残ったまま全件が並ぶ」画面になる。本番の入口
-/// （`on_search`）をそのまま呼び直して、新しい全件に対して絞り直す。届くまでの 1 tick は
-/// 絞り込まれていない一覧が見えるが、絞り込みが黙って消えるよりはよい。
+/// （`on_search`）をそのまま呼び直して、新しい全件に対して絞り直す。
+///
+/// **届くまでは絞り込まれていない一覧が見える**。投げ直した検索は本文（文字起こしと議事録）を
+/// 全件ぶん読み直すので、早くて次の tick、保存先が遅ければそれより後になる（`spawn_search`）。
+/// スレッドを立てられなければ結果は来ないので、そのときは絞り込みが解けたまま残る——検索欄の
+/// 語は残るので、打ち直せば絞り直せる。
 fn apply_scanned_sessions(
     rec: &LibraryWindow,
     model: &slint::VecModel<SessionRow>,
@@ -2754,8 +2758,13 @@ struct ListCounts {
 /// 状態をまとめて渡して**ここ 1 箇所で決める**（削除・検索・解除・走査のどこから来ても同じ形に
 /// なる）。
 ///
-/// **走査の状態は `Cell` のまま受け取る**（値ではなく）。値で受けると呼び出し側が選べてしまい、
-/// 上の `ScanState` の doc に書いた復活が起きる。
+/// **引数ではなく共有の 1 つの状態を読む**。値で受けると呼び出し側が「走査中ではない」と書ける
+/// ので、上の `ScanState` の doc に書いた復活が起きる。
+///
+/// **型は書き込みを禁じていない**（`&Cell` は `set` できる）。効いているのは「**書くのは走査の
+/// 経路だけ**」という約束——投げるとき（`open_library_window`）と着地したとき
+/// （`apply_scanned_sessions`）の 2 箇所だけが `set` し、削除・検索・解除は読むだけ。走査以外から
+/// `set` しないことはコンパイラではなく約束で守っている。
 fn apply_list_counts(rec: &LibraryWindow, counts: ListCounts, scan: &Cell<ScanState>) {
     let ListCounts {
         shown,
@@ -2950,9 +2959,11 @@ fn open_library_window(
     // 開いた人は録音を失ったと思う。ここで出るのは `Looking for recordings…`
     // （`library_text::EmptyList::Scanning`）。
     //
-    // **速い保存先でも 1 tick は出る**。結果を拾うのは 100ms 周期の tick で、しかも走査を
-    // 投げているのはその tick の中（メニューイベントの処理）なので、いちばん早くても次の周回。
-    // 体感時間を決めているのは走査の速さではなくポーリング間隔。
+    // **体感時間を決めているのは走査の速さではなく 100ms のポーリング間隔**。走査を投げるのも
+    // 結果を拾うのも同じ tick の中（メニューイベントの処理 → 受け口のドレイン）なので、走査
+    // スレッドがその間に読み切れば同じ周回で着地するが、まず間に合わないので次以降の周回になる。
+    // 例外は走査スレッドを立てられなかったとき——`spawn_session_scan` が UI スレッドから同期で
+    // 送るので、この文言は出ないまま `Could not look for recordings` へ差し替わる。
     handles.scan_state.set(ScanState::Awaiting);
     apply_list_counts(
         rec,
@@ -4320,8 +4331,10 @@ mod tests {
         ));
         rec.set_search_text("release".into());
 
-        // 走査の相手は空の一時ディレクトリ（結果は tick が拾うので、ここでは待たない）。
+        // 走査の相手は**実在する空のディレクトリ**（無いと `read_dir` が失敗して、走ったのか
+        // 走らなかったのか区別できない）。
         let recording_dir = std::env::temp_dir().join("shoki-open-library-window");
+        std::fs::create_dir_all(&recording_dir).expect("make an empty recordings folder");
         let config = std::rc::Rc::new(RefCell::new(super::Config {
             recording_dir,
             ..super::Config::default()
@@ -4379,8 +4392,15 @@ mod tests {
         assert!(handles.sessions.borrow().is_empty());
         // 絞り込みも持ち越さない（残ると、録音が消えたように見える）。
         assert_eq!(rec.get_search_text(), "");
-        // 走査は投げてある（世代が進み、結果の受け口が繋がっている）。
+        // **走査が実際に飛んだところまで見る**。世代だけを見ると、`spawn_session_scan` の
+        // 呼び出しを消しても通る——症状は「`Looking for recordings…` のまま永久に埋まらない」で、
+        // #181 が作った状態のうちいちばん出してはいけない画面。
         assert_eq!(handles.scan_generation.get(), 1);
+        let scanned = handles
+            .scan_receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the scan must actually be spawned and report back");
+        assert_eq!(scanned.generation, 1);
     }
 
     /// 走査中に打たれた検索が、**走査の着地で黙って捨てられない**こと（#181）。
@@ -5265,6 +5285,12 @@ mod tests {
         let (heading, body) = super::library_text::empty_list_message(EmptyList::ScanFailed);
         assert_eq!(heading, "Could not look for recordings");
         assert!(body.starts_with("Reading the save location did not start"));
+        // **導線の名前をトレイのラベルと突き合わせる**。ここだけが「もう一度やる方法」を
+        // 伝える文なので、実在しない項目名を書くと詰む（実際に `Recordings` と書いていた）。
+        assert!(
+            body.contains(super::tray::LIBRARY_LABEL),
+            "the way back must name the menu item that exists, got {body:?}"
+        );
 
         let (heading, body) =
             super::library_text::empty_list_message(EmptyList::NoMatches { not_downloaded: 0 });

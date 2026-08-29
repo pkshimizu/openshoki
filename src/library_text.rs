@@ -76,7 +76,7 @@ pub fn empty_list_message(state: EmptyList) -> (&'static str, String) {
         // なるが、実際は 1 件も見ていない。稀な縮退なので、やり直す手だけ示す。
         EmptyList::ScanFailed => (
             "Could not look for recordings",
-            "Reading the save location did not start. Open Recordings again from the shoki icon \
+            "Reading the save location did not start. Open Library… again from the shoki icon \
              in the menu bar."
                 .to_owned(),
         ),
