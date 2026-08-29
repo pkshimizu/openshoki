@@ -140,11 +140,11 @@
   一覧の各行にドット（前/中/完了/失敗）・詳細ペインにテキストで表示する（変化した行だけ
   `set_row_data` する差分更新。ウィンドウ表示中の tick に相乗り）。失敗の状態テキストは警告色
   （`Style.danger`）で表示し、セグメントが無いときは状態ごとに**見出し・なぜ無いのか・次の操作**の
-  3 段を出す（#154。対応表の正は `reading_pane::TranscriptPane::message`）。完了済みの再実行中は
+  3 段を出す（#154。対応表の正は `shoki_core::TranscriptPane::message`）。完了済みの再実行中は
   旧トランスクリプトの表示を維持する。
   **途中で失敗した文字起こしは、そこまでを残して読める**（#164）: 音源を最後まで読めなくても
   読めた範囲を文字起こしして保存し、失敗の理由に「どこまで読めたか」を載せる
-  （`reading_pane::FailedSource`）。ただし**保存するのは残す価値があるときだけ**——1 件も
+  （`shoki_core::FailedSource`）。ただし**保存するのは残す価値があるときだけ**——1 件も
   認識できていない途中結果は書かず、**すでに在る文字起こしも置き換えない**（前の実行が最後まで
   読めていればそれは完成品で、音源がもう最後まで読めない以上、上書きは取り返しがつかない。
   正は `transcribe::write_decision`）。
@@ -153,7 +153,7 @@
   （`TranscriptPane::shows_partial`）で、前回の完成した文字起こしが残っているだけの失敗
   （モデルのロードに失敗した再実行など）では伏せない。
   **録音とどう食い違っているかは JSON に残す**（#175 / #176。`complete` と `gapped` の 2 欄で、
-  読んだ直後に `reading_pane::TranscriptShortfall` へ畳む）ので、この区別は**再起動しても
+  読んだ直後に `shoki_core::TranscriptShortfall` へ畳む）ので、この区別は**再起動しても
   消えない**——失敗の記録がメモリのみなのは変わらないが、ディスクの印から復元する。食い違いは
   「**在る音源ごとに、読めて食い違いの無い JSON があるか**」で決める
   （`transcript::load_transcript`）——「読めた JSON がすべて揃っている」にすると、片方の JSON が
@@ -189,9 +189,9 @@
   `summary.md` を行単位に出し、見出し行（`#` の連なり＋空白か行末）だけ記号を落として強調する
   （Markdown をどこまで解釈するかの正は `main::summary_rows` の doc）。読み込みは文字起こし JSON と同じガード（サイズ上限・通常ファイル確認）で、
   欠落・破損・空はいずれも状態依存の空表示に落とす（状態→文言の対応表の正は
-  `reading_pane::SummaryPane::message`。ここに並べ直すと片方だけ古くなる）。文字起こしが無いセッションは
+  `shoki_core::SummaryPane::message`。ここに並べ直すと片方だけ古くなる）。文字起こしが無いセッションは
   「まだ書いていない」ではなく「まだ書けない」と言い分ける。**入力が無いときは、なぜ無いのかで
-  3 つに割れる**（#165。`reading_pane::TranscriptInput`）: いま作っている（`WaitingForTranscript`）／
+  3 つに割れる**（#165。`shoki_core::TranscriptInput`）: いま作っている（`WaitingForTranscript`）／
   作ろうとして失敗した（`TranscriptFailed`）／まだ何もしていない（`Blocked`）。`Blocked` の主操作は
   **「Transcribe, then write notes」**で、文字起こしジョブに議事録の依頼をぶら下げて投入する
   （`main::chained_summarize_job`。続けるかどうかの判断は `TranscribeWorker` が持ち、**全音源
