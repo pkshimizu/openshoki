@@ -21,6 +21,8 @@
 //!   見られる。`has-gaps` の本文がこのペインで最長なので、折り返しはそこで見る
 //! - `transcript-partial`: 途中まで読めて失敗した状態（#164）。**件数と組み合わせる**——
 //!   セグメントが在っても `Show partial` を押すまで空表示が出るところを見る
+//! - `transcript-partial-with-gaps`: 同上だが、そこまでの間にも抜けがある（#176）。位置を
+//!   言わないぶん文が長くなるので、失敗の理由の折り返しはここで見る
 //! - `show-partial`: その途中結果を開いた状態（一覧に切り替わるところを見る）
 //!   Notes タブの入力待ち・入力の失敗（#165）は、`no-transcript` に `transcribing` /
 //!   `transcript-failed` を重ねて作る（Transcript タブと同じ値から出るので、別のフラグは無い）
@@ -147,6 +149,19 @@ fn transcript_pane(has_transcript: bool) -> reading_pane::TranscriptPane {
                         reading_pane::KeptFromSource::Nothing,
                     ),
                 ],
+                kept_other_sources: false,
+            },
+        };
+    }
+    if flag("transcript-partial-with-gaps") {
+        // 途中まで読めて失敗し、そこまでの間にも抜けがある（#176）。**位置を言わない**ので、
+        // `TranscribeFailure::Files` の中でいちばん長い文になる（折り返しをここで見る）。
+        return reading_pane::TranscriptPane::Failed {
+            reason: reading_pane::TranscribeFailure::Files {
+                failed: vec![reading_pane::FailedSource::new(
+                    "mic.mp3",
+                    reading_pane::KeptFromSource::SomeWithGaps,
+                )],
                 kept_other_sources: false,
             },
         };

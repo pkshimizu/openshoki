@@ -4239,9 +4239,23 @@ mod tests {
             other_source_kept.message().body,
             "system.mp3 could not be transcribed. Everything that was read is kept."
         );
+        // **抜けもあるなら位置を言わない**（#176）。残せた長さは読み飛ばしたぶん前へ詰まって
+        // いて、音声の位置ではない。それでも**残っているので開く手は出す**。
+        let cut_short_with_gaps = TranscriptPane::Failed {
+            reason: TranscribeFailure::Files {
+                failed: vec![FailedSource::new("mic.mp3", KeptFromSource::SomeWithGaps)],
+                kept_other_sources: false,
+            },
+        };
+        assert_eq!(
+            cut_short_with_gaps.message().body,
+            "mic.mp3 could not be read to the end, and parts of what was read are missing. \
+             Everything that was read is kept."
+        );
+
         // 残っていれば、開く手を出す（#164）。**主操作はやり直しのまま**——読めるのが途中まで
         // だと分かった人が次にしたいのは、たいてい取り直しではなく再実行。
-        for pane in [&cut_short, &other_source_kept] {
+        for pane in [&cut_short, &other_source_kept, &cut_short_with_gaps] {
             assert!(pane.shows_partial());
             assert_eq!(
                 pane.message()
@@ -4798,6 +4812,16 @@ mod tests {
                     kept_other_sources: false,
                 },
                 "mic.mp3 could not be read past 1:04:12. Everything that was read is kept.",
+            ),
+            (
+                // 抜けもある音源は、**位置を言わない**（#176）。残せた長さは読み飛ばした
+                // ぶん前へ詰まっていて、音声の位置ではない。
+                T::Files {
+                    failed: vec![FailedSource::new("mic.mp3", KeptFromSource::SomeWithGaps)],
+                    kept_other_sources: false,
+                },
+                "mic.mp3 could not be read to the end, and parts of what was read are missing. \
+                 Everything that was read is kept.",
             ),
             (
                 // 失敗した音源から何も残らなくても、もう 1 本が最後まで行っていれば読める。
