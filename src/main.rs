@@ -4277,6 +4277,37 @@ mod tests {
             ]
         );
 
+        // **食い違いごとに違うことを言う**（#176）。同じ文言へ畳むと、最後まで読めた録音に
+        // 「一部しか文字起こしできていない」を出すことになる。**操作の並びは 3 つとも同じ**
+        // ——押す位置が画面に出ない区別で入れ替わると、押し間違いを誘う。
+        let messages: Vec<_> = [
+            TranscriptShortfall::StopsPartway,
+            TranscriptShortfall::HasGaps,
+            TranscriptShortfall::StopsPartwayWithGaps,
+        ]
+        .into_iter()
+        .map(|shortfall| TranscriptPane::NotWhole { shortfall }.message())
+        .collect();
+        for message in &messages {
+            assert_eq!(
+                message
+                    .actions
+                    .iter()
+                    .map(|action| (action.kind, action.primary))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (PaneActionKind::Transcribe, true),
+                    (PaneActionKind::ShowPartialTranscript, false),
+                ]
+            );
+        }
+        let bodies: std::collections::HashSet<&str> =
+            messages.iter().map(|m| m.body.as_str()).collect();
+        assert_eq!(bodies.len(), 3, "each shortfall must explain itself");
+        // 抜けだけのときは、届いていないとは言わない。
+        assert_eq!(messages[1].heading, "This transcript has gaps");
+        assert!(!messages[1].body.contains("only part of this recording"));
+
         // **なぜ止まったか分からない**ときは、分かったふりをしない。
         assert_eq!(
             TranscriptPane::Failed {
