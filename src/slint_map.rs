@@ -104,6 +104,28 @@ pub fn to_ui_pane_action(action: &shoki_core::PaneAction) -> UiPaneAction {
     }
 }
 
+/// すでにモデルに入っているボタン 1 つが、core の値と同じか。
+///
+/// **比較もここに置く**（#188）。呼び出し側でフィールドを並べて比べると、写像は分解束縛で
+/// 割れるのに比較だけ黙って通る——足したフィールドが比較から落ち、「その欄だけ変わった tick で
+/// 差分が立たず、古いボタンが残る」。**両側とも分解束縛で受ける**ので、どちらにフィールドを
+/// 足しても割れる。
+///
+/// 確保はしない（`set_pane_actions` は 100ms tick を通る）。
+pub fn ui_pane_action_matches(current: &UiPaneAction, next: &shoki_core::PaneAction) -> bool {
+    let UiPaneAction {
+        label: ui_label,
+        kind: ui_kind,
+        primary: ui_primary,
+    } = current;
+    let shoki_core::PaneAction {
+        label,
+        kind,
+        primary,
+    } = next;
+    ui_label.as_str() == label && *ui_kind == to_ui_pane_action_kind(*kind) && ui_primary == primary
+}
+
 /// ボタン列。Slint のモデルへそのまま入れられる形にする。
 pub fn to_ui_pane_actions(actions: &[shoki_core::PaneAction]) -> ModelRc<UiPaneAction> {
     ModelRc::from(Rc::new(VecModel::from(

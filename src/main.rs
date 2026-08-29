@@ -34,10 +34,12 @@ use shoki_core::{
     StoredTranscript, SummaryPane, TranscriptInput, TranscriptPane, actions_allowed_while_busy,
     elapsed_text, session_transcript_word, summary_status_text,
 };
-// **このファイルでは裸の型名を書かない**（#188）。`slint::include_modules!()` が生成型を
-// クレート直下に置くので、`TranscriptStatus` のような裸の名前は Slint 型を指してしまい、
-// core の同名の型と読み分けられない。Slint 型は `Ui` 付きの別名で、core 型は `shoki_core::` で
-// 修飾して書く。
+// **core と同名の型（`TranscriptStatus` / `SummaryStatus` / `PaneAction` / `PaneActionKind`）は
+// 裸で書かない**（#188）。`slint::include_modules!()` が生成型をクレート直下に置くので、裸の
+// 名前は Slint 型を指してしまい、core の同名の型と読み分けられない。Slint 側は `Ui` 付きの
+// 別名、core 側は `shoki_core::` で修飾する。
+//
+// **衝突しない生成型（`LibraryWindow` / `SessionRow` / `StatusTone` など）はそのままでよい。**
 use slint_map::{UiPaneAction, UiPaneActionKind};
 
 use std::cell::{Cell, RefCell};
@@ -3125,11 +3127,10 @@ fn set_pane_actions(
     // **比べるために確保しない**。ここは 100ms tick を通るので、一致して早期 return する
     // 大半のケースでも `Vec` と `SharedString` を作ることになる（実測で 1 回あたり約 78ns の差）。
     let same = current.row_count() == actions.len()
-        && current.iter().zip(actions.iter()).all(|(current, next)| {
-            current.label.as_str() == next.label
-                && current.kind == slint_map::to_ui_pane_action_kind(next.kind)
-                && current.primary == next.primary
-        });
+        && current
+            .iter()
+            .zip(actions.iter())
+            .all(|(current, next)| slint_map::ui_pane_action_matches(&current, next));
     if same {
         return;
     }
