@@ -28,10 +28,10 @@
 - Closes #{番号}   （関連 issue があれば。マージで自動クローズさせる。無ければ省く）
 
 ## 確認事項
-- [ ] `cargo build` が通る
-- [ ] `cargo fmt --check` が通る（整形済み）
-- [ ] `cargo clippy -- -D warnings` が通る
-- [ ] `cargo test` が通る／手動で動作確認した
+- [ ] `cargo build --workspace` が通る
+- [ ] `cargo fmt --all --check` が通る（整形済み）
+- [ ] `cargo clippy --workspace --all-targets -- -D warnings` が通る
+- [ ] `cargo test --workspace` が通る／手動で動作確認した
 ```
 
 ## 運用

@@ -1,9 +1,12 @@
 ---
+# パスの `**/` は**ルート直下にも一致する**（`src/main.rs` を含む）。クレート名を列挙せずに
+# ワークスペース全体を拾うための書き方（#187。理由は `docs/rules/coding-conventions.md` の
+# 「同じ背景説明を複数箇所に重複させない」）。
 paths:
-  - "src/**"
-  - "examples/**"
-  - "tests/**"
-  - "build.rs"
+  - "**/src/**"
+  - "**/examples/**"
+  - "**/tests/**"
+  - "**/build.rs"
 ---
 # レビュー観点: Rust アンチパターン
 

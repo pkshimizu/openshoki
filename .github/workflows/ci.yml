@@ -137,11 +137,13 @@ jobs:
           cargo clippy --version
           cargo fmt --version
       - uses: Swatinem/rust-cache@v2
+      # `--workspace` / `--all` を落とさないこと（#187。理由は
+      # `docs/rules/coding-conventions.md` の「検証コマンド」）。
       - name: fmt
-        run: cargo fmt --check
+        run: cargo fmt --all --check
       - name: clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
       - name: build
-        run: cargo build --verbose
+        run: cargo build --workspace --verbose
       - name: test
-        run: cargo test --verbose
+        run: cargo test --workspace --verbose

@@ -267,8 +267,8 @@ fn write_decision(produced: &Transcription, existing: Option<StoredReach>) -> Wr
   `recordings.rs` は chrono を使う。どちらも純粋）
 - CI・`cargo dev`（cargo-watch のエイリアス）・MAS パッケージング（#109）への影響を確認する
 
-**完了の判定**: 挙動が一切変わらない。`cargo build` / `cargo fmt --check` /
-`cargo clippy --all-targets -- -D warnings` / `cargo test` がすべて通り、`cargo dev` が動く。
+**完了の判定**: 挙動が一切変わらない。`docs/rules/coding-conventions.md` の検証コマンド一式が
+すべて通り、`cargo dev` が動く。
 
 ### 段階 01 — 文字起こしの状態を `core` へ移す（#188）
 

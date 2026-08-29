@@ -1,11 +1,21 @@
 ---
+# パスの `**/` は**ルート直下にも一致する**（`src/main.rs` を含む）。クレート名を列挙せずに
+# ワークスペース全体を拾うための書き方（#187。理由は `docs/rules/coding-conventions.md` の
+# 「同じ背景説明を複数箇所に重複させない」）。
 paths:
-  - "src/**"
-  - "ui/**"
-  - "build.rs"
-  - "Cargo.toml"
+  - "**/src/**"
+  - "**/ui/**"
+  - "**/build.rs"
+  - "**/Cargo.toml"
   - "scripts/**"
   - ".github/**"
+  # **守りを置いたファイルは、ここにも足すこと**（#187）。足し忘れると、その守りを外す差分で
+  # セキュリティ観点が起動せず、静かに弱められる。
+  - "**/clippy.toml"
+  - "**/.clippy.toml"
+  - ".cargo/**"
+  - "rust-toolchain.toml"
+  - "Cargo.lock"
 ---
 # レビュー観点: セキュリティ
 

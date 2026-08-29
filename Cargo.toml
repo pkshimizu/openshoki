@@ -1,7 +1,30 @@
+# **ワークスペースにしてある**（#187）。`shoki`（このパッケージ＝shell）と `shoki-core`
+# （純粋な層）の 2 つ。向きは `shoki` → `shoki-core` の一方向で、逆は無い。何が守られていて
+# 何が守られていないかは `shoki-core/src/lib.rs` の doc が正。
+#
+# ルートをパッケージのまま残しているのは、`src/` や `ui/` を動かさないため。移動すると
+# `build.rs` の Slint コンパイル・`include_bytes!` のアイコン・CI のアイコン検査まで一斉に
+# 触ることになり、器を作るだけの変更でなくなる。
+#
+# **検証コマンドは `--workspace` / `--all` を付けること**（理由は
+# `docs/rules/coding-conventions.md` の「検証コマンド」）。
+[workspace]
+members = ["shoki-core"]
+# ルートを virtual manifest（`[package]` を持たない形）へ変えても解決規則が動かないよう、
+# edition 2024 が含意するのと同じ `3` を明示しておく。いまの形では挙動は変わらない。
+resolver = "3"
+
+# クレートをまたいで同じにするものはここに置く（増えたときに片方だけ古くならないように）。
+# `version` は分ける——`shoki-core` は公開せず、アプリの版の正は `shoki` 側だけにしたいため。
+[workspace.package]
+edition = "2024"
+
 [package]
 name = "shoki"
 version = "0.1.0"
-edition = "2024"
+edition.workspace = true
+# 公開しない（サプライチェーン上の事故を機械的に止める）。
+publish = false
 
 [dependencies]
 chrono = "0.4.45"
@@ -25,6 +48,9 @@ rubato = "4.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+# 純粋な層（#187）。**まだ何も使っていない**——最初の利用は #188（文字起こしの状態を移す）。
+# ここで先に繋いでおくのは、ワークスペースの配線と CI をこの PR で確かめるため。
+shoki-core = { path = "shoki-core" }
 # raw-window-handle-06: メニューからの前面化でネイティブウィンドウを得る（bring_to_front 参照）。
 slint = { version = "1.17.0", features = ["raw-window-handle-06"] }
 symphonia = { version = "0.6", default-features = false, features = ["mp3"] }

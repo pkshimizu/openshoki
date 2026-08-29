@@ -1,0 +1,65 @@
+# core に副作用を持ち込ませないための**うっかり止め**（#187）。
+#
+# **これは網羅でも証明でもない。** クレート境界が禁じるのは `shoki` 側の型に触ることだけで、
+# `std` の I/O は依存ゼロでも書ける。原則は `src/lib.rs` の doc にある 1 行——「この層は状態と
+# 判断と文言だけを持つ」——で、ここはその原則を外れたときに CI（`-D warnings`）で気づける
+# ようにするための仕掛け。抜け道はいくらでもあるので、レビューの代わりにはならない。
+#
+# **モジュールごと禁じる書き方が clippy に無い**ので、個別に並べるしかない。だから
+# **足すときは family ごと見ること**——`create_dir_all` だけ塞いで `create_dir` と
+# `DirBuilder` が空いていると、「この系統は塞がれている」という誤った安心だけが残る
+# （`docs/rules/security.md` が 0700 のディレクトリ作成に名指ししているのは `DirBuilder`）。
+#
+# **このファイルは `shoki-core` にだけ効く**（clippy は各クレートのディレクトリから設定を探す）。
+# shell 側は `std::fs::File` を 3 ファイルで使っているが、そちらは検出されない。
+#
+# **依存を足すときは、その依存の入り口もここへ足す**。例: `chrono` を足すなら
+# `chrono::Utc::now` / `chrono::Local::now` を `disallowed-methods` に足す。
+#
+# **これは CI では守れない**。依存に無いパスを書いても clippy は黙って無視する（存在しない
+# `std::` のパスだけは「does not refer to a reachable function」と言う）ので、足し忘れても緑の
+# まま通る。だから依存追加と同じ PR で足すこと——`shoki-core/Cargo.toml` にも同じ申し送りがある。
+disallowed-types = [
+  # ファイル
+  { path = "std::fs::File", reason = "読み書きは shell の adapter が行う。core は値を受け取る" },
+  { path = "std::fs::OpenOptions", reason = "同上" },
+  { path = "std::fs::DirBuilder", reason = "ディレクトリ作成も shell の仕事（0700 の保証は private_file 側）" },
+  # 並行性
+  { path = "std::thread::Builder", reason = "並行性は shell の job runtime が持つ。core は単一スレッドが所有する" },
+  # 外の世界
+  { path = "std::process::Command", reason = "外部プロセスの起動は shell の仕事" },
+  { path = "std::net::TcpStream", reason = "ネットワークは shell の adapter が行う" },
+  { path = "std::net::UdpSocket", reason = "同上" },
+]
+
+disallowed-methods = [
+  # 読む（事実は adapter が集め、Event に載せて渡す）
+  { path = "std::fs::read", reason = "事実は adapter が集め、Event に載せて渡す" },
+  { path = "std::fs::read_to_string", reason = "同上" },
+  { path = "std::fs::read_dir", reason = "同上（走査は Effect::ScanSessions → Event::Scanned）" },
+  { path = "std::fs::metadata", reason = "同上" },
+  # 書く（0600 / 0700 の保証は private_file が持つ。core は Effect を返して shell に任せる）
+  { path = "std::fs::write", reason = "書き込みは Effect を返して shell に任せる（0600 の保証は private_file）" },
+  { path = "std::fs::create_dir", reason = "同上" },
+  { path = "std::fs::create_dir_all", reason = "同上" },
+  { path = "std::fs::copy", reason = "同上" },
+  { path = "std::fs::rename", reason = "同上" },
+  { path = "std::fs::remove_file", reason = "同上" },
+  { path = "std::fs::remove_dir_all", reason = "同上" },
+  { path = "std::fs::set_permissions", reason = "同上" },
+  # 並行性
+  { path = "std::thread::spawn", reason = "並行性は shell の job runtime が持つ" },
+  # 時刻（外から来る事実。Event に載せて渡すと、テストが決定的になる）
+  { path = "std::time::SystemTime::now", reason = "時刻も外から来る事実。Event に載せると、テストが決定的になる" },
+  { path = "std::time::Instant::now", reason = "同上" },
+]
+
+# ログ（`docs/rules/security.md` のログ衛生——本文もフルパスも出さない——を core 側で守らせる
+# 手段が無いので、そもそも書かせない。伝えたいことは値にして shell へ返す）。
+disallowed-macros = [
+  { path = "std::println", reason = "ログは shell が出す。core は値を返す" },
+  { path = "std::eprintln", reason = "同上" },
+  { path = "std::print", reason = "同上" },
+  { path = "std::eprint", reason = "同上" },
+  { path = "std::dbg", reason = "デバッグ出力を残さない" },
+]

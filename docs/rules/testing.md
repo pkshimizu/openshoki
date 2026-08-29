@@ -135,9 +135,10 @@ assert 先は「その状態でしか出ない値」を選ぶ（本文・状態 
 `-D warnings` で落ちる。#152 で実際に 2 件すり抜けた。
 
 置き換えたら、その場で `grep` して呼び出しが残っているか確かめる。疑わしいときは
-`find src -name '*.rs' -exec touch {} + && cargo clippy --all-targets -- -D warnings` で
-解析し直す。**ディレクトリを列挙しない**——列挙するとモジュールが増えたときに漏れる
-（実際 `src/windows` を足したときも、`src/summarize` を足したときも漏れた）。
+`find . -path ./target -prune -o -name '*.rs' -exec touch {} + && cargo clippy --workspace
+--all-targets -- -D warnings` で解析し直す。**ディレクトリを列挙しない**——列挙するとモジュールが
+増えたときに漏れる（実際 `src/windows` を足したときも、`src/summarize` を足したときも漏れた。
+#187 でクレートが増えたときも、`find src` 決め打ちだったせいで `shoki-core/src` を取り落とした）。
 
 なお**バージョン差による見逃しは別問題**で、そちらは `rust-toolchain.toml` が塞いでいる（#156。
 手元と CI で同じ Rust を使う）。`touch` で解決するのは「同じバージョンでの差分ビルド」だけ。

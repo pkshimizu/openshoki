@@ -5321,6 +5321,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "shoki-core",
  "slint",
  "slint-build",
  "symphonia 0.6.0",
@@ -5330,6 +5331,10 @@ dependencies = [
  "ureq",
  "whisper-rs",
 ]
+
+[[package]]
+name = "shoki-core"
+version = "0.0.0"
 
 [[package]]
 name = "signal-hook-registry"
