@@ -34,6 +34,9 @@
 //! - `search` / `no-match`: 一覧を絞り込み中／0 件にする（検索欄・件数・解除の導線の確認）
 //! - `not-downloaded`: 退避されていて検索できなかった録音がある状態（#182。件数の行と
 //!   0 件の説明に理由が出る。`search` / `no-match` と組み合わせる）
+//! - `scanning`: 走査がまだ終わっていない状態（#181。0 件だが「録音が無い」とは言わない）。
+//!   **件数 0 と組み合わせる**。`search` / `no-match` と重ねても検索欄は立たない——本番は
+//!   走査を投げる前に検索を解除するので、両方が立った画面は作れない
 //! - `snapshot <path>`: PNG に書き出す（画面収録の許可が無い環境用）
 
 slint::include_modules!();
@@ -352,13 +355,25 @@ fn main() {
     let searching = flag("search") || flag("no-match");
     let not_downloaded = if flag("not-downloaded") { 2 } else { 0 };
     let matched = if flag("no-match") { 0 } else { 3 };
-    if searching {
+    if searching && !flag("scanning") {
         win.set_search_text("recording format".into());
         win.set_search_summary(
             library_text::search_summary_text(matched, 5, not_downloaded).into(),
         );
     }
-    let (empty_heading, empty_body) = library_text::empty_list_message(searching, not_downloaded);
+    // **状態は 1 つの値から出す**（`docs/rules/testing.md`）。走査中の表示も見られるように
+    // `scanning` フラグを足してある（#181）。
+    //
+    // **走査中は絞り込みと重ならない**——`open_library_window` は走査を投げる前に検索を解除
+    // するので、本番では両方が立った画面は作れない。重ねられるようにすると、「Looking for
+    // recordings…」の下に `Clear search` が並ぶ、本番では出ない画面を目視することになる。
+    let (empty_heading, empty_body) = library_text::empty_list_message(if flag("scanning") {
+        library_text::EmptyList::Scanning
+    } else if searching {
+        library_text::EmptyList::NoMatches { not_downloaded }
+    } else {
+        library_text::EmptyList::NoRecordings
+    });
     win.set_empty_heading(empty_heading.into());
     win.set_empty_body(empty_body.into());
 

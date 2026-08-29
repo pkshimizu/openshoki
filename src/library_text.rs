@@ -5,6 +5,20 @@
 //! そのまま取り込むので、**crate 内の何にも依存させない**——例外は同じやり方で共有して
 //! いる `shoki_core::reading_pane`（単複の言い回しをそこに寄せてある）。
 
+/// 一覧が空のとき、**なぜ空なのか**（#161 / #181 / #182）。
+///
+/// **真偽値を並べない**——「走査中か」「絞り込み中か」を別々の bool で持つと、両方立った
+/// 組み合わせの文言を決め忘れられる（`docs/rules/coding-conventions.md`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmptyList {
+    /// まだ走査が終わっていない（#181）。件数は 0 だが、録音が無いとは限らない。
+    Scanning,
+    /// 走査は終わっていて、録音が 1 件も無い。
+    NoRecordings,
+    /// 絞り込んだ結果 0 件。`not_downloaded` は本文を読めなかった録音の数（#182）。
+    NoMatches { not_downloaded: usize },
+}
+
 /// 一覧の下端に出す合計。**件数だけ**にする——容量を出すには全セッションのファイルを開く必要が
 /// あり、一覧を開くたびに走らせるには重い。
 pub fn library_summary(count: usize) -> String {
@@ -41,15 +55,29 @@ pub fn search_summary_text(matched: usize, total: usize, not_downloaded: usize) 
 ///
 /// **絞り込んで 0 件のときこそ理由を言う**。一覧の下端の 1 行は省略されうるので、退避されて
 /// 読めなかったことを伝える場所としてはここがいちばん見える。
-pub fn empty_list_message(searching: bool, not_downloaded: usize) -> (&'static str, String) {
-    if !searching {
-        return (
-            "No recordings yet",
+pub fn empty_list_message(state: EmptyList) -> (&'static str, String) {
+    let not_downloaded = match state {
+        // **「録音が無い」とは言わない**（#181）。まだ数えていないだけで、在るかどうかは
+        // 分かっていない。走査は 0.6ms（#178）なので速い保存先ではまず目に入らないが、
+        // 遅いボリュームではここが数秒出る——そこで嘘をつくと、開いた人は録音を失ったと思う。
+        EmptyList::Scanning => {
+            return (
+                "Looking for recordings…",
+                "Reading the save location. This can take a moment on a network or external \
+                 volume."
+                    .to_owned(),
+            );
+        }
+        EmptyList::NoMatches { not_downloaded } => not_downloaded,
+        EmptyList::NoRecordings => {
+            return (
+                "No recordings yet",
             "Start one from the shoki icon in the menu bar, or turn on Record automatically in \
              Settings so meetings are captured for you."
                 .to_owned(),
-        );
-    }
+            );
+        }
+    };
     let mut body = "No transcript or notes mention it. Recordings that have not been \
                     transcribed are not searched."
         .to_owned();

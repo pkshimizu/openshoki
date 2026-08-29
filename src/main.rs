@@ -816,7 +816,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let all = all_sessions.borrow().clone();
             let total = all.len();
             sessions_model.set_vec(session_rows(&all, &transcriber));
-            apply_list_counts(&rec, total, total, 0);
+            apply_list_counts(
+                &rec,
+                ListCounts {
+                    shown: total,
+                    total,
+                    not_downloaded: 0,
+                    scanning: false,
+                },
+            );
             reselect_after_list_change(
                 &rec,
                 &sessions,
@@ -978,11 +986,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let all = all_sessions.borrow();
                 apply_list_counts(
                     &rec,
-                    sessions.len(),
-                    all.len(),
-                    // **消したぶんは落として数え直す**（#182）。絞り込みは解除されないので、
-                    // 読めなかった話も消さずに残す。
-                    not_downloaded_count(&search_not_downloaded.borrow(), &all),
+                    ListCounts {
+                        shown: sessions.len(),
+                        total: all.len(),
+                        // **消したぶんは落として数え直す**（#182）。絞り込みは解除されない
+                        // ので、読めなかった話も消さずに残す。
+                        not_downloaded: not_downloaded_count(&search_not_downloaded.borrow(), &all),
+                        scanning: false,
+                    },
                 );
                 if let Some(mut row) = sessions_model.row_data(i) {
                     row.group_heading =
@@ -1927,7 +1938,15 @@ fn apply_scanned_sessions(
     // **件数も空表示もここを通す**（`docs/rules/slint.md` の「表示値の導出は 1 つの関数に
     // 集める」）。走査直後は絞り込みも読めなかったものも無い（`open_library_window` が
     // 検索を解除している）。
-    apply_list_counts(rec, scanned.sessions.len(), scanned.sessions.len(), 0);
+    apply_list_counts(
+        rec,
+        ListCounts {
+            shown: scanned.sessions.len(),
+            total: scanned.sessions.len(),
+            not_downloaded: 0,
+            scanning: false,
+        },
+    );
     *lists.all.borrow_mut() = scanned.sessions.clone();
     *lists.shown.borrow_mut() = scanned.sessions;
     true
@@ -2625,13 +2644,39 @@ fn reselect_after_list_change(
 }
 
 /// 一覧の下の件数を入れる。**絞り込み中かどうかで文が変わる**ので、両方の件数を渡して
+/// 一覧の件数（#181 で `scanning` を足した）。
+///
+/// **構造体で渡す**——`shown` と `total` と `not_downloaded` はどれも `usize` なので、引数で
+/// 並べると渡し違えても通る（`docs/rules/coding-conventions.md`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ListCounts {
+    /// いま一覧に出ている件数（絞り込むと縮む）。
+    shown: usize,
+    /// 走査で見つかった全件。
+    total: usize,
+    /// 最後の検索で本文を読めなかった件数（#182）。
+    not_downloaded: usize,
+    /// **まだ走査が終わっていない**（#181）。件数は 0 だが、録音が無いとは限らない。
+    scanning: bool,
+}
 /// ここ 1 箇所で決める（削除・検索・解除のどこから来ても同じ形になる）。
-fn apply_list_counts(rec: &LibraryWindow, shown: usize, total: usize, not_downloaded: usize) {
+fn apply_list_counts(rec: &LibraryWindow, counts: ListCounts) {
+    let ListCounts {
+        shown,
+        total,
+        not_downloaded,
+        scanning,
+    } = counts;
     rec.set_library_summary(library_text::library_summary(total).into());
     // 空表示の文も**同じ値から**決める（#182）。件数の文とは別に組み立てると、片方だけ
     // 「読めなかった」を言う画面ができる。
-    let (heading, body) =
-        library_text::empty_list_message(!rec.get_search_text().is_empty(), not_downloaded);
+    let (heading, body) = library_text::empty_list_message(if scanning {
+        library_text::EmptyList::Scanning
+    } else if rec.get_search_text().is_empty() {
+        library_text::EmptyList::NoRecordings
+    } else {
+        library_text::EmptyList::NoMatches { not_downloaded }
+    });
     rec.set_empty_heading(heading.into());
     rec.set_empty_body(body.into());
     // 絞り込んでいないなら件数の文は出さない（`library_summary` が出る）。**このとき
@@ -2663,9 +2708,13 @@ fn apply_search_result(
     let counted = count_search_result(result.matched, &stored.borrow(), all);
     apply_list_counts(
         rec,
-        counted.matched.len(),
-        counted.total,
-        counted.not_downloaded,
+        ListCounts {
+            shown: counted.matched.len(),
+            total: counted.total,
+            not_downloaded: counted.not_downloaded,
+            // 検索結果が届いた＝走査は終わっている。
+            scanning: false,
+        },
     );
     counted.matched
 }
@@ -2792,7 +2841,17 @@ fn open_library_window(
     // `library_text::empty_list_message` が「まだ何も無い」と言う——走査は 0.6ms（#178）なので、
     // 速いボリュームではこの状態が目に入る前に埋まる。
     handles.sessions_model.set_vec(Vec::new());
-    apply_list_counts(rec, 0, 0, 0);
+    // **走査中であることを言う**（#181）。0 件のまま「録音が無い」と言うと、遅い保存先で
+    // 開いた人は録音を失ったと思う。
+    apply_list_counts(
+        rec,
+        ListCounts {
+            shown: 0,
+            total: 0,
+            not_downloaded: 0,
+            scanning: true,
+        },
+    );
     handles.all_sessions.borrow_mut().clear();
     // 開くたびに未選択・停止表示へ初期化する。
     clear_library_selection(rec, &handles.transcript_segments, &handles.load_generation);
@@ -4770,16 +4829,40 @@ mod tests {
         let rec = super::LibraryWindow::new().expect("create the library window");
 
         // 絞り込んでおらず、読めなかったものも無い＝言うことが無い。
-        super::apply_list_counts(&rec, 11, 11, 0);
+        super::apply_list_counts(
+            &rec,
+            super::ListCounts {
+                shown: 11,
+                total: 11,
+                not_downloaded: 0,
+                scanning: false,
+            },
+        );
         assert_eq!(rec.get_search_summary(), "");
 
         // 絞り込み中は件数を出す。
-        super::apply_list_counts(&rec, 2, 11, 0);
+        super::apply_list_counts(
+            &rec,
+            super::ListCounts {
+                shown: 2,
+                total: 11,
+                not_downloaded: 0,
+                scanning: false,
+            },
+        );
         assert_eq!(rec.get_search_summary(), "2 of 11 recordings mention it");
 
         // **読めなかったものが在るなら、件数の行にも言う**（本番で実際に出る組み合わせ。
         // 全件一致かつ一部が退避、は `SearchOutcome` が排他なので作れない）。
-        super::apply_list_counts(&rec, 0, 11, 8);
+        super::apply_list_counts(
+            &rec,
+            super::ListCounts {
+                shown: 0,
+                total: 11,
+                not_downloaded: 8,
+                scanning: false,
+            },
+        );
         assert_eq!(
             rec.get_search_summary(),
             "0 of 11 recordings mention it · 8 not downloaded"
@@ -4788,7 +4871,15 @@ mod tests {
         // **空表示の文も同じ呼び出しで入る**（別々に組むと、片方だけ「読めなかった」を
         // 言う画面ができる）。検索中かはウィンドウの検索欄から見る。
         rec.set_search_text("release".into());
-        super::apply_list_counts(&rec, 0, 11, 8);
+        super::apply_list_counts(
+            &rec,
+            super::ListCounts {
+                shown: 0,
+                total: 11,
+                not_downloaded: 8,
+                scanning: false,
+            },
+        );
         assert_eq!(rec.get_empty_heading(), "No matches");
         assert!(
             rec.get_empty_body()
@@ -4797,7 +4888,15 @@ mod tests {
             rec.get_empty_body()
         );
         rec.set_search_text("".into());
-        super::apply_list_counts(&rec, 0, 0, 0);
+        super::apply_list_counts(
+            &rec,
+            super::ListCounts {
+                shown: 0,
+                total: 0,
+                not_downloaded: 0,
+                scanning: false,
+            },
+        );
         assert_eq!(rec.get_empty_heading(), "No recordings yet");
     }
 
@@ -4808,11 +4907,21 @@ mod tests {
     /// 場所はここ**。
     #[test]
     fn an_empty_list_says_why_it_is_empty() {
-        let (heading, body) = super::library_text::empty_list_message(false, 0);
+        use super::library_text::EmptyList;
+
+        let (heading, body) = super::library_text::empty_list_message(EmptyList::NoRecordings);
         assert_eq!(heading, "No recordings yet");
         assert!(body.starts_with("Start one from the shoki icon"));
 
-        let (heading, body) = super::library_text::empty_list_message(true, 0);
+        // **走査中は「録音が無い」と言わない**（#181）。まだ数えていないだけで、在るかどうかは
+        // 分かっていない。ここが `NoRecordings` に潰れると、遅い保存先で開いた人は録音を
+        // 失ったと思う。
+        let (heading, body) = super::library_text::empty_list_message(EmptyList::Scanning);
+        assert_eq!(heading, "Looking for recordings…");
+        assert!(body.starts_with("Reading the save location"));
+
+        let (heading, body) =
+            super::library_text::empty_list_message(EmptyList::NoMatches { not_downloaded: 0 });
         assert_eq!(heading, "No matches");
         assert_eq!(
             body,
@@ -4822,7 +4931,8 @@ mod tests {
 
         // **読めなかったものが在るなら、0 件の理由に加える**。件数は独立した文にする
         // （カンマで繋ぐと、直前の「文字起こしされていない録音」に係って読める）。
-        let (_, body) = super::library_text::empty_list_message(true, 8);
+        let (_, body) =
+            super::library_text::empty_list_message(EmptyList::NoMatches { not_downloaded: 8 });
         assert!(
             body.ends_with(
                 " 8 recordings are not downloaded to this Mac, so what they say could not be \
@@ -4831,7 +4941,8 @@ mod tests {
             "got {body:?}"
         );
         // 1 件でも文が壊れない（名詞も動詞も単数に合わせる）。
-        let (_, body) = super::library_text::empty_list_message(true, 1);
+        let (_, body) =
+            super::library_text::empty_list_message(EmptyList::NoMatches { not_downloaded: 1 });
         assert!(
             body.ends_with(
                 " 1 recording is not downloaded to this Mac, so what they say could not be \
@@ -4841,7 +4952,8 @@ mod tests {
         );
 
         // 絞り込んでいなければ、読めなかったものの話はしない（検索していないので）。
-        let (heading, body) = super::library_text::empty_list_message(false, 8);
+        // **状態が持てる形にしたので、そもそも件数を渡せない**（#181）。
+        let (heading, body) = super::library_text::empty_list_message(EmptyList::NoRecordings);
         assert_eq!(heading, "No recordings yet");
         assert!(!body.contains("not downloaded"));
     }
