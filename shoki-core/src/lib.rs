@@ -1,6 +1,6 @@
-// **クレート属性はファイルの先頭に置く**。`//!` の後ろに置くと、`pub mod` を 1 つ足した
-// 瞬間に「inner attribute is not permitted in this context」で落ちる（いま通っているのは
-// item がゼロだからでしかない）。
+// **クレート属性は item より前に置く**（`//!` の後ろでも通るが、item の後ろだと
+// 「inner attribute is not permitted in this context」で落ちる）。doc と混ぜず先頭に固めて
+// おけば、#188 で `pub mod` をどこに足しても位置を考えなくて済む。
 //
 // FFI も `unsafe` も shell の仕事なので、`allow` で穴を開けられない `forbid` にする。
 #![forbid(unsafe_code)]
