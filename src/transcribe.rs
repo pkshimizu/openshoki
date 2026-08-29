@@ -2707,14 +2707,18 @@ mod tests {
             WriteDecision::Write,
             "reaching the end outranks a longer run that stopped partway"
         );
+
         // **どちらも途中で終わっていて、どちらかに抜けがある**。長さは比べられないので、
-        // すでに在るものを守る（比べると、抜けたぶん詰まった値を音声の位置として使うことになる）。
+        // すでに在るものを守る（比べると、抜けたぶん詰まった値を音声の位置として使うことに
+        // なる）。**在るほうを短くしておく**——長いままだと、長さで比べても同じ答えになって
+        // しまい、比較へ落ちる壊れ方を見逃す。
+        stored(r#"{"complete":false,"duration_secs":10.0,"segments":[]}"#);
         assert_eq!(
             decide(both, 3),
             WriteDecision::KeepWhatIsThere { stored: Some(cut) },
             "lengths cannot be compared across gaps"
         );
-        stored(r#"{"complete":false,"gapped":true,"duration_secs":3000.0,"segments":[]}"#);
+        stored(r#"{"complete":false,"gapped":true,"duration_secs":10.0,"segments":[]}"#);
         for shortfall in [cut, both] {
             assert_eq!(
                 decide(shortfall, 3),
