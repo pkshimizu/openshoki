@@ -40,10 +40,16 @@ const RECORDING_BRIGHT: [u8; 3] = [0xD0, 0x21, 0x1c]; // 明滅の明るい側�
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `cargo test --workspace`
 
-**`--workspace` / `--all` を落とさないこと**（#187）。ワークスペースにしてあるので、付けないと
-ルートパッケージ（`shoki`）だけが対象になり、`shoki-core` は依存としてコンパイルされるだけで
-整形も lint もテストも走らない。CI は付けて回すので、手元で落とすと「手元では通ったのに CI で
-落ちる」が起きる。
+**`--workspace` / `--all` を落とさないこと**（#187）。実測した差は次のとおりで、いちばん効くのは
+`cargo test`:
+
+- `cargo test`: 付けないと **`shoki-core` のテストが 1 件も走らない**
+- `cargo clippy --all-targets`: メンバーの lib は付けなくても lint されるが、**test / example
+  ターゲットには届かない**
+- `cargo fmt`: 付けなくても現状は同じファイルを見る（`--all` は将来メンバーが増えたときの保険）
+
+4 つとも付けておくのは、サブディレクトリから叩いたときとメンバーが増えたときに効くため。CI は
+付けて回すので、手元で落とすと「手元では通ったのに CI で落ちる」が起きる。
 
 ## 手順書に書くコマンドは、その手順の目的を満たす一式にする
 

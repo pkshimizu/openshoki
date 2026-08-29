@@ -1,5 +1,8 @@
 [alias]
 # 開発用ホットリロード: ソース変更を監視して自動で再ビルド＆再起動する。
 # 事前に `cargo install cargo-watch` が必要。
-# `shoki-core` も監視する（#187）。落とすと、core を直しても再ビルドが走らない。
-dev = "watch -w src -w ui -w build.rs -w Cargo.toml -w shoki-core -x run"
+# **監視対象は列挙せず、除くものを書く**（#187）。`-w` で並べるとクレートが増えるたびに
+# 足す必要があり、落としても失敗せず「直したのに再ビルドされない」という気づきにくい形で
+# 壊れる（`docs/rules/coding-conventions.md` の「例外基準で書く」）。cargo-watch は既定で
+# `.gitignore` と `target/` を無視するので、あとはドキュメントを除けば足りる。
+dev = ["watch", "-i", "docs", "-i", "*.md", "-x", "run"]

@@ -25,6 +25,6 @@
 # ので、`stable` のようなチャンネル名ではなく**具体的な版**にすること。そして edition 2024 を
 # 使っているので、**1.85 未満にはできない**。
 channel = "1.98.0"
-# 手元でも CI でも `cargo fmt --check` / `cargo clippy` を通す（`docs/rules/coding-conventions.md`
-# の検証コマンド）。ここに書いておけば、ワークフロー側で `components:` を指定しなくてよい。
+# `docs/rules/coding-conventions.md` の検証コマンドを手元でも CI でも通すため。ここに書いて
+# おけば、ワークフロー側で `components:` を指定しなくてよい。
 components = ["rustfmt", "clippy"]

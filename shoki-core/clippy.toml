@@ -1,0 +1,26 @@
+# core に副作用を持ち込ませないための**うっかり止め**（#187）。
+#
+# **これは網羅でも証明でもない。** クレート境界が禁じるのは `shoki` 側の型に触ることだけで、
+# `std` の I/O は依存ゼロでも書ける。原則は `src/lib.rs` の doc にある 1 行——「この層は状態と
+# 判断と文言だけを持つ」——で、ここはその原則を外れたときに CI（`-D warnings`）で気づける
+# ようにするための仕掛け。抜け道はいくらでもあるので、レビューの代わりにはならない。
+#
+# **このファイルは `shoki-core` にだけ効く**（clippy は各クレートのディレクトリから設定を探す）。
+# shell 側は `std::fs::File` を 3 ファイルで使っているが、そちらは検出されない。
+disallowed-types = [
+  { path = "std::fs::File", reason = "読み書きは shell の adapter が行う。core は値を受け取る" },
+  { path = "std::fs::OpenOptions", reason = "同上" },
+  { path = "std::process::Command", reason = "外部プロセスの起動は shell の仕事" },
+  { path = "std::net::TcpStream", reason = "ネットワークは shell の adapter が行う" },
+]
+
+disallowed-methods = [
+  { path = "std::fs::read", reason = "事実は adapter が集め、Event に載せて渡す" },
+  { path = "std::fs::read_to_string", reason = "同上" },
+  { path = "std::fs::write", reason = "書き込みは Effect を返して shell に任せる（0600 の保証は private_file が持つ）" },
+  { path = "std::fs::remove_file", reason = "同上" },
+  { path = "std::fs::create_dir_all", reason = "同上" },
+  { path = "std::thread::spawn", reason = "並行性は shell の job runtime が持つ。core は単一スレッドが所有する" },
+  { path = "std::time::SystemTime::now", reason = "時刻も外から来る事実。Event に載せて渡すと、テストが決定的になる" },
+  { path = "std::time::Instant::now", reason = "同上" },
+]

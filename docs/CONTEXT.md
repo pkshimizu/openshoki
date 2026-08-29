@@ -45,10 +45,13 @@
     結果は「走り出した効果の出力」として `Event` で戻る。ジョブの通番は `update` の中で
     `core` が採番する（押した瞬間に状態と `Effect` を同時に決める。別々にすると #163 と同じ
     窓が開く）。
-  - **向きを守るのはクレート境界**。`shoki-core` は `shoki` に依存しないので、`core` から
-    ディスクを読むコードはコンパイルが通らない（いまの `transcribe::write_decision` は
-    `transcript::stored_reach` を呼んでいて、これができてしまっている）。adapter が事実を
-    集め、`Event` に載せて渡す。
+  - **向きを守るのはクレート境界**。`shoki-core` は `shoki` に依存しないので、`shoki` 側の型
+    （Slint の生成型・whisper・adapter・`private_file` などのヘルパー）に触れるコードは
+    コンパイルが通らない。**ただし `std` の I/O は止まらない**——依存ゼロでも
+    `std::fs::read_to_string` は書けるので、そこは `shoki-core/clippy.toml` の
+    `disallowed-types` / `disallowed-methods` で入り口を塞ぐ（網羅ではない）。事実は adapter が
+    集め、`Event` に載せて渡す（いまの `transcribe::write_decision` は
+    `transcript::stored_reach` を呼んでいて、この形になっていない）。
   - **`view` は 3 つの粒度**。1 件ぶんの軽いもの（トレイ・詳細・設定・モデル一覧）は毎 tick
     組んでよい。一覧の行は `row_key`（Copy・安い）で差分を取り、変わった行だけ `view_row`
     （文字列を組む）を呼ぶ。本文は `loaded` の `(dir, generation)` が変わったときだけ。

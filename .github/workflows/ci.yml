@@ -137,8 +137,8 @@ jobs:
           cargo clippy --version
           cargo fmt --version
       - uses: Swatinem/rust-cache@v2
-      # **`--all` / `--workspace` を付ける**（#187）。付けないとルートパッケージだけが対象で、
-      # `shoki-core` は依存としてコンパイルされるだけになり、整形も lint もテストも走らない。
+      # `--workspace` / `--all` を落とさないこと（#187。理由は
+      # `docs/rules/coding-conventions.md` の「検証コマンド」）。
       - name: fmt
         run: cargo fmt --all --check
       - name: clippy

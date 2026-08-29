@@ -3,17 +3,16 @@ name = "shoki-core"
 # **公開しないので、この版に意味は無い**。アプリのバージョンの正は `shoki` の `version`
 # （#74。`env!("CARGO_PKG_VERSION")` で画面に出る）。ここを上げても何も変わらない。
 version = "0.0.0"
-edition = "2024"
+edition.workspace = true
 publish = false
 
-# **ここに副作用を持つクレートを足さないこと**（#187 / #188）。この層は状態・判断・状態から
-# 文言への表だけを持ち、I/O もスレッドも UI も持たない——それが「判断だけをテストから丸ごと
-# 呼べる」という保証の根拠になっている（`docs/plans/done/20260829-core-shell-layers.md`）。
+# **足してよいのは純粋なものだけ**（#187 / #188）。基準は 1 つ——ファイルを読む・スレッドを
+# 立てる・時刻を取る・画面を触る・ネットワークに出るクレートは入れない。それらは `shoki` 側
+# （shell）に置き、core は値を受け取って値を返す。
 #
-# 足してよい: `serde`（保存形式の型）・`chrono`（セッション名の日時）など、純粋なもの。
-# 足さない: `slint` / `whisper-rs` / `llama-cpp-2` / `rodio` / `cpal` / `ureq` / `objc2` 系。
-#   ファイルを読む・スレッドを立てる・画面を触るコードは `shoki` 側（shell）に置く。
+# 例: `serde`（保存形式の型）・`chrono`（セッション名の日時）は足してよい。いま `shoki` にある
+# `slint` / `whisper-rs` / `llama-cpp-2` / `rodio` / `cpal` / `ureq` / `objc2` 系は足さない。
 #
-# `shoki-core` は `shoki` に依存しない。この向きがあるから、core からディスクを読むコードは
-# コンパイルが通らない。
+# 何が守られていて何が守られていないかは `src/lib.rs` の doc が正（`std` の I/O はクレート境界
+# では止まらないので、`clippy.toml` で入り口を塞いでいる）。
 [dependencies]

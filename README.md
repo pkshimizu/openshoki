@@ -308,13 +308,14 @@ macOS では `screencapturekit` と `objc2` 系を使います。
   ./scripts/check-icons.sh
   ```
 
-- コミット前の検証コマンド:
+- コミット前の検証コマンド（正は `docs/rules/coding-conventions.md` の「検証コマンド」。
+  `--workspace` / `--all` を落とすと `shoki-core` が検査から外れる）:
 
   ```sh
-  cargo fmt --check
-  cargo clippy --all-targets -- -D warnings
-  cargo build
-  cargo test
+  cargo build --workspace
+  cargo fmt --all --check
+  cargo clippy --workspace --all-targets -- -D warnings
+  cargo test --workspace
   ```
 
 - CI（GitHub Actions）で上記の build／fmt／clippy／test と `cargo audit`（依存の脆弱性検査）を
