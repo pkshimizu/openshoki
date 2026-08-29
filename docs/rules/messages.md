@@ -65,7 +65,10 @@ grep -rnP '"[^"]*[ぁ-んァ-ヶ一-龠][^"]*"' src ui --include='*.rs' --includ
 
 ## 用語と文体を揃える
 
-- 同じ概念には同じ語を使う。録音の保存先は UI ラベルに合わせて **folder**（`path` と混在させない）。
+- 同じ概念には同じ語を使う。録音の保存先は、**画面に出す文言では `save location`** に揃える
+  （Settings のラベルが `Save location` なので、読んだ人が同じものだと分かる）。`path` と
+  混在させない。**ログの `recording folder`（`src/config.rs` / `src/main.rs` の 3 箇所）は
+  未統一**——画面には出ないが同じ概念に 2 語なので、揃えるのは別 issue。
 - **装飾の記号をラベルに混ぜない**（`＋ Add app…` ではなく `Add app…`）。ラベルはそのまま
   `accessible-label` になるので、飾りの記号まで読み上げられる。記号は部品側の別プロパティ
   （`ActionButton` の `glyph`）で足す。全角記号は日本語混入の grep にも掛からない。

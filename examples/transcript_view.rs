@@ -34,6 +34,11 @@
 //! - `search` / `no-match`: 一覧を絞り込み中／0 件にする（検索欄・件数・解除の導線の確認）
 //! - `not-downloaded`: 退避されていて検索できなかった録音がある状態（#182。件数の行と
 //!   0 件の説明に理由が出る。`search` / `no-match` と組み合わせる）
+//! - `scanning` / `scan-failed`: 走査がまだ終わっていない／走査を始められなかった状態
+//!   （#181。どちらも 0 件だが「録音が無い」とは言わない）。**`no-match` と併せて指定する**
+//!   ——一覧を空にできるのは `no-match` だけで、空でないと空表示そのものが描画されない
+//!   （`ui/library-window.slint` の `if root.sessions.length == 0`）。`search` と重ねると
+//!   「走査中に検索を打った」画面になる（本番でも作れる組み合わせ）
 //! - `snapshot <path>`: PNG に書き出す（画面収録の許可が無い環境用）
 
 slint::include_modules!();
@@ -349,16 +354,41 @@ fn main() {
     // 検索（#161）。`search` は絞り込み中、`no-match` は 0 件（解除の導線を見る）。
     // **件数の文も空表示の文も本番と同じ関数で組む**（#182。ここを複製すると、目視の対象が
     // 出荷される文言でなくなる）。
+    let scanning = flag("scanning") || flag("scan-failed");
     let searching = flag("search") || flag("no-match");
     let not_downloaded = if flag("not-downloaded") { 2 } else { 0 };
     let matched = if flag("no-match") { 0 } else { 3 };
-    if searching {
-        win.set_search_text("recording format".into());
-        win.set_search_summary(
-            library_text::search_summary_text(matched, 5, not_downloaded).into(),
-        );
+    // **走査中は件数を 0 に寄せる**（#181）。本番はまだ 1 件も数えていないので、下端は
+    // `0 recordings` になる——「5 recordings」や「3 of 5 recordings mention it」が出る画面は
+    // 作れない。
+    if scanning {
+        win.set_library_summary(library_text::library_summary(0).into());
     }
-    let (empty_heading, empty_body) = library_text::empty_list_message(searching, not_downloaded);
+    if searching {
+        // **走査中と重ねられる**。走査中も検索欄は生きているので、走っている間に打てる——本番でも
+        // 「Looking for recordings…」の下に `Clear search` が並ぶ（`ui/library-window.slint` の
+        // `if root.search-text != ""` は空表示の文言と無関係に出る）。#181 が作った中間状態
+        // そのものなので、ここで目視できるようにしておく。
+        win.set_search_text("recording format".into());
+        if !scanning {
+            win.set_search_summary(
+                library_text::search_summary_text(matched, 5, not_downloaded).into(),
+            );
+        }
+    }
+    // **状態は 1 つの値から出す**（`docs/rules/testing.md`）。走査中の表示も見られるように
+    // `scanning` / `scan-failed` フラグを足してある（#181）。走査中は絞り込みより優先する
+    // ——本番の `apply_list_counts` と同じ順番（0 件は「当たらなかった」ではなく「まだ数えて
+    // いない」）。
+    let (empty_heading, empty_body) = library_text::empty_list_message(if flag("scan-failed") {
+        library_text::EmptyList::ScanFailed
+    } else if flag("scanning") {
+        library_text::EmptyList::Scanning
+    } else if searching {
+        library_text::EmptyList::NoMatches { not_downloaded }
+    } else {
+        library_text::EmptyList::NoRecordings
+    });
     win.set_empty_heading(empty_heading.into());
     win.set_empty_body(empty_body.into());
 
