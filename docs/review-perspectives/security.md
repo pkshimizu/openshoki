@@ -1,9 +1,12 @@
 ---
+# ワークスペースにしたので、パスは `**/` を頭に付けてクレートを問わず拾う（#187）。
+# クレート名を列挙すると、増えたときに片方だけ古くなる
+# （`docs/rules/coding-conventions.md` の「列挙のまま書かない」）。
 paths:
-  - "src/**"
-  - "ui/**"
-  - "build.rs"
-  - "Cargo.toml"
+  - "**/src/**"
+  - "**/ui/**"
+  - "**/build.rs"
+  - "**/Cargo.toml"
   - "scripts/**"
   - ".github/**"
 ---
