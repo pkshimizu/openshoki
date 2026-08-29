@@ -1950,7 +1950,8 @@ fn advance_scan_generation(generation: &Cell<u64>) -> u64 {
 /// （`on_search`）をそのまま呼び直して、新しい全件に対して絞り直す。
 ///
 /// **届くまでは絞り込まれていない一覧が見える**。投げ直した検索は本文（文字起こしと議事録）を
-/// 全件ぶん読み直すので、早くて次の tick、保存先が遅ければそれより後になる（`spawn_search`）。
+/// 全件ぶん読み直す（`search_sessions`）。検索の受け口をドレインするのは走査のすぐ後なので、
+/// 読み切れれば同じ周回、まず間に合わないので次以降の周回になる（保存先が遅ければさらに後）。
 /// スレッドを立てられなければ結果は来ないので、そのときは絞り込みが解けたまま残る——検索欄の
 /// 語は残るので、打ち直せば絞り直せる。
 fn apply_scanned_sessions(
@@ -4331,12 +4332,20 @@ mod tests {
         ));
         rec.set_search_text("release".into());
 
-        // 走査の相手は**実在する空のディレクトリ**（無いと `read_dir` が失敗して、走ったのか
-        // 走らなかったのか区別できない）。
-        let recording_dir = std::env::temp_dir().join("shoki-open-library-window");
-        std::fs::create_dir_all(&recording_dir).expect("make an empty recordings folder");
+        // 走査の相手には**録音を 1 件置く**。走査スレッドがこの保存先を実際に読んだことは、
+        // 届いた結果の中身でしか分からない——ディレクトリが無くても `scan_sessions` は空一覧を
+        // 返すし、スレッドが立たなかったときも UI スレッドから同期で結果が届く。
+        //
+        // **プロセスごとに別の名前にし、先に消す**（既存のテストと同じ作法）。走査スレッドは
+        // 一時ファイルの回収まで通るので、他が置いたものを拾える固定パスは使わない。
+        let recording_dir =
+            std::env::temp_dir().join(format!("shoki-open-library-window-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&recording_dir);
+        let session_dir = recording_dir.join("20260810-140200");
+        std::fs::create_dir_all(&session_dir).expect("make a recordings folder with one session");
+        std::fs::write(session_dir.join("mic.mp3"), b"").expect("write the mic source");
         let config = std::rc::Rc::new(RefCell::new(super::Config {
-            recording_dir,
+            recording_dir: recording_dir.clone(),
             ..super::Config::default()
         }));
 
@@ -4401,6 +4410,16 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("the scan must actually be spawned and report back");
         assert_eq!(scanned.generation, 1);
+        // **中身まで見る**。世代と「何か届いた」だけだと、スレッドが立たなかったとき
+        // （`ScanOutcome::CouldNotStart` を UI スレッドから同期で送る）と区別できない。
+        match scanned.outcome {
+            super::ScanOutcome::Scanned(sessions) => {
+                assert_eq!(sessions.len(), 1, "the scan must have read this folder");
+                assert_eq!(sessions[0].dir, session_dir);
+            }
+            super::ScanOutcome::CouldNotStart => panic!("the scan thread must start"),
+        }
+        let _ = std::fs::remove_dir_all(&recording_dir);
     }
 
     /// 走査中に打たれた検索が、**走査の着地で黙って捨てられない**こと（#181）。

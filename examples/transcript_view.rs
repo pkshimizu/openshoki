@@ -358,8 +358,9 @@ fn main() {
     let searching = flag("search") || flag("no-match");
     let not_downloaded = if flag("not-downloaded") { 2 } else { 0 };
     let matched = if flag("no-match") { 0 } else { 3 };
-    // **走査中は件数を出さない**（#181）。本番はまだ 1 件も数えていないので、下端に
-    // 「5 recordings」や「3 of 5 recordings mention it」が出る画面は作れない。
+    // **走査中は件数を 0 に寄せる**（#181）。本番はまだ 1 件も数えていないので、下端は
+    // `0 recordings` になる——「5 recordings」や「3 of 5 recordings mention it」が出る画面は
+    // 作れない。
     if scanning {
         win.set_library_summary(library_text::library_summary(0).into());
     }
