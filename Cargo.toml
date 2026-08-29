@@ -1,3 +1,19 @@
+# **ワークスペースにしてある**（#187）。`shoki`（このパッケージ＝shell）と `shoki-core`
+# （純粋な層）の 2 つ。向きは `shoki` → `shoki-core` の一方向で、逆は無い——だから core から
+# ディスクを読むコードはコンパイルが通らない（`docs/CONTEXT.md` の「core / shell の 2 層に
+# 分ける」）。
+#
+# ルートをパッケージのまま残しているのは、`src/` や `ui/` を動かさないため。移動すると
+# `build.rs` の Slint コンパイル・`include_bytes!` のアイコン・CI のアイコン検査まで一斉に
+# 触ることになり、器を作るだけの変更でなくなる。
+#
+# **検証コマンドは `--workspace` を付けること**（`docs/rules/coding-conventions.md`）。
+# 付けないと `shoki-core` は依存としてコンパイルされるだけで、clippy もテストも走らない。
+[workspace]
+members = ["shoki-core"]
+# edition 2024 と同じ依存解決にそろえる（明示しないと将来の既定変更で黙って変わる）。
+resolver = "3"
+
 [package]
 name = "shoki"
 version = "0.1.0"
@@ -25,6 +41,9 @@ rubato = "4.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+# 純粋な層（#187）。**まだ何も使っていない**——最初の利用は #188（文字起こしの状態を移す）。
+# ここで先に繋いでおくのは、ワークスペースの配線と CI をこの PR で確かめるため。
+shoki-core = { path = "shoki-core" }
 # raw-window-handle-06: メニューからの前面化でネイティブウィンドウを得る（bring_to_front 参照）。
 slint = { version = "1.17.0", features = ["raw-window-handle-06"] }
 symphonia = { version = "0.6", default-features = false, features = ["mp3"] }

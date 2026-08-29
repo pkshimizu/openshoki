@@ -35,9 +35,15 @@ const RECORDING_BRIGHT: [u8; 3] = [0xD0, 0x21, 0x1c]; // 明滅の明るい側�
 
 コミット前に次が通ること（PR の確認事項と対応）:
 
-- `cargo build`
-- `cargo fmt --check`
-- `cargo clippy --all-targets -- -D warnings`
+- `cargo build --workspace`
+- `cargo fmt --all --check`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo test --workspace`
+
+**`--workspace` / `--all` を落とさないこと**（#187）。ワークスペースにしてあるので、付けないと
+ルートパッケージ（`shoki`）だけが対象になり、`shoki-core` は依存としてコンパイルされるだけで
+整形も lint もテストも走らない。CI は付けて回すので、手元で落とすと「手元では通ったのに CI で
+落ちる」が起きる。
 
 ## 手順書に書くコマンドは、その手順の目的を満たす一式にする
 
