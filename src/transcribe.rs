@@ -677,9 +677,10 @@ fn apply_outcome(queue: &Mutex<QueueState>, session_dir: &Path, seq: u64, outcom
 
 /// 1 ジョブの処理結果（状態マップへの反映用）。
 enum JobOutcome {
-    /// 全音源の文字起こしに成功した。`shortfall` は**失敗として数えない食い違い**
-    /// （#176。読み飛ばしのあった音源）——ここに来るのは `HasGaps` だけで、途中で終わった
-    /// 音源は `Failed` へ行く。
+    /// 全音源の文字起こしに成功した。`shortfall` は**失敗として数えない食い違い**（#176）で、
+    /// 2 系統が入る: この実行が読み飛ばした音源（`HasGaps`）と、書かずに守った保存物の
+    /// 食い違い（種別は問わない。`StopsPartway` もありうる）。この実行で途中終了した音源は
+    /// `Failed` へ行く。
     Done {
         shortfall: Option<TranscriptShortfall>,
     },
@@ -698,12 +699,13 @@ impl JobOutcome {
     /// 欠けたまま完成品に見えてしまう。止めたジョブも同じで、続けると「止めたのに議事録が
     /// 出てくる」ことになる。
     ///
-    /// **読み飛ばしがあっても続ける**（#176）。ここで止めると、押した「Transcribe, then write
-    /// notes」が黙って消える（落ちたことを言う先が無い）うえ、読み飛ばしは一時的な読み取り
-    /// 失敗でも起きるので 1 パケットで自動議事録が丸ごと止まる。欠けた入力から書いたことは
-    /// ディスクの印が残し、議事録タブが先に言う（`SummaryPane::NotesFromPartialTranscript`）
-    /// ——#175 が「途中で終わっている入力」に対して採ったのと同じ扱いに揃える。書いた議事録
-    /// 自体に出典を残すのは #184。
+    /// **`Done` が食い違いを持っていても続ける**（#176）。ここで止めると、押した
+    /// 「Transcribe, then write notes」が黙って消える（落ちたことを言う先が無い）うえ、
+    /// 読み飛ばしは一時的な読み取り失敗でも起きるので 1 パケットで自動議事録が丸ごと止まる。
+    /// 欠けた入力から書いたことはディスクの印が残し、議事録タブが先に言う
+    /// （`SummaryPane::NotesFromPartialTranscript`）——#175 が「途中で終わっている入力」に
+    /// 対して採ったのと同じ扱いに揃える。**この実行が失敗したときだけは止める**（`Failed`）。
+    /// 書いた議事録自体に出典を残すのは #184。
     ///
     /// **ワイルドカードを置かない**（結果を足したら扱いを書くまで通らない）。
     fn keeps_summary(&self) -> bool {
@@ -898,12 +900,16 @@ fn report_file_outcome(name: &str, outcome: &FileOutcome) {
 fn job_outcome(results: Vec<(String, FileOutcome)>) -> JobOutcome {
     // 最後まで行かなかった音源を集める（文にするのは読む領域の仕事。`TranscribeFailure`）。
     let mut failed: Vec<FailedSource> = Vec::new();
-    // **読める文字起こしを残せたか**を覚える（本数ではない。`TranscribeFailure::Files`）。
-    // 1 件も認識できなかった音源は数えない——残っていると言っても、開く行が無い。
+    // **この実行が読める文字起こしを書けたか**を覚える（本数ではない。`TranscribeFailure::Files`
+    // の doc がこの意味を持つ）。1 件も認識できなかった音源は数えない。
     let mut kept_other_sources = false;
-    // 全音源をまとめた食い違い。**途中で終わった音源はここに来ない**——そちらは `failed` へ
-    // 行き、ジョブごと `Failed` になる。ここに残るのは、失敗として数えない食い違い
-    // （読み飛ばし）と、書かずに守った保存物の食い違い。
+    // **開いて読む行がセッションのどこかに在るか**（#176）。上とは別の問い——書かずに守った
+    // 音源は「この実行が書いた」には数えないが、ディスクには読める行が在る。1 つの真偽値に
+    // 相乗りさせると、全音源を守ったジョブで食い違いが握り潰される。
+    let mut has_readable_lines = false;
+    // 全音源をまとめた食い違い。**この実行で途中終了した音源はここに来ない**——そちらは
+    // `failed` へ行き、ジョブごと `Failed` になる。ここに残るのは、この実行の読み飛ばしと、
+    // 書かずに守った保存物の食い違い（種別は問わない。`StopsPartway` もありうる）。
     let mut shortfall: Option<TranscriptShortfall> = None;
     for (name, outcome) in results {
         match outcome {
@@ -929,6 +935,7 @@ fn job_outcome(results: Vec<(String, FileOutcome)>) -> JobOutcome {
                     failed.push(FailedSource::new(name, kept));
                 } else {
                     kept_other_sources |= segments > 0;
+                    has_readable_lines |= segments > 0;
                     shortfall = TranscriptShortfall::join(shortfall, of_source);
                 }
             }
@@ -940,7 +947,11 @@ fn job_outcome(results: Vec<(String, FileOutcome)>) -> JobOutcome {
             // （`TranscribeFailure::Files` の doc）。
             FileOutcome::KeptWhatWasThere {
                 shortfall: of_source,
-            } => shortfall = TranscriptShortfall::join(shortfall, of_source),
+                has_lines,
+            } => {
+                has_readable_lines |= has_lines;
+                shortfall = TranscriptShortfall::join(shortfall, of_source);
+            }
             // 読めた範囲があっても残さなかった（`write_decision` が理由を持つ）。
             // この音源からは何も残らないので、途中結果としては数えない。
             FileOutcome::NotKept => failed.push(FailedSource::new(name, KeptFromSource::Nothing)),
@@ -957,7 +968,10 @@ fn job_outcome(results: Vec<(String, FileOutcome)>) -> JobOutcome {
     // ——音源ごとに見ると、「抜けた mic は 0 件・正常な system は 5 件」のジョブが食い違いを
     // 落とし、ディスクには `gapped` と書いてあるのに画面は「Transcribed」と言う。この記録は
     // 再起動まで残り、ディスクの印より優先されるので直らない。
-    if !kept_other_sources {
+    //
+    // **`kept_other_sources` では判断しない**——あちらは「この実行が書いたか」なので、全音源を
+    // 書かずに守ったジョブで false のままになり、同じ握り潰しが起きる。
+    if !has_readable_lines {
         return JobOutcome::Done { shortfall: None };
     }
     JobOutcome::Done { shortfall }
@@ -980,6 +994,8 @@ enum FileOutcome {
     /// そちらのもので、`shortfall` はディスクから読んだ値。
     KeptWhatWasThere {
         shortfall: Option<TranscriptShortfall>,
+        /// 在るほうに開いて読む行があるか（#176）。
+        has_lines: bool,
     },
     /// **保存せず、この音源からは何も残らない**（#164 / #176。理由は `write_decision`、または
     /// `transcribe_file` そのものが失敗した）。
@@ -1011,24 +1027,40 @@ fn write_decision(
     transcript_path: &Path,
     read_upto_secs: f64,
 ) -> WriteDecision {
-    // **途中で終わっていて読む行が無いなら書かない**（#164）。書いても開く行が無く、それでも
-    // 「残っている」と言うと、押しても何も現れない `Show partial` を出すことになる。
-    // **抜けているだけのものは別**（#176）——最後までは読めているので、行が無いのは
-    // 「話していなかった」でもありうる。
+    // まだ何も無い（または読めない）ので、書いて困るものが無い。ただし**途中で終わっていて
+    // 読む行が無いなら書かない**（#164）——書いても開く行が無く、それでも「残っている」と言うと、
+    // 押しても何も現れない `Show partial` を出すことになる。**抜けているだけのものは別**（#176）
+    // ——最後までは読めているので、行が無いのは「話していなかった」でもありうる。
+    let Some(stored) = crate::transcript::stored_reach(transcript_path) else {
+        if segments == 0 && shortfall.stops_partway() {
+            return WriteDecision::NothingToOpen;
+        }
+        return WriteDecision::Write;
+    };
+    let keep = WriteDecision::KeepWhatIsThere {
+        stored: stored.shortfall,
+        has_lines: stored.has_lines,
+    };
+    // **読める行を、読める行の無い結果で潰さない**（#176）。やり直しで読み飛ばしが増えて 1 件も
+    // 認識できなかったとき、前回の読める文字起こしを消す理由は無い。
+    if segments == 0 && stored.has_lines {
+        return keep;
+    }
     if segments == 0 && shortfall.stops_partway() {
         return WriteDecision::NothingToOpen;
     }
-    // まだ何も無い（または読めない）ので、書いて困るものが無い。
-    let Some(stored) = crate::transcript::stored_reach(transcript_path) else {
-        return WriteDecision::Write;
-    };
     // **食い違いの無い保存物は降格させない**（#175）。長さが同じでも「最後まで読めた」が
     // 「途中で終わった」「抜けている」に変わるのは降格で、やり直しでは戻らない。
     let Some(stored_shortfall) = stored.shortfall else {
-        return WriteDecision::KeepWhatIsThere { stored: None };
+        return keep;
     };
-    let keep = WriteDecision::KeepWhatIsThere {
-        stored: Some(stored_shortfall),
+    // 長さを比べるのは JSON へ書く値そのもの（`read_upto_secs`）——表示用に秒へ丸めた値で
+    // 比べると、やり直しが必ず「前のほうが長い」に転ぶ。長さが読めなければ守るものが
+    // 分からないので、書いてよい。
+    let reaches_at_least_as_far = || {
+        stored
+            .duration_secs
+            .is_none_or(|existing| existing <= read_upto_secs)
     };
     // **9 通りを網羅で書く**（#176）。真偽値 2 つの早期 return を重ねると、`StopsPartwayWithGaps`
     // が黙って長さの比較へ落ちる——実際に落ちていて、抜けたぶん詰まった長さを音声の位置として
@@ -1037,28 +1069,32 @@ fn write_decision(
         // 在るほうは最後まで届いている（抜けはある）。届いていない結果では潰さない。
         (TranscriptShortfall::HasGaps, TranscriptShortfall::StopsPartway)
         | (TranscriptShortfall::HasGaps, TranscriptShortfall::StopsPartwayWithGaps) => keep,
-        // 新しいほうが最後まで届いた。長さを見るまでもなく、こちらのほうが録音に近い。
-        (TranscriptShortfall::HasGaps, TranscriptShortfall::HasGaps)
-        | (TranscriptShortfall::StopsPartway, TranscriptShortfall::HasGaps)
+        // 新しいほうが最後まで届いた。在るほうは届いていないので、こちらのほうが録音に近い。
+        (TranscriptShortfall::StopsPartway, TranscriptShortfall::HasGaps)
         | (TranscriptShortfall::StopsPartwayWithGaps, TranscriptShortfall::HasGaps) => {
             WriteDecision::Write
         }
+        // どちらも最後まで届いていて、どちらも抜けている。**長さは「音声のどこまで」ではなく
+        // 「どれだけ残ったか」**（得られたサンプル数）なので、位置としてではなく残量として
+        // 比べる——読み飛ばしが増えたやり直しで、前より中身の少ない結果に置き換えない。
+        (TranscriptShortfall::HasGaps, TranscriptShortfall::HasGaps) => {
+            if reaches_at_least_as_far() {
+                WriteDecision::Write
+            } else {
+                keep
+            }
+        }
         // どちらも途中で終わっていて、どちらかに抜けがある。**長さでは比べられない**
-        // （`duration_secs` は得られたサンプル数から出すので、抜けたぶん詰まっていて音声の
-        // 位置ではない）ので、すでに在るものを守る。
+        // （抜けたぶん詰まっている値と、詰まっていない値を並べることになる）ので、すでに在る
+        // ものを守る。
         (TranscriptShortfall::StopsPartwayWithGaps, TranscriptShortfall::StopsPartway)
         | (TranscriptShortfall::StopsPartway, TranscriptShortfall::StopsPartwayWithGaps)
         | (TranscriptShortfall::StopsPartwayWithGaps, TranscriptShortfall::StopsPartwayWithGaps) => {
             keep
         }
-        // どちらも途中で終わっていて、抜けは無い。どこまで届いたかで比べる。比べるのは JSON へ
-        // 書く値そのもの（`read_upto_secs`）——表示用に秒へ丸めた値で比べると、やり直しが必ず
-        // 「前のほうが長い」に転ぶ。長さが読めなければ守るものが分からないので、書いてよい。
+        // どちらも途中で終わっていて、抜けは無い。どこまで届いたかで比べる。
         (TranscriptShortfall::StopsPartway, TranscriptShortfall::StopsPartway) => {
-            if stored
-                .duration_secs
-                .is_none_or(|existing| existing <= read_upto_secs)
-            {
+            if reaches_at_least_as_far() {
                 WriteDecision::Write
             } else {
                 keep
@@ -1075,7 +1111,13 @@ enum WriteDecision {
     Write,
     /// 書かない。**すでに在るもののほうが録音に近い**ので、画面が言うべき食い違いはそちらの
     /// もの（`stored`）。**失敗として数えない**——この音源の答えはディスクに在る。
-    KeepWhatIsThere { stored: Option<TranscriptShortfall> },
+    ///
+    /// `has_lines` は在るほうに開いて読む行があるか。**食い違いを言ってよいかの判断に要る**
+    /// ——行が無いのに言うと、押しても何も現れない `Show partial` を出すことになる。
+    KeepWhatIsThere {
+        stored: Option<TranscriptShortfall>,
+        has_lines: bool,
+    },
     /// 書かない。途中で終わっていて、開いて読む行が 1 件も無い。
     NothingToOpen,
 }
@@ -1237,12 +1279,15 @@ fn transcribe_file(
             eprintln!("Not saving the transcript of {name} because nothing could be recognized");
             return Ok(FileOutcome::NotKept);
         }
-        WriteDecision::KeepWhatIsThere { stored } => {
+        WriteDecision::KeepWhatIsThere { stored, has_lines } => {
             eprintln!(
                 "Keeping the transcript already saved for {name} because it is no further from \
                  the recording"
             );
-            return Ok(FileOutcome::KeptWhatWasThere { shortfall: stored });
+            return Ok(FileOutcome::KeptWhatWasThere {
+                shortfall: stored,
+                has_lines,
+            });
         }
         WriteDecision::Write => {}
     }
@@ -2142,7 +2187,8 @@ mod tests {
                 (
                     "mic.mp3".to_owned(),
                     FileOutcome::KeptWhatWasThere {
-                        shortfall: Some(TranscriptShortfall::StopsPartway)
+                        shortfall: Some(TranscriptShortfall::StopsPartway),
+                        has_lines: true
                     }
                 ),
                 ("system.mp3".to_owned(), kept(None, 5)),
@@ -2174,6 +2220,33 @@ mod tests {
                 KeptFromSource::Upto(Duration::from_secs(252))
             )]
         );
+
+        // **全音源を書かずに守ったジョブでも、食い違いは残る**（#176）。「この実行が書いたか」で
+        // 判断すると、ここが false のままになって食い違いが握り潰され、ディスクには印が在るのに
+        // 画面は「Transcribed」と言う（この記録は再起動まで残る）。
+        assert!(matches!(
+            job_outcome(vec![(
+                "mic.mp3".to_owned(),
+                FileOutcome::KeptWhatWasThere {
+                    shortfall: Some(TranscriptShortfall::HasGaps),
+                    has_lines: true
+                }
+            )]),
+            JobOutcome::Done {
+                shortfall: Some(TranscriptShortfall::HasGaps)
+            }
+        ));
+        // 在るほうにも読む行が無いなら、食い違いは言わない（開いても何も現れない）。
+        assert!(matches!(
+            job_outcome(vec![(
+                "mic.mp3".to_owned(),
+                FileOutcome::KeptWhatWasThere {
+                    shortfall: Some(TranscriptShortfall::HasGaps),
+                    has_lines: false
+                }
+            )]),
+            JobOutcome::Done { shortfall: None }
+        ));
 
         // **抜けもあるなら位置を言わない**（#176）。`kept_upto` は読み飛ばしたぶん前へ
         // 詰まっていて、音声の位置ではない。
@@ -2657,7 +2730,7 @@ mod tests {
         // 同じところまでしか読めなかったやり直し（Try again）。中身は同じなので置き換える
         // ——ここが止まると、途中結果を伏せる仕組みが Try again 一発で外れる。
         stored(&format!(
-            r#"{{"complete":false,"duration_secs":{read_upto_secs},"segments":[]}}"#
+            r#"{{"complete":false,"duration_secs":{read_upto_secs},"segments":[{{"start":0.0,"text":"a"}}]}}"#
         ));
         assert_eq!(
             decide(cut, 3),
@@ -2669,21 +2742,27 @@ mod tests {
         // だけの結果でも同じ**——#176 より前は「終端まで読めた」を無条件に書いていたので、
         // あとから壊れたファイルの結果が完成品を静かに潰せた。
         stored(&format!(
-            r#"{{"complete":true,"duration_secs":{read_upto_secs},"segments":[]}}"#
+            r#"{{"complete":true,"duration_secs":{read_upto_secs},"segments":[{{"start":0.0,"text":"a"}}]}}"#
         ));
         for shortfall in [cut, gaps, both] {
             assert_eq!(
                 decide(shortfall, 3),
-                WriteDecision::KeepWhatIsThere { stored: None },
+                WriteDecision::KeepWhatIsThere {
+                    stored: None,
+                    has_lines: true
+                },
                 "a transcript with no shortfall is never replaced"
             );
         }
 
         // 前の実行のほうが先まで読めている（印が無い古い JSON でも）。置き換えない。
-        stored(r#"{"duration_secs":3600.0,"segments":[]}"#);
+        stored(r#"{"duration_secs":3600.0,"segments":[{"start":0.0,"text":"a"}]}"#);
         assert_eq!(
             decide(cut, 3),
-            WriteDecision::KeepWhatIsThere { stored: None },
+            WriteDecision::KeepWhatIsThere {
+                stored: None,
+                has_lines: true
+            },
             "what reaches further is never replaced by a shorter partial run"
         );
 
@@ -2691,17 +2770,24 @@ mod tests {
         // あると `duration_secs` は抜けたぶん短くなり、音声の位置ではなくなる。
         //
         // 在るほうが最後まで届いている（抜けてはいる）。届いていない結果では潰さない。
-        stored(r#"{"complete":true,"gapped":true,"duration_secs":3200.0,"segments":[]}"#);
+        stored(
+            r#"{"complete":true,"gapped":true,"duration_secs":3200.0,"segments":[{"start":0.0,"text":"a"}]}"#,
+        );
         for shortfall in [cut, both] {
             assert_eq!(
                 decide(shortfall, 3),
-                WriteDecision::KeepWhatIsThere { stored: Some(gaps) },
+                WriteDecision::KeepWhatIsThere {
+                    stored: Some(gaps),
+                    has_lines: true
+                },
                 "a gapped transcript of the whole recording outranks one that stops partway"
             );
         }
         // 逆向き。在るほうが 55 分で切れていて、新しいほうは最後まで届いた（抜けてはいる）。
         // 長さで比べると「前のほうが長い」に転んで、最後まで届いた結果を捨ててしまう。
-        stored(r#"{"complete":false,"duration_secs":3300.0,"segments":[]}"#);
+        stored(
+            r#"{"complete":false,"duration_secs":3300.0,"segments":[{"start":0.0,"text":"a"}]}"#,
+        );
         assert_eq!(
             decide(gaps, 3),
             WriteDecision::Write,
@@ -2712,18 +2798,54 @@ mod tests {
         // すでに在るものを守る（比べると、抜けたぶん詰まった値を音声の位置として使うことに
         // なる）。**在るほうを短くしておく**——長いままだと、長さで比べても同じ答えになって
         // しまい、比較へ落ちる壊れ方を見逃す。
-        stored(r#"{"complete":false,"duration_secs":10.0,"segments":[]}"#);
+        stored(r#"{"complete":false,"duration_secs":10.0,"segments":[{"start":0.0,"text":"a"}]}"#);
         assert_eq!(
             decide(both, 3),
-            WriteDecision::KeepWhatIsThere { stored: Some(cut) },
+            WriteDecision::KeepWhatIsThere {
+                stored: Some(cut),
+                has_lines: true
+            },
             "lengths cannot be compared across gaps"
         );
-        stored(r#"{"complete":false,"gapped":true,"duration_secs":10.0,"segments":[]}"#);
+        stored(
+            r#"{"complete":false,"gapped":true,"duration_secs":10.0,"segments":[{"start":0.0,"text":"a"}]}"#,
+        );
         for shortfall in [cut, both] {
             assert_eq!(
                 decide(shortfall, 3),
-                WriteDecision::KeepWhatIsThere { stored: Some(both) },
+                WriteDecision::KeepWhatIsThere {
+                    stored: Some(both),
+                    has_lines: true
+                },
                 "lengths cannot be compared across gaps"
+            );
+        }
+
+        // **抜けている保存物を、抜けている結果で潰すときも残量で比べる**（#176）。どちらも
+        // 最後まで届いているので位置ではないが、「どれだけ残ったか」の比較としては意味がある
+        // ——読み飛ばしが増えたやり直しで、前より中身の少ない結果に置き換えない。
+        stored(
+            r#"{"complete":true,"gapped":true,"duration_secs":3200.0,"segments":[{"start":0.0,"text":"a"}]}"#,
+        );
+        assert_eq!(
+            decide(gaps, 3),
+            WriteDecision::KeepWhatIsThere {
+                stored: Some(gaps),
+                has_lines: true
+            },
+            "a gapped run that recovered less must not replace one that recovered more"
+        );
+
+        // **読める行を、読める行の無い結果で潰さない**（#176）。抜けが増えて 1 件も認識でき
+        // なかったやり直しで、前回の読める文字起こしを消す理由は無い。
+        for shortfall in [cut, gaps, both] {
+            assert_eq!(
+                decide(shortfall, 0),
+                WriteDecision::KeepWhatIsThere {
+                    stored: Some(gaps),
+                    has_lines: true
+                },
+                "a run with no lines must not replace a transcript that has some"
             );
         }
 

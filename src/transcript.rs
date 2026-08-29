@@ -386,6 +386,7 @@ pub fn stored_reach(path: &Path) -> Option<StoredReach> {
         duration_secs: (parsed.duration_secs.is_finite() && parsed.duration_secs > 0.0)
             .then_some(parsed.duration_secs),
         shortfall: parsed.shortfall(),
+        has_lines: !parsed.segments.is_empty(),
     })
 }
 
@@ -400,6 +401,10 @@ pub struct StoredReach {
     pub duration_secs: Option<f64>,
     /// その音源と録音の食い違い（`None` は食い違い無し）。
     pub shortfall: Option<TranscriptShortfall>,
+    /// 開いて読む行が在るか（#176）。**「読める行を、読める行の無い結果で潰さない」を決める
+    /// のに使う**（`transcribe::write_decision`）。すでにパースした結果を数えるだけなので、
+    /// 読み取りは増えない。
+    pub has_lines: bool,
 }
 
 /// 1 つの文字起こし JSON を、信頼境界外の入力として読む共通部（読む側の唯一の入口）。
