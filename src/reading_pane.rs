@@ -58,20 +58,46 @@ pub struct FailedSource {
     /// 音源の**ファイル名だけ**（パスは持たない。`docs/rules/security.md`）。名前を作るのは
     /// `transcribe::audio_display_name` だけで、そこが保証する。
     pub name: String,
-    /// 読めた範囲を保存できたなら、その終わり（#164）。**この音源から読めるものが残らな
-    /// かったときは `None`**——1 サンプルも読めなかった・推論や保存で落ちた・残す価値が
-    /// なくて保存しなかった（`transcribe::partial_is_worth_keeping`）のいずれでも `None`
-    /// になる。理由は分けず、「残っていない」だけを表す。
-    pub kept_upto: Option<Duration>,
+    /// この音源から何が残ったか（#164 / #176）。
+    pub kept: KeptFromSource,
+}
+
+/// 最後まで行かなかった音源から、何が残ったか（#164 / #176）。
+///
+/// **`Option<Duration>` では持たない**（#176）。「残っていない」と「残ったがどこまでかは
+/// 言えない」を `None` に相乗りさせると、`Show partial` を出すかの判断
+/// （`TranscribeFailure::kept_partial`）が「位置を言えるか」に化ける。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeptFromSource {
+    /// 何も残らなかった——1 サンプルも読めなかった・推論や保存で落ちた・残す価値が
+    /// なくて保存しなかった（`transcribe::partial_is_worth_keeping`）のいずれでもここへ来る。
+    /// 理由は分けず、「残っていない」だけを表す。
+    Nothing,
+    /// ここまでを保存した（#164）。
+    Upto(Duration),
+    /// 保存したが、**どこまで読めたかは言えない**（#176）。壊れたパケットを読み飛ばして
+    /// いるので、残せた長さは読み飛ばしたぶん前へ詰まっていて音声の位置ではない。
+    SomeWithGaps,
+}
+
+impl KeptFromSource {
+    /// 開いて読む行が残っているか。**ワイルドカードを置かない**（残り方を足したら扱いを
+    /// 書くまで通らない）。
+    fn is_something(&self) -> bool {
+        match self {
+            Self::Nothing => false,
+            Self::Upto(_) | Self::SomeWithGaps => true,
+        }
+    }
 }
 
 impl FailedSource {
     /// 音源 1 本ぶんの記録を組む。**確認用バイナリとテストも同じものを使う**（それぞれで
     /// 組み立てを書くと、フィールドを足した日に片方だけ古くなる）。
-    pub fn new(name: impl Into<String>, kept_upto: Option<Duration>) -> Self {
+    pub fn new(name: impl Into<String>, kept: KeptFromSource) -> Self {
         Self {
             name: name.into(),
-            kept_upto,
+            kept,
         }
     }
 }
@@ -97,7 +123,7 @@ impl TranscribeFailure {
             Self::Files {
                 failed,
                 kept_other_sources,
-            } => *kept_other_sources || failed.iter().any(|source| source.kept_upto.is_some()),
+            } => *kept_other_sources || failed.iter().any(|source| source.kept.is_something()),
             // どこで落ちたか分からないので、残っていると言い切らない。
             Self::Panicked => false,
         }
@@ -184,6 +210,119 @@ impl PaneMessage {
     }
 }
 
+/// 保存済みの文字起こしが、録音とどう食い違っているか（#164 / #176）。
+///
+/// **食い違いが無いことは `Option::None` で表す**。「最後まで読めたか」と「途中を読み飛ばして
+/// いないか」を別々の真偽値で持ち回ると、両方欠けた組み合わせの扱いを決め忘れられる
+/// （`docs/rules/coding-conventions.md` の「真偽値を並べない」）。
+///
+/// **文言を持たない**のは `TranscribeFailure` と同じ理由——種別だけを持ち、文にするのは
+/// `TranscriptPane::message` の網羅 match。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptShortfall {
+    /// 途中で終わっている（#164 / #175）。音源が途中で読めなくなった・在る音源の片方ぶんが
+    /// 無い（一方だけ失敗した・途中で止めた）のどちらでもここへ来る。
+    StopsPartway,
+    /// 中が抜けている（#176）。壊れたパケットを読み飛ばしたので、**抜けたぶん以降の時刻は
+    /// 本来より早い**（読み飛ばしたサンプルのぶん前へ詰まる）。
+    HasGaps,
+    /// 途中で終わっていて、その手前にも抜けがある（#176）。
+    StopsPartwayWithGaps,
+}
+
+/// 文字起こし JSON に残す 2 つの印（#176）。
+///
+/// **名前付きのフィールドで受ける**ので、位置で取り違えられない（`docs/rules/coding-conventions.md`
+/// の「同型の引数を並べた関数に切り出さない」）。極性は欄の意味に合わせてあり、揃っていない
+/// ——`reached_the_end` は「食い違い無し」が `true`、`gapped` は `false`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShortfallMarks {
+    /// デコーダがストリーム終端まで到達したか（JSON の `complete`）。
+    pub reached_the_end: bool,
+    /// 壊れたパケットを読み飛ばしたか（JSON の `gapped`）。
+    pub gapped: bool,
+}
+
+impl TranscriptShortfall {
+    /// いまの食い違いに「途中で終わっている」を重ねる。
+    ///
+    /// **真偽値を 2 つ並べたコンストラクタにしない**（`docs/rules/coding-conventions.md` の
+    /// 「同型の引数を並べた関数に切り出さない」）——`of(stops, gaps)` の形にすると、渡し違えて
+    /// も通るうえ、`complete` と `gapped` は極性が逆なので揃えたくなる力まで働く。
+    ///
+    /// **ワイルドカードを置かない**（種別を足したら扱いを書くまで通らない）。
+    pub fn with_stop(current: Option<Self>) -> Self {
+        match current {
+            None | Some(Self::StopsPartway) => Self::StopsPartway,
+            Some(Self::HasGaps) | Some(Self::StopsPartwayWithGaps) => Self::StopsPartwayWithGaps,
+        }
+    }
+
+    /// いまの食い違いに「中が抜けている」を重ねる（`with_stop` と対）。
+    pub fn with_gaps(current: Option<Self>) -> Self {
+        match current {
+            None | Some(Self::HasGaps) => Self::HasGaps,
+            Some(Self::StopsPartway) | Some(Self::StopsPartwayWithGaps) => {
+                Self::StopsPartwayWithGaps
+            }
+        }
+    }
+
+    /// 途中で終わっているか。
+    pub fn stops_partway(self) -> bool {
+        match self {
+            Self::StopsPartway | Self::StopsPartwayWithGaps => true,
+            Self::HasGaps => false,
+        }
+    }
+
+    /// 中が抜けているか。
+    pub fn has_gaps(self) -> bool {
+        match self {
+            Self::HasGaps | Self::StopsPartwayWithGaps => true,
+            Self::StopsPartway => false,
+        }
+    }
+
+    /// 保存欄（`complete` / `gapped`）から食い違いを組む（#176）。**書く側と読む側が同じ
+    /// 関数を通る**ので、片方だけ極性が反転する壊れ方が無い。
+    pub fn from_marks(marks: ShortfallMarks) -> Option<Self> {
+        let mut shortfall = None;
+        if !marks.reached_the_end {
+            shortfall = Some(Self::with_stop(shortfall));
+        }
+        if marks.gapped {
+            shortfall = Some(Self::with_gaps(shortfall));
+        }
+        shortfall
+    }
+
+    /// 食い違いを保存欄へ戻す（`from_marks` の逆）。
+    pub fn marks(shortfall: Option<Self>) -> ShortfallMarks {
+        ShortfallMarks {
+            reached_the_end: !shortfall.is_some_and(Self::stops_partway),
+            gapped: shortfall.is_some_and(Self::has_gaps),
+        }
+    }
+
+    /// 2 つの食い違いを重ねる（音源ごとの食い違いを、セッション 1 つぶんへまとめる）。
+    ///
+    /// **畳み込みの種にしない**。空の列を畳むと「食い違い無し」＝欠けた文字起こしを完成品
+    /// として見せる側へ倒れる（`docs/rules/coding-conventions.md` の空真の罠）。空をどう扱うかは
+    /// 呼び出し側（`transcript::sources_shortfall`）が先に決める。
+    pub fn join(left: Option<Self>, right: Option<Self>) -> Option<Self> {
+        let Some(right) = right else { return left };
+        let mut merged = left;
+        if right.stops_partway() {
+            merged = Some(Self::with_stop(merged));
+        }
+        if right.has_gaps() {
+            merged = Some(Self::with_gaps(merged));
+        }
+        merged
+    }
+}
+
 /// 読む領域が出す文字起こしの状態と、そこに出す中身（#154）。
 ///
 /// **`TranscriptStatus` はここから導出する**（`status`）。状態 enum と説明を別々に組み立てて
@@ -203,14 +342,11 @@ pub enum TranscriptPane {
     /// 走り終わっている。**この空表示が出るのは JSON が読めなかったときだけ**
     /// （セグメントがあれば一覧が出るので、ここへは来ない）。
     Done,
-    /// 走り終わっているが、**在る音源ぶんの文字起こしが揃っていない**（#175）。途中で読めなく
-    /// なった・片方の音源ぶんが無い（一方だけ失敗した・途中で止めた）のどちらでもここへ来る。
-    /// ディスクに残った印から分かるので、**再起動しても消えない**——`Failed` はメモリだけの
-    /// 記録で、再起動で消える。
+    /// 走り終わっているが、**録音と食い違っている**（#175 / #176）。ディスクに残った印から
+    /// 分かるので、**再起動しても消えない**——`Failed` はメモリだけの記録で、再起動で消える。
     ///
-    /// **原因は断定しない**（文言も同じ）。逆に「揃っている」とも言い切らない——壊れたパケットを
-    /// 読み飛ばして中抜けした音源は印が立たない（扱いは #176）。
-    NotReadToTheEnd,
+    /// **どう食い違っているかまでは持つが、原因は断定しない**（文言も同じ）。
+    NotWhole { shortfall: TranscriptShortfall },
     /// **理由は必ずある**（失敗の記録は理由と一緒にしか作られない。#159）。文言はここで組む。
     Failed { reason: TranscribeFailure },
 }
@@ -225,7 +361,7 @@ impl TranscriptPane {
             // **一覧と共用の状態は増やさない**（#175）。一覧は全セッションぶんの JSON を読めない
             // ので、この区別を出せない（理由は `docs/CONTEXT.md`）。状態行の文言は
             // `status_text` が pane から出す。
-            Self::Done | Self::NotReadToTheEnd => TranscriptStatus::Done,
+            Self::Done | Self::NotWhole { .. } => TranscriptStatus::Done,
             Self::Failed { .. } => TranscriptStatus::Failed,
         }
     }
@@ -242,7 +378,7 @@ impl TranscriptPane {
     pub fn shows_partial(&self) -> bool {
         match self {
             Self::Failed { reason } => reason.kept_partial(),
-            Self::NotReadToTheEnd => true,
+            Self::NotWhole { .. } => true,
             Self::NotTranscribed { .. }
             | Self::Transcribing { .. }
             | Self::Stopping { .. }
@@ -256,7 +392,14 @@ impl TranscriptPane {
     /// **ワイルドカードを置かない**（状態を足したら文言を決めるまで通らない）。
     pub fn status_text(&self) -> &'static str {
         match self {
-            Self::NotReadToTheEnd => "Transcribed in part",
+            // **届いていないことを先に言う**（#176）。抜けているかより、読める範囲そのものが
+            // 足りないほうが読み手の判断を変える。
+            Self::NotWhole { shortfall } => match shortfall {
+                TranscriptShortfall::StopsPartway | TranscriptShortfall::StopsPartwayWithGaps => {
+                    "Transcribed in part"
+                }
+                TranscriptShortfall::HasGaps => "Transcribed with gaps",
+            },
             Self::NotTranscribed { .. }
             | Self::Transcribing { .. }
             | Self::Stopping { .. }
@@ -312,10 +455,29 @@ impl TranscriptPane {
             .with_primary("Transcribe again", PaneActionKind::Transcribe),
             // **開く手を必ず添える**——伏せた一覧を出す口はこれだけなので、落とすとセグメントが
             // 在るのに永久に読めなくなる。
-            Self::NotReadToTheEnd => PaneMessage::new(
-                "This transcript stops partway",
-                "It covers only part of this recording. Transcribing again will try the rest.",
-            )
+            //
+            // **操作は 3 つとも同じ並び**（#176）。押す位置が食い違いの種別で入れ替わると、
+            // 画面からは見えない区別でボタンが動くことになる。
+            Self::NotWhole { shortfall } => match shortfall {
+                TranscriptShortfall::StopsPartway => PaneMessage::new(
+                    "This transcript stops partway",
+                    "It covers only part of this recording. Transcribing again will try the rest.",
+                ),
+                // **やり直しで直るとも直らないとも言い切らない**（#176）。読み飛ばしは音源が
+                // 壊れているときにも、読み取りが一時的に失敗したときにも起きる
+                // （`transcribe::decode_mp3_stream`）ので、断定するとどちらかで嘘になる。
+                TranscriptShortfall::HasGaps => PaneMessage::new(
+                    "This transcript has gaps",
+                    "Parts of the audio could not be read, so some speech is missing and the \
+                     times after the gaps are earlier than they should be. If the recording \
+                     itself is damaged, transcribing again will not fill them in.",
+                ),
+                TranscriptShortfall::StopsPartwayWithGaps => PaneMessage::new(
+                    "This transcript stops partway",
+                    "It covers only part of this recording, and parts of what was read are \
+                     missing as well. Transcribing again will try the rest.",
+                ),
+            }
             .with_primary("Transcribe again", PaneActionKind::Transcribe)
             .with_secondary("Show partial", PaneActionKind::ShowPartialTranscript),
             Self::Failed { reason } => {
@@ -413,13 +575,13 @@ pub fn summary_status_text(display_status: SummaryStatus) -> &'static str {
 pub enum StoredTranscript {
     /// 文字起こしが無い。
     None,
-    /// 在って、**「揃っていない」とは言えない**。最後まで読み切れているか、読み直しの最中で
-    /// 分からないか、**読める行が無い**（読めなかった JSON。押しても何も現れない `Show partial`
-    /// を出さないよう、ここへ落とす。`main::LoadedTranscript::stored`）。
-    Complete,
-    /// 在って読める行もあるが、**在る音源ぶんが揃っていない**（途中で読めなくなった・片方の
-    /// 音源ぶんが無い）。**原因は断定しない**。
-    NotReadToTheEnd,
+    /// 在って、**食い違いは分かっていない**（#176 で名前を意味に合わせた）。最後まで読み
+    /// 切れているか、読み直しの最中で分からないか、**読める行が無い**（読めなかった JSON。
+    /// 押しても何も現れない `Show partial` を出さないよう、ここへ落とす。
+    /// `main::LoadedTranscript::stored`）。「完成品と分かっている」ではない。
+    NoKnownShortfall,
+    /// 在って読める行もあるが、**録音と食い違っている**。**原因は断定しない**。
+    NotWhole { shortfall: TranscriptShortfall },
 }
 
 /// 議事録タブから見た**入力（文字起こし）の様子**（#165）。
@@ -429,14 +591,17 @@ pub enum StoredTranscript {
 /// `docs/rules/coding-conventions.md`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TranscriptInput {
-    /// 読める文字起こしが在り、**「揃っていない」とは言えない**（`StoredTranscript::Complete`
-    /// と同じ範囲。読めなかった JSON もここへ来る——そのときは Transcript タブが
-    /// 「読めなかった」の空表示を出す）。
+    /// 読める文字起こしが在り、**食い違いは分かっていない**
+    /// （`StoredTranscript::NoKnownShortfall` と同じ範囲。読めなかった JSON もここへ来る
+    /// ——そのときは Transcript タブが「読めなかった」の空表示を出す）。
     Ready,
-    /// 読める文字起こしが在るが、**在る音源ぶんが揃っていない**（#175。原因は
-    /// `StoredTranscript::NotReadToTheEnd` と同じで、断定しない）。議事録は書けるが、欠けた
-    /// 入力から書いたものになる。
-    NotReadToTheEnd,
+    /// 読める文字起こしが在るが、**録音と食い違っている**（#175 / #176）。議事録は書けるが、
+    /// 欠けた入力から書いたものになる。
+    ///
+    /// **どう食い違っているかは持たない**（#176）。議事録タブの言い分は 3 種類とも同じで、
+    /// 内訳を言うのは Transcript タブの仕事。持たせると、同じことを 2 箇所で言い分ける
+    /// ことになる。
+    NotWhole,
     /// まだ無いが、いま作っている。
     Running,
     /// まだ無く、作ろうとして失敗した。
@@ -456,8 +621,8 @@ impl TranscriptInput {
         match stored {
             // **ディスクが答えを持っている**（#175）。ワーカーの記録は再起動で消えるので、
             // そちらで見分けると同じセッションが再起動の前後で違うことを言う。
-            StoredTranscript::Complete => Self::Ready,
-            StoredTranscript::NotReadToTheEnd => Self::NotReadToTheEnd,
+            StoredTranscript::NoKnownShortfall => Self::Ready,
+            StoredTranscript::NotWhole { .. } => Self::NotWhole,
             // 入力が無いときだけ、なぜ無いのかをワーカーの記録で言い分ける。
             StoredTranscript::None => match transcript.status() {
                 TranscriptStatus::Transcribing | TranscriptStatus::Stopping => Self::Running,
@@ -474,7 +639,7 @@ impl TranscriptInput {
     pub fn pane_when_no_notes(self, auto_on: bool) -> SummaryPane {
         match self {
             Self::Ready => SummaryPane::NotSummarized { auto_on },
-            Self::NotReadToTheEnd => SummaryPane::NotesFromPartialTranscript,
+            Self::NotWhole => SummaryPane::NotesFromPartialTranscript,
             Self::Running => SummaryPane::WaitingForTranscript,
             Self::Failed => SummaryPane::TranscriptFailed,
             Self::Missing => SummaryPane::Blocked,
@@ -495,8 +660,9 @@ pub enum SummaryPane {
     /// 文字起こしが失敗したので、議事録は始まらなかった（#165）。**入力が欠けたまま
     /// 完成品に見える議事録を作らない**という判断の結果なので、そう言う。
     TranscriptFailed,
-    /// 入力の文字起こしが**最後まで読めていない**（#175）。書けるが、欠けたまま完成品に見える
-    /// 議事録になる——**止めはせず、そうなると先に言う**（自動・連鎖の経路は #164 が止めている）。
+    /// 入力の文字起こしが**録音と食い違っている**（#175 / #176。途中で終わっている／中が
+    /// 抜けている）。書けるが、欠けたまま完成品に見える議事録になる——**止めはせず、そうなると
+    /// 先に言う**（文字起こしが失敗した経路だけは #164 が止めている）。
     NotesFromPartialTranscript,
     /// 文字起こしはあるが、まだ書いていない。
     NotSummarized { auto_on: bool },
@@ -566,10 +732,13 @@ impl SummaryPane {
             )
             .with_primary("Try again", PaneActionKind::TranscribeThenNotes)
             .with_secondary("Open transcription", PaneActionKind::OpenTranscription),
+            // **どう食い違っているかは言い分けない**（#176）。途中で終わっていても中が抜けて
+            // いても、議事録にとっては「入力が欠けている」の一言で足り、内訳は Transcript
+            // タブが言う。
             Self::NotesFromPartialTranscript => PaneMessage::new(
                 "No notes yet",
-                "The transcript covers only part of this recording. Notes written from it \
-                 would be missing the rest.",
+                "The transcript is missing parts of this recording. Notes written from it \
+                 would be missing them too.",
             )
             .with_primary("Write notes anyway", PaneActionKind::WriteNotes)
             .with_secondary("Open transcription", PaneActionKind::OpenTranscription),
@@ -631,13 +800,21 @@ pub fn transcribe_failure_text(reason: &TranscribeFailure) -> String {
         TranscribeFailure::Files { failed, .. } => {
             let mut text = failed
                 .iter()
-                .map(|source| match source.kept_upto {
-                    Some(upto) => format!(
+                .map(|source| match source.kept {
+                    KeptFromSource::Upto(upto) => format!(
                         "{} could not be read past {}.",
                         source.name,
                         format_elapsed(upto)
                     ),
-                    None => format!("{} could not be transcribed.", source.name),
+                    // **位置は言わない**（#176）。読み飛ばしたぶん時刻が前へ詰まっているので、
+                    // 残せた長さは「そこまで読めた」を意味しない。
+                    KeptFromSource::SomeWithGaps => format!(
+                        "{} could not be read to the end, and parts of what was read are missing.",
+                        source.name
+                    ),
+                    KeptFromSource::Nothing => {
+                        format!("{} could not be transcribed.", source.name)
+                    }
                 })
                 .collect::<Vec<_>>()
                 .join(" ");

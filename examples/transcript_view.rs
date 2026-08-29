@@ -17,6 +17,9 @@
 //! - `not-read-to-the-end`: 走り終わっているが音源を最後まで読めていない状態（#175。ディスクの
 //!   印から分かるので再起動しても消えない）。**件数と組み合わせる**——セグメントが在っても
 //!   `Show partial` を押すまで空表示が出る。`summary` と重ねると Notes タブの言い分も見られる
+//! - `has-gaps` / `stops-partway-with-gaps`: 壊れたパケットを読み飛ばして中が抜けている状態と、
+//!   途中で終わっていて手前にも抜けがある状態（#176）。`not-read-to-the-end` と同じ扱いで、
+//!   見出しと本文だけが違う（`has-gaps` の本文がこのペインで最長なので、折り返しはここで見る）
 //! - `transcript-partial`: 途中まで読めて失敗した状態（#164）。**件数と組み合わせる**——
 //!   セグメントが在っても `Show partial` を押すまで空表示が出るところを見る
 //! - `show-partial`: その途中結果を開いた状態（一覧に切り替わるところを見る）
@@ -113,7 +116,22 @@ fn transcript_pane(has_transcript: bool) -> reading_pane::TranscriptPane {
     if flag("not-read-to-the-end") {
         // 走り終わっているが、音源を最後まで読めていない（#175。ディスクの印から分かるので
         // 再起動しても消えない）。
-        return reading_pane::TranscriptPane::NotReadToTheEnd;
+        return reading_pane::TranscriptPane::NotWhole {
+            shortfall: reading_pane::TranscriptShortfall::StopsPartway,
+        };
+    }
+    if flag("has-gaps") {
+        // 走り終わって最後まで読めているが、壊れたパケットを読み飛ばして中が抜けている
+        // （#176。いちばん長い本文なので、折り返しもここで見る）。
+        return reading_pane::TranscriptPane::NotWhole {
+            shortfall: reading_pane::TranscriptShortfall::HasGaps,
+        };
+    }
+    if flag("stops-partway-with-gaps") {
+        // 途中で終わっていて、その手前にも抜けがある（#176）。
+        return reading_pane::TranscriptPane::NotWhole {
+            shortfall: reading_pane::TranscriptShortfall::StopsPartwayWithGaps,
+        };
     }
     if flag("transcript-failed") {
         // ワーカーが返す中でいちばん長い理由（折り返しを見る）。何も残っていないので
@@ -121,8 +139,14 @@ fn transcript_pane(has_transcript: bool) -> reading_pane::TranscriptPane {
         return reading_pane::TranscriptPane::Failed {
             reason: reading_pane::TranscribeFailure::Files {
                 failed: vec![
-                    reading_pane::FailedSource::new("mic.mp3", None),
-                    reading_pane::FailedSource::new("system.mp3", None),
+                    reading_pane::FailedSource::new(
+                        "mic.mp3",
+                        reading_pane::KeptFromSource::Nothing,
+                    ),
+                    reading_pane::FailedSource::new(
+                        "system.mp3",
+                        reading_pane::KeptFromSource::Nothing,
+                    ),
                 ],
                 kept_other_sources: false,
             },
@@ -135,7 +159,7 @@ fn transcript_pane(has_transcript: bool) -> reading_pane::TranscriptPane {
             reason: reading_pane::TranscribeFailure::Files {
                 failed: vec![reading_pane::FailedSource::new(
                     "mic.mp3",
-                    Some(Duration::from_secs(252)),
+                    reading_pane::KeptFromSource::Upto(Duration::from_secs(252)),
                 )],
                 kept_other_sources: false,
             },
@@ -164,10 +188,12 @@ fn summary_pane(
     // ディスクの様子も**同じ値から**出す（#175。本番は `main::LoadedTranscript::stored`）。
     let stored = match (has_transcript, transcript) {
         (false, _) => reading_pane::StoredTranscript::None,
-        (true, reading_pane::TranscriptPane::NotReadToTheEnd) => {
-            reading_pane::StoredTranscript::NotReadToTheEnd
+        (true, reading_pane::TranscriptPane::NotWhole { shortfall }) => {
+            reading_pane::StoredTranscript::NotWhole {
+                shortfall: *shortfall,
+            }
         }
-        (true, _) => reading_pane::StoredTranscript::Complete,
+        (true, _) => reading_pane::StoredTranscript::NoKnownShortfall,
     };
     let input = reading_pane::TranscriptInput::of(transcript, stored);
     if input != reading_pane::TranscriptInput::Ready {

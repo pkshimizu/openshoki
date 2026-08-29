@@ -1934,7 +1934,7 @@ fn spawn_session_load(
             // 資源枯渇のたびに全セッションが伏せられる（#175）。
             transcript: transcript::Transcript {
                 segments: Vec::new(),
-                complete: true,
+                shortfall: None,
             },
             summary: None,
             summary_written: None,
@@ -2019,15 +2019,18 @@ impl LoadedTranscript {
         // うちはやらない。読み直しの最中（同じ録音）は直前の値を保つ——毎回戻すと、打鍵の
         // たびに伏せてある途中結果が 1 tick 開いてしまう。
         if self.dir.as_deref() != Some(session.dir.as_path()) {
-            return StoredTranscript::Complete;
+            return StoredTranscript::NoKnownShortfall;
         }
-        // **読める行が無いなら「途中で終わっている」とは言わない**。押しても何も現れない
-        // `Show partial` を出すことになる——読めなかった JSON は `Done` の空表示
-        // （「The transcript file is missing or could not be read」）が担当する。
-        if self.transcript.complete || self.transcript.segments.is_empty() {
-            return StoredTranscript::Complete;
+        // **読める行が無いなら食い違いを言わない**。押しても何も現れない `Show partial` を
+        // 出すことになる——読めなかった JSON は `Done` の空表示（「The transcript file is
+        // missing or could not be read」）が担当する。
+        let Some(shortfall) = self.transcript.shortfall else {
+            return StoredTranscript::NoKnownShortfall;
+        };
+        if self.transcript.segments.is_empty() {
+            return StoredTranscript::NoKnownShortfall;
         }
-        StoredTranscript::NotReadToTheEnd
+        StoredTranscript::NotWhole { shortfall }
     }
 
     /// まだ読めていない状態。**「最後まで読めた」側から始める**（伏せるのは驚く動作なので、
@@ -2037,7 +2040,7 @@ impl LoadedTranscript {
             dir: None,
             transcript: transcript::Transcript {
                 segments: Vec::new(),
-                complete: true,
+                shortfall: None,
             },
         }
     }
@@ -3138,13 +3141,18 @@ fn transcript_pane_of(
         Some(transcribe::TranscribeState::Stopping { model_label }) => {
             TranscriptPane::Stopping { model: model_label }
         }
-        Some(transcribe::TranscribeState::Done) => TranscriptPane::Done,
+        // 走り終わった記録。**食い違いも一緒に持っている**（#176）ので、走った直後だけ
+        // 「Transcribed」と言ってしまうことがない（この記録はディスクの印より優先される）。
+        Some(transcribe::TranscribeState::Done { shortfall: None }) => TranscriptPane::Done,
+        Some(transcribe::TranscribeState::Done {
+            shortfall: Some(shortfall),
+        }) => TranscriptPane::NotWhole { shortfall },
         Some(transcribe::TranscribeState::Failed { reason }) => TranscriptPane::Failed { reason },
         // ワーカーの記録が無いときは、ディスクに残った印で決める（#175）。**再起動しても
         // 消えない**のがメモリの失敗記録との違い。
         None => match stored {
-            StoredTranscript::NotReadToTheEnd => TranscriptPane::NotReadToTheEnd,
-            StoredTranscript::Complete => TranscriptPane::Done,
+            StoredTranscript::NotWhole { shortfall } => TranscriptPane::NotWhole { shortfall },
+            StoredTranscript::NoKnownShortfall => TranscriptPane::Done,
             StoredTranscript::None => TranscriptPane::NotTranscribed { auto_on },
         },
     }
@@ -3636,8 +3644,8 @@ pub(crate) fn init_test_backend() {
 mod tests {
     use super::reading_pane::StoredTranscript;
     use super::reading_pane::{
-        FailedSource, SummarizeFailure, TranscribeFailure, summarize_failure_text,
-        transcribe_failure_text, transcript_status_text,
+        FailedSource, KeptFromSource, SummarizeFailure, TranscribeFailure, TranscriptShortfall,
+        summarize_failure_text, transcribe_failure_text, transcript_status_text,
     };
     use super::{
         PaneAction, PaneActionKind, StatusTone, SummaryPane, SummaryStatus, TranscriptPane,
@@ -3683,7 +3691,10 @@ mod tests {
 
         let partial = TranscriptPane::Failed {
             reason: TranscribeFailure::Files {
-                failed: vec![FailedSource::new("mic.mp3", Some(Duration::from_secs(252)))],
+                failed: vec![FailedSource::new(
+                    "mic.mp3",
+                    KeptFromSource::Upto(Duration::from_secs(252)),
+                )],
                 kept_other_sources: false,
             },
         };
@@ -3703,7 +3714,13 @@ mod tests {
 
         // **ディスクの印から立つ途中結果も伏せる**（#175）。ここが緩むと、再起動後に欠けた
         // 文字起こしが完成品として読める。
-        super::apply_detail_transcript_status(&rec, &TranscriptPane::NotReadToTheEnd, false);
+        super::apply_detail_transcript_status(
+            &rec,
+            &TranscriptPane::NotWhole {
+                shortfall: TranscriptShortfall::StopsPartway,
+            },
+            false,
+        );
         assert!(rec.get_detail_transcript_partial());
         // **状態行も同じ値から出す**。ここだけ `transcript_status_text(pane.status())` に
         // 戻すと、途中結果を伏せたまま「Transcribed」と言う画面になる——`status()` は
@@ -3764,7 +3781,7 @@ mod tests {
                         text: "a".to_owned(),
                         speaker: super::transcript::Speaker::Mic,
                     }],
-                    complete: false,
+                    shortfall: Some(TranscriptShortfall::StopsPartway),
                 },
             })
         };
@@ -4081,7 +4098,15 @@ mod tests {
             TranscriptPane::Failed {
                 reason: TranscribeFailure::Panicked,
             },
-            TranscriptPane::NotReadToTheEnd,
+            TranscriptPane::NotWhole {
+                shortfall: TranscriptShortfall::StopsPartway,
+            },
+            TranscriptPane::NotWhole {
+                shortfall: TranscriptShortfall::HasGaps,
+            },
+            TranscriptPane::NotWhole {
+                shortfall: TranscriptShortfall::StopsPartwayWithGaps,
+            },
         ];
         for pane in &panes {
             let message = pane.message();
@@ -4157,7 +4182,7 @@ mod tests {
         // 1 文ずつ並ぶ。何も残っていないので、途中結果の 1 文もボタンも出ない。
         let nothing_kept = TranscriptPane::Failed {
             reason: TranscribeFailure::Files {
-                failed: vec![FailedSource::new("mic.mp3", None)],
+                failed: vec![FailedSource::new("mic.mp3", KeptFromSource::Nothing)],
                 kept_other_sources: false,
             },
         };
@@ -4178,8 +4203,8 @@ mod tests {
             TranscriptPane::Failed {
                 reason: TranscribeFailure::Files {
                     failed: vec![
-                        FailedSource::new("mic.mp3", None),
-                        FailedSource::new("system.mp3", None),
+                        FailedSource::new("mic.mp3", KeptFromSource::Nothing),
+                        FailedSource::new("system.mp3", KeptFromSource::Nothing),
                     ],
                     kept_other_sources: false,
                 },
@@ -4191,7 +4216,10 @@ mod tests {
         // 途中まで読めた音源は、**どこまで読めたか**を言う（#164）。
         let cut_short = TranscriptPane::Failed {
             reason: TranscribeFailure::Files {
-                failed: vec![FailedSource::new("mic.mp3", Some(Duration::from_secs(252)))],
+                failed: vec![FailedSource::new(
+                    "mic.mp3",
+                    KeptFromSource::Upto(Duration::from_secs(252)),
+                )],
                 kept_other_sources: false,
             },
         };
@@ -4202,7 +4230,7 @@ mod tests {
         // もう 1 本が最後まで行っていれば、失敗した音源から何も残らなくても読める。
         let other_source_kept = TranscriptPane::Failed {
             reason: TranscribeFailure::Files {
-                failed: vec![FailedSource::new("system.mp3", None)],
+                failed: vec![FailedSource::new("system.mp3", KeptFromSource::Nothing)],
                 kept_other_sources: true,
             },
         };
@@ -4228,7 +4256,9 @@ mod tests {
         }
         // 走り終わっているが揃っていない（#175）。**開く手を必ず添える**——伏せた一覧を出す口は
         // これだけなので、落とすとセグメントが在るのに永久に読めなくなる。
-        let stops_partway = TranscriptPane::NotReadToTheEnd;
+        let stops_partway = TranscriptPane::NotWhole {
+            shortfall: TranscriptShortfall::StopsPartway,
+        };
         assert!(stops_partway.shows_partial());
         assert_eq!(
             stops_partway.message().heading,
@@ -4710,7 +4740,7 @@ mod tests {
             (T::ModelLoad, "The transcription model could not be loaded."),
             (
                 T::Files {
-                    failed: vec![FailedSource::new("mic.mp3", None)],
+                    failed: vec![FailedSource::new("mic.mp3", KeptFromSource::Nothing)],
                     kept_other_sources: false,
                 },
                 "mic.mp3 could not be transcribed.",
@@ -4719,8 +4749,8 @@ mod tests {
                 // **件数で文の形は変えない**（`docs/rules/messages.md`）ので、音源ごとに 1 文。
                 T::Files {
                     failed: vec![
-                        FailedSource::new("mic.mp3", None),
-                        FailedSource::new("system.mp3", None),
+                        FailedSource::new("mic.mp3", KeptFromSource::Nothing),
+                        FailedSource::new("system.mp3", KeptFromSource::Nothing),
                     ],
                     kept_other_sources: false,
                 },
@@ -4731,7 +4761,7 @@ mod tests {
                 T::Files {
                     failed: vec![FailedSource::new(
                         "mic.mp3",
-                        Some(Duration::from_secs(3852)),
+                        KeptFromSource::Upto(Duration::from_secs(3852)),
                     )],
                     kept_other_sources: false,
                 },
@@ -4740,7 +4770,7 @@ mod tests {
             (
                 // 失敗した音源から何も残らなくても、もう 1 本が最後まで行っていれば読める。
                 T::Files {
-                    failed: vec![FailedSource::new("system.mp3", None)],
+                    failed: vec![FailedSource::new("system.mp3", KeptFromSource::Nothing)],
                     kept_other_sources: true,
                 },
                 "system.mp3 could not be transcribed. Everything that was read is kept.",
@@ -4784,7 +4814,7 @@ mod tests {
                     model_label: "Medium".to_owned(),
                     percent: Some(48),
                 }),
-                StoredTranscript::Complete,
+                StoredTranscript::NoKnownShortfall,
                 false,
             ),
             TranscriptPane::Transcribing {
@@ -4796,16 +4826,16 @@ mod tests {
             transcript_pane_of(
                 Some(transcribe::TranscribeState::Failed {
                     reason: TranscribeFailure::Files {
-                        failed: vec![FailedSource::new("mic.mp3", None)],
+                        failed: vec![FailedSource::new("mic.mp3", KeptFromSource::Nothing)],
                         kept_other_sources: false,
                     },
                 }),
-                StoredTranscript::Complete,
+                StoredTranscript::NoKnownShortfall,
                 false,
             ),
             TranscriptPane::Failed {
                 reason: TranscribeFailure::Files {
-                    failed: vec![FailedSource::new("mic.mp3", None)],
+                    failed: vec![FailedSource::new("mic.mp3", KeptFromSource::Nothing)],
                     kept_other_sources: false,
                 },
             }
@@ -4817,7 +4847,7 @@ mod tests {
                 Some(transcribe::TranscribeState::Stopping {
                     model_label: "Medium".to_owned(),
                 }),
-                StoredTranscript::Complete,
+                StoredTranscript::NoKnownShortfall,
                 false,
             ),
             TranscriptPane::Stopping {
@@ -4828,13 +4858,34 @@ mod tests {
         // ワーカーに記録が無ければ、**ディスクに残った印**で解決する（#175）。止め終わった後も
         // ここへ来る（降りたジョブは記録ごと消える）。
         assert_eq!(
-            transcript_pane_of(None, StoredTranscript::Complete, false),
+            transcript_pane_of(None, StoredTranscript::NoKnownShortfall, false),
             TranscriptPane::Done
         );
         // **再起動しても消えない**のがメモリの失敗記録との違い（#175）。
         assert_eq!(
-            transcript_pane_of(None, StoredTranscript::NotReadToTheEnd, false),
-            TranscriptPane::NotReadToTheEnd
+            transcript_pane_of(
+                None,
+                StoredTranscript::NotWhole {
+                    shortfall: TranscriptShortfall::StopsPartway
+                },
+                false
+            ),
+            TranscriptPane::NotWhole {
+                shortfall: TranscriptShortfall::StopsPartway
+            }
+        );
+        // 読み飛ばしの印も、そのまま読む領域まで届く（#176）。
+        assert_eq!(
+            transcript_pane_of(
+                None,
+                StoredTranscript::NotWhole {
+                    shortfall: TranscriptShortfall::HasGaps
+                },
+                false
+            ),
+            TranscriptPane::NotWhole {
+                shortfall: TranscriptShortfall::HasGaps
+            }
         );
         // 自動文字起こしの状態は、なぜ無いのかの説明を変えるので pane まで届く。
         assert_eq!(
@@ -4854,7 +4905,9 @@ mod tests {
                     model_label: "Medium".to_owned(),
                     percent: None,
                 }),
-                StoredTranscript::NotReadToTheEnd,
+                StoredTranscript::NotWhole {
+                    shortfall: TranscriptShortfall::StopsPartway
+                },
                 false,
             ),
             TranscriptPane::Transcribing {
@@ -4864,20 +4917,38 @@ mod tests {
         );
     }
 
-    /// 状態行の文言は、**空表示と同じ値から出す**（#175）。一覧と共用の状態 enum は「最後まで
-    /// 読めていない」を持てないので、状態 enum から出すと同じペインの中で
+    /// 状態行の文言は、**空表示と同じ値から出す**（#175 / #176）。一覧と共用の状態 enum は
+    /// 録音との食い違いを持てないので、状態 enum から出すと同じペインの中で
     /// 「Transcribed」と「This transcript stops partway」が並ぶ。
     #[test]
     fn the_status_line_says_the_same_thing_as_the_empty_state() {
+        let not_whole = |shortfall| TranscriptPane::NotWhole { shortfall }.status_text();
         assert_eq!(
-            TranscriptPane::NotReadToTheEnd.status_text(),
+            not_whole(TranscriptShortfall::StopsPartway),
             "Transcribed in part"
         );
-        assert_ne!(
-            TranscriptPane::NotReadToTheEnd.status_text(),
-            TranscriptPane::Done.status_text(),
-            "a transcript that stops partway must not read as a finished one"
+        // **抜けは届いていないことと区別して言う**（#176）。同じ文言に畳むと、事実と違う
+        // 「一部しか文字起こしできていない」を、最後まで読めた録音に出すことになる。
+        assert_eq!(
+            not_whole(TranscriptShortfall::HasGaps),
+            "Transcribed with gaps"
         );
+        // 両方のときは、届いていないほうを先に言う。
+        assert_eq!(
+            not_whole(TranscriptShortfall::StopsPartwayWithGaps),
+            "Transcribed in part"
+        );
+        for shortfall in [
+            TranscriptShortfall::StopsPartway,
+            TranscriptShortfall::HasGaps,
+            TranscriptShortfall::StopsPartwayWithGaps,
+        ] {
+            assert_ne!(
+                not_whole(shortfall),
+                TranscriptPane::Done.status_text(),
+                "a transcript that does not match the recording must not read as a finished one"
+            );
+        }
         // 残りは状態 enum の表をそのまま使う（増やしたのはこの 1 つだけ）。
         for pane in [
             TranscriptPane::Done,
@@ -4917,10 +4988,15 @@ mod tests {
             session.has_transcript = has_transcript;
             session
         };
-        let loaded = |dir: &str, segments: Vec<transcript::TranscriptSegment>, complete: bool| {
+        let loaded = |dir: &str,
+                      segments: Vec<transcript::TranscriptSegment>,
+                      shortfall: Option<TranscriptShortfall>| {
             LoadedTranscript {
                 dir: Some(std::path::PathBuf::from(dir)),
-                transcript: transcript::Transcript { segments, complete },
+                transcript: transcript::Transcript {
+                    segments,
+                    shortfall,
+                },
             }
         };
         let line = || {
@@ -4933,37 +5009,50 @@ mod tests {
 
         // 文字起こしが無ければ、中身は意味を持たない。
         assert_eq!(
-            loaded("a", vec![], true).stored(&session("a", false)),
+            loaded("a", vec![], None).stored(&session("a", false)),
             StoredTranscript::None
         );
         assert_eq!(
-            loaded("a", line(), false).stored(&session("a", false)),
+            loaded("a", line(), Some(TranscriptShortfall::StopsPartway))
+                .stored(&session("a", false)),
             StoredTranscript::None
         );
 
         assert_eq!(
-            loaded("a", line(), true).stored(&session("a", true)),
-            StoredTranscript::Complete
+            loaded("a", line(), None).stored(&session("a", true)),
+            StoredTranscript::NoKnownShortfall
         );
         assert_eq!(
-            loaded("a", line(), false).stored(&session("a", true)),
-            StoredTranscript::NotReadToTheEnd
+            loaded("a", line(), Some(TranscriptShortfall::StopsPartway))
+                .stored(&session("a", true)),
+            StoredTranscript::NotWhole {
+                shortfall: TranscriptShortfall::StopsPartway
+            }
+        );
+        // 読み飛ばしの印も、そのまま議事録タブまで届く（#176）。
+        assert_eq!(
+            loaded("a", line(), Some(TranscriptShortfall::HasGaps)).stored(&session("a", true)),
+            StoredTranscript::NotWhole {
+                shortfall: TranscriptShortfall::HasGaps
+            }
         );
         // 読める行が無いなら、印が落ちていても「読めなかった」側。
         assert_eq!(
-            loaded("a", vec![], false).stored(&session("a", true)),
-            StoredTranscript::Complete
+            loaded("a", vec![], Some(TranscriptShortfall::StopsPartway))
+                .stored(&session("a", true)),
+            StoredTranscript::NoKnownShortfall
         );
 
         // **別の録音を読んだ結果では伏せない**。まだ読めていないのと同じ扱いにする。
         assert_eq!(
-            loaded("a", line(), false).stored(&session("b", true)),
-            StoredTranscript::Complete
+            loaded("a", line(), Some(TranscriptShortfall::StopsPartway))
+                .stored(&session("b", true)),
+            StoredTranscript::NoKnownShortfall
         );
         // 一度も読んでいないときも同じ。
         assert_eq!(
             LoadedTranscript::unknown().stored(&session("a", true)),
-            StoredTranscript::Complete
+            StoredTranscript::NoKnownShortfall
         );
     }
 
@@ -5014,15 +5103,17 @@ mod tests {
         );
         // 入力が揃っていないときは、そう言う（#175）。**止めはしない**ので、書く手は出す。
         assert_eq!(
-            summary_pane_of(None, false, I::NotReadToTheEnd, false),
+            summary_pane_of(None, false, I::NotWhole, false),
             SummaryPane::NotesFromPartialTranscript
         );
         let partial_input = SummaryPane::NotesFromPartialTranscript;
+        // **どう食い違っているかは言い分けない**（#176）。途中で終わっていても中が抜けていても
+        // 議事録にとっては同じなので、内訳を持たない言い方であること。
         assert!(
             partial_input
                 .message()
                 .body
-                .contains("only part of this recording")
+                .contains("missing parts of this recording")
         );
         assert_eq!(
             partial_input
@@ -5065,20 +5156,33 @@ mod tests {
             percent: None,
         };
         // 作り直している最中でも、ディスクに在るものが入力。
-        assert_eq!(I::of(&running, StoredTranscript::Complete), I::Ready);
         assert_eq!(
-            I::of(&running, StoredTranscript::NotReadToTheEnd),
-            I::NotReadToTheEnd
+            I::of(&running, StoredTranscript::NoKnownShortfall),
+            I::Ready
+        );
+        assert_eq!(
+            I::of(
+                &running,
+                StoredTranscript::NotWhole {
+                    shortfall: TranscriptShortfall::StopsPartway
+                }
+            ),
+            I::NotWhole
         );
         // **失敗の記録が残っていても、ディスクが答えを持つ**。
         let failed = TranscriptPane::Failed {
             reason: TranscribeFailure::Panicked,
         };
         assert_eq!(
-            I::of(&failed, StoredTranscript::NotReadToTheEnd),
-            I::NotReadToTheEnd
+            I::of(
+                &failed,
+                StoredTranscript::NotWhole {
+                    shortfall: TranscriptShortfall::HasGaps
+                }
+            ),
+            I::NotWhole
         );
-        assert_eq!(I::of(&failed, StoredTranscript::Complete), I::Ready);
+        assert_eq!(I::of(&failed, StoredTranscript::NoKnownShortfall), I::Ready);
 
         // 入力が無いときだけ、なぜ無いのかをワーカーの記録で言い分ける。
         assert_eq!(I::of(&running, StoredTranscript::None), I::Running);
