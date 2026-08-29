@@ -338,6 +338,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 選択の世代。**遅れて届いた結果で新しい選択を上書きしない**ための番号で、選ぶたびに増やす
     // （速く切り替えると、前の読み込みがあとから返ってくる）。
     let load_generation = Rc::new(Cell::new(0u64));
+    // 一覧の走査結果を UI スレッドへ返す道（#181。`load_receiver` と同じ理由）。
+    let (scan_sender, scan_receiver) = std::sync::mpsc::channel::<ScannedSessions>();
+    // 走査の世代。**閉じて開き直した・保存先を変えたときに、古い走査の結果で一覧を
+    // 書き換えない**ための番号。
+    let scan_generation = Rc::new(Cell::new(0u64));
     // 検索の世代（#161）。閉じるときにも降ろすので、閉じるハンドラより前に用意する。
     let search_generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
     // **最後の検索で本文を読めなかった録音**（#182。理由は `not_downloaded_count` の doc）。
@@ -1212,6 +1217,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 load_receiver,
                 load_sender: load_sender.clone(),
                 load_generation: Rc::clone(&load_generation),
+                scan_receiver,
+                scan_sender: scan_sender.clone(),
+                scan_generation: Rc::clone(&scan_generation),
                 sessions: Rc::clone(&sessions),
                 all_sessions: Rc::clone(&all_sessions),
                 search_receiver,
@@ -1277,6 +1285,12 @@ struct LibraryHandles {
     /// 走査で見つかった**全部**のセッション（#161）。検索を解除したときに戻す元で、
     /// 絞り込みの対象でもある。
     all_sessions: Rc<RefCell<Vec<recordings::RecordingSession>>>,
+    /// 一覧の走査結果の受け口（#181。`load_receiver` と同じ流儀）。
+    scan_receiver: std::sync::mpsc::Receiver<ScannedSessions>,
+    /// 走査を投げるための送り口（開くたび・保存先を変えたときに使う）。
+    scan_sender: std::sync::mpsc::Sender<ScannedSessions>,
+    /// いま出している走査の世代。届いた結果がこれと違えば**捨てる**。
+    scan_generation: Rc<Cell<u64>>,
     /// 検索結果の受け口。本文を読むので背景スレッドで絞り、結果だけ送る（`#152` と同じ流儀）。
     search_receiver: std::sync::mpsc::Receiver<SearchResult>,
     /// いま出している検索の世代。届いた結果がこれと違えば捨てる（打ち込むたびに投げるので、
@@ -1480,6 +1494,25 @@ fn build_menu_event_handler(
             .and_then(|index| i32::try_from(index).ok())
             .unwrap_or(-1);
             rec.set_current_segment(current);
+        }
+
+        // 走査の結果を一覧へ入れる（#181）。**閉じていても受け取って捨てる**（溜めたままに
+        // しない。読み込み・検索と同じ）。
+        while let Ok(scanned) = recordings.scan_receiver.try_recv() {
+            let Some(rec) = recordings.ui.upgrade() else {
+                continue;
+            };
+            apply_scanned_sessions(
+                &rec,
+                &recordings.sessions_model,
+                SessionLists {
+                    all: &recordings.all_sessions,
+                    shown: &recordings.sessions,
+                },
+                &recordings.scan_generation,
+                &recordings.transcriber,
+                scanned,
+            );
         }
 
         // 絞り込みが終わった検索結果を一覧へ入れる（#161）。読み込みと同じく、閉じていても
@@ -1853,6 +1886,65 @@ fn advance_load_generation(generation: &Cell<u64>) -> u64 {
     next
 }
 
+/// 走査の世代を 1 つ進め、走っている走査に「降りろ」と伝える（#181）。
+///
+/// **番号を進めるのと伝えるのを 1 つにしてある**（`advance_load_generation` と同じ理由）——
+/// 別々にすると、進めたのに伝え忘れる書き方が残る。
+fn advance_scan_generation(generation: &Cell<u64>) -> u64 {
+    let next = generation.get().wrapping_add(1);
+    generation.set(next);
+    SCAN_WATCHERS.with(|watchers| {
+        let mut watchers = watchers.borrow_mut();
+        watchers.retain(|w| Arc::strong_count(w) > 1);
+        for w in watchers.iter() {
+            w.store(next, Ordering::Relaxed);
+        }
+    });
+    next
+}
+
+/// 届いた走査結果を一覧へ入れる（#181）。
+///
+/// **繋ぎを丸ごと呼べる形にしてある**（`docs/rules/testing.md`）。ここが持つ判断は 3 つ
+/// ——古い世代を捨てる・全件と表示中の両方へ入れる・件数と空表示を揃える——で、どれも
+/// tick の中に書くとウィンドウ無しでは検査できない。
+///
+/// **`all_sessions` と `sessions` の両方へ入れる**（#161）。片方だけ更新する経路を残すと、
+/// 検索を解除したときに消えたはずの録音が戻る。
+fn apply_scanned_sessions(
+    rec: &LibraryWindow,
+    model: &slint::VecModel<SessionRow>,
+    lists: SessionLists,
+    generation: &Cell<u64>,
+    transcriber: &transcribe::TranscribeWorker,
+    scanned: ScannedSessions,
+) -> bool {
+    if scanned.generation != generation.get() {
+        // 閉じて開き直した・保存先を変えた。古い走査で一覧を書き換えない。
+        return false;
+    }
+    model.set_vec(session_rows(&scanned.sessions, transcriber));
+    // **件数も空表示もここを通す**（`docs/rules/slint.md` の「表示値の導出は 1 つの関数に
+    // 集める」）。走査直後は絞り込みも読めなかったものも無い（`open_library_window` が
+    // 検索を解除している）。
+    apply_list_counts(rec, scanned.sessions.len(), scanned.sessions.len(), 0);
+    *lists.all.borrow_mut() = scanned.sessions.clone();
+    *lists.shown.borrow_mut() = scanned.sessions;
+    true
+}
+
+/// 走査結果の反映先の 2 つの一覧（#181）。
+///
+/// **まとめて渡す**——どちらも `RefCell<Vec<RecordingSession>>` なので、引数で並べると渡し
+/// 違えても通る（`docs/rules/coding-conventions.md` の「同型の引数を並べた関数に切り出さない」）。
+/// 名前付きのフィールドなら位置で取り違えられない。
+struct SessionLists<'a> {
+    /// 走査で見つかった**全部**（検索を解除したときに戻す元。#161）。
+    all: &'a RefCell<Vec<recordings::RecordingSession>>,
+    /// いま**一覧に出ている**ぶん（絞り込むと縮む）。
+    shown: &'a RefCell<Vec<recordings::RecordingSession>>,
+}
+
 /// 選んだ録音の重い読み込みを別スレッドで始める。
 ///
 /// **`set_segments` を書く経路をここ 1 本に絞る**ための入口（#152）。読み込み中に文字起こしや
@@ -1961,6 +2053,11 @@ thread_local! {
     /// いま走っている読み込みへ「世代が進んだ」ことを伝える手（`spawn_session_load` の doc）。
     /// UI スレッド専有なので `thread_local` で足りる。
     static LOAD_WATCHERS: RefCell<Vec<Arc<AtomicU64>>> = const { RefCell::new(Vec::new()) };
+}
+
+thread_local! {
+    /// 走っている走査へ「降りろ」と伝える手（#181。`LOAD_WATCHERS` と同じ流儀）。
+    static SCAN_WATCHERS: RefCell<Vec<Arc<AtomicU64>>> = const { RefCell::new(Vec::new()) };
     /// 検索版（`spawn_search` の doc）。読み込みと分けるのは、片方を進めてももう片方を
     /// 降ろさないため（選択の切り替えで走っている検索を殺さない）。
     static SEARCH_WATCHERS: RefCell<Vec<Arc<AtomicU64>>> = const { RefCell::new(Vec::new()) };
@@ -2058,6 +2155,71 @@ impl LoadedTranscript {
                 shortfall: None,
             },
         }
+    }
+}
+
+/// 一覧の走査結果（#181。別スレッドで作り、UI スレッドへ渡す）。
+///
+/// **`LoadedSession` と同じ流儀**（#152）——走査スレッドは UI スレッド専有のものに触れないので、
+/// 送るだけにして、拾って反映するのは tick の仕事。
+struct ScannedSessions {
+    /// どの走査に対する結果か。**受け取る側が世代を確かめて、古い結果を捨てる**（閉じて開き
+    /// 直した・保存先を変えた場合に、前の走査が後から届いて一覧を書き換えないように）。
+    generation: u64,
+    sessions: Vec<recordings::RecordingSession>,
+}
+
+/// 一覧の走査を別スレッドで始める（#181）。
+///
+/// **ウィンドウは先に出す**。保存先が遅いボリューム（ネットワーク共有・外付け・スピンドル）だと、
+/// UI スレッドで走査を待つとトレイから押しても窓が出ない。#178 で走査そのものは 0.6ms になったが、
+/// 遅いのはディスクのほうなので、非同期にするしかない。
+///
+/// **世代を持たせる**のは `spawn_session_load` と同じ理由（`advance_scan_generation`）。
+///
+/// 一時ファイルの回収（`spawn_session_part_sweep`）も**走査スレッドの中で呼ぶ**——走査結果が要る
+/// うえに表示には使わない副作用なので、UI スレッドへ戻す必要が無い。
+fn spawn_session_scan(
+    recording_dir: std::path::PathBuf,
+    generation_id: u64,
+    sender: &std::sync::mpsc::Sender<ScannedSessions>,
+) {
+    let thread_sender = sender.clone();
+    let fallback_sender = sender.clone();
+    let live = Arc::new(AtomicU64::new(generation_id));
+    // 世代が進んだことを走査スレッドへ伝える手を登録する（書き込むのは `advance_scan_generation`）。
+    SCAN_WATCHERS.with(|watchers| {
+        let mut watchers = watchers.borrow_mut();
+        watchers.retain(|w| Arc::strong_count(w) > 1);
+        watchers.push(Arc::clone(&live));
+    });
+
+    let spawned = std::thread::Builder::new()
+        .name("session-scan".to_owned())
+        .spawn(move || {
+            // **重い処理の前に降りられるか見る**。開いて閉じてを繰り返したぶんだけ走査が
+            // 積み上がると、いま見たい一覧を自分で遅くする（`spawn_session_load` と同じ）。
+            if live.load(Ordering::Relaxed) != generation_id {
+                return;
+            }
+            let sessions = recordings::list_sessions(&recording_dir);
+            // 一覧に出たセッションに取り残された一時ファイルを回収する（強制終了などで残った
+            // もの。範囲と時期の判断は `recordings::spawn_session_part_sweep` の doc）。
+            // 表示には使わない副作用なので、完了は待たない。
+            recordings::spawn_session_part_sweep(&sessions, SystemTime::now());
+            let _ = thread_sender.send(ScannedSessions {
+                generation: generation_id,
+                sessions,
+            });
+        });
+    if let Err(err) = spawned {
+        // スレッドを立てられないのは資源枯渇（`docs/rules/error-handling.md`）。**空の結果を
+        // 送る**——送らないと、一覧が「読み込み中」のまま二度と埋まらない。
+        eprintln!("Showing an empty list because the scan thread could not start: {err}");
+        let _ = fallback_sender.send(ScannedSessions {
+            generation: generation_id,
+            sessions: Vec::new(),
+        });
     }
 }
 
@@ -2606,14 +2768,18 @@ fn open_library_window(
     geometry_committed: &mut bool,
     last_play_secs: &mut Option<u64>,
 ) {
-    let list = recordings::list_sessions(&config.borrow().recording_dir);
-    // 一覧に出たセッションに取り残された一時ファイルを回収する（強制終了などで残ったもの。
-    // 範囲と時期の判断は `recordings::spawn_session_part_sweep` の doc）。表示には使わない
-    // 副作用なので、完了は待たない。
-    recordings::spawn_session_part_sweep(&list, SystemTime::now());
-    handles
-        .sessions_model
-        .set_vec(session_rows(&list, &handles.transcriber));
+    // **走査は別スレッドへ投げ、窓は待たずに出す**（#181）。保存先が遅いボリューム
+    // （ネットワーク共有・外付け・スピンドル）だと、ここで待つとトレイから押しても窓が出ない。
+    // 結果は tick が拾う（`apply_scanned_sessions`）。
+    //
+    // **世代を先に進める**——閉じて開き直したとき、前の走査の結果が後から届いて一覧を
+    // 書き換えないように（`spawn_session_load` と同じ流儀）。
+    let generation = advance_scan_generation(&handles.scan_generation);
+    spawn_session_scan(
+        config.borrow().recording_dir.clone(),
+        generation,
+        &handles.scan_sender,
+    );
     // 開くたびに検索は解除しておく（前に開いたときの絞り込みが残っていると、録音が消えたように
     // 見える）。**世代も進める**——走っていた検索の結果が後から届いて絞り込むのを防ぐ。
     reset_search(
@@ -2621,14 +2787,16 @@ fn open_library_window(
         &handles.search_generation,
         &handles.search_not_downloaded,
     );
-    // **件数も空表示もここを通す**（`docs/rules/slint.md` の「表示値の導出は 1 つの関数に集め、
-    // 起動時の初期化もその関数を通す」）。直接 set すると、開いた直後だけ空表示の文が欠ける。
-    // 検索は上で解除したので、絞り込みも読めなかったものも無い。
-    apply_list_counts(rec, list.len(), list.len(), 0);
-    *handles.all_sessions.borrow_mut() = list.clone();
+    // **前の一覧は残さず、空にして待つ**（#181）。残すと、保存先を変えた直後に前の保存先の
+    // 録音が並び、押せてしまう（選ぶと読み込みが失敗する）。空表示は
+    // `library_text::empty_list_message` が「まだ何も無い」と言う——走査は 0.6ms（#178）なので、
+    // 速いボリュームではこの状態が目に入る前に埋まる。
+    handles.sessions_model.set_vec(Vec::new());
+    apply_list_counts(rec, 0, 0, 0);
+    handles.all_sessions.borrow_mut().clear();
     // 開くたびに未選択・停止表示へ初期化する。
     clear_library_selection(rec, &handles.transcript_segments, &handles.load_generation);
-    *handles.sessions.borrow_mut() = list;
+    handles.sessions.borrow_mut().clear();
     *last_play_secs = None;
     // 再生ハンドルがあれば前回の再生対象を手放す（未選択表示に合わせて「何もロードされて
     // いない」状態へ揃える。理由は `AudioPlayer::unload` の doc コメント参照）。
@@ -3769,6 +3937,89 @@ mod tests {
             true,
         );
         assert!(!rec.get_show_partial_transcript());
+    }
+
+    /// 走査結果が**一覧まで届き、古い世代は捨てられる**こと（#181）。
+    ///
+    /// 走査を別スレッドへ出した以上、結果を反映する繋ぎは本番だけが通る 1 本になる。ここを
+    /// 通らないと、`set_vec` の行を消しても、世代の照合を外しても全部緑のままになる
+    /// （`docs/rules/testing.md` の「繋いでいる関数は、呼べるなら丸ごと呼ぶ」）。
+    ///
+    /// ワーカーは立てるがジョブは投げない（走らせた記録が無い＝ディスクの有無だけが効く場面）。
+    #[test]
+    fn a_scan_result_reaches_the_list_and_stale_ones_are_dropped() {
+        use std::cell::{Cell, RefCell};
+
+        super::init_test_backend();
+        let rec = super::LibraryWindow::new().expect("create the library window");
+        let summarizer = super::summarize::SummarizeWorker::start(
+            super::model_download::ModelDownloader::new(),
+            super::inference_slot::InferenceSlot::new(),
+        );
+        let transcriber = super::transcribe::TranscribeWorker::start(
+            super::model_download::ModelDownloader::new(),
+            summarizer,
+            super::inference_slot::InferenceSlot::new(),
+        );
+        let model: slint::VecModel<super::SessionRow> = slint::VecModel::default();
+        let all = RefCell::new(Vec::new());
+        let shown = RefCell::new(Vec::new());
+        let generation = Cell::new(7u64);
+        let apply = |scanned| {
+            super::apply_scanned_sessions(
+                &rec,
+                &model,
+                super::SessionLists {
+                    all: &all,
+                    shown: &shown,
+                },
+                &generation,
+                &transcriber,
+                scanned,
+            )
+        };
+        let sessions = |count: usize| -> Vec<recordings::RecordingSession> {
+            (0..count)
+                .map(|i| {
+                    let mut session = recordings::RecordingSession::for_test(
+                        chrono::NaiveDate::from_ymd_opt(2026, 8, 10)
+                            .expect("a real date")
+                            .and_hms_opt(14, 2, 0)
+                            .expect("a real time"),
+                    );
+                    session.dir = std::path::PathBuf::from(format!("20260810-14020{i}"));
+                    session.has_mic = true;
+                    session
+                })
+                .collect()
+        };
+
+        // **古い世代は捨てる**。閉じて開き直した・保存先を変えた走査が後から届いても、
+        // 一覧を書き換えない。
+        assert!(!apply(super::ScannedSessions {
+            generation: 6,
+            sessions: sessions(3),
+        }));
+        {
+            use slint::Model as _;
+            assert_eq!(model.row_count(), 0, "a stale scan must not fill the list");
+        }
+        assert!(all.borrow().is_empty());
+        assert!(shown.borrow().is_empty());
+
+        // いまの世代なら、行・件数・2 つの一覧のすべてが揃う。
+        assert!(apply(super::ScannedSessions {
+            generation: 7,
+            sessions: sessions(2),
+        }));
+        {
+            use slint::Model as _;
+            assert_eq!(model.row_count(), 2);
+        }
+        // **両方の一覧へ入れる**（#161）。片方だけだと、検索を解除したときに食い違う。
+        assert_eq!(all.borrow().len(), 2);
+        assert_eq!(shown.borrow().len(), 2);
+        assert_eq!(rec.get_library_summary(), "2 recordings");
     }
 
     /// 読み込んだ文字起こしが**画面まで届く**こと（#175）。
