@@ -3939,6 +3939,49 @@ mod tests {
         assert!(!rec.get_show_partial_transcript());
     }
 
+    /// 世代を進めたら、**走っている走査へ必ず伝わる**こと（#181）。
+    ///
+    /// 番号を進めるのと伝えるのは `advance_scan_generation` の中で 1 つになっているが、
+    /// **伝える側だけを消しても、届いた結果を捨てる仕組みは動き続ける**——古い結果は捨てられる
+    /// ので画面は正しいまま、走っているスレッドだけが降りずに走り切る。連打したぶんだけ
+    /// 走査が積み上がり、いま見たい一覧を自分で遅くする（`spawn_session_load` の doc）。
+    /// 症状が画面に出ないので、ここで留めておかないと気づけない。
+    #[test]
+    fn advancing_the_scan_generation_tells_the_running_scans_to_stand_down() {
+        use std::cell::Cell;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let generation = Cell::new(3u64);
+        // 走っている走査が持つ手（`spawn_session_scan` が登録するのと同じもの）。
+        let running = Arc::new(AtomicU64::new(3));
+        // すでに終わったスレッドの手（`Vec` だけが持っている＝相手がいない）。落ちること。
+        let finished = Arc::new(AtomicU64::new(3));
+        super::SCAN_WATCHERS.with(|watchers| {
+            let mut watchers = watchers.borrow_mut();
+            watchers.clear();
+            watchers.push(Arc::clone(&running));
+            watchers.push(finished);
+        });
+
+        let next = super::advance_scan_generation(&generation);
+
+        assert_eq!(next, 4);
+        assert_eq!(generation.get(), 4);
+        assert_eq!(
+            running.load(Ordering::Relaxed),
+            4,
+            "a running scan must be told to stand down"
+        );
+        super::SCAN_WATCHERS.with(|watchers| {
+            assert_eq!(
+                watchers.borrow().len(),
+                1,
+                "the hand of a thread that already finished is dropped"
+            );
+        });
+    }
+
     /// 走査結果が**一覧まで届き、古い世代は捨てられる**こと（#181）。
     ///
     /// 走査を別スレッドへ出した以上、結果を反映する繋ぎは本番だけが通る 1 本になる。ここを
