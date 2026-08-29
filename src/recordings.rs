@@ -205,7 +205,7 @@ impl RecordingSession {
     /// ごとに、読めて最後まで読み切った JSON があるかを見る（`transcript::load_transcript`）。
     ///
     /// **「在る音源」を言う場所はここ 1 つ**。ここが音源を取り落とすと、欠けた文字起こしが
-    /// 完成品として画面に出る（`transcript::all_sources_are_complete` が数える対象そのもの）。
+    /// 完成品として画面に出る（`transcript::sources_shortfall` が数える対象そのもの）。
     pub fn speakers(&self) -> Vec<crate::transcript::Speaker> {
         let mut speakers = Vec::new();
         if self.has_mic {
@@ -589,7 +589,7 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     /// 「在る音源」を言うのはここ 1 つ（#175）。**取り落とすと、欠けた文字起こしが完成品として
-    /// 画面に出る**（`transcript::all_sources_are_complete` が数える対象そのもの）——本番では
+    /// 画面に出る**（`transcript::sources_shortfall` が数える対象そのもの）——本番では
     /// `spawn_session_load` が渡すだけなので、壊れても症状が出るまでに何段も挟まる。
     #[test]
     fn the_sources_a_session_has_come_from_the_files_it_has() {

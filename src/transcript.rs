@@ -12,6 +12,7 @@
 //! `Done` のままセグメントだけ空になるので、未実施とは違う文が出る）。
 
 use crate::dataless::{Fetch, ReadFailure};
+use crate::reading_pane::TranscriptShortfall;
 use std::path::Path;
 use std::time::Duration;
 
@@ -93,13 +94,70 @@ struct TranscriptFile {
     /// この 1 欄のせいで JSON 全体のパースが失敗し、セグメントごと消えるのを避ける
     /// （`docs/rules/error-handling.md` の「寛容にデシリアライズし既定へ丸める」）。
     ///
-    /// **`true` は「デコーダがストリーム終端まで到達した」という意味**でしかない。壊れたパケットを
-    /// 読み飛ばして中抜けした音源も `true` になる（`transcribe::decode_mp3_stream`。扱いは #176）。
+    /// **`true` は「デコーダがストリーム終端まで到達した」という意味**でしかない。壊れた
+    /// パケットを読み飛ばして中抜けした音源も `true` になるので、そちらは `gapped` が持つ（#176）。
     #[serde(
         default = "complete_by_default",
         deserialize_with = "deserialize_complete"
     )]
     complete: bool,
+    /// 壊れたパケットを**読み飛ばした**か（#176）。`true` は中身が抜けていて、抜けたぶん以降の
+    /// 時刻が本来より早いことを表す（`transcribe::decode_mp3_stream`）。
+    ///
+    /// **欠けている JSON は `false`**（`gapped_by_default`）。**在って読めない値なら `true`**
+    /// ——`complete` と極性は逆だが、倒す先の理屈は同じで「分からないときは欠けている側」。
+    #[serde(default = "gapped_by_default", deserialize_with = "deserialize_gapped")]
+    gapped: bool,
+}
+
+impl TranscriptFile {
+    /// 2 つの欄を、**下流が取り違えられない 1 つの値**へ畳む（#176）。
+    fn shortfall(&self) -> Option<TranscriptShortfall> {
+        ShortfallMarks {
+            reached_the_end: self.complete,
+            gapped: self.gapped,
+        }
+        .shortfall()
+    }
+}
+
+/// 文字起こし JSON に残す 2 つの印（#176）。**保存形式の語彙なのでこのモジュールが持つ**
+/// （`reading_pane` は読む領域が説明できることの語彙だけを持つ）。書く側
+/// （`transcribe::Transcription`）と読む側（`TranscriptFile`）が同じ型を通る。
+///
+/// **名前付きのフィールドで受ける**ので、位置で取り違えられない
+/// （`docs/rules/coding-conventions.md` の「同型の引数を並べた関数に切り出さない」）。極性は
+/// 欄の意味に合わせてあり、揃っていない——`reached_the_end` は「食い違い無し」が `true`、
+/// `gapped` は `false`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShortfallMarks {
+    /// デコーダがストリーム終端まで到達したか（JSON の `complete`）。
+    pub reached_the_end: bool,
+    /// 壊れたパケットを読み飛ばしたか（JSON の `gapped`）。
+    pub gapped: bool,
+}
+
+impl ShortfallMarks {
+    /// 保存欄から食い違いを組む。**書く側と読む側が同じ関数を通る**ので、片方だけ極性が
+    /// 反転する壊れ方が無い。
+    pub fn shortfall(self) -> Option<TranscriptShortfall> {
+        let mut shortfall = None;
+        if !self.reached_the_end {
+            shortfall = Some(TranscriptShortfall::adding_stop(shortfall));
+        }
+        if self.gapped {
+            shortfall = Some(TranscriptShortfall::adding_gaps(shortfall));
+        }
+        shortfall
+    }
+
+    /// 食い違いを保存欄へ戻す（`shortfall` の逆）。
+    pub fn of(shortfall: Option<TranscriptShortfall>) -> Self {
+        Self {
+            reached_the_end: !shortfall.is_some_and(TranscriptShortfall::stops_partway),
+            gapped: shortfall.is_some_and(TranscriptShortfall::has_gaps),
+        }
+    }
 }
 
 /// `complete` が欠けている JSON の既定。
@@ -120,8 +178,39 @@ fn deserialize_complete<'de, D>(deserializer: D) -> Result<bool, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
+    deserialize_bool_or(deserializer, false)
+}
+
+/// 真偽値を寛容に読む共通部。**倒す先だけを呼び出し側が決める**——同じ実装を 2 本置くと、
+/// 片方だけ直して食い違う（この機能そのものが「極性の逆な 2 欄を取り違えない」ための
+/// ものなので、なおさら分けない）。
+///
+/// **この 1 欄のために JSON 全体のパースを失敗させない**（`docs/rules/error-handling.md`）。
+fn deserialize_bool_or<'de, D>(deserializer: D, fallback: bool) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
     let value = serde_json::Value::deserialize(deserializer)?;
-    Ok(value.as_bool().unwrap_or(false))
+    Ok(value.as_bool().unwrap_or(fallback))
+}
+
+/// `gapped` が欠けている JSON の既定（#176）。
+///
+/// **#176 より前に書かれた JSON は、読み飛ばしがあっても取り逃す**——その頃の出力は読み飛ばしを
+/// 数えてはいたがログに出すだけで、欄に残していない。まだ配布していない（`docs/CONTEXT.md` の
+/// 配布の決定記録）ので手元のデータにしか無く、やり直せば直る。`complete_by_default` と
+/// 同じ性質の割り切り。
+fn gapped_by_default() -> bool {
+    false
+}
+
+/// `gapped` を寛容に読む。**欄が在って読めない値なら「抜けている」へ倒す**
+/// （`deserialize_complete` と極性は逆だが、理屈は同じ——分からないときは守りたい側）。
+fn deserialize_gapped<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bool_or(deserializer, true)
 }
 
 /// JSON の 1 セグメント。`text` は欠けていても既定値で読めるようにする（前方互換）。
@@ -138,26 +227,28 @@ struct RawSegment {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Transcript {
     pub segments: Vec<TranscriptSegment>,
-    /// **在る音源ぶんの文字起こしが、すべて最後まで読めているか**（#175）。
+    /// **在る音源ぶんをまとめた、録音との食い違い**（#175 / #176）。`None` は食い違いが
+    /// 見つからなかったこと。
     ///
     /// 音源が 2 本あって片方の JSON が無いセッション（一方だけ失敗した・途中で止めた）も
-    /// `false` になる。「読めた JSON がすべて `complete`」にすると、そこが `true` に化ける。
+    /// `StopsPartway` になる。「読めた JSON がすべて揃っている」にすると、そこが `None` に化ける。
     ///
-    /// 読めなかった JSON（欠落・破損・過大）も `false`。読めない以上「揃っている」とは言えない。
-    pub complete: bool,
+    /// 読めなかった JSON（欠落・破損・過大）も `StopsPartway`。読めない以上「揃っている」とは
+    /// 言えない。
+    pub shortfall: Option<TranscriptShortfall>,
 }
 
 /// セッションの文字起こしを読み、話者ラベル付きで開始秒の昇順にマージする（#175）。
 ///
-/// **本文は在る JSON を全部読む**（`read_all`）。**`sources` は「揃っているか」の判定にだけ
-/// 使う**（`all_sources_are_complete`）。このセッションに在る音源を渡すこと——揃っているかは
-/// 「在る音源ごとに、読めて最後まで読み切った JSON があるか」で決まる。
+/// **本文は在る JSON を全部読む**（`read_all`）。**`sources` は食い違いの判定にだけ使う**
+/// （`sources_shortfall`）。このセッションに在る音源を渡すこと——食い違いは「在る音源ごとに、
+/// 読めて食い違いの無い JSON があるか」で決まる。
 pub fn load_transcript(session_dir: &Path, sources: &[Speaker], fetch: Fetch) -> Transcript {
     let read = read_all(session_dir, fetch);
-    let complete = all_sources_are_complete(&read, sources);
+    let shortfall = sources_shortfall(&read, sources);
     Transcript {
         segments: merged_segments(read),
-        complete,
+        shortfall,
     }
 }
 
@@ -167,8 +258,7 @@ pub fn load_transcript(session_dir: &Path, sources: &[Speaker], fetch: Fetch) ->
 /// `load_transcript` を使うこと（#175）。
 ///
 /// **読み方は `load_transcript` と同じ 1 本**（`read_all` → `merged_segments`）。
-/// **`load_transcript` へ空の `sources` を渡す形にはしない**——理由は
-/// `all_sources_are_complete`。
+/// **`load_transcript` へ空の `sources` を渡す形にはしない**——理由は `sources_shortfall`。
 pub fn load_segments(session_dir: &Path, fetch: Fetch) -> Segments {
     segments_from(read_all(session_dir, fetch))
 }
@@ -232,25 +322,35 @@ fn merged_segments(read: Vec<(Speaker, ReadOutcome)>) -> Vec<TranscriptSegment> 
     segments
 }
 
-/// 在る音源ぶんが、すべて読めて最後まで読み切っているか（#175）。
+/// 在る音源ぶんをまとめた、録音との食い違い（#175 / #176）。
 ///
-/// **読めなかった JSON も揃っていない側**（読めない以上そうとは言えない）。
+/// **読めなかった JSON も食い違い側**（読めない以上そうとは言えない）。そちらは
+/// 「途中で終わっている」として数える——中が抜けているかは、読めない以上言えない。
 ///
-/// **音源を 1 つも渡さないときは「揃っている」と言わない**。`all()` は空だと真になるので、
-/// 音源を取り落とす壊れ方が「欠けた文字起こしを完成品として出す」といういちばん危険な側へ
-/// 落ちてしまう。音源ゼロのセッションは一覧に載らない（`list_sessions` が飛ばす）ので、
-/// 空が来るのは渡し間違いのときだけ——そのときは伏せる側で止める。
-fn all_sources_are_complete(read: &[(Speaker, ReadOutcome)], sources: &[Speaker]) -> bool {
-    !sources.is_empty()
-        && sources.iter().all(|source| {
-            read.iter()
-                .find(|(speaker, _)| speaker == source)
-                .is_some_and(|(_, guarded)| match guarded {
-                    ReadOutcome::Read(parsed) => parsed.complete,
-                    // **読めなかったものは揃っていない側**（読めない以上そうとは言えない）。
-                    ReadOutcome::Unusable | ReadOutcome::NotDownloaded => false,
-                })
-        })
+/// **音源を 1 つも渡さないときは「食い違い無し」と言わない**。畳み込みは空だと種の値
+/// （＝食い違い無し）を返すので、音源を取り落とす壊れ方が「欠けた文字起こしを完成品として
+/// 出す」といういちばん危険な側へ落ちてしまう（`docs/rules/coding-conventions.md` の空真の罠。
+/// #175 では `all()` の空真として同じ穴が開いていた）。音源ゼロのセッションは一覧に載らない
+/// （`list_sessions` が飛ばす）ので、空が来るのは渡し間違いのときだけ——そのときは伏せる側で
+/// 止める。
+fn sources_shortfall(
+    read: &[(Speaker, ReadOutcome)],
+    sources: &[Speaker],
+) -> Option<TranscriptShortfall> {
+    if sources.is_empty() {
+        return Some(TranscriptShortfall::StopsPartway);
+    }
+    sources.iter().fold(None, |merged, source| {
+        let of_source = match read.iter().find(|(speaker, _)| speaker == source) {
+            Some((_, ReadOutcome::Read(parsed))) => parsed.shortfall(),
+            // 読めなかった／そもそも無い（`read_all` は在りうる音源ぶんを必ず並べるので、
+            // `None` は渡し間違いのときだけ）。どちらも「届いていない」側で数える。
+            Some((_, ReadOutcome::Unusable | ReadOutcome::NotDownloaded)) | None => {
+                Some(TranscriptShortfall::StopsPartway)
+            }
+        };
+        TranscriptShortfall::join(merged, of_source)
+    })
 }
 
 /// 開始秒で安定ソート（同秒は mic→system の追加順を保つ）。NaN は来ない想定だが total_cmp で安全に。
@@ -274,7 +374,7 @@ fn to_segments(parsed: TranscriptFile, speaker: Speaker) -> Vec<TranscriptSegmen
 /// 保存済みの文字起こしが**どこまで届いているか**（#175）。読めない・欠けている・長さが入って
 /// いないときは `None`（＝分からない）。
 ///
-/// 途中結果を保存してよいかの判断に使う（`transcribe::partial_is_worth_keeping`）。長さだけでは
+/// 途中結果を保存してよいかの判断に使う（`transcribe::write_decision`）。長さだけでは
 /// 「最後まで読めた完成品」と「たまたま同じ長さの途中結果」を見分けられないので、印も一緒に返す。
 pub fn stored_reach(path: &Path) -> Option<StoredReach> {
     let ReadOutcome::Read(parsed) = read_guarded(path, Fetch::allowed()) else {
@@ -285,17 +385,26 @@ pub fn stored_reach(path: &Path) -> Option<StoredReach> {
         // **印まで一緒に捨てない**——長さが読めない古い JSON にも、最後まで読めた印はありうる。
         duration_secs: (parsed.duration_secs.is_finite() && parsed.duration_secs > 0.0)
             .then_some(parsed.duration_secs),
-        complete: parsed.complete,
+        shortfall: parsed.shortfall(),
+        has_lines: !parsed.segments.is_empty(),
     })
 }
 
-/// 保存済みの文字起こしが届いている範囲（#175）。
+/// 保存済みの文字起こしが届いている範囲（#175 / #176）。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StoredReach {
     /// どこまでの音源から作られたか（秒）。読めなければ `None`。
+    ///
+    /// **読み飛ばしがあると、これは音声の位置ではない**（#176）。書く側は得られたサンプル数
+    /// から出す（`transcribe::transcribe_file`）ので、抜けたぶん短くなる。だから比較に使う
+    /// 前に `shortfall` で場合分けすること（`transcribe::write_decision`）。
     pub duration_secs: Option<f64>,
-    /// その音源を最後まで読めたか。
-    pub complete: bool,
+    /// その音源と録音の食い違い（`None` は食い違い無し）。
+    pub shortfall: Option<TranscriptShortfall>,
+    /// 開いて読む行が在るか（#176）。**「読める行を、読める行の無い結果で潰さない」を決める
+    /// のに使う**（`transcribe::write_decision`）。すでにパースした結果を数えるだけなので、
+    /// 読み取りは増えない。
+    pub has_lines: bool,
 }
 
 /// 1 つの文字起こし JSON を、信頼境界外の入力として読む共通部（読む側の唯一の入口）。
@@ -419,7 +528,9 @@ pub fn current_index(segments: &[TranscriptSegment], pos_secs: f64) -> Option<us
 
 #[cfg(test)]
 mod tests {
-    use super::{Fetch, Speaker, current_index, load_segments, load_transcript};
+    use super::{
+        Fetch, Speaker, TranscriptShortfall, current_index, load_segments, load_transcript,
+    };
     use std::fs;
     use std::path::PathBuf;
 
@@ -476,7 +587,7 @@ mod tests {
     /// 落ちる。本番で空が来る経路は無い（音源ゼロのセッションは一覧に載らない）ので、これは
     /// 壊れたときだけ効くガード——だからテストで留める。
     #[test]
-    fn no_sources_never_counts_as_complete() {
+    fn no_sources_never_counts_as_whole() {
         let dir = unique_dir("no-sources");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
@@ -486,9 +597,16 @@ mod tests {
         )
         .unwrap();
 
-        // 読める・最後まで読み切っている JSON が在っても、数える対象が無ければ真にしない。
-        assert!(!load_transcript(&dir, &[], Fetch::allowed()).complete);
-        assert!(load_transcript(&dir, &[Speaker::Mic], Fetch::allowed()).complete);
+        // 読める・食い違いの無い JSON が在っても、数える対象が無ければ「食い違い無し」に
+        // しない（#176 で `all()` の空真から畳み込みへ形が変わっても、倒れる先は同じ）。
+        assert_eq!(
+            load_transcript(&dir, &[], Fetch::allowed()).shortfall,
+            Some(TranscriptShortfall::StopsPartway)
+        );
+        assert_eq!(
+            load_transcript(&dir, &[Speaker::Mic], Fetch::allowed()).shortfall,
+            None
+        );
         // 本文だけ要る呼び出しは、そもそも空の並びを渡す形にしない。
         assert_eq!(load_segments(&dir, Fetch::allowed()).segments.len(), 1);
 
@@ -550,39 +668,81 @@ mod tests {
     /// 「読めた JSON がすべて complete」にすると、**片方の JSON が丸ごと無いセッション**
     /// （一方だけ失敗した・途中で止めた）が `true` に化ける。#164 の途中結果でいちばん普通の形。
     #[test]
-    fn a_transcript_is_complete_only_when_every_source_has_one() {
+    fn a_transcript_is_whole_only_when_every_source_has_one() {
         let dir = unique_dir("complete");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let both = [Speaker::Mic, Speaker::System];
+        let mic = [Speaker::Mic];
+        let shortfall =
+            |sources: &[Speaker]| load_transcript(&dir, sources, Fetch::allowed()).shortfall;
 
         let done = r#"{"complete":true,"segments":[{"start":0.0,"text":"a"}]}"#;
         fs::write(dir.join("mic.json"), done).unwrap();
         fs::write(dir.join("system.json"), done).unwrap();
-        assert!(load_transcript(&dir, &both, Fetch::allowed()).complete);
+        assert_eq!(shortfall(&both), None);
 
-        // **片方の JSON が無い**。音源は 2 本あるので揃っていない。
+        // **片方の JSON が無い**。音源は 2 本あるので届いていない。
         fs::remove_file(dir.join("system.json")).unwrap();
-        assert!(
-            !load_transcript(&dir, &both, Fetch::allowed()).complete,
-            "a source with no transcript is missing, not complete"
+        assert_eq!(
+            shortfall(&both),
+            Some(TranscriptShortfall::StopsPartway),
+            "a source with no transcript is missing, not whole"
         );
-        // 音源が mic だけのセッションなら、同じディスクの中身でも揃っている。
-        assert!(load_transcript(&dir, &[Speaker::Mic], Fetch::allowed()).complete);
+        // 音源が mic だけのセッションなら、同じディスクの中身でも食い違わない。
+        assert_eq!(shortfall(&mic), None);
 
-        // 最後まで読めなかった印が立っていれば、読めても揃っていない。
+        // 最後まで読めなかった印が立っていれば、読めても届いていない。
         fs::write(
             dir.join("mic.json"),
             r#"{"complete":false,"segments":[{"start":0.0,"text":"a"}]}"#,
         )
         .unwrap();
-        assert!(!load_transcript(&dir, &[Speaker::Mic], Fetch::allowed()).complete);
+        assert_eq!(shortfall(&mic), Some(TranscriptShortfall::StopsPartway));
 
-        // **読めない JSON も揃っていない側**（破損・過大。読めない以上そうとは言えない）。
+        // **読み飛ばしは別の食い違い**（#176）。最後までは読めているので「途中で終わって
+        // いる」とは言わない——ここが `StopsPartway` に化けると、読む領域が事実と違う文を出す。
+        fs::write(
+            dir.join("mic.json"),
+            r#"{"complete":true,"gapped":true,"segments":[{"start":0.0,"text":"a"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(shortfall(&mic), Some(TranscriptShortfall::HasGaps));
+
+        // 1 本の音源で両方起きた。
+        fs::write(
+            dir.join("mic.json"),
+            r#"{"complete":false,"gapped":true,"segments":[{"start":0.0,"text":"a"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            shortfall(&mic),
+            Some(TranscriptShortfall::StopsPartwayWithGaps)
+        );
+
+        // **音源をまたいでも重なる**（#176）。mic は抜けていて、system は途中で終わっている。
+        fs::write(
+            dir.join("mic.json"),
+            r#"{"complete":true,"gapped":true,"segments":[{"start":0.0,"text":"a"}]}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("system.json"),
+            r#"{"complete":false,"segments":[{"start":0.0,"text":"b"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            shortfall(&both),
+            Some(TranscriptShortfall::StopsPartwayWithGaps),
+            "one source stopping and another having gaps is both, not either"
+        );
+
+        // **読めない JSON も届いていない側**（破損・過大。読めない以上そうとは言えない）。
+        fs::remove_file(dir.join("system.json")).unwrap();
         fs::write(dir.join("mic.json"), b"{ this is not json").unwrap();
-        let broken = load_transcript(&dir, &[Speaker::Mic], Fetch::allowed());
+        let broken = load_transcript(&dir, &mic, Fetch::allowed());
         assert!(broken.segments.is_empty());
-        assert!(!broken.complete);
+        assert_eq!(broken.shortfall, Some(TranscriptShortfall::StopsPartway));
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -598,32 +758,44 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let mic = [Speaker::Mic];
+        let read = |json: &str| {
+            fs::write(dir.join("mic.json"), json).unwrap();
+            load_transcript(&dir, &mic, Fetch::allowed())
+        };
 
-        // 欄が無い（#164 より前の出力）。最後まで読めたものとして読む。
-        fs::write(
-            dir.join("mic.json"),
-            r#"{"segments":[{"start":0.0,"text":"a"}]}"#,
-        )
-        .unwrap();
-        let old = load_transcript(&dir, &mic, Fetch::allowed());
+        // どちらの欄も無い（#164 より前の出力）。食い違い無しとして読む。
+        let old = read(r#"{"segments":[{"start":0.0,"text":"a"}]}"#);
         assert_eq!(old.segments.len(), 1);
-        assert!(old.complete);
+        assert_eq!(old.shortfall, None);
 
-        // 型が違う（手編集）。**セグメントは残し、印は守りたい側へ倒す**。
-        fs::write(
-            dir.join("mic.json"),
-            r#"{"complete":"yes","segments":[{"start":0.0,"text":"a"}]}"#,
-        )
-        .unwrap();
-        let edited = load_transcript(&dir, &mic, Fetch::allowed());
+        // `complete` の型が違う（手編集）。**セグメントは残し、印は守りたい側へ倒す**。
+        let edited = read(r#"{"complete":"yes","segments":[{"start":0.0,"text":"a"}]}"#);
         assert_eq!(
             edited.segments.len(),
             1,
             "one bad field must not drop the segments"
         );
-        assert!(
-            !edited.complete,
+        assert_eq!(
+            edited.shortfall,
+            Some(TranscriptShortfall::StopsPartway),
             "a flag we cannot read is not a promise that the audio was read to the end"
+        );
+
+        // `gapped` は欠落と壊れた値で倒し先が逆（#176）。**極性が逆でも理屈は同じ**——
+        // 欠落には互換の根拠があり、壊れた値には無いので守りたい側へ倒す。
+        let missing_gapped = read(r#"{"complete":true,"segments":[{"start":0.0,"text":"a"}]}"#);
+        assert_eq!(missing_gapped.shortfall, None);
+        let broken_gapped =
+            read(r#"{"complete":true,"gapped":3,"segments":[{"start":0.0,"text":"a"}]}"#);
+        assert_eq!(
+            broken_gapped.segments.len(),
+            1,
+            "one bad field must not drop the segments"
+        );
+        assert_eq!(
+            broken_gapped.shortfall,
+            Some(TranscriptShortfall::HasGaps),
+            "a flag we cannot read is not a promise that nothing was skipped"
         );
 
         let _ = fs::remove_dir_all(&dir);

@@ -14,11 +14,15 @@
 //! - `transcribing` / `stopping` / `transcript-failed` / `transcript-unreadable`:
 //!   Transcript タブの空表示を、実行中／停止中／失敗／JSON が読めなかった状態にする
 //!   （見出し・理由・操作の 3 段と、最長の理由の折り返しの確認。件数 0 と組み合わせる）
-//! - `not-read-to-the-end`: 走り終わっているが音源を最後まで読めていない状態（#175。ディスクの
-//!   印から分かるので再起動しても消えない）。**件数と組み合わせる**——セグメントが在っても
-//!   `Show partial` を押すまで空表示が出る。`summary` と重ねると Notes タブの言い分も見られる
+//! - `stops-partway` / `has-gaps` / `stops-partway-with-gaps`: 走り終わっているが録音と
+//!   食い違っている状態の 3 通り（#175 / #176。途中で終わっている／中が抜けている／両方。
+//!   ディスクの印から分かるので再起動しても消えない）。**件数と組み合わせる**——セグメントが
+//!   在っても `Show partial` を押すまで空表示が出る。`summary` と重ねると Notes タブの言い分も
+//!   見られる。`has-gaps` の本文がこのペインで最長なので、折り返しはそこで見る
 //! - `transcript-partial`: 途中まで読めて失敗した状態（#164）。**件数と組み合わせる**——
 //!   セグメントが在っても `Show partial` を押すまで空表示が出るところを見る
+//! - `transcript-partial-with-gaps`: 同上だが、そこまでの間にも抜けがある（#176）。位置を
+//!   言わないぶん文が長くなるので、失敗の理由の折り返しはここで見る
 //! - `show-partial`: その途中結果を開いた状態（一覧に切り替わるところを見る）
 //!   Notes タブの入力待ち・入力の失敗（#165）は、`no-transcript` に `transcribing` /
 //!   `transcript-failed` を重ねて作る（Transcript タブと同じ値から出るので、別のフラグは無い）
@@ -110,10 +114,25 @@ fn transcript_pane(has_transcript: bool) -> reading_pane::TranscriptPane {
             model: "Medium".to_owned(),
         };
     }
-    if flag("not-read-to-the-end") {
+    if flag("stops-partway") {
         // 走り終わっているが、音源を最後まで読めていない（#175。ディスクの印から分かるので
         // 再起動しても消えない）。
-        return reading_pane::TranscriptPane::NotReadToTheEnd;
+        return reading_pane::TranscriptPane::NotWhole {
+            shortfall: reading_pane::TranscriptShortfall::StopsPartway,
+        };
+    }
+    if flag("has-gaps") {
+        // 走り終わって最後まで読めているが、壊れたパケットを読み飛ばして中が抜けている
+        // （#176。いちばん長い本文なので、折り返しもここで見る）。
+        return reading_pane::TranscriptPane::NotWhole {
+            shortfall: reading_pane::TranscriptShortfall::HasGaps,
+        };
+    }
+    if flag("stops-partway-with-gaps") {
+        // 途中で終わっていて、その手前にも抜けがある（#176）。
+        return reading_pane::TranscriptPane::NotWhole {
+            shortfall: reading_pane::TranscriptShortfall::StopsPartwayWithGaps,
+        };
     }
     if flag("transcript-failed") {
         // ワーカーが返す中でいちばん長い理由（折り返しを見る）。何も残っていないので
@@ -121,9 +140,28 @@ fn transcript_pane(has_transcript: bool) -> reading_pane::TranscriptPane {
         return reading_pane::TranscriptPane::Failed {
             reason: reading_pane::TranscribeFailure::Files {
                 failed: vec![
-                    reading_pane::FailedSource::new("mic.mp3", None),
-                    reading_pane::FailedSource::new("system.mp3", None),
+                    reading_pane::FailedSource::new(
+                        "mic.mp3",
+                        reading_pane::KeptFromSource::Nothing,
+                    ),
+                    reading_pane::FailedSource::new(
+                        "system.mp3",
+                        reading_pane::KeptFromSource::Nothing,
+                    ),
                 ],
+                kept_other_sources: false,
+            },
+        };
+    }
+    if flag("transcript-partial-with-gaps") {
+        // 途中まで読めて失敗し、そこまでの間にも抜けがある（#176）。**位置を言わない**ので、
+        // `TranscribeFailure::Files` の中でいちばん長い文になる（折り返しをここで見る）。
+        return reading_pane::TranscriptPane::Failed {
+            reason: reading_pane::TranscribeFailure::Files {
+                failed: vec![reading_pane::FailedSource::new(
+                    "mic.mp3",
+                    reading_pane::KeptFromSource::SomeWithGaps,
+                )],
                 kept_other_sources: false,
             },
         };
@@ -135,7 +173,7 @@ fn transcript_pane(has_transcript: bool) -> reading_pane::TranscriptPane {
             reason: reading_pane::TranscribeFailure::Files {
                 failed: vec![reading_pane::FailedSource::new(
                     "mic.mp3",
-                    Some(Duration::from_secs(252)),
+                    reading_pane::KeptFromSource::Upto(Duration::from_secs(252)),
                 )],
                 kept_other_sources: false,
             },
@@ -164,10 +202,12 @@ fn summary_pane(
     // ディスクの様子も**同じ値から**出す（#175。本番は `main::LoadedTranscript::stored`）。
     let stored = match (has_transcript, transcript) {
         (false, _) => reading_pane::StoredTranscript::None,
-        (true, reading_pane::TranscriptPane::NotReadToTheEnd) => {
-            reading_pane::StoredTranscript::NotReadToTheEnd
+        (true, reading_pane::TranscriptPane::NotWhole { shortfall }) => {
+            reading_pane::StoredTranscript::NotWhole {
+                shortfall: *shortfall,
+            }
         }
-        (true, _) => reading_pane::StoredTranscript::Complete,
+        (true, _) => reading_pane::StoredTranscript::NoKnownShortfall,
     };
     let input = reading_pane::TranscriptInput::of(transcript, stored);
     if input != reading_pane::TranscriptInput::Ready {
