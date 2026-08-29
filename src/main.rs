@@ -2021,12 +2021,13 @@ impl LoadedTranscript {
         if self.dir.as_deref() != Some(session.dir.as_path()) {
             return StoredTranscript::NoKnownShortfall;
         }
-        // **読める行が無いなら食い違いを言わない**。押しても何も現れない `Show partial` を
-        // 出すことになる——読めなかった JSON は `Done` の空表示（「The transcript file is
-        // missing or could not be read」）が担当する。
+        // 食い違いが見つかっていなければ、言うことは無い。
         let Some(shortfall) = self.transcript.shortfall else {
             return StoredTranscript::NoKnownShortfall;
         };
+        // **読める行が無いなら食い違いを言わない**。押しても何も現れない `Show partial` を
+        // 出すことになる——読めなかった JSON は `Done` の空表示（「The transcript file is
+        // missing or could not be read」）が担当する。
         if self.transcript.segments.is_empty() {
             return StoredTranscript::NoKnownShortfall;
         }
@@ -3724,7 +3725,7 @@ mod tests {
         assert!(rec.get_detail_transcript_partial());
         // **状態行も同じ値から出す**。ここだけ `transcript_status_text(pane.status())` に
         // 戻すと、途中結果を伏せたまま「Transcribed」と言う画面になる——`status()` は
-        // `NotReadToTheEnd` を `Done` へ畳むので、この一言でしか差が出ない。
+        // `NotWhole` を `Done` へ畳むので、この一言でしか差が出ない。
         assert_eq!(rec.get_detail_transcript_text(), "Transcribed in part");
 
         // 走り始めたら、開いた途中結果は畳む（理由は `fold_partial_transcript` の doc）。

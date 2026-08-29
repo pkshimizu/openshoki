@@ -14,12 +14,11 @@
 //! - `transcribing` / `stopping` / `transcript-failed` / `transcript-unreadable`:
 //!   Transcript タブの空表示を、実行中／停止中／失敗／JSON が読めなかった状態にする
 //!   （見出し・理由・操作の 3 段と、最長の理由の折り返しの確認。件数 0 と組み合わせる）
-//! - `not-read-to-the-end`: 走り終わっているが音源を最後まで読めていない状態（#175。ディスクの
-//!   印から分かるので再起動しても消えない）。**件数と組み合わせる**——セグメントが在っても
-//!   `Show partial` を押すまで空表示が出る。`summary` と重ねると Notes タブの言い分も見られる
-//! - `has-gaps` / `stops-partway-with-gaps`: 壊れたパケットを読み飛ばして中が抜けている状態と、
-//!   途中で終わっていて手前にも抜けがある状態（#176）。`not-read-to-the-end` と同じ扱いで、
-//!   見出しと本文だけが違う（`has-gaps` の本文がこのペインで最長なので、折り返しはここで見る）
+//! - `stops-partway` / `has-gaps` / `stops-partway-with-gaps`: 走り終わっているが録音と
+//!   食い違っている状態の 3 通り（#175 / #176。途中で終わっている／中が抜けている／両方。
+//!   ディスクの印から分かるので再起動しても消えない）。**件数と組み合わせる**——セグメントが
+//!   在っても `Show partial` を押すまで空表示が出る。`summary` と重ねると Notes タブの言い分も
+//!   見られる。`has-gaps` の本文がこのペインで最長なので、折り返しはそこで見る
 //! - `transcript-partial`: 途中まで読めて失敗した状態（#164）。**件数と組み合わせる**——
 //!   セグメントが在っても `Show partial` を押すまで空表示が出るところを見る
 //! - `show-partial`: その途中結果を開いた状態（一覧に切り替わるところを見る）
@@ -113,7 +112,7 @@ fn transcript_pane(has_transcript: bool) -> reading_pane::TranscriptPane {
             model: "Medium".to_owned(),
         };
     }
-    if flag("not-read-to-the-end") {
+    if flag("stops-partway") {
         // 走り終わっているが、音源を最後まで読めていない（#175。ディスクの印から分かるので
         // 再起動しても消えない）。
         return reading_pane::TranscriptPane::NotWhole {

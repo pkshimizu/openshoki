@@ -12,7 +12,7 @@
 //! `Done` のままセグメントだけ空になるので、未実施とは違う文が出る）。
 
 use crate::dataless::{Fetch, ReadFailure};
-use crate::reading_pane::{ShortfallMarks, TranscriptShortfall};
+use crate::reading_pane::TranscriptShortfall;
 use std::path::Path;
 use std::time::Duration;
 
@@ -112,15 +112,51 @@ struct TranscriptFile {
 
 impl TranscriptFile {
     /// 2 つの欄を、**下流が取り違えられない 1 つの値**へ畳む（#176）。
-    ///
-    /// **組める場所はここだけ**にしてある。`complete` と `gapped` を別々に持ち回ると、極性が
-    /// 逆なぶん揃えたくなる力が働き、入れ替えても通ってしまう
-    /// （`docs/rules/coding-conventions.md` の「同型の引数を並べた関数に切り出さない」）。
     fn shortfall(&self) -> Option<TranscriptShortfall> {
-        TranscriptShortfall::from_marks(ShortfallMarks {
+        ShortfallMarks {
             reached_the_end: self.complete,
             gapped: self.gapped,
-        })
+        }
+        .shortfall()
+    }
+}
+
+/// 文字起こし JSON に残す 2 つの印（#176）。**保存形式の語彙なのでこのモジュールが持つ**
+/// （`reading_pane` は読む領域が説明できることの語彙だけを持つ）。書く側
+/// （`transcribe::Transcription`）と読む側（`TranscriptFile`）が同じ型を通る。
+///
+/// **名前付きのフィールドで受ける**ので、位置で取り違えられない
+/// （`docs/rules/coding-conventions.md` の「同型の引数を並べた関数に切り出さない」）。極性は
+/// 欄の意味に合わせてあり、揃っていない——`reached_the_end` は「食い違い無し」が `true`、
+/// `gapped` は `false`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShortfallMarks {
+    /// デコーダがストリーム終端まで到達したか（JSON の `complete`）。
+    pub reached_the_end: bool,
+    /// 壊れたパケットを読み飛ばしたか（JSON の `gapped`）。
+    pub gapped: bool,
+}
+
+impl ShortfallMarks {
+    /// 保存欄から食い違いを組む。**書く側と読む側が同じ関数を通る**ので、片方だけ極性が
+    /// 反転する壊れ方が無い。
+    pub fn shortfall(self) -> Option<TranscriptShortfall> {
+        let mut shortfall = None;
+        if !self.reached_the_end {
+            shortfall = Some(TranscriptShortfall::adding_stop(shortfall));
+        }
+        if self.gapped {
+            shortfall = Some(TranscriptShortfall::adding_gaps(shortfall));
+        }
+        shortfall
+    }
+
+    /// 食い違いを保存欄へ戻す（`shortfall` の逆）。
+    pub fn of(shortfall: Option<TranscriptShortfall>) -> Self {
+        Self {
+            reached_the_end: !shortfall.is_some_and(TranscriptShortfall::stops_partway),
+            gapped: shortfall.is_some_and(TranscriptShortfall::has_gaps),
+        }
     }
 }
 
@@ -142,8 +178,20 @@ fn deserialize_complete<'de, D>(deserializer: D) -> Result<bool, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
+    deserialize_bool_or(deserializer, false)
+}
+
+/// 真偽値を寛容に読む共通部。**倒す先だけを呼び出し側が決める**——同じ実装を 2 本置くと、
+/// 片方だけ直して食い違う（この機能そのものが「極性の逆な 2 欄を取り違えない」ための
+/// ものなので、なおさら分けない）。
+///
+/// **この 1 欄のために JSON 全体のパースを失敗させない**（`docs/rules/error-handling.md`）。
+fn deserialize_bool_or<'de, D>(deserializer: D, fallback: bool) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
     let value = serde_json::Value::deserialize(deserializer)?;
-    Ok(value.as_bool().unwrap_or(false))
+    Ok(value.as_bool().unwrap_or(fallback))
 }
 
 /// `gapped` が欠けている JSON の既定（#176）。
@@ -162,8 +210,7 @@ fn deserialize_gapped<'de, D>(deserializer: D) -> Result<bool, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let value = serde_json::Value::deserialize(deserializer)?;
-    Ok(value.as_bool().unwrap_or(true))
+    deserialize_bool_or(deserializer, true)
 }
 
 /// JSON の 1 セグメント。`text` は欠けていても既定値で読めるようにする（前方互換）。
@@ -327,7 +374,7 @@ fn to_segments(parsed: TranscriptFile, speaker: Speaker) -> Vec<TranscriptSegmen
 /// 保存済みの文字起こしが**どこまで届いているか**（#175）。読めない・欠けている・長さが入って
 /// いないときは `None`（＝分からない）。
 ///
-/// 途中結果を保存してよいかの判断に使う（`transcribe::partial_is_worth_keeping`）。長さだけでは
+/// 途中結果を保存してよいかの判断に使う（`transcribe::write_decision`）。長さだけでは
 /// 「最後まで読めた完成品」と「たまたま同じ長さの途中結果」を見分けられないので、印も一緒に返す。
 pub fn stored_reach(path: &Path) -> Option<StoredReach> {
     let ReadOutcome::Read(parsed) = read_guarded(path, Fetch::allowed()) else {
@@ -349,7 +396,7 @@ pub struct StoredReach {
     ///
     /// **読み飛ばしがあると、これは音声の位置ではない**（#176）。書く側は得られたサンプル数
     /// から出す（`transcribe::transcribe_file`）ので、抜けたぶん短くなる。だから比較に使う
-    /// 前に `shortfall` で場合分けすること（`transcribe::is_worth_writing`）。
+    /// 前に `shortfall` で場合分けすること（`transcribe::write_decision`）。
     pub duration_secs: Option<f64>,
     /// その音源と録音の食い違い（`None` は食い違い無し）。
     pub shortfall: Option<TranscriptShortfall>,

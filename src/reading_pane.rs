@@ -67,10 +67,10 @@ pub struct FailedSource {
 /// **`Option<Duration>` では持たない**（#176）。「残っていない」と「残ったがどこまでかは
 /// 言えない」を `None` に相乗りさせると、`Show partial` を出すかの判断
 /// （`TranscribeFailure::kept_partial`）が「位置を言えるか」に化ける。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeptFromSource {
     /// 何も残らなかった——1 サンプルも読めなかった・推論や保存で落ちた・残す価値が
-    /// なくて保存しなかった（`transcribe::partial_is_worth_keeping`）のいずれでもここへ来る。
+    /// なくて保存しなかった（`transcribe::write_decision`）のいずれでもここへ来る。
     /// 理由は分けず、「残っていない」だけを表す。
     Nothing,
     /// ここまでを保存した（#164）。
@@ -83,7 +83,7 @@ pub enum KeptFromSource {
 impl KeptFromSource {
     /// 開いて読む行が残っているか。**ワイルドカードを置かない**（残り方を足したら扱いを
     /// 書くまで通らない）。
-    fn is_something(&self) -> bool {
+    fn has_lines(self) -> bool {
         match self {
             Self::Nothing => false,
             Self::Upto(_) | Self::SomeWithGaps => true,
@@ -111,7 +111,7 @@ impl TranscribeFailure {
     /// 途中結果として隠すことになる。
     ///
     /// **残っている＝読む行がある**。保存したのに 1 件も認識できていなければ、開いても何も
-    /// 出ない（そういう音源は保存しない。`transcribe::partial_is_worth_keeping`）。
+    /// 出ない（そういう音源は保存しない。`transcribe::write_decision`）。
     ///
     /// **ワイルドカードを置かない**（種別を足したら扱いを書くまで通らない）。
     pub fn kept_partial(&self) -> bool {
@@ -123,7 +123,7 @@ impl TranscribeFailure {
             Self::Files {
                 failed,
                 kept_other_sources,
-            } => *kept_other_sources || failed.iter().any(|source| source.kept.is_something()),
+            } => *kept_other_sources || failed.iter().any(|source| source.kept.has_lines()),
             // どこで落ちたか分からないので、残っていると言い切らない。
             Self::Panicked => false,
         }
@@ -214,7 +214,7 @@ impl PaneMessage {
 ///
 /// **食い違いが無いことは `Option::None` で表す**。「最後まで読めたか」と「途中を読み飛ばして
 /// いないか」を別々の真偽値で持ち回ると、両方欠けた組み合わせの扱いを決め忘れられる
-/// （`docs/rules/coding-conventions.md` の「真偽値を並べない」）。
+/// （`docs/rules/coding-conventions.md` の「状態は『status + Option の袋』にしない」）。
 ///
 /// **文言を持たない**のは `TranscribeFailure` と同じ理由——種別だけを持ち、文にするのは
 /// `TranscriptPane::message` の網羅 match。
@@ -230,19 +230,6 @@ pub enum TranscriptShortfall {
     StopsPartwayWithGaps,
 }
 
-/// 文字起こし JSON に残す 2 つの印（#176）。
-///
-/// **名前付きのフィールドで受ける**ので、位置で取り違えられない（`docs/rules/coding-conventions.md`
-/// の「同型の引数を並べた関数に切り出さない」）。極性は欄の意味に合わせてあり、揃っていない
-/// ——`reached_the_end` は「食い違い無し」が `true`、`gapped` は `false`。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ShortfallMarks {
-    /// デコーダがストリーム終端まで到達したか（JSON の `complete`）。
-    pub reached_the_end: bool,
-    /// 壊れたパケットを読み飛ばしたか（JSON の `gapped`）。
-    pub gapped: bool,
-}
-
 impl TranscriptShortfall {
     /// いまの食い違いに「途中で終わっている」を重ねる。
     ///
@@ -251,15 +238,15 @@ impl TranscriptShortfall {
     /// も通るうえ、`complete` と `gapped` は極性が逆なので揃えたくなる力まで働く。
     ///
     /// **ワイルドカードを置かない**（種別を足したら扱いを書くまで通らない）。
-    pub fn with_stop(current: Option<Self>) -> Self {
+    pub fn adding_stop(current: Option<Self>) -> Self {
         match current {
             None | Some(Self::StopsPartway) => Self::StopsPartway,
             Some(Self::HasGaps) | Some(Self::StopsPartwayWithGaps) => Self::StopsPartwayWithGaps,
         }
     }
 
-    /// いまの食い違いに「中が抜けている」を重ねる（`with_stop` と対）。
-    pub fn with_gaps(current: Option<Self>) -> Self {
+    /// いまの食い違いに「中が抜けている」を重ねる（`adding_stop` と対）。
+    pub fn adding_gaps(current: Option<Self>) -> Self {
         match current {
             None | Some(Self::HasGaps) => Self::HasGaps,
             Some(Self::StopsPartway) | Some(Self::StopsPartwayWithGaps) => {
@@ -284,40 +271,20 @@ impl TranscriptShortfall {
         }
     }
 
-    /// 保存欄（`complete` / `gapped`）から食い違いを組む（#176）。**書く側と読む側が同じ
-    /// 関数を通る**ので、片方だけ極性が反転する壊れ方が無い。
-    pub fn from_marks(marks: ShortfallMarks) -> Option<Self> {
-        let mut shortfall = None;
-        if !marks.reached_the_end {
-            shortfall = Some(Self::with_stop(shortfall));
-        }
-        if marks.gapped {
-            shortfall = Some(Self::with_gaps(shortfall));
-        }
-        shortfall
-    }
-
-    /// 食い違いを保存欄へ戻す（`from_marks` の逆）。
-    pub fn marks(shortfall: Option<Self>) -> ShortfallMarks {
-        ShortfallMarks {
-            reached_the_end: !shortfall.is_some_and(Self::stops_partway),
-            gapped: shortfall.is_some_and(Self::has_gaps),
-        }
-    }
-
     /// 2 つの食い違いを重ねる（音源ごとの食い違いを、セッション 1 つぶんへまとめる）。
     ///
-    /// **畳み込みの種にしない**。空の列を畳むと「食い違い無し」＝欠けた文字起こしを完成品
-    /// として見せる側へ倒れる（`docs/rules/coding-conventions.md` の空真の罠）。空をどう扱うかは
-    /// 呼び出し側（`transcript::sources_shortfall`）が先に決める。
+    /// **空の列に対する答えはここでは決めない**。`None` を種に畳むと「食い違い無し」＝欠けた
+    /// 文字起こしを完成品として見せる側へ倒れるので、空をどう扱うかは畳み込みに入る前に
+    /// 呼び出し側が決める（`transcript::sources_shortfall` の `is_empty` ガード。
+    /// `docs/rules/coding-conventions.md` の空真の罠）。
     pub fn join(left: Option<Self>, right: Option<Self>) -> Option<Self> {
         let Some(right) = right else { return left };
         let mut merged = left;
         if right.stops_partway() {
-            merged = Some(Self::with_stop(merged));
+            merged = Some(Self::adding_stop(merged));
         }
         if right.has_gaps() {
-            merged = Some(Self::with_gaps(merged));
+            merged = Some(Self::adding_gaps(merged));
         }
         merged
     }
