@@ -101,7 +101,11 @@ pub struct SummarizeJob {
 }
 
 /// セッション単位の要約の進行状況（`TranscribeWorker` と同型）。Library ウィンドウの
-/// 詳細ペインが `shoki_core::view_detail` で表示状態へ合成して出す。
+/// **読む領域はこれを見ない**（#189）。あちらへ渡るのは `SummarizeEntry::phase()` が組む
+/// `shoki_core::SummaryPhase` のほうで、こちらを読むのは削除のガード（`counts_as_pending` /
+/// `cancel_queued`）と、届いた検索結果へ生成物の有無を埋め直すところ
+/// （`main::build_menu_event_handler` の中。`sweep_finished_jobs` と同じ理由で、そこだけ状態が
+/// 古いと行の差分が「変化なし」と判断して以後どの tick でも直らない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SummarizeStatus {
     /// 投入済みで、ワーカーが取り出すのを待っている（まだ CPU を使っていない）。
@@ -414,9 +418,9 @@ impl SummarizeWorker {
     /// **エントリは貯まる**——`apply_outcome` は `Done` / `Failed` を録音を消すまで残すので、
     /// 写す件数は「いま走っているジョブ数」ではなく**常駐中に議事録を投入した本数**に比例する
     /// （`TranscribeWorker::snapshot` と同じ性質）。実測では 500 件で 16µs/tick（突き合わせまで
-    /// 含む。release ビルド）——`String` を持つのは `Summarizing` の 1 件だけで、残りは
-    /// `PathBuf` の clone だけなので、文字起こし側（同条件で 0.16ms）より軽い。しかもこの経路は
-    /// ウィンドウを開いている間しか通らない。
+    /// 含む。release ビルド）。**文字起こし側の実測（0.16ms）とは比べない**——あちらは条件を
+    /// 書いていないので、10 倍の差が中身の違いなのか測り方の違いなのか分からない。しかもこの
+    /// 経路はウィンドウを開いている間しか通らない。
     pub fn snapshot(&self) -> Vec<(PathBuf, shoki_core::SummaryJob)> {
         lock_queue(&self.queue)
             .status
@@ -657,7 +661,8 @@ fn demote_superseded(queue: &mut QueueState, session_dir: &Path) {
 /// **切り出してあるのは、この写像が本番の唯一の書き手だから**。ワーカーループの中に埋めたままだと
 /// LLM を回さずに検査できず、`JobOutcome::Done` を `remove` に書き換えても全部緑のまま通る
 /// ——読む領域の「議事録が完成したら本文を読み直す」は**この記録が残ることに乗っている**
-/// （`main::refresh_detail_panes`）ので、そこが死ぬと出来上がった議事録が画面に出ない。
+/// （判断は `shoki_core::update` の `Event::SummaryChanged`）ので、そこが死ぬと出来上がった
+/// 議事録が画面に出ない。
 /// `transcribe::apply_outcome` と同じ流儀。
 ///
 /// **`Skipped` は痕跡ごと消す**（対象なしで何もしなかった）。`Done` / `Failed` は残す——消すと
@@ -1205,7 +1210,8 @@ mod tests {
     /// 走り終わった結果が**状態マップにどう残るか**（#188）。
     ///
     /// 読む領域の「議事録が完成したら本文を読み直す」は、`Done` の記録が残ることに乗っている
-    /// （`main::refresh_detail_panes`）。ここが `remove` に化けると、出来上がった議事録が画面に
+    /// （判断は `shoki_core::update` の `Event::SummaryChanged`）。ここが `remove` に化けると、
+    /// 出来上がった議事録が画面に
     /// 出ないまま静かに残る——本番でこの写像を通るのは LLM を回したときだけなので、
     /// 写像そのものを固定する。
     ///

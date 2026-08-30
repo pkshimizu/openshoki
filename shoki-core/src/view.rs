@@ -362,8 +362,6 @@ fn transcript_pane(
 /// **文字起こし側の busy と OR して使う**のは shell（`main::refresh_detail_panes`）。そこで
 /// 作る値は Slint の `detail-jobs-pending` と**同じ条件**でなければならない——片方だけ変えると、
 /// 同じ操作がヘッダからは押せないのに空表示からは押せる、という穴になる。
-///
-/// 議事録の状態そのものを組むのは shell（core へ移すのは段階 03）。
 pub fn summary_is_pending(status: SummaryStatus) -> bool {
     matches!(status, SummaryStatus::Queued | SummaryStatus::Summarizing)
 }
