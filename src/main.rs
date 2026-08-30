@@ -2851,6 +2851,13 @@ fn clear_shown_transcript(rec: &LibraryWindow) {
     rec.set_segments(Rc::new(slint::VecModel::<TranscriptRow>::default()).into());
     rec.set_summary_rows(Rc::new(slint::VecModel::<SummaryRow>::default()).into());
     rec.set_detail_summary_footer(slint::SharedString::new());
+    // **議事録の状態も畳む**（#188）。`refresh_detail_panes` は「前の状態」をこのプロパティから
+    // 取るが、プロパティは**どの録音のものかを持たない**——畳まないと、A を要約中に B を選んだ
+    // ときに「A の生成中 → B の生成済み」を遷移と読み、B の音声つき読み込みを降ろしてしまう
+    // （世代が進むので、選んだ録音が再生できないまま残る）。
+    rec.set_detail_summary_status(slint_map::to_ui_summary_status(
+        shoki_core::SummaryStatus::NotSummarized,
+    ));
     rec.set_current_segment(-1);
     // **読み込みが終わるまでは再生できない**（音源をまだ開いていない）。
     rec.set_playable(false);
@@ -3556,7 +3563,12 @@ fn set_pane_actions(
     set(slint_map::to_ui_pane_actions(actions));
 }
 
-/// 選択中セッションの読む領域（両タブ）を組み直す。
+/// 選択中セッションの読む領域（両タブ）を組み直し、**議事録が完成へ移っていたら本文を
+/// 読み直す**（#188。世代を進めて `spawn_session_load` を起こす。音声は差し替えない）。
+///
+/// **表示するだけの関数ではない**——読み直しを起こす唯一の場所。遷移を観測できるのは 1 回だけ
+/// （すぐ上書きする）なので、呼び出し側へ返して守らせると、押した瞬間の再描画が最初の観測者に
+/// なったときに消える（ワーカーは別スレッドで、tick が最初とは限らない）。
 ///
 /// **選択時・手動投入直後・tick 追従の全経路がここを通る**。進捗の割合と経過は状態が変わらない
 /// まま動くので、状態の差分だけで更新すると数字が止まって見える（`docs/rules/slint.md`）。
@@ -3597,7 +3609,10 @@ fn refresh_detail_panes(
     // **書く前に読む**（#188）。前の状態はウィンドウの現在値から取るので、`apply_*` が書いた
     // あとで読むと「前」と「いま」が同じ値になり、遷移が永久に立たない
     // （`docs/rules/coding-conventions.md` の「値を 2 度読まず、書いた値そのもので分岐する」）。
-    // **戻り値にしてあるのは、その順序を呼び出し側に守らせないため**——ここで完結する。
+    //
+    // **観測と読み直しをここで完結させる**（呼び出し側に順序を守らせない）。プロパティは
+    // どの録音のものかを持たないので、表示する録音が変わるときは `clear_shown_transcript` が
+    // 畳んでいる（そちらの doc）。
     let previous = slint_map::from_ui_summary_status(rec.get_detail_summary_status());
     let just_finished = shoki_core::summary_is_pending(previous)
         && summary.status() == shoki_core::SummaryStatus::Done;
@@ -4550,6 +4565,81 @@ mod tests {
                 .recv_timeout(std::time::Duration::from_millis(200))
                 .is_err(),
             "the transition fires once"
+        );
+    }
+
+    /// 別の録音を選んだときに、**偽の遷移で読み直さない**こと（#188）。
+    ///
+    /// 「前の議事録の状態」はウィンドウのプロパティから取るが、あれは**どの録音のものかを
+    /// 持たない**。畳まないと「A の生成中 → B の生成済み」を遷移と読み、世代を進めて B の
+    /// 音声つき読み込みを降ろす——**選んだ録音が再生できないまま残る**（同じ行を選び直しても
+    /// 音は差し替えないので直らない）。
+    #[test]
+    fn choosing_another_recording_does_not_look_like_finished_notes() {
+        use std::cell::RefCell;
+
+        super::init_test_backend();
+        let rec = super::LibraryWindow::new().expect("create the library window");
+        let summarizer = super::summarize::SummarizeWorker::start(
+            super::model_download::ModelDownloader::new(),
+            super::inference_slot::InferenceSlot::new(),
+        );
+        let session = |dir: &str, has_summary: bool| {
+            let mut session = recordings::session_for_test(
+                chrono::NaiveDate::from_ymd_opt(2026, 8, 10)
+                    .expect("a real date")
+                    .and_hms_opt(14, 2, 0)
+                    .expect("a real time"),
+            );
+            session.dir = std::path::PathBuf::from(dir);
+            session.has_mic = true;
+            session.has_transcript = true;
+            session.has_summary = has_summary;
+            session
+        };
+        // B は議事録が出来ている（ワーカーの記録は無いので `summary.md` の有無で `Done`）。
+        let b = session("b", true);
+        let (load_sender, _load_receiver) = std::sync::mpsc::channel();
+        let runner = super::EffectRunner {
+            ui: slint::ComponentHandle::as_weak(&rec),
+            state: std::rc::Rc::new(RefCell::new(shoki_core::AppState::default())),
+            segments: std::rc::Rc::new(RefCell::new(super::LoadedTranscript::unknown())),
+            sessions: std::rc::Rc::new(RefCell::new(vec![session("a", false), b.clone()])),
+            player: std::rc::Rc::new(RefCell::new(None)),
+            load_generation: std::rc::Rc::new(std::cell::Cell::new(0)),
+            load_sender,
+        };
+        let config = RefCell::new(super::Config::default());
+
+        // A を選んでいて、その議事録は生成中。
+        {
+            let mut state = runner.state.borrow_mut();
+            let _ = shoki_core::update(
+                &mut state,
+                shoki_core::Msg::Command(shoki_core::Command::Select(Some(
+                    std::path::PathBuf::from("a"),
+                ))),
+            );
+        }
+        rec.set_detail_summary_status(super::slint_map::to_ui_summary_status(
+            shoki_core::SummaryStatus::Summarizing,
+        ));
+
+        // B を選ぶ（本番と同じ順序——`update` の依頼を実行してから組み直す）。
+        let effects = {
+            let mut state = runner.state.borrow_mut();
+            shoki_core::update(
+                &mut state,
+                shoki_core::Msg::Command(shoki_core::Command::Select(Some(b.dir.clone()))),
+            )
+        };
+        super::run_effects(&runner, effects, None);
+        let after_select = runner.load_generation.get();
+        super::refresh_detail_panes(&rec, &runner, &summarizer, &b, &config);
+        assert_eq!(
+            runner.load_generation.get(),
+            after_select,
+            "picking another recording must not stand down the load it just started"
         );
     }
 
