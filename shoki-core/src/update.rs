@@ -99,12 +99,21 @@ fn update_event(state: &mut AppState, event: Event) -> Vec<Effect> {
             // 読み直すが、こちらは**`summary.md` を触った相へ移ったとき**だけ読み直す。
             //
             // **あちらの `restarted`（1 tick の間に通番が入れ替わったら前のジョブは終わっている）
-            // に当たるものは要らない**。あちらは走り終わりを観測で拾うので、100ms の窓に
-            // 「完了 → 再投入」が収まると見落とす。こちらで同じ形が起きないのは、**追い越された
-            // ジョブの `Done` はそもそも状態マップに載らない**から——ワーカーは走り終わったときに
-            // `is_current` を確かめ、追い越されていれば結果を捨てる（`summarize` のワーカーループ。
-            // 積み直しは走っている表示をそのまま引き継ぐので、観測されるのは `(N+1, Summarizing)`）。
-            // その場合 N が書いた中身はその場では読み直さないが、N+1 が終われば追いつく。
+            // に当たるものは、下の `was != next` として入っている**（要らないのではない）。
+            //
+            // 積み直しは 2 通りあって、拾えるのは片方だけ:
+            //
+            // - **走っている最中に積み直された**（`(N, Summarizing)` → `(N+1, Summarizing)`）。
+            //   N の `Done` はそもそもマップに載らない——ワーカーは走り終わったときに
+            //   `is_current` を確かめ、追い越されていれば結果を捨てる（`summarize` のワーカー
+            //   ループ）。`submit` は走っている表示をまるごと引き継ぐので、観測されるのも
+            //   `Summarizing` のまま。見落とす `Done` が存在しない
+            // - **完走してから積み直された**（`(N, Done)` → `(N+1, Queued)`）。`submit` が
+            //   引き継ぐのは `Summarizing` だけで、`Done` は `Queued` へ落ちる。この 2 つが
+            //   100ms の同じ窓に収まると、N が書いた中身はその場では読み直されない。**起きうる**
+            //   ——起きにくいのは、その間ボタンが `detail-jobs-pending` で塞がっているのと、
+            //   自動の積み直し（`main::chained_summarize_job`）が文字起こしの完了に続くため。
+            //   その場合も N+1 が終われば追いつく
             //
             // 議事録のジョブは、取り消し・入力が無くて飛ばした・積み直しで追い越された、の
             // どれでも**記録が消えるだけ**でファイルには触らない。そこで読み直すと、読み込みの
@@ -139,7 +148,9 @@ fn update_event(state: &mut AppState, event: Event) -> Vec<Effect> {
             let after = job.as_ref().map(|next| (next.id, touched(&next.phase)));
             state.set_summary(dir.clone(), job);
             let just_touched = match (before, after) {
-                // 同じジョブが既に触ったあとなら、もう読み直してある。
+                // 同じジョブが既に触ったあとなら、もう読み直してある。**通番が違えば読み直す**
+                // ——触った相のまま別のジョブへ入れ替わったとき（`(N, Failed)` → `(N+1, Failed)`
+                // など）に、相だけ見ていると差分が立たない（文字起こし側の `restarted` と同じ役目）。
                 (Some((was, already)), Some((next, true))) => !already || was != next,
                 (None, Some((_, true))) => true,
                 // 触っていない相へ移った・記録が消えた・記録がずっと無い。どれも読み直さない。
@@ -449,6 +460,38 @@ mod tests {
         assert!(
             update(&mut state, changed(None)).is_empty(),
             "cancelling notes touches no file, so it must not stand down a load in flight"
+        );
+    }
+
+    /// **触った相のまま別のジョブへ入れ替わっても読み直す**（#189）。文字起こし側の
+    /// `a_job_that_was_replaced_within_one_tick_still_reloads` と対。
+    ///
+    /// 相だけを見ていると、`(N, Failed)` → `(N+1, Failed)` はどちらも「触った」なので差分が
+    /// 立たない。`Failed` は文字起こしにぶら下げて走った分だと古い `summary.md` を消すので、
+    /// ここが立たないと**消えた議事録が画面に残り続ける**。
+    #[test]
+    fn notes_replaced_by_another_job_reload_again() {
+        let mut state = AppState::default();
+        update(&mut state, Msg::Command(Command::Select(Some(dir("a")))));
+        let changed = |job| Msg::Event(Event::SummaryChanged { dir: dir("a"), job });
+
+        // 1 本目が書き上がって読み直す。
+        assert_eq!(
+            update(&mut state, changed(Some(wrote(1)))),
+            vec![Effect::LoadSession {
+                dir: dir("a"),
+                replaces_playback: false
+            }]
+        );
+        // **2 本目が書き上がったら、もう一度読み直す**。相はどちらも `Done` なので、通番を
+        // 見ていないとここで止まる。
+        assert_eq!(
+            update(&mut state, changed(Some(wrote(2)))),
+            vec![Effect::LoadSession {
+                dir: dir("a"),
+                replaces_playback: false
+            }],
+            "a different job that also wrote must be read back again"
         );
     }
 
