@@ -420,6 +420,19 @@ impl SummarizeWorker {
             .map(|(_, entry)| entry.status())
     }
 
+    /// テストが「走り終わった記録」を置く口（#188）。
+    ///
+    /// **本番は `submit` を通す**。ここが在るのは、繋ぎ（完成 → 本文の読み直し）を確かめるのに
+    /// LLM を回したくないから。
+    #[cfg(test)]
+    pub fn mark_done_for_test(&self, session_dir: &Path) {
+        let mut queue = lock_queue(&self.queue);
+        let seq = queue.next_seq();
+        queue
+            .status
+            .insert(session_dir.to_path_buf(), (seq, SummarizeEntry::Done));
+    }
+
     /// セッションの進行状況と、読む領域に出す中身（モデル名・順番・経過・失敗の理由）。
     /// **`status_of` はこれの一部**なので、状態と説明が食い違わない。
     pub fn state_of(&self, session_dir: &Path) -> Option<SummarizeState> {
