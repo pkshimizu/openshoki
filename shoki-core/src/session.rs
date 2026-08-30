@@ -113,16 +113,28 @@ pub struct RecordingSession {
 
 impl std::fmt::Debug for RecordingSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // **分解してから組む**。フィールドを足すとここが割れるので、載せ忘れも、フルパスを
+        // そのまま載せる書き方も黙って通らない（`src/slint_map.rs` の写像と同じ理由）。
+        let Self {
+            datetime,
+            dir,
+            has_mic,
+            has_system,
+            has_mix,
+            has_transcript,
+            has_summary,
+            duration,
+        } = self;
         f.debug_struct("RecordingSession")
-            .field("started", &self.datetime)
+            .field("datetime", datetime)
             // **ファイル名だけ**（上の doc）。名前が取れないパス（末尾が `..` など）は伏せる。
-            .field("dir", &self.dir.file_name())
-            .field("has_mic", &self.has_mic)
-            .field("has_system", &self.has_system)
-            .field("has_mix", &self.has_mix)
-            .field("has_transcript", &self.has_transcript)
-            .field("has_summary", &self.has_summary)
-            .field("duration", &self.duration)
+            .field("dir", &dir.file_name())
+            .field("has_mic", has_mic)
+            .field("has_system", has_system)
+            .field("has_mix", has_mix)
+            .field("has_transcript", has_transcript)
+            .field("has_summary", has_summary)
+            .field("duration", duration)
             .finish()
     }
 }

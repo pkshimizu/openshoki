@@ -15,9 +15,13 @@
 #
 # **依存を足すときは、その依存の入り口もここへ足す**（実例は下の `chrono` の 2 つ）。
 #
-# **これは CI では守れない**。依存に無いパスを書いても clippy は黙って無視する（存在しない
-# `std::` のパスだけは「does not refer to a reachable function」と言う）ので、足し忘れても緑の
-# まま通る。だから依存追加と同じ PR で足すこと——`shoki-core/Cargo.toml` にも同じ申し送りがある。
+# **足し忘れは CI では守れない**。分かれ目は「そのパスの**先頭のクレートが解決できるか**」で、
+# 依存に入っていないクレートのパスは clippy が黙って無視する——足し忘れても緑のまま通る。
+# だから依存追加と同じ PR で足すこと（`shoki-core/Cargo.toml` にも同じ申し送りがある）。
+#
+# 逆に、クレートは依存に在って**項目だけ無い**パスは「does not refer to a reachable function」と
+# 言う。綴り間違いはここで落ちるし、機能で消えている `chrono::Local::now` もこちらに当たる
+# （下の chrono の 2 つ。単体では出るのが正常）。
 disallowed-types = [
   # ファイル
   { path = "std::fs::File", reason = "読み書きは shell の adapter が行う。core は値を受け取る" },
@@ -56,8 +60,8 @@ disallowed-methods = [
   # 二の矢（一の矢と両者の関係は `shoki-core/Cargo.toml` の chrono の行が正）。
   #
   # `cargo clippy -p shoki-core` では「パスが解決できない」警告が 2 本出るが、それが正常
-  # （単体では機能が付かないので当然）。`allow-invalid = true` で黙らせない——綴り間違いの
-  # 検出まで捨てることになり、下の「足し忘れても緑」に一歩近づく。
+  # （単体では機能が付かないので当然）。`allow-invalid = true` で黙らせない——上のヘッダに
+  # 書いたとおり、この警告は綴り間違いを落とす網でもあるので、捨てると足し忘れに気づけなくなる。
   { path = "chrono::Local::now", reason = "時刻は外から来る事実。Event に載せる（環境変数と /etc/localtime も読む）" },
   { path = "chrono::Utc::now", reason = "同上" },
 ]

@@ -27,9 +27,10 @@ publish = false
 # `chrono::Local` は**型として存在せず**、`Utc::now` も**メソッドとして存在しない**——core から
 # 現在時刻を取る書き方はコンパイルを通らない。
 #
-# **守れるのは `cargo build -p shoki-core` のときだけ**。`shoki` が `clock` 付きで要求するので、
-# ワークスペースをまとめて建てると機能が合流して両方とも生える。だから CI は core を単体でも
-# 建てる（`.github/workflows/ci.yml`）。合流したときの経路は `clippy.toml` の
+# **守れるのは `cargo build -p shoki-core` のときの、しかも lib だけ**。`shoki` が `clock` 付きで
+# 要求するのでワークスペースをまとめて建てると機能が合流して両方とも生えるし、`cargo build` は
+# テスト対象を組まないのでテストコードは素通りする。だから CI は core を単体でも建てたうえで
+# （`.github/workflows/ci.yml`）、合流したときとテスト側の経路を `clippy.toml` の
 # `disallowed-methods` が塞ぐ（二の矢）。
 #
 # **core に依存を足すときは、それが `chrono` の `clock` / `now` を引かないことも確かめる**。
