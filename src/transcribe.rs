@@ -109,7 +109,7 @@ pub enum TranscribeState {
     ///
     /// `shortfall` は**失敗ではないが録音と食い違っている**ことを表す（#176。壊れたパケットを
     /// 読み飛ばした音源があった）。**ここで持たないとディスクの印に負ける**——この状態は
-    /// `transcript_pane_of` でディスクより優先されるので、持たせないと走った直後だけ
+    /// `shoki_core::view_detail` でディスクより優先されるので、持たせないと走った直後だけ
     /// 「Transcribed」と言ってしまう。
     Done {
         shortfall: Option<TranscriptShortfall>,
@@ -134,43 +134,6 @@ impl TranscribeState {
             Self::Stopping { .. } => TranscribeStatus::Stopping,
             Self::Done { .. } => TranscribeStatus::Done,
             Self::Failed { .. } => TranscribeStatus::Failed,
-        }
-    }
-}
-
-/// 一覧の行が要る分だけの進行状況（#162）。`TranscribeState` からモデル名と理由を落としたもので、
-/// **確保しない**。
-///
-/// 状態と割合をタプルで並べない——`(Done, Some(50))` のようなありえない組み合わせを型が許して
-/// しまう（`docs/rules/coding-conventions.md`）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TranscribeProgress {
-    Transcribing {
-        /// whisper が返し始めるまでは `None`（そのときは割合を出さない）。
-        percent: Option<u8>,
-    },
-    /// 止めるよう伝えた後、まだ降りていない（#163）。
-    Stopping,
-    Done,
-    Failed,
-}
-
-impl TranscribeProgress {
-    /// 一覧の行が読む、粗い進行状況。
-    pub fn status(self) -> TranscribeStatus {
-        match self {
-            Self::Transcribing { .. } => TranscribeStatus::Transcribing,
-            Self::Stopping => TranscribeStatus::Stopping,
-            Self::Done => TranscribeStatus::Done,
-            Self::Failed => TranscribeStatus::Failed,
-        }
-    }
-
-    /// 走っている間の割合（それ以外では `None`）。
-    pub fn percent(self) -> Option<u8> {
-        match self {
-            Self::Transcribing { percent } => percent,
-            Self::Stopping | Self::Done | Self::Failed => None,
         }
     }
 }
@@ -534,33 +497,50 @@ impl TranscribeWorker {
             .map(|(_, state)| state.status())
     }
 
-    /// 一覧の行が要る分だけ（状態と進捗）を、**確保なしで**取る。
-    ///
-    /// `state_of` はモデル名まで clone するので、全行を毎 tick 回すこの経路には重い
-    /// （`status_of` を `state_of` へ委譲しないのと同じ理由）。
-    pub fn progress_of(&self, session_dir: &Path) -> Option<TranscribeProgress> {
-        lock_queue(&self.queue)
-            .status
-            .get(session_dir)
-            .map(|(_, state)| match state {
-                TranscribeState::Transcribing { percent, .. } => {
-                    TranscribeProgress::Transcribing { percent: *percent }
-                }
-                TranscribeState::Stopping { .. } => TranscribeProgress::Stopping,
-                TranscribeState::Done { .. } => TranscribeProgress::Done,
-                TranscribeState::Failed { .. } => TranscribeProgress::Failed,
-            })
-    }
-
     /// セッションの進行状況と、読む領域に出す中身（モデル名・進捗・失敗の理由）。
     ///
-    /// **`status_of` はこれの一部を取り出したもの**なので、状態と説明が食い違わない
-    /// （2 つのマップに分けると、片方だけ更新した瞬間にありえない組み合わせができる）。
+    /// **本番は `snapshot` を通る**（#188。表示は `AppState` から出す）。1 件だけ見たい
+    /// テストのために残してある。
+    #[cfg(test)]
     pub fn state_of(&self, session_dir: &Path) -> Option<TranscribeState> {
         lock_queue(&self.queue)
             .status
             .get(session_dir)
             .map(|(_, state)| state.clone())
+    }
+
+    /// テストが状態マップへ直接エントリを置く口（#188）。
+    ///
+    /// **本番は `submit` を通す**。ここが在るのは、繋ぎ（差分 → `update` → 画面）を確かめる
+    /// のに whisper を回したくないから——ジョブを投げると実際にモデルを取りに行く。
+    #[cfg(test)]
+    pub fn mark_running_for_test(&self, session_dir: &Path, model_label: &str) {
+        let mut queue = lock_queue(&self.queue);
+        let seq = queue.next_seq();
+        queue.status.insert(
+            session_dir.to_path_buf(),
+            (seq, TranscribeState::starting(model_label.to_owned())),
+        );
+    }
+
+    /// 状態マップを**ロック 1 回で丸ごと**取る（#188）。
+    ///
+    /// **セッション数ではなくジョブ数に比例する**。tick が `AppState.jobs` と突き合わせるために
+    /// 呼ぶので、`state_of` を全行ぶん回すと `progress_of` を足した #162 の意図が消える
+    /// （あれは「全行を毎 tick 回す経路でモデル名を確保しない」ためのもの）。
+    ///
+    /// **エントリは貯まる**。走り終わった印はセッションを削除するまで残る（`TranscribeState`
+    /// の doc）ので、常駐中に文字起こしした本数ぶん増える。実測では 500 件で 0.16ms/tick
+    /// （突き合わせまで含む）——しかもこの経路はウィンドウを開いている間しか通らない。
+    ///
+    /// **通番も返す**。相だけを比べると、100ms の間に「完了 → 再投入」と往復したとき差分が
+    /// 立たない（何を落とすかは `shoki_core::JobId` の doc が正）。
+    pub fn snapshot(&self) -> Vec<(std::path::PathBuf, u64, TranscribeState)> {
+        lock_queue(&self.queue)
+            .status
+            .iter()
+            .map(|(dir, (seq, state))| (dir.clone(), *seq, state.clone()))
+            .collect()
     }
 
     /// 文字起こしのジョブが在るか（**キュー待ちを含む**。`TranscribeStatus::Transcribing` は
@@ -2150,14 +2130,15 @@ mod tests {
                 },
             ),
         );
-        let progress = worker.progress_of(&dir).expect("the entry should exist");
-        assert_eq!(progress, TranscribeProgress::Stopping);
-        assert_eq!(progress.status(), TranscribeStatus::Stopping);
-        assert_eq!(
-            progress.percent(),
-            None,
-            "the progress after deciding to stop tells the reader nothing"
-        );
+        let snapshot = worker.snapshot();
+        let (_, _, state) = snapshot
+            .iter()
+            .find(|(entry, _, _)| entry == &dir)
+            .expect("the entry should exist");
+        assert_eq!(state.status(), TranscribeStatus::Stopping);
+        // **止めると決めた後の進捗は読み手の判断に何も足さない**ので、割合は持たない
+        // （`TranscribeState::Stopping` にフィールドが無いことがそのまま保証）。
+        assert!(matches!(state, TranscribeState::Stopping { .. }));
     }
 
     /// 止めたジョブから議事録を続けない（#163）。**全結果を網羅**で固定する——ここが緩むと

@@ -597,8 +597,8 @@ pub fn summary_status_text(display_status: SummaryStatus) -> &'static str {
 /// 読み切れているか」を別々に渡すと、渡し違えてもコンパイルが通る
 /// （`docs/rules/coding-conventions.md`）。
 ///
-/// 組み立てるのは `shoki` 側の `LoadedTranscript::stored`（`transcript::Transcript` を見るので、
-/// crate に依存できないこのモジュールには置けない）。
+/// 組み立てるのは `crate::view` の `stored_transcript`（`AppState` が覚えている読み込み結果から
+/// 決める）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoredTranscript {
     /// 文字起こしが無い。
@@ -606,7 +606,7 @@ pub enum StoredTranscript {
     /// 在って、**食い違いは分かっていない**（#176 で名前を意味に合わせた）。最後まで読み
     /// 切れているか、読み直しの最中で分からないか、**読める行が無い**（読めなかった JSON。
     /// 押しても何も現れない `Show partial` を出さないよう、ここへ落とす。
-    /// `shoki` 側の `LoadedTranscript::stored`）。「完成品と分かっている」ではない。
+    /// `crate::view` の `stored_transcript`）。「完成品と分かっている」ではない。
     NoKnownShortfall,
     /// 在って読める行もあるが、**録音と食い違っている**。**原因は断定しない**。
     NotWhole { shortfall: TranscriptShortfall },
@@ -645,7 +645,10 @@ impl TranscriptInput {
     /// 在るものだから。入力が無いときだけ、なぜ無いのかをワーカーの記録で言い分ける。
     ///
     /// **ワイルドカードを置かない**（状態を足したら扱いを書くまで通らない）。
-    pub fn of(transcript: &TranscriptPane, stored: StoredTranscript) -> Self {
+    ///
+    /// **呼ぶのは `crate::view::view_detail` だけ**（#188）。公開すると、文字起こしの状態を
+    /// 答える経路がもう 1 本できる——`view_detail` が返す `transcript_input` を使うこと。
+    pub(crate) fn of(transcript: &TranscriptPane, stored: StoredTranscript) -> Self {
         match stored {
             // **ディスクが答えを持っている**（#175）。ワーカーの記録は再起動で消えるので、
             // そちらで見分けると同じセッションが再起動の前後で違うことを言う。
@@ -921,5 +924,77 @@ pub fn plural(count: u64, unit: &str) -> String {
         format!("1 {unit}")
     } else {
         format!("{count} {unit}s")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 入力の様子は、**ディスクに在るものが先**（#175）。作り直している最中でも、議事録が読むのは
+    /// ディスクに在るものなので、そこで「入力が無い」に落とさない。
+    ///
+    /// **ワーカーの記録では見分けない**——記録は再起動で消えるので、同じセッションが再起動の
+    /// 前後で違うことを言う（#175 が直したかった穴の、議事録側）。
+    #[test]
+    fn transcript_input_reads_what_is_on_disk_first() {
+        use super::TranscriptInput as I;
+
+        let running = TranscriptPane::Transcribing {
+            model: "Medium".to_owned(),
+            percent: None,
+        };
+        // 作り直している最中でも、ディスクに在るものが入力。
+        assert_eq!(
+            I::of(&running, StoredTranscript::NoKnownShortfall),
+            I::Ready
+        );
+        assert_eq!(
+            I::of(
+                &running,
+                StoredTranscript::NotWhole {
+                    shortfall: TranscriptShortfall::StopsPartway
+                }
+            ),
+            I::NotWhole
+        );
+        // **失敗の記録が残っていても、ディスクが答えを持つ**。
+        let failed = TranscriptPane::Failed {
+            reason: TranscribeFailure::Panicked,
+        };
+        assert_eq!(
+            I::of(
+                &failed,
+                StoredTranscript::NotWhole {
+                    shortfall: TranscriptShortfall::HasGaps
+                }
+            ),
+            I::NotWhole
+        );
+        assert_eq!(I::of(&failed, StoredTranscript::NoKnownShortfall), I::Ready);
+
+        // 入力が無いときだけ、なぜ無いのかをワーカーの記録で言い分ける。
+        assert_eq!(I::of(&running, StoredTranscript::None), I::Running);
+        assert_eq!(
+            I::of(
+                &TranscriptPane::Stopping {
+                    model: "Medium".to_owned()
+                },
+                StoredTranscript::None
+            ),
+            I::Running
+        );
+        assert_eq!(I::of(&failed, StoredTranscript::None), I::Failed);
+        assert_eq!(
+            I::of(
+                &TranscriptPane::NotTranscribed { auto_on: false },
+                StoredTranscript::None
+            ),
+            I::Missing
+        );
+        assert_eq!(
+            I::of(&TranscriptPane::Done, StoredTranscript::None),
+            I::Missing
+        );
     }
 }

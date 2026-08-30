@@ -106,45 +106,60 @@ fn apply_summary_pane(win: &LibraryWindow, message: &shoki_core::PaneMessage) {
     win.set_detail_summary_actions(slint_map::to_ui_pane_actions(&message.actions));
 }
 
-/// Transcript タブに出す状態を引数で選ぶ。**状態そのものを返す**——状態行と空表示を別々に
-/// 選ぶと、本番では作れない組み合わせ（「Transcribed」なのに空表示は「Transcribing」）が
-/// 出せてしまう。文言は `reading_pane` が組む（#160）。
-fn transcript_pane(has_transcript: bool) -> shoki_core::TranscriptPane {
-    if flag("transcribing") {
-        return shoki_core::TranscriptPane::Transcribing {
-            model: "Medium".to_owned(),
+/// 選んだ状態から、**本番と同じ入口で** `AppState` を組む（#188）。
+///
+/// `TranscriptPane` をフラグから直に作らないのは、本番がそこを通らないから——通らない道で
+/// 目視すると、優先順位（ジョブの記録が先か、ディスクの印が先か）を確かめたことにならない
+/// （`docs/rules/testing.md` の「テストが見ている入口と、本番が通る入口をずらさない」）。
+fn app_state(dir: &std::path::Path, has_transcript: bool) -> shoki_core::AppState {
+    let mut state = shoki_core::AppState::default();
+    let mut send = |msg| {
+        shoki_core::update(&mut state, msg);
+    };
+    send(shoki_core::Msg::Command(shoki_core::Command::Select(Some(
+        dir.to_path_buf(),
+    ))));
+
+    // ディスクに残っている様子（読み込みが届いたところ）。
+    let shortfall = if flag("stops-partway") {
+        Some(shoki_core::TranscriptShortfall::StopsPartway)
+    } else if flag("has-gaps") {
+        Some(shoki_core::TranscriptShortfall::HasGaps)
+    } else if flag("stops-partway-with-gaps") {
+        Some(shoki_core::TranscriptShortfall::StopsPartwayWithGaps)
+    } else {
+        None
+    };
+    if has_transcript {
+        send(shoki_core::Msg::Event(shoki_core::Event::SessionLoaded {
+            dir: dir.to_path_buf(),
+            generation: 1,
+            // `transcript-unreadable`（生成済みなのに中身が読めない）は、読める行が無い状態。
+            has_readable_segments: !flag("transcript-unreadable"),
+            shortfall,
+        }));
+    }
+
+    // 走っている／走り終わったジョブ（**ディスクの印より優先される**）。
+    let job = |phase| {
+        Some(shoki_core::Job {
+            id: shoki_core::JobId(1),
+            phase,
+        })
+    };
+    let phase = if flag("transcribing") {
+        job(shoki_core::JobPhase::Running {
+            model_label: "Medium".to_owned(),
             percent: Some(48),
-        };
-    }
-    if flag("stopping") {
-        return shoki_core::TranscriptPane::Stopping {
-            model: "Medium".to_owned(),
-        };
-    }
-    if flag("stops-partway") {
-        // 走り終わっているが、音源を最後まで読めていない（#175。ディスクの印から分かるので
-        // 再起動しても消えない）。
-        return shoki_core::TranscriptPane::NotWhole {
-            shortfall: shoki_core::TranscriptShortfall::StopsPartway,
-        };
-    }
-    if flag("has-gaps") {
-        // 走り終わって最後まで読めているが、壊れたパケットを読み飛ばして中が抜けている
-        // （#176。いちばん長い本文なので、折り返しもここで見る）。
-        return shoki_core::TranscriptPane::NotWhole {
-            shortfall: shoki_core::TranscriptShortfall::HasGaps,
-        };
-    }
-    if flag("stops-partway-with-gaps") {
-        // 途中で終わっていて、その手前にも抜けがある（#176）。
-        return shoki_core::TranscriptPane::NotWhole {
-            shortfall: shoki_core::TranscriptShortfall::StopsPartwayWithGaps,
-        };
-    }
-    if flag("transcript-failed") {
+        })
+    } else if flag("stopping") {
+        job(shoki_core::JobPhase::Stopping {
+            model_label: "Medium".to_owned(),
+        })
+    } else if flag("transcript-failed") {
         // ワーカーが返す中でいちばん長い理由（折り返しを見る）。何も残っていないので
         // `Show partial` は出ない。
-        return shoki_core::TranscriptPane::Failed {
+        job(shoki_core::JobPhase::Failed {
             reason: shoki_core::TranscribeFailure::Files {
                 failed: vec![
                     shoki_core::FailedSource::new("mic.mp3", shoki_core::KeptFromSource::Nothing),
@@ -155,12 +170,11 @@ fn transcript_pane(has_transcript: bool) -> shoki_core::TranscriptPane {
                 ],
                 kept_other_sources: false,
             },
-        };
-    }
-    if flag("transcript-partial-with-gaps") {
+        })
+    } else if flag("transcript-partial-with-gaps") {
         // 途中まで読めて失敗し、そこまでの間にも抜けがある（#176）。**位置を言わない**ので、
-        // `TranscribeFailure::Files` の中でいちばん長い文になる（折り返しをここで見る）。
-        return shoki_core::TranscriptPane::Failed {
+        // `TranscribeFailure::Files` の中でいちばん長い文になる。
+        job(shoki_core::JobPhase::Failed {
             reason: shoki_core::TranscribeFailure::Files {
                 failed: vec![shoki_core::FailedSource::new(
                     "mic.mp3",
@@ -168,12 +182,11 @@ fn transcript_pane(has_transcript: bool) -> shoki_core::TranscriptPane {
                 )],
                 kept_other_sources: false,
             },
-        };
-    }
-    if flag("transcript-partial") {
-        // 途中まで読めて失敗した状態（#164）。セグメントが在っても、開かれるまでは
-        // この空表示が出る。
-        return shoki_core::TranscriptPane::Failed {
+        })
+    } else if flag("transcript-partial") {
+        // 途中まで読めて失敗した状態（#164）。セグメントが在っても、開かれるまではこの
+        // 空表示が出る。
+        job(shoki_core::JobPhase::Failed {
             reason: shoki_core::TranscribeFailure::Files {
                 failed: vec![shoki_core::FailedSource::new(
                     "mic.mp3",
@@ -181,16 +194,17 @@ fn transcript_pane(has_transcript: bool) -> shoki_core::TranscriptPane {
                 )],
                 kept_other_sources: false,
             },
-        };
+        })
+    } else {
+        None
+    };
+    if phase.is_some() {
+        send(shoki_core::Msg::Event(shoki_core::Event::JobChanged {
+            dir: dir.to_path_buf(),
+            job: phase,
+        }));
     }
-    // `transcript-unreadable`（生成済みなのに中身が読めない）も、状態としては生成済み。
-    // 違いは行が 0 件になることで、それは呼び出し側が `set_segments` を省いて作る。
-    if has_transcript {
-        return shoki_core::TranscriptPane::Done;
-    }
-    shoki_core::TranscriptPane::NotTranscribed {
-        auto_on: flag("auto-on"),
-    }
+    state
 }
 
 /// Notes タブに出す状態（同上）。
@@ -200,20 +214,8 @@ fn transcript_pane(has_transcript: bool) -> shoki_core::TranscriptPane {
 /// 目視することになる（`docs/rules/testing.md`）。
 fn summary_pane(
     status: shoki_core::SummaryStatus,
-    transcript: &shoki_core::TranscriptPane,
-    has_transcript: bool,
+    input: shoki_core::TranscriptInput,
 ) -> shoki_core::SummaryPane {
-    // ディスクの様子も**同じ値から**出す（#175。本番は `main::LoadedTranscript::stored`）。
-    let stored = match (has_transcript, transcript) {
-        (false, _) => shoki_core::StoredTranscript::None,
-        (true, shoki_core::TranscriptPane::NotWhole { shortfall }) => {
-            shoki_core::StoredTranscript::NotWhole {
-                shortfall: *shortfall,
-            }
-        }
-        (true, _) => shoki_core::StoredTranscript::NoKnownShortfall,
-    };
-    let input = shoki_core::TranscriptInput::of(transcript, stored);
     if input != shoki_core::TranscriptInput::Ready {
         return input.pane_when_no_notes(flag("auto-on"));
     }
@@ -411,7 +413,25 @@ fn main() {
     let has_transcript = !flag("no-transcript");
     win.set_has_transcript(has_transcript);
     win.set_show_partial_transcript(flag("show-partial"));
-    let transcript_pane = transcript_pane(has_transcript);
+    // **本番と同じ入口を通す**（#188）。`view_detail` が両タブの状態を 1 つの値から出すので、
+    // 本番では作れない組み合わせを目視することがない。
+    let dir = std::path::PathBuf::from("20260810-140200");
+    let state = app_state(&dir, has_transcript);
+    let session = shoki_core::RecordingSession::new(
+        chrono::NaiveDate::from_ymd_opt(2026, 8, 10)
+            .expect("a real date")
+            .and_hms_opt(14, 2, 0)
+            .expect("a real time"),
+        dir,
+        shoki_core::DiskFacts {
+            has_mic: true,
+            has_system: true,
+            has_transcript,
+            ..shoki_core::DiskFacts::default()
+        },
+    );
+    let detail = shoki_core::view_detail(&state, &session, flag("auto-on"));
+    let transcript_pane = detail.transcript.clone();
     // 読む領域の空表示（#154）。**状態を引数で選べる**ようにする——見出し・理由・操作の 3 段が
     // 最長文言で崩れないか、ボタンが 2 つ並んだときに収まるかを目視する。文言は本番と同じ
     // `reading_pane` が組む（#160）。
@@ -440,7 +460,7 @@ fn main() {
     } else {
         shoki_core::SummaryStatus::Done
     };
-    let summary_pane = summary_pane(summary_status, &transcript_pane, has_transcript);
+    let summary_pane = summary_pane(summary_status, detail.transcript_input);
     win.set_detail_summary_status(slint_map::to_ui_summary_status(summary_pane.status()));
     win.set_detail_summary_status_text(
         shoki_core::summary_status_text(summary_pane.status()).into(),

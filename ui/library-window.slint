@@ -2,8 +2,8 @@ import { ListView, ScrollView } from "std-widgets.slint";
 import { Style, StatusTone } from "style.slint";
 import { DangerButton, FocusRing, ActionButton, ButtonRole, Toggle, SearchField } from "controls.slint";
 
-// 文字起こしの表示状態。Rust 側（main.rs の transcript_display_status）がワーカーの
-// 進行状況と JSON の有無から合成して詰める。
+// 文字起こしの表示状態。Rust 側（`shoki_core::view_row`）がジョブの記録と JSON の有無から
+// 合成して詰める。
 export enum TranscriptStatus {
     not-transcribed,
     transcribing,
@@ -13,7 +13,7 @@ export enum TranscriptStatus {
     failed,
 }
 
-// 議事録要約の表示状態。Rust 側（main.rs の summary_display_status）がワーカーの進行状況と
+// 議事録要約の表示状態。Rust 側（`main::summary_pane_of`）がワーカーの進行状況と
 // `summary.md` の有無から合成して詰める。TranscriptStatus と同じ流儀（先頭が未生成＝既定値）。
 export enum SummaryStatus {
     not-summarized,
@@ -66,7 +66,7 @@ export struct SessionRow {
     time-text: string,
     // 日付と長さ（`Aug 10, 2026 · 1:12:40`）。日付は見出しと重なるが、スクロールで見出しが
     // 流れても分かるように残す。長さが分からない録音では**区切りごと出さない**（#162）ので、
-    // ここでは分岐しない（組み立ては `main::session_date_text`）。
+    // ここでは分岐しない（組み立ては `shoki_core::view` の `date_text`）。
     date-text: string,
     // 音源と状態を 1 行にしたもの（`Mic + system · transcribing 48%`）。**Rust が組む**
     // （状態→文言の対応表は Rust の網羅 match が正。`docs/rules/slint.md`）。

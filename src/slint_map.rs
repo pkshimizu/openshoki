@@ -38,7 +38,12 @@ pub fn to_ui_transcript_status(status: shoki_core::TranscriptStatus) -> UiTransc
     }
 }
 
-/// 逆向き（Slint のモデルに入っている状態 → core の語彙）。一覧の行が持つ現在値と比べるのに使う。
+/// 逆向き（Slint のモデルに入っている状態 → core の語彙）。
+///
+/// **本番の経路からは呼ばれない**（#188 で行の差分が core の `RowKey` へ移った）。往復で戻る
+/// ことを固定するテストのために残してある——写し先を付け替えると両方向ともコンパイルは通る
+/// ので、片道だけでは非対称に気づけない。
+#[cfg(test)]
 pub fn from_ui_transcript_status(status: UiTranscriptStatus) -> shoki_core::TranscriptStatus {
     match status {
         UiTranscriptStatus::NotTranscribed => shoki_core::TranscriptStatus::NotTranscribed,
@@ -140,9 +145,8 @@ mod tests {
     /// **写像が往復で戻ること**（#188）。
     ///
     /// 変種を足したときは網羅 match が捕まえるが、**写し先を付け替えたときは両方向とも
-    /// コンパイルが通る**。そのとき非対称になると、`came_off_the_worker` が立たず読み直しが
-    /// 走らない／議事録が完成しても表示が差し替わらない、という形で静かに壊れる
-    /// （#152 / #162 と同じ追従漏れ）。
+    /// コンパイルが通る**。そのとき非対称になると、`to_ui_transcript_status` が別の状態を
+    /// 画面へ書く——一覧の行が実際とは違う状態を出したまま、テストは緑で通る。
     ///
     /// **両方向から回す**。片方だけだと、2 つの変種が 1 つへ潰れる写し間違いを取り逃す。
     #[test]
