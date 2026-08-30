@@ -408,8 +408,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // 入り、発話本文を次に開くまで抱え続ける——世代を進めるだけでは止まらない
             // （届いた結果を捨てるかは core が `selected` で決めるので、そちらも解除する）。
             //
-            // **再生は止めない**。音源を手放すのは「音源を差し替える」依頼のときだけで、閉じても
-            // 鳴っているものは鳴り続ける（開き直すと `open_library_window` が手放す）。
+            // **再生は止めない**。音源を手放すのは「音源を差し替える」依頼のときと、開き直した
+            // ときだけ——閉じても鳴っているものは鳴り続ける（既存の挙動）。
             let effects = {
                 let mut state = close_state.borrow_mut();
                 shoki_core::update(
@@ -484,9 +484,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             run_effects(&runner, effects, None);
 
             // 状態の表示は、落としたあとの状態から組み直す。
-            // **戻り値は捨てる**。押した直後の再描画で議事録が完成へ移ることはない
-            // （完成を拾うのは tick）。
-            let _ = refresh_detail_panes(&rec, &app_state.borrow(), &summarizer, &session, &config);
+            refresh_detail_panes(&rec, &runner, &summarizer, &session, &config);
         });
     }
 
@@ -609,7 +607,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let sessions = Rc::clone(&sessions);
         let config = Rc::clone(&config);
-        let app_state = Rc::clone(&app_state);
+        let runner = runner.clone();
         let transcriber = transcriber.clone();
         // 読む領域は両タブまとめて組み直すので、相手のワーカーも要る（`refresh_detail_panes`）。
         let summarizer = summarizer.clone();
@@ -620,11 +618,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return;
             };
             submit_transcription(session, &config, &transcriber, ChainNotes::FollowTheSetting);
-            observe_jobs(&transcriber, &app_state);
+            observe_jobs(&transcriber, &runner);
             if let Some(rec) = rec_weak.upgrade() {
-                // **戻り値は捨てる**（押した直後の再描画。完成を拾うのは tick）。
-                let _ =
-                    refresh_detail_panes(&rec, &app_state.borrow(), &summarizer, session, &config);
+                refresh_detail_panes(&rec, &runner, &summarizer, session, &config);
             }
         });
     }
@@ -635,7 +631,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let sessions = Rc::clone(&sessions);
         let config = Rc::clone(&config);
-        let app_state = Rc::clone(&app_state);
+        let runner = runner.clone();
         let transcriber = transcriber.clone();
         let summarizer = summarizer.clone();
         let rec_weak = library_ui.as_weak();
@@ -645,11 +641,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return;
             };
             submit_transcription(session, &config, &transcriber, ChainNotes::Always);
-            observe_jobs(&transcriber, &app_state);
+            observe_jobs(&transcriber, &runner);
             if let Some(rec) = rec_weak.upgrade() {
-                // **戻り値は捨てる**（押した直後の再描画。完成を拾うのは tick）。
-                let _ =
-                    refresh_detail_panes(&rec, &app_state.borrow(), &summarizer, session, &config);
+                refresh_detail_panes(&rec, &runner, &summarizer, session, &config);
             }
         });
     }
@@ -660,7 +654,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let sessions = Rc::clone(&sessions);
         let config = Rc::clone(&config);
-        let app_state = Rc::clone(&app_state);
+        let runner = runner.clone();
         let summarizer = summarizer.clone();
         let rec_weak = library_ui.as_weak();
         library_ui.on_summarize_session(move |index| {
@@ -679,9 +673,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             summarizer.submit(manual_summarize_job(&config.borrow(), &session.dir));
             // 投入結果（通常は「生成中」）を即反映し、2 連クリックの多重投入を防ぐ。
             if let Some(rec) = rec_weak.upgrade() {
-                // **戻り値は捨てる**（押した直後の再描画。完成を拾うのは tick）。
-                let _ =
-                    refresh_detail_panes(&rec, &app_state.borrow(), &summarizer, session, &config);
+                refresh_detail_panes(&rec, &runner, &summarizer, session, &config);
             }
         });
     }
@@ -692,7 +684,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let sessions = Rc::clone(&sessions);
         let summarizer = summarizer.clone();
         let config = Rc::clone(&config);
-        let app_state = Rc::clone(&app_state);
+        let runner = runner.clone();
         let rec_weak = library_ui.as_weak();
         library_ui.on_cancel_summary(move |index| {
             let sessions = sessions.borrow();
@@ -706,9 +698,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             // 取り消し結果（通常は未生成／生成済みへ戻る）を即反映する。
             if let Some(rec) = rec_weak.upgrade() {
-                // **戻り値は捨てる**（押した直後の再描画。完成を拾うのは tick）。
-                let _ =
-                    refresh_detail_panes(&rec, &app_state.borrow(), &summarizer, session, &config);
+                refresh_detail_panes(&rec, &runner, &summarizer, session, &config);
             }
         });
     }
@@ -721,7 +711,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let transcriber = transcriber.clone();
         let summarizer = summarizer.clone();
         let config = Rc::clone(&config);
-        let app_state = Rc::clone(&app_state);
+        let runner = runner.clone();
         let rec_weak = library_ui.as_weak();
         library_ui.on_stop_transcription(move |index| {
             let sessions = sessions.borrow();
@@ -741,11 +731,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("Skipping the stop because the transcription is no longer running");
                 }
             }
-            observe_jobs(&transcriber, &app_state);
+            observe_jobs(&transcriber, &runner);
             if let Some(rec) = rec_weak.upgrade() {
-                // **戻り値は捨てる**（押した直後の再描画。完成を拾うのは tick）。
-                let _ =
-                    refresh_detail_panes(&rec, &app_state.borrow(), &summarizer, session, &config);
+                refresh_detail_panes(&rec, &runner, &summarizer, session, &config);
             }
         });
     }
@@ -795,7 +783,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let search_generation = Rc::clone(&search_generation);
         let search_not_downloaded = Rc::clone(&search_not_downloaded);
         let scan_state = Rc::clone(&scan_state);
-        let app_state = Rc::clone(&app_state);
         let runner = runner.clone();
         let rec_weak = library_ui.as_weak();
         library_ui.on_clear_search(move || {
@@ -805,7 +792,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             reset_search(&rec, &search_generation, &search_not_downloaded);
             let all = all_sessions.borrow().clone();
             let total = all.len();
-            sessions_model.replace_all(&all, &app_state.borrow());
+            sessions_model.replace_all(&all, &runner.state.borrow());
             apply_list_counts(
                 &rec,
                 ListCounts {
@@ -1217,8 +1204,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ui: library_ui.as_weak(),
                 player: Rc::clone(&player),
                 load_receiver,
-                load_sender: load_sender.clone(),
-                load_generation: Rc::clone(&load_generation),
                 scan_receiver,
                 scan_sender: scan_sender.clone(),
                 scan_generation: Rc::clone(&scan_generation),
@@ -1278,12 +1263,6 @@ struct LibraryHandles {
     /// 選んだ録音の読み込み結果の受け口（#152）。**tick が拾って反映する**——読み込みスレッドは
     /// UI スレッド専有のものに触れないので、送るだけにしてある。
     load_receiver: std::sync::mpsc::Receiver<LoadedSession>,
-    /// 読み込みをやり直すための送り口。tick は**表示を直接書かず**、中身が変わったら読み直す
-    /// （理由は `spawn_session_load` の doc）。
-    load_sender: std::sync::mpsc::Sender<LoadedSession>,
-    /// いま表示している選択の世代。届いた結果がこれと違えば**捨てる**（速く切り替えたときに、
-    /// 前の読み込みがあとから返って新しい選択を上書きするのを防ぐ）。
-    load_generation: Rc<Cell<u64>>,
     /// **一覧に出ている**セッション。行と 1 対 1 で、添字が操作対象の解決に使われる
     /// （絞り込むとここも縮む。`docs/rules/slint.md`）。
     sessions: Rc<RefCell<Vec<recordings::RecordingSession>>>,
@@ -1615,7 +1594,6 @@ fn build_menu_event_handler(
             // 引きだけで、ディスクは読まない。
             sweep_finished_jobs(&recordings);
 
-            let mut summary_done = false;
             {
                 let sessions_ref = recordings.sessions.borrow();
                 let state = recordings.state.borrow();
@@ -1630,34 +1608,16 @@ fn build_menu_event_handler(
                     // **読む領域は毎回組み直す**（#154）。進捗の割合と経過は状態が変わらない
                     // まま動くので、状態の差分だけで更新すると数字が止まって見える
                     // （`docs/rules/slint.md` の「差分更新は表示に使う値ぜんぶで比べる」）。
-                    // 議事録が完成したら読み直す（文字起こし側は `update` が `Effect` で返す）。
-                    summary_done = refresh_detail_panes(
+                    // 議事録が完成したら、この中で読み直す（文字起こし側は `update` が
+                    // `Effect` で返す）。
+                    refresh_detail_panes(
                         &rec,
-                        &state,
+                        &recordings.runner,
                         &recordings.summarizer,
                         session,
                         &recordings.config,
-                    )
-                    .0;
-                    rec.set_has_transcript(session.has_transcript);
-                }
-            }
-
-            // 中身が変わったので読み直す。**世代を進めてから**起こすので、走っている古い読み込みの
-            // 結果は届いても捨てられる（`spawn_session_load` の doc）。
-            if summary_done {
-                let sessions = recordings.sessions.borrow();
-                if let Some(session) = selected.and_then(|i| sessions.get(i)) {
-                    let generation_id = advance_load_generation(&recordings.load_generation);
-                    // **音声は読み直さない**。変わったのは文字起こし・議事録だけで、ここで
-                    // 差し替えると再生中の音が止まって先頭へ戻る（`PlaybackLoad`）。
-                    spawn_session_load(
-                        session,
-                        generation_id,
-                        &recordings.load_generation,
-                        &recordings.load_sender,
-                        load_replaces_playback(false),
                     );
+                    rec.set_has_transcript(session.has_transcript);
                 }
             }
         }
@@ -1872,7 +1832,6 @@ struct SessionLists<'a> {
 fn spawn_session_load(
     session: &recordings::RecordingSession,
     generation_id: u64,
-    generation: &Rc<Cell<u64>>,
     sender: &std::sync::mpsc::Sender<LoadedSession>,
     // 音声も読み直すか。**中身だけ変わった読み直しでは false**（理由は `PlaybackLoad`）。
     load_playback: bool,
@@ -1895,7 +1854,6 @@ fn spawn_session_load(
         watchers.retain(|w| Arc::strong_count(w) > 1);
         watchers.push(Arc::clone(&live));
     });
-    let _ = generation;
 
     let spawned = std::thread::Builder::new()
         .name("session-load".to_owned())
@@ -2757,7 +2715,6 @@ fn run_effects(
                 spawn_session_load(
                     &session,
                     generation_id,
-                    &recordings.load_generation,
                     &recordings.load_sender,
                     replaces_playback,
                 );
@@ -2781,13 +2738,20 @@ fn run_effects(
 /// 「Stopping…」へ移らないと、押しても効いていないように見える（#163）。**削除のガードも
 /// これに乗っている**——`on_delete_session` は「投入の直後にゲートが閉じる」ことを前提に、
 /// 走行中セッションを消せない形にしている。
-fn observe_jobs(transcriber: &transcribe::TranscribeWorker, state: &RefCell<shoki_core::AppState>) {
-    let mut state = state.borrow_mut();
-    for msg in job_changes(transcriber, &state) {
-        // **`Effect` は捨てる**。ここで返るのは選択中の録音の読み直しだけで、投入・停止の直後に
-        // 読み直しても中身はまだ変わっていない（変わったら tick が拾う）。
-        let _ = shoki_core::update(&mut state, msg);
-    }
+///
+/// **返った依頼は必ず実行する**。ここが `jobs` を揃えてしまうので、捨てると次の tick の差分は
+/// 1 件も立たない——押す直前にワーカーが完了していると、その読み直しがここで消える
+/// （完成した発話が画面に出ないまま残る）。**借用を落としてから**実行するのは `run_effects` の doc
+/// のとおり。
+fn observe_jobs(transcriber: &transcribe::TranscribeWorker, runner: &EffectRunner) {
+    let effects = {
+        let mut state = runner.state.borrow_mut();
+        job_changes(transcriber, &state)
+            .into_iter()
+            .flat_map(|msg| shoki_core::update(&mut state, msg))
+            .collect::<Vec<_>>()
+    };
+    run_effects(runner, effects, None);
 }
 
 /// ワーカーの状態マップと `AppState.jobs` を突き合わせ、**違うものだけ**を `Msg` にする（#188）。
@@ -2878,7 +2842,7 @@ fn sweep_finished_jobs(recordings: &LibraryHandles) {
     mark(&mut recordings.sessions.borrow_mut());
 }
 
-/// 表示中の文字起こし・議事録・再生対象を手放す（#188 の `Effect::ClearLoaded`）。
+/// 表示中の文字起こしと議事録を手放す（#188 の `Effect::ClearLoaded`）。
 ///
 /// どちらも発話由来の機微データなので、詳細ペインが隠れている間も持ち続けない
 /// （`docs/rules/security.md`）。**core の `loaded` を落とすのと対**——片方だけ落とすと、
@@ -3097,6 +3061,12 @@ fn open_library_window(
     handles.all_sessions.borrow_mut().clear();
     // 開くたびに未選択・停止表示へ初期化する。
     clear_library_selection(rec, &handles.runner);
+    // **開き直しでは再生対象を手放す**（未選択表示に合わせて「何もロードされていない」状態へ
+    // 揃える。理由は `AudioPlayer::unload` の doc）。閉じただけでは手放さない——閉じても
+    // 鳴っているものは鳴り続ける、という既存の挙動を変えないため。
+    if let Some(p) = handles.player.borrow_mut().as_mut() {
+        p.unload();
+    }
     handles.sessions.borrow_mut().clear();
     *last_play_secs = None;
     show_window(
@@ -3599,15 +3569,16 @@ fn set_pane_actions(
 /// ボタンは Slint に `enabled` を持たないので、同じ条件で**出すかどうか**を Rust が決める。
 fn refresh_detail_panes(
     rec: &LibraryWindow,
-    state: &shoki_core::AppState,
+    runner: &EffectRunner,
     summarizer: &summarize::SummarizeWorker,
     session: &recordings::RecordingSession,
     config: &RefCell<Config>,
-) -> SummaryJustFinished {
+) {
     let (auto_transcribe, auto_summarize) = {
         let config = config.borrow();
         (config.auto_transcribe, config.auto_summarize)
     };
+    let state = &runner.state.borrow();
     // **文字起こし側の状態を答えるのはここ 1 本**（#188）。旧 4 関数
     // （`transcript_display_status` / `transcript_pane_of` / `LoadedTranscript::stored` /
     // `TranscriptInput::of`）はこの中へ畳んである。
@@ -3628,23 +3599,26 @@ fn refresh_detail_panes(
     // （`docs/rules/coding-conventions.md` の「値を 2 度読まず、書いた値そのもので分岐する」）。
     // **戻り値にしてあるのは、その順序を呼び出し側に守らせないため**——ここで完結する。
     let previous = slint_map::from_ui_summary_status(rec.get_detail_summary_status());
-    let just_finished = SummaryJustFinished(
-        shoki_core::summary_is_pending(previous)
-            && summary.status() == shoki_core::SummaryStatus::Done,
-    );
+    let just_finished = shoki_core::summary_is_pending(previous)
+        && summary.status() == shoki_core::SummaryStatus::Done;
     apply_detail_transcript_status(rec, &detail, jobs_pending);
     apply_detail_summary_status(rec, &summary, jobs_pending);
-    just_finished
+    if just_finished {
+        // **ここで読み直す**（#188）。遷移を観測できるのは 1 回だけ（すぐ上で上書きする）なので、
+        // 呼び出し側へ返して「立っていたら読み直す」を守らせると、押した瞬間の再描画が最初の
+        // 観測者になったときに消える——ワーカーは別スレッドなので、tick が最初とは限らない。
+        //
+        // **音声は読み直さない**。変わったのは議事録だけで、差し替えると再生中の音が止まって
+        // 先頭へ戻る（`PlaybackLoad`）。
+        let generation_id = advance_load_generation(&runner.load_generation);
+        spawn_session_load(
+            session,
+            generation_id,
+            &runner.load_sender,
+            load_replaces_playback(false),
+        );
+    }
 }
-
-/// 議事録が**この tick で完成へ移ったか**（#188）。
-///
-/// **`bool` を裸で返さない**——呼び出し側が「何の真偽か」を取り違えると、読み直しが起きない／
-/// 毎 tick 起きるのどちらかになる。立ったときだけ本文を読み直す（`apply_loaded_session` が
-/// `summary_rows` を書く唯一の経路）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[must_use = "議事録が完成したら本文を読み直す。捨てると出来上がった議事録が画面に出ない"]
-struct SummaryJustFinished(bool);
 
 /// `summary.md` を Summary タブの表示行へ分ける（**Markdown をどこまで解釈するかの正はここ**。
 /// `ui/library-window.slint` の `SummaryRow` はこの doc を参照する）。
@@ -4391,8 +4365,6 @@ mod tests {
             ui: slint::ComponentHandle::as_weak(&rec),
             player: std::rc::Rc::new(RefCell::new(None)),
             load_receiver,
-            load_sender,
-            load_generation: std::rc::Rc::new(Cell::new(0)),
             sessions: std::rc::Rc::new(RefCell::new(vec![stale.clone()])),
             all_sessions: std::rc::Rc::new(RefCell::new(vec![stale])),
             scan_receiver,
@@ -4520,14 +4492,15 @@ mod tests {
         }
     }
 
-    /// 議事録が完成したら、**本文を読み直す契機が立つ**こと（#188）。
+    /// 議事録が完成したら、**本文を読み直す**こと（#188）。
     ///
-    /// 立てるのは `refresh_detail_panes` の戻り値だけ。**前の状態を書く前に読む**ので、
-    /// ここで捨てると出来上がった議事録が画面に出ない（`summary_rows` を書くのは
-    /// `apply_loaded_session` だけ）。呼び出し側に順序を守らせる形にすると、書いたあとで
-    /// 読んで「前」と「いま」が同じ値になり、遷移が永久に立たなくなる。
+    /// 遷移を観測できるのは 1 回だけ（`refresh_detail_panes` がすぐ上書きする）。呼び出し側へ
+    /// 返して「立っていたら読み直す」を守らせると、押した瞬間の再描画が最初の観測者になった
+    /// ときに消える——ワーカーは別スレッドなので、tick が最初とは限らない。だから読み直しも
+    /// この関数の中でやる。ここが落ちると、出来上がった議事録が画面に出ない
+    /// （`summary_rows` を書くのは `apply_loaded_session` だけ）。
     #[test]
-    fn a_summary_that_just_finished_asks_for_a_reload() {
+    fn a_summary_that_just_finished_is_read_back() {
         use std::cell::RefCell;
 
         super::init_test_backend();
@@ -4542,26 +4515,110 @@ mod tests {
                 .and_hms_opt(14, 2, 0)
                 .expect("a real time"),
         );
-        session.dir = std::path::PathBuf::from("20260810-140200");
+        session.dir = std::env::temp_dir().join(format!("shoki-summary-{}", std::process::id()));
         session.has_mic = true;
         session.has_transcript = true;
         // 出来上がっている（ワーカーの記録は無い＝`summary.md` の有無で解決する）。
         session.has_summary = true;
-        let state = RefCell::new(shoki_core::AppState::default());
+
+        let (load_sender, load_receiver) = std::sync::mpsc::channel();
+        let runner = super::EffectRunner {
+            ui: slint::ComponentHandle::as_weak(&rec),
+            state: std::rc::Rc::new(RefCell::new(shoki_core::AppState::default())),
+            segments: std::rc::Rc::new(RefCell::new(super::LoadedTranscript::unknown())),
+            sessions: std::rc::Rc::new(RefCell::new(Vec::new())),
+            player: std::rc::Rc::new(RefCell::new(None)),
+            load_generation: std::rc::Rc::new(std::cell::Cell::new(0)),
+            load_sender,
+        };
         let config = RefCell::new(super::Config::default());
 
         // 画面は「生成中」を出している。
         rec.set_detail_summary_status(super::slint_map::to_ui_summary_status(
             shoki_core::SummaryStatus::Summarizing,
         ));
-        let just_finished =
-            super::refresh_detail_panes(&rec, &state.borrow(), &summarizer, &session, &config);
-        assert!(just_finished.0, "the notes just became readable");
+        super::refresh_detail_panes(&rec, &runner, &summarizer, &session, &config);
+        let loaded = load_receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the notes that just finished must be read back");
+        assert_eq!(loaded.dir, session.dir);
 
-        // **もう一度呼んでも立たない**。立ち続けると毎 tick 読み直すことになる。
-        let again =
-            super::refresh_detail_panes(&rec, &state.borrow(), &summarizer, &session, &config);
-        assert!(!again.0, "the transition fires once");
+        // **もう一度呼んでも読み直さない**。毎 tick 読み直すことになる。
+        super::refresh_detail_panes(&rec, &runner, &summarizer, &session, &config);
+        assert!(
+            load_receiver
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "the transition fires once"
+        );
+    }
+
+    /// 押す直前にワーカーが終わっていたら、**その場で読み直す**こと（#188）。
+    ///
+    /// `observe_jobs` は `AppState.jobs` をワーカーへ揃えてしまうので、返った依頼を捨てると
+    /// **次の tick の差分は 1 件も立たない**——完成した発話が画面に出ないまま残る（`summary_rows`
+    /// と `segments` を書くのは `apply_loaded_session` だけ）。tick が最初の観測者とは限らない。
+    #[test]
+    fn a_job_that_finished_just_before_a_press_is_read_back() {
+        use std::cell::RefCell;
+
+        super::init_test_backend();
+        let rec = super::LibraryWindow::new().expect("create the library window");
+        let summarizer = super::summarize::SummarizeWorker::start(
+            super::model_download::ModelDownloader::new(),
+            super::inference_slot::InferenceSlot::new(),
+        );
+        let transcriber = super::transcribe::TranscribeWorker::start(
+            super::model_download::ModelDownloader::new(),
+            summarizer,
+            super::inference_slot::InferenceSlot::new(),
+        );
+        let mut session = recordings::session_for_test(
+            chrono::NaiveDate::from_ymd_opt(2026, 8, 10)
+                .expect("a real date")
+                .and_hms_opt(14, 2, 0)
+                .expect("a real time"),
+        );
+        session.dir = std::env::temp_dir().join(format!("shoki-press-{}", std::process::id()));
+        session.has_mic = true;
+
+        let (load_sender, load_receiver) = std::sync::mpsc::channel();
+        let runner = super::EffectRunner {
+            ui: slint::ComponentHandle::as_weak(&rec),
+            state: std::rc::Rc::new(RefCell::new(shoki_core::AppState::default())),
+            segments: std::rc::Rc::new(RefCell::new(super::LoadedTranscript::unknown())),
+            sessions: std::rc::Rc::new(RefCell::new(vec![session.clone()])),
+            player: std::rc::Rc::new(RefCell::new(None)),
+            load_generation: std::rc::Rc::new(std::cell::Cell::new(0)),
+            load_sender,
+        };
+
+        // この録音を選んでいて、文字起こしが走っている。
+        {
+            let mut state = runner.state.borrow_mut();
+            let _ = shoki_core::update(
+                &mut state,
+                shoki_core::Msg::Command(shoki_core::Command::Select(Some(session.dir.clone()))),
+            );
+        }
+        // 選択が投げた読み込みは、ここでは見ない。
+        let _ = load_receiver.recv_timeout(std::time::Duration::from_secs(5));
+        transcriber.mark_running_for_test(&session.dir, "Medium");
+        super::observe_jobs(&transcriber, &runner);
+        assert!(
+            load_receiver
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "starting a job does not reload"
+        );
+
+        // ワーカーが降りた（押す直前に完了した、と同じ形）。
+        transcriber.forget(&session.dir);
+        super::observe_jobs(&transcriber, &runner);
+        let loaded = load_receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("coming off the worker must read the recording back");
+        assert_eq!(loaded.dir, session.dir);
     }
 
     /// **ワーカーの様子が core を通って画面まで届く**こと（#188）。
@@ -4594,13 +4651,23 @@ mod tests {
         session.dir = std::path::PathBuf::from("20260810-140200");
         session.has_mic = true;
 
-        let state = RefCell::new(shoki_core::AppState::default());
+        let state = std::rc::Rc::new(RefCell::new(shoki_core::AppState::default()));
         let config = RefCell::new(super::Config::default());
+        let (load_sender, _load_receiver) = std::sync::mpsc::channel();
+        let runner = super::EffectRunner {
+            ui: slint::ComponentHandle::as_weak(&rec),
+            state: std::rc::Rc::clone(&state),
+            segments: std::rc::Rc::new(RefCell::new(super::LoadedTranscript::unknown())),
+            sessions: std::rc::Rc::new(RefCell::new(Vec::new())),
+            player: std::rc::Rc::new(RefCell::new(None)),
+            load_generation: std::rc::Rc::new(std::cell::Cell::new(0)),
+            load_sender,
+        };
         let rows = super::SessionRows::new();
         rows.replace_all(std::slice::from_ref(&session), &state.borrow());
 
         // まだ走らせていない。
-        let _ = super::refresh_detail_panes(&rec, &state.borrow(), &summarizer, &session, &config);
+        super::refresh_detail_panes(&rec, &runner, &summarizer, &session, &config);
         assert_eq!(
             rec.get_detail_transcript_status(),
             super::slint_map::to_ui_transcript_status(shoki_core::TranscriptStatus::NotTranscribed)
@@ -4633,7 +4700,7 @@ mod tests {
             );
             assert_eq!(row.detail_text, "Mic only · transcribing");
         }
-        let _ = super::refresh_detail_panes(&rec, &state.borrow(), &summarizer, &session, &config);
+        super::refresh_detail_panes(&rec, &runner, &summarizer, &session, &config);
         assert_eq!(rec.get_detail_transcript_text(), "Transcribing…");
     }
 
