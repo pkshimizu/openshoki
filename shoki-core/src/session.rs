@@ -113,8 +113,11 @@ pub struct RecordingSession {
 
 impl std::fmt::Debug for RecordingSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // **分解してから組む**。フィールドを足すとここが割れるので、載せ忘れも、フルパスを
-        // そのまま載せる書き方も黙って通らない（`src/slint_map.rs` の写像と同じ理由）。
+        // **分解してから組む**。フィールドを足すとここが割れるので、**載せ忘れ**が黙って通らない
+        // （`src/slint_map.rs` の写像と同じ理由）。
+        //
+        // 分解が守るのはそこまで。`dir` をそのまま載せればフルパスは出るし、コンパイルも通る
+        // ——そちらを止めているのは `debug_shows_the_file_name_not_the_whole_path`。
         let Self {
             datetime,
             dir,

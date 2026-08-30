@@ -29,9 +29,13 @@ publish = false
 #
 # **守れるのは `cargo build -p shoki-core` のときの、しかも lib だけ**。`shoki` が `clock` 付きで
 # 要求するのでワークスペースをまとめて建てると機能が合流して両方とも生えるし、`cargo build` は
-# テスト対象を組まないのでテストコードは素通りする。だから CI は core を単体でも建てたうえで
-# （`.github/workflows/ci.yml`）、合流したときとテスト側の経路を `clippy.toml` の
-# `disallowed-methods` が塞ぐ（二の矢）。
+# テスト対象を組まないのでテストコードは素通りする。だから CI は core を単体でも建てる
+# （`.github/workflows/ci.yml`）。
+#
+# 合流したときとテスト側は `clippy.toml` が受け持つが、**二の矢は一の矢より狭い**。塞げるのは
+# `Local::now` / `Utc::now` の 2 メソッドと、`Local` を**型として**書いた場合だけで、
+# `chrono::Local.from_local_datetime(..)` のように**値として**書く経路は開いたまま（測って確認。
+# 詳細は `clippy.toml` の該当エントリ）。
 #
 # **core に依存を足すときは、それが `chrono` の `clock` / `now` を引かないことも確かめる**。
 # 引くと単体ビルドでも生えるので、一の矢が黙って消える。
