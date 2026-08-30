@@ -175,6 +175,27 @@ enum SummarizeEntry {
 }
 
 impl SummarizeEntry {
+    /// core の語彙へ写す（**網羅 match**——相を足したら写し忘れで割れる）。
+    ///
+    /// **順番と経過は渡さない**。どちらも読み出しのたびに導出するもので、ここで固定すると
+    /// 繰り上がらない順番・止まった経過になる（`shoki_core::SummaryPhase` の doc）。
+    fn phase(&self) -> shoki_core::SummaryPhase {
+        match self {
+            Self::Queued => shoki_core::SummaryPhase::Queued,
+            Self::Summarizing {
+                model_label,
+                started,
+            } => shoki_core::SummaryPhase::Summarizing {
+                model_label: model_label.clone(),
+                started: *started,
+            },
+            Self::Done => shoki_core::SummaryPhase::Done,
+            Self::Failed { reason } => shoki_core::SummaryPhase::Failed {
+                reason: reason.clone(),
+            },
+        }
+    }
+
     /// 削除ガードや表示が読む、粗い進行状況。
     fn status(&self) -> SummarizeStatus {
         match self {
@@ -186,44 +207,10 @@ impl SummarizeEntry {
     }
 }
 
-/// 読む領域が読む、セッション 1 件分の要約の状態。`SummarizeEntry` から組み立てる
-/// （順番・経過はマップ全体を見ないと出せないので、読み出しのたびに計算する）。
-#[derive(Debug, Clone)]
-pub enum SummarizeState {
-    Queued {
-        /// キュー待ちの中で何番目か（1 始まり）。**保存せず読み出し時に数える**——前のジョブが
-        /// 終われば順番は繰り上がるので、投入時に固定すると嘘になる。
-        position: usize,
-    },
-    /// **モデル名を持つのはここだけ**。読む領域が「何が動いているか」を言うのは走っている間で、
-    /// 待っている間・終わったあとに出しても読み手の役に立たない（要るようになったら足す）。
-    Summarizing {
-        model_label: String,
-        /// 始めてからの経過。
-        elapsed: std::time::Duration,
-    },
-    Done,
-    Failed {
-        reason: SummarizeFailure,
-    },
-}
-
 impl QueueState {
     /// この通番のジョブが、そのセッションの「いま有効なジョブ」か。
     fn is_current(&self, session_dir: &Path, seq: u64) -> bool {
         self.status.get(session_dir).map(|(latest, _)| *latest) == Some(seq)
-    }
-
-    /// この通番のキュー待ちジョブが、キュー待ちの中で何番目か（1 始まり）。
-    ///
-    /// **走り出しているジョブは数えない**。数えると「1 番目なのに始まらない」になる
-    /// （先頭は既に生成中で、待っている側から見た順番ではない）。
-    fn queued_position(&self, seq: u64) -> usize {
-        self.status
-            .values()
-            .filter(|(other, entry)| matches!(entry, SummarizeEntry::Queued) && *other < seq)
-            .count()
-            + 1
     }
 
     /// 通番を 1 つ配る（ロックの中でしか呼べないので、採番順とマップの登録順がずれない）。
@@ -395,10 +382,11 @@ impl SummarizeWorker {
 
     /// セッションの進行状況。マップに載っていなければ `None`
     /// （表示側が `summary.md` の有無で「未生成/生成済み」を解決する。
-    /// `main::summary_pane_of`）。
+    /// `shoki_core::view_detail`）。
+    ///
+    /// **`snapshot` へ委譲しない**（理由は `TranscribeWorker::status_of`）。こちらは削除の
+    /// ガードが 1 件ずつ呼ぶ経路で、委譲すると状態 1 つを読むのにマップ全体の複製が付いてくる。
     pub fn status_of(&self, session_dir: &Path) -> Option<SummarizeStatus> {
-        // **`state_of` へ委譲しない**（理由は `TranscribeWorker::status_of`）。こちらは
-        // 委譲すると、状態 1 つを読むのに `queued_position` のマップ全走査まで付いてくる。
         lock_queue(&self.queue)
             .status
             .get(session_dir)
@@ -417,27 +405,17 @@ impl SummarizeWorker {
         apply_outcome(&mut queue, session_dir.to_path_buf(), seq, JobOutcome::Done);
     }
 
-    /// セッションの進行状況と、読む領域に出す中身（モデル名・順番・経過・失敗の理由）。
-    /// **`status_of` はこれの一部**なので、状態と説明が食い違わない。
-    pub fn state_of(&self, session_dir: &Path) -> Option<SummarizeState> {
-        let queue = lock_queue(&self.queue);
-        let (seq, entry) = queue.status.get(session_dir)?;
-        Some(match entry {
-            SummarizeEntry::Queued => SummarizeState::Queued {
-                position: queue.queued_position(*seq),
-            },
-            SummarizeEntry::Summarizing {
-                model_label,
-                started,
-            } => SummarizeState::Summarizing {
-                model_label: model_label.clone(),
-                elapsed: started.elapsed(),
-            },
-            SummarizeEntry::Done => SummarizeState::Done,
-            SummarizeEntry::Failed { reason } => SummarizeState::Failed {
-                reason: reason.clone(),
-            },
-        })
+    /// 状態マップを丸ごと写す（#189）。**ロック 1 回**で、ジョブ数に比例する。
+    ///
+    /// **`state_of` を件数ぶん呼ばない**——あちらは 1 件ごとにロックを取り、さらに順番を数えるのに
+    /// マップを全走査するので、件数の 2 乗になる。順番と経過は core が読み出し時に導出するので
+    /// （`shoki_core::view_detail`）、ここは相をそのまま渡す。
+    pub fn snapshot(&self) -> Vec<(PathBuf, u64, shoki_core::SummaryPhase)> {
+        lock_queue(&self.queue)
+            .status
+            .iter()
+            .map(|(dir, (seq, entry))| (dir.clone(), *seq, entry.phase()))
+            .collect()
     }
 
     /// キュー待ちのジョブを取り消す（取り消せたら `true`）。
@@ -2033,32 +2011,6 @@ mod tests {
         assert!(counts_as_pending(SummarizeStatus::Summarizing));
         assert!(!counts_as_pending(SummarizeStatus::Done));
         assert!(!counts_as_pending(SummarizeStatus::Failed));
-    }
-
-    /// キュー待ちの順番は**読み出しのたびに数え直す**（前が終われば繰り上がる）。走っている
-    /// ジョブは数えない——数えると「1 番目なのに始まらない」になる。
-    #[test]
-    fn queued_position_counts_only_the_jobs_still_waiting() {
-        let mut queue = QueueState {
-            status: HashMap::new(),
-            next_seq: 0,
-        };
-        let mut put = |name: &str, seq: u64, status| {
-            queue
-                .status
-                .insert(std::path::PathBuf::from(name), (seq, test_entry(status)));
-        };
-        put("/tmp/a", 1, SummarizeStatus::Summarizing);
-        put("/tmp/b", 2, SummarizeStatus::Queued);
-        put("/tmp/c", 3, SummarizeStatus::Queued);
-        put("/tmp/d", 4, SummarizeStatus::Done);
-
-        assert_eq!(queue.queued_position(2), 1, "走っている分は数えない");
-        assert_eq!(queue.queued_position(3), 2);
-
-        // 前のキュー待ちが取り消されたら繰り上がる。
-        queue.status.remove(std::path::Path::new("/tmp/b"));
-        assert_eq!(queue.queued_position(3), 1);
     }
 
     /// ワーカー越しでも同じ判定が効くこと（状態マップを直接組んで、ジョブを走らせずに見る）。

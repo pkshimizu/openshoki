@@ -63,3 +63,18 @@ pub use reading_pane::*;
 pub use session::*;
 pub use update::update;
 pub use view::*;
+
+/// テストが使う「いま」。
+///
+/// **本番の core は時刻を取らない**（`clippy.toml` の `Instant::now`）——外から来る事実は引数か
+/// `Event` で受け取る。テストは基点を作らないと `Instant` を組めないので、ここ 1 箇所に集めて
+/// 許す。**テストの中でも直接 `Instant::now()` と書かない**こと（1 箇所なら、本番へ紛れ込んだ
+/// ときに `clippy.toml` が落とす）。
+#[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "テストは基点が要る。本番の経路はこれを通らない"
+)]
+pub(crate) fn test_now() -> std::time::Instant {
+    std::time::Instant::now()
+}

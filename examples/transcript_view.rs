@@ -430,7 +430,15 @@ fn main() {
             ..shoki_core::DiskFacts::default()
         },
     );
-    let detail = shoki_core::view_detail(&state, &session, flag("auto-on"));
+    let detail = shoki_core::view_detail(
+        &state,
+        &session,
+        shoki_core::AutoFlags {
+            transcribe: flag("auto-on"),
+            summarize: flag("auto-on"),
+        },
+        std::time::Instant::now(),
+    );
     let transcript_pane = detail.transcript.clone();
     // 読む領域の空表示（#154）。**状態を引数で選べる**ようにする——見出し・理由・操作の 3 段が
     // 最長文言で崩れないか、ボタンが 2 つ並んだときに収まるかを目視する。文言は本番と同じ

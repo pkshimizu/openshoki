@@ -65,7 +65,12 @@ pub fn to_ui_summary_status(status: shoki_core::SummaryStatus) -> UiSummaryStatu
     }
 }
 
-/// 逆向き（Slint のプロパティに入っている状態 → core の語彙）。詳細ペインの現在値と比べるのに使う。
+/// 逆向き（Slint のプロパティに入っている状態 → core の語彙）。
+///
+/// **本番では使わない**（#189）。表示の現在値を「前の状態」として読む経路が消えて、判断は
+/// `shoki_core::update` が `AppState` の上でやるようになった。残してあるのは往復テストのため
+/// ——`to_ui_summary_status` の網羅を、逆写像と突き合わせて確かめる。
+#[cfg(test)]
 pub fn from_ui_summary_status(status: UiSummaryStatus) -> shoki_core::SummaryStatus {
     match status {
         UiSummaryStatus::NotSummarized => shoki_core::SummaryStatus::NotSummarized,

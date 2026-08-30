@@ -5,7 +5,7 @@
 //! （`docs/rules/coding-conventions.md` の「`RefCell` の借用を持ったまま、作り直しの経路を
 //! 呼ばない」）。
 
-use crate::app::{AppState, Job};
+use crate::app::{AppState, Job, SummaryPhase};
 use crate::msg::{Command, Effect, Event, Msg};
 
 /// 状態を進めて、shell への依頼を返す。
@@ -94,8 +94,46 @@ fn update_event(state: &mut AppState, event: Event) -> Vec<Effect> {
             }
             Vec::new()
         }
+        Event::SummaryChanged { dir, job } => {
+            // **文字起こし側とは判定が違う**（#189）。あちらは「走っていた状態から降りた」で
+            // 読み直すが、こちらは**`summary.md` を触った相へ移ったとき**だけ読み直す。
+            //
+            // 議事録のジョブは、取り消し・入力が無くて飛ばした・積み直しで追い越された、の
+            // どれでも**記録が消えるだけ**でファイルには触らない。そこで読み直すと、読み込みの
+            // 世代が繰り上がって、選んだ直後に投げた音声つきの読み込みが降りる——**選んだ録音が
+            // 再生できないまま残る**（同じ行を選び直しても音は差し替えないので直らない。#188）。
+            let touched = |phase: &SummaryPhase| {
+                // **`Failed` も触りうる**。作り直しに失敗したときに限り、`summarize::failed` が
+                // 古い `summary.md` を消す（`existing_is_stale` が立っているとき）。触らない
+                // ときに読み直しても、読み込みは同じ中身を返すだけで害は無い。
+                matches!(phase, SummaryPhase::Done | SummaryPhase::Failed { .. })
+            };
+            let before = state
+                .summary(&dir)
+                .map(|previous| (previous.id, touched(&previous.phase)));
+            let after = job.as_ref().map(|next| (next.id, touched(&next.phase)));
+            state.set_summary(dir.clone(), job);
+            let just_touched = match (before, after) {
+                // 同じジョブが既に触ったあとなら、もう読み直してある。
+                (Some((was, already)), Some((now, true))) => !already || was != now,
+                (None, Some((_, true))) => true,
+                _ => false,
+            };
+            // **選んでいる録音だけ**（見ていない録音の中身を読む理由が無い）。ここで表示を直接
+            // 書かないのは、少し前に始まった読み込みの古いスナップショットが上書きするため。
+            if just_touched && state.selected() == Some(dir.as_path()) {
+                return vec![Effect::LoadSession {
+                    dir,
+                    // **音は差し替えない**。変わったのは議事録だけで、差し替えると鳴っている音が
+                    // 止まって先頭へ戻る。
+                    replaces_playback: false,
+                }];
+            }
+            Vec::new()
+        }
         Event::Deleted { dir } => {
             state.set_job(dir.clone(), None);
+            state.set_summary(dir.clone(), None);
             if state.selected() == Some(dir.as_path()) {
                 state.set_selected(None);
                 state.clear_loaded();
@@ -109,7 +147,7 @@ fn update_event(state: &mut AppState, event: Event) -> Vec<Effect> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{JobId, JobPhase};
+    use crate::app::{JobId, JobPhase, SummaryJob};
     use crate::reading_pane::TranscriptShortfall;
     use std::path::PathBuf;
 
@@ -131,6 +169,23 @@ mod tests {
         Job {
             id: JobId(seq),
             phase: JobPhase::Done { shortfall: None },
+        }
+    }
+
+    fn summarizing(seq: u64) -> SummaryJob {
+        SummaryJob {
+            id: JobId(seq),
+            phase: SummaryPhase::Summarizing {
+                model_label: "Qwen".to_owned(),
+                started: crate::test_now(),
+            },
+        }
+    }
+
+    fn wrote(seq: u64) -> SummaryJob {
+        SummaryJob {
+            id: JobId(seq),
+            phase: SummaryPhase::Done,
         }
     }
 
@@ -316,6 +371,86 @@ mod tests {
                 }),
             )
             .is_empty()
+        );
+    }
+
+    /// 議事録は **`summary.md` を触った相へ移ったときだけ**読み直す（#189）。
+    ///
+    /// **取り消しでは読み直さない**のが肝。記録は消えるだけでファイルには触っていないので、
+    /// ここで世代を繰り上げると、選んだ直後に投げた音声つきの読み込みが降りて**選んだ録音が
+    /// 再生できないまま残る**（#188）。文字起こし側の「降りたら読み直す」と同じ形にすると
+    /// この穴が開くので、判定を分けてある。
+    #[test]
+    fn notes_reload_when_they_are_written_and_not_when_they_are_cancelled() {
+        let mut state = AppState::default();
+        update(&mut state, Msg::Command(Command::Select(Some(dir("a")))));
+        let changed = |job| Msg::Event(Event::SummaryChanged { dir: dir("a"), job });
+
+        // 積んだだけ・走り出しただけでは読み直さない。
+        assert!(
+            update(
+                &mut state,
+                changed(Some(SummaryJob {
+                    id: JobId(1),
+                    phase: SummaryPhase::Queued,
+                })),
+            )
+            .is_empty()
+        );
+        assert!(update(&mut state, changed(Some(summarizing(1)))).is_empty());
+        // 書き終わったら読み直す。
+        assert_eq!(
+            update(&mut state, changed(Some(wrote(1)))),
+            vec![Effect::LoadSession {
+                dir: dir("a"),
+                replaces_playback: false
+            }]
+        );
+        // 同じジョブのまま流れてきても、もう読み直してある。
+        assert!(update(&mut state, changed(Some(wrote(1)))).is_empty());
+
+        // 積み直して取り消す——**記録が消えるだけ**なので読み直さない。
+        assert!(
+            update(
+                &mut state,
+                changed(Some(SummaryJob {
+                    id: JobId(2),
+                    phase: SummaryPhase::Queued,
+                })),
+            )
+            .is_empty()
+        );
+        assert!(
+            update(&mut state, changed(None)).is_empty(),
+            "cancelling notes touches no file, so it must not stand down a load in flight"
+        );
+    }
+
+    /// 失敗も読み直す。作り直しに失敗したときは `summarize::failed` が古い `summary.md` を
+    /// 消すので、消えたことを画面へ反映する必要がある。**選んでいない録音では読み直さない**のは
+    /// 文字起こし側と同じ。
+    #[test]
+    fn failed_notes_reload_but_only_for_the_recording_that_is_selected() {
+        let mut state = AppState::default();
+        update(&mut state, Msg::Command(Command::Select(Some(dir("a")))));
+        let failed = |dir: &str| {
+            Msg::Event(Event::SummaryChanged {
+                dir: PathBuf::from(dir),
+                job: Some(SummaryJob {
+                    id: JobId(1),
+                    phase: SummaryPhase::Failed {
+                        reason: crate::reading_pane::SummarizeFailure::ModelRun,
+                    },
+                }),
+            })
+        };
+        assert!(update(&mut state, failed("b")).is_empty());
+        assert_eq!(
+            update(&mut state, failed("a")),
+            vec![Effect::LoadSession {
+                dir: dir("a"),
+                replaces_playback: false
+            }]
         );
     }
 

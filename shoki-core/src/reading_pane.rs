@@ -997,4 +997,16 @@ mod tests {
             I::Missing
         );
     }
+
+    /// 経過は読める粒度へ丸める（100ms の tick で秒が動き続けないように、1 分以上は分だけ）。
+    #[test]
+    fn elapsed_text_rounds_to_a_readable_unit() {
+        assert_eq!(elapsed_text(Duration::from_secs(0)), "0 seconds");
+        assert_eq!(elapsed_text(Duration::from_secs(40)), "40 seconds");
+        assert_eq!(elapsed_text(Duration::from_secs(59)), "59 seconds");
+        // **単複を揃える**。そのまま `started 1 minute ago` として画面に出る。
+        assert_eq!(elapsed_text(Duration::from_secs(1)), "1 second");
+        assert_eq!(elapsed_text(Duration::from_secs(60)), "1 minute");
+        assert_eq!(elapsed_text(Duration::from_secs(200)), "3 minutes");
+    }
 }

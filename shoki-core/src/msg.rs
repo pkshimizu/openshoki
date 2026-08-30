@@ -9,7 +9,7 @@
 
 use std::path::PathBuf;
 
-use crate::app::{Job, ShownPath};
+use crate::app::{Job, ShownPath, SummaryJob};
 use crate::reading_pane::TranscriptShortfall;
 
 /// 状態へ入る唯一の入口。
@@ -43,10 +43,17 @@ pub enum Event {
     /// 選択は必ず一覧から取るし、閉じて開き直すと `Select(None)` が先に流れる。それでも置いて
     /// あるのは、引けなかったときに「読み込み中」の表示を永久に残さないため（受け皿）。
     LoadCouldNotStart { dir: PathBuf },
-    /// ジョブの様子が変わった（`None` は**エントリが消えた**＝止めた・対象が無かった）。
+    /// 文字起こしジョブの様子が変わった（`None` は**エントリが消えた**＝止めた・対象が無かった）。
     ///
     /// tick が `TranscribeWorker` のマップと `jobs` を突き合わせて、違うものだけ流す。
     JobChanged { dir: PathBuf, job: Option<Job> },
+    /// 議事録ジョブの様子が変わった（同上。#189）。
+    ///
+    /// **分けてあるのは、同じ録音で 2 つが同時に在るから**（`crate::app::AppState::summaries` の doc）。
+    SummaryChanged {
+        dir: PathBuf,
+        job: Option<SummaryJob>,
+    },
     /// 録音を消した。
     Deleted { dir: PathBuf },
 }
@@ -121,6 +128,11 @@ impl std::fmt::Debug for Event {
                 .finish(),
             Self::JobChanged { dir, job } => f
                 .debug_struct("JobChanged")
+                .field("dir", &ShownPath(dir))
+                .field("job", job)
+                .finish(),
+            Self::SummaryChanged { dir, job } => f
+                .debug_struct("SummaryChanged")
                 .field("dir", &ShownPath(dir))
                 .field("job", job)
                 .finish(),
