@@ -40,11 +40,13 @@
 //!
 //! # いまの状態
 //!
-//! 読む領域の文言と状態（`reading_pane`）が入っている（#188 の PR-1）。`AppState` / `update` /
-//! `Effect` はまだ無い（PR-3）。
+//! 読む領域の文言と状態（`reading_pane`。#188 の PR-1）と、録音セッションの事実と表示
+//! （`session`。PR-3a）が入っている。`AppState` / `update` / `Effect` はまだ無い（PR-3b）。
 
 pub mod reading_pane;
+pub mod session;
 
 // **doc とコードでは短いほう（`shoki_core::X`）で書く**。glob を張ってあるので同じ項目に
 // 公開パスが 2 本あるが、参照が割れると「どちらが正か」を読み手が判断できなくなる。
 pub use reading_pane::*;
+pub use session::*;

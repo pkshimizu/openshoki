@@ -909,7 +909,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let Some((dir, playback_path)) = sessions
                 .borrow()
                 .get(i)
-                .map(|s| (s.dir.clone(), s.playback_path()))
+                .map(|s| (s.dir.clone(), recordings::playback_path(s)))
             else {
                 return;
             };
@@ -2029,7 +2029,7 @@ fn spawn_session_load(
     let dir = session.dir.clone();
     // 揃っているかは「在る音源ごとに JSON があるか」で決まる（#175）ので、音源の並びも渡す。
     let speakers = session.speakers();
-    let playback_path = session.playback_path();
+    let playback_path = recordings::playback_path(session);
     // スレッドへ渡す口と、失敗したときにこのスレッドから送る口を分けて持つ。
     let thread_sender = sender.clone();
     let fallback_sender = sender.clone();
@@ -3156,7 +3156,7 @@ fn submit_transcription(
     transcriber: &transcribe::TranscribeWorker,
     chain: ChainNotes,
 ) {
-    let audio_paths = session.audio_source_paths();
+    let audio_paths = recordings::audio_source_paths(session);
     if audio_paths.is_empty() {
         return;
     }
@@ -3746,7 +3746,7 @@ fn summary_footer_text(written: Option<SystemTime>) -> String {
         "Written from the transcript · {}",
         written
             .with_timezone(&chrono::Local)
-            .format(recordings::DISPLAY_DATETIME_FORMAT)
+            .format(shoki_core::DISPLAY_DATETIME_FORMAT)
     )
 }
 
@@ -4208,7 +4208,7 @@ mod tests {
         let sessions = |count: usize| -> Vec<recordings::RecordingSession> {
             (0..count)
                 .map(|i| {
-                    let mut session = recordings::RecordingSession::for_test(
+                    let mut session = recordings::session_for_test(
                         chrono::NaiveDate::from_ymd_opt(2026, 8, 10)
                             .expect("a real date")
                             .and_hms_opt(14, 2, 0)
@@ -4316,7 +4316,7 @@ mod tests {
         let sessions_model = std::rc::Rc::new(slint::VecModel::<super::SessionRow>::default());
         // **前に開いたときの状態**を作っておく。開き直したらこれが残っていないことを見る。
         let stale = {
-            let mut session = recordings::RecordingSession::for_test(
+            let mut session = recordings::session_for_test(
                 chrono::NaiveDate::from_ymd_opt(2026, 8, 10)
                     .expect("a real date")
                     .and_hms_opt(14, 2, 0)
@@ -4469,7 +4469,7 @@ mod tests {
         );
         assert_eq!(rec.get_empty_heading(), "Looking for recordings…");
 
-        let mut session = recordings::RecordingSession::for_test(
+        let mut session = recordings::session_for_test(
             chrono::NaiveDate::from_ymd_opt(2026, 8, 10)
                 .expect("a real date")
                 .and_hms_opt(14, 2, 0)
@@ -4522,7 +4522,7 @@ mod tests {
         let config = std::cell::RefCell::new(super::Config::default());
 
         let dir = std::env::temp_dir().join("shoki-detail-panes");
-        let mut session = super::recordings::RecordingSession::for_test(
+        let mut session = super::recordings::session_for_test(
             chrono::NaiveDate::from_ymd_opt(2026, 8, 10)
                 .expect("a real date")
                 .and_hms_opt(14, 2, 0)
@@ -4625,9 +4625,9 @@ mod tests {
             .and_hms_opt(18, 0, 0)
             .expect("a valid time");
         let sessions = [
-            crate::recordings::RecordingSession::for_test(now.with_hour(14).expect("a valid hour")),
-            crate::recordings::RecordingSession::for_test(now.with_hour(9).expect("a valid hour")),
-            crate::recordings::RecordingSession::for_test(
+            crate::recordings::session_for_test(now.with_hour(14).expect("a valid hour")),
+            crate::recordings::session_for_test(now.with_hour(9).expect("a valid hour")),
+            crate::recordings::session_for_test(
                 now.with_day(9)
                     .expect("a valid day")
                     .with_hour(16)
@@ -4652,7 +4652,7 @@ mod tests {
             .expect("a valid date")
             .and_hms_opt(14, 0, 0)
             .expect("a valid time");
-        let mut session = crate::recordings::RecordingSession::for_test(now);
+        let mut session = crate::recordings::session_for_test(now);
         session.has_mic = true;
         session.has_system = true;
         assert_eq!(
@@ -4689,7 +4689,7 @@ mod tests {
             .expect("a valid date")
             .and_hms_opt(14, 0, 0)
             .expect("a valid time");
-        let mut session = crate::recordings::RecordingSession::for_test(now);
+        let mut session = crate::recordings::session_for_test(now);
         assert_eq!(super::session_date_text(&session), "Aug 10, 2026");
         session.duration = Some(Duration::from_secs(4360));
         assert_eq!(super::session_date_text(&session), "Aug 10, 2026 · 1:12:40");
@@ -5360,7 +5360,7 @@ mod tests {
         use super::SearchOutcome as O;
 
         let session = |dir: &str| {
-            let mut session = recordings::RecordingSession::for_test(
+            let mut session = recordings::session_for_test(
                 chrono::NaiveDate::from_ymd_opt(2026, 8, 10)
                     .expect("a real date")
                     .and_hms_opt(14, 2, 0)
@@ -5412,7 +5412,7 @@ mod tests {
         rec.set_search_text("release".into());
 
         let session = |dir: &str| {
-            let mut session = recordings::RecordingSession::for_test(
+            let mut session = recordings::session_for_test(
                 chrono::NaiveDate::from_ymd_opt(2026, 8, 10)
                     .expect("a real date")
                     .and_hms_opt(14, 2, 0)
@@ -5490,7 +5490,7 @@ mod tests {
     #[test]
     fn the_count_drops_recordings_that_are_gone() {
         let session = |dir: &str| {
-            let mut session = recordings::RecordingSession::for_test(
+            let mut session = recordings::session_for_test(
                 chrono::NaiveDate::from_ymd_opt(2026, 8, 10)
                     .expect("a real date")
                     .and_hms_opt(14, 2, 0)
@@ -5877,7 +5877,7 @@ mod tests {
         use super::{LoadedTranscript, transcript};
 
         let session = |dir: &str, has_transcript: bool| {
-            let mut session = recordings::RecordingSession::for_test(
+            let mut session = recordings::session_for_test(
                 chrono::NaiveDate::from_ymd_opt(2026, 8, 10)
                     .expect("a real date")
                     .and_hms_opt(14, 2, 0)

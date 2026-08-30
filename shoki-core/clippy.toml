@@ -13,12 +13,20 @@
 # **このファイルは `shoki-core` にだけ効く**（clippy は各クレートのディレクトリから設定を探す）。
 # shell 側は `std::fs::File` を 3 ファイルで使っているが、そちらは検出されない。
 #
-# **依存を足すときは、その依存の入り口もここへ足す**。例: `chrono` を足すなら
-# `chrono::Utc::now` / `chrono::Local::now` を `disallowed-methods` に足す。
+# **依存を足すときは、その依存の入り口もここへ足す**（実例は下の `chrono` の 2 つ）。
 #
-# **これは CI では守れない**。依存に無いパスを書いても clippy は黙って無視する（存在しない
-# `std::` のパスだけは「does not refer to a reachable function」と言う）ので、足し忘れても緑の
-# まま通る。だから依存追加と同じ PR で足すこと——`shoki-core/Cargo.toml` にも同じ申し送りがある。
+# **足し忘れは CI では守れない**。ここに書き忘れた入り口は当然ながら素通りするので、依存追加と
+# 同じ PR で足すこと（`shoki-core/Cargo.toml` にも同じ申し送りがある）。
+#
+# 書いたパスが効いているかは、clippy が**先頭のクレートを解決できるか**で決まる。測った結果:
+#
+# - `serde::…`（`shoki-core` の依存に無い）→ **何も言わない**。書いても効かないことに気づけない
+# - `chrono::Utcc::now`（依存に在るクレートの綴り間違い）→ 「does not refer to a reachable
+#   function」と言う。綴り間違いはここで落ちる
+#
+# 機能で消えている `chrono::Local` / `Local::now` / `Utc::now` も後者に当たるので、
+# `cargo clippy -p shoki-core` では 3 本の警告が出る。**それが正常**（単体では `clock` が
+# 付かないので、型もメソッドも無い）。
 disallowed-types = [
   # ファイル
   { path = "std::fs::File", reason = "読み書きは shell の adapter が行う。core は値を受け取る" },
@@ -30,6 +38,18 @@ disallowed-types = [
   { path = "std::process::Command", reason = "外部プロセスの起動は shell の仕事" },
   { path = "std::net::TcpStream", reason = "ネットワークは shell の adapter が行う" },
   { path = "std::net::UdpSocket", reason = "同上" },
+  # chrono（#188）。`Local::now` を塞いでも `Local.from_local_datetime(..)` /
+  # `with_timezone(&Local)` が残り、そちらも環境変数と `/etc/localtime` を読む
+  # （上の「family ごと見ること」と同じ）。
+  #
+  # **ただし塞げる範囲は型の位置だけ**。測った結果、`DateTime<Local>` のように**型として**書けば
+  # 落ちるが、`chrono::Local.from_local_datetime(..)` のように**単位構造体の値として**書くと
+  # `disallowed_types` は反応しない。値で書く経路まで止めているのは `cargo build -p shoki-core`
+  # （`Local` が型ごと存在しない）のほうで、ワークスペースのビルドでは開いたままになる。
+  #
+  # `Utc` は塞がない。`DateTime<Utc>` は値を運ぶだけで外を読まない（外を読むのは `Utc::now` の
+  # ほうで、下の `disallowed-methods` が持つ）。
+  { path = "chrono::Local", reason = "タイムゾーンは外から来る事実。時刻ごと Event に載せて渡す" },
 ]
 
 disallowed-methods = [
@@ -52,6 +72,14 @@ disallowed-methods = [
   # 時刻（外から来る事実。Event に載せて渡すと、テストが決定的になる）
   { path = "std::time::SystemTime::now", reason = "時刻も外から来る事実。Event に載せると、テストが決定的になる" },
   { path = "std::time::Instant::now", reason = "同上" },
+  # chrono（#188 の PR-3a で依存に足した）。**core 単体では存在しない**が、ワークスペースを
+  # まとめてビルドすると `shoki` 側の機能と合流して生える——その経路を塞ぐ二の矢（一の矢と
+  # 両者の関係は `shoki-core/Cargo.toml` の chrono の行が正）。
+  #
+  # `allow-invalid = true` で上の警告を黙らせない。ヘッダに書いたとおり、あの警告は綴り間違いを
+  # 落とす網でもあるので、捨てると**書いても効いていないエントリ**に気づけなくなる。
+  { path = "chrono::Local::now", reason = "時刻は外から来る事実。Event に載せる（環境変数と /etc/localtime も読む）" },
+  { path = "chrono::Utc::now", reason = "同上" },
 ]
 
 # ログ（`docs/rules/security.md` のログ衛生——本文もフルパスも出さない——を core 側で守らせる

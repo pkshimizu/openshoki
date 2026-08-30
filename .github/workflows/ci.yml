@@ -145,5 +145,18 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: build
         run: cargo build --workspace --verbose
+      # **core を単体でも建てる**（#188）。単体だと `chrono` に `clock` が付かないので、
+      # **本番コード（lib）に** `chrono::Local` / `Utc::now` を書くとここで落ちる（まとめて
+      # 建てると `shoki` の機能と合流して生えてしまう）。
+      #
+      # 射程は 2 つの意味で狭い。**テストコードは `cargo build` が組まない**ので通るし、
+      # `std::time::SystemTime::now` は素の `std` なので単体でも通る。どちらも上の
+      # `cargo clippy --workspace --all-targets` が二の矢として受け持つ。
+      #
+      # **逆に、二の矢が届かない範囲もこのステップだけが止めている**——`chrono::Local` を値として
+      # 書く経路（`Local.from_local_datetime(..)`）は clippy では落ちない。射程の内訳は
+      # `shoki-core/Cargo.toml` の chrono の行が正。
+      - name: build core alone
+        run: cargo build -p shoki-core --verbose
       - name: test
         run: cargo test --workspace --verbose
