@@ -13,8 +13,7 @@
 # **このファイルは `shoki-core` にだけ効く**（clippy は各クレートのディレクトリから設定を探す）。
 # shell 側は `std::fs::File` を 3 ファイルで使っているが、そちらは検出されない。
 #
-# **依存を足すときは、その依存の入り口もここへ足す**。例: `chrono` を足すなら
-# `chrono::Utc::now` / `chrono::Local::now` を `disallowed-methods` に足す。
+# **依存を足すときは、その依存の入り口もここへ足す**（実例は下の `chrono` の 2 つ）。
 #
 # **これは CI では守れない**。依存に無いパスを書いても clippy は黙って無視する（存在しない
 # `std::` のパスだけは「does not refer to a reachable function」と言う）ので、足し忘れても緑の
@@ -52,9 +51,13 @@ disallowed-methods = [
   # 時刻（外から来る事実。Event に載せて渡すと、テストが決定的になる）
   { path = "std::time::SystemTime::now", reason = "時刻も外から来る事実。Event に載せると、テストが決定的になる" },
   { path = "std::time::Instant::now", reason = "同上" },
-  # chrono（#188 の PR-3a で依存に足した）。**素の `chrono` では `Local` / `Utc::now` は
-  # そもそも存在しない**（`clock` を外してある）が、ワークスペースをまとめてビルドすると
-  # `shoki` 側の機能と合流して生えるので、その経路をここで塞ぐ。
+  # chrono（#188 の PR-3a で依存に足した）。**core 単体では両方とも存在しない**が、
+  # ワークスペースをまとめてビルドすると `shoki` 側の機能と合流して生える——その経路を塞ぐ
+  # 二の矢（一の矢と両者の関係は `shoki-core/Cargo.toml` の chrono の行が正）。
+  #
+  # `cargo clippy -p shoki-core` では「パスが解決できない」警告が 2 本出るが、それが正常
+  # （単体では機能が付かないので当然）。`allow-invalid = true` で黙らせない——綴り間違いの
+  # 検出まで捨てることになり、下の「足し忘れても緑」に一歩近づく。
   { path = "chrono::Local::now", reason = "時刻は外から来る事実。Event に載せる（環境変数と /etc/localtime も読む）" },
   { path = "chrono::Utc::now", reason = "同上" },
 ]

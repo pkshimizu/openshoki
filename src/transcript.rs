@@ -13,11 +13,12 @@
 
 use crate::dataless::{Fetch, ReadFailure};
 use shoki_core::TranscriptShortfall;
+use std::path::Path;
+use std::time::Duration;
+
 // **話者は core に置いてある**（#188 の PR-3a）。ここから再エクスポートするのは、
 // `transcript::Speaker` という既存の呼び名を保つため（文字起こしの語彙としてはここが自然）。
 pub use shoki_core::Speaker;
-use std::path::Path;
-use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -37,9 +38,8 @@ const ALL_SPEAKERS: [Speaker; 2] = [Speaker::Mic, Speaker::System];
 /// この音源の文字起こし JSON のファイル名。`transcribe.rs` が `<音源名>.json` で保存する
 /// 名前と一致させること。
 ///
-/// **`Speaker` のメソッドにしない**（#188）。`Speaker` は `shoki-core` にあり、そちらは
-/// ディスクレイアウトを知らない層——名前を知っているのは書き手のモジュールだけにする
-/// （`shoki_core::session` の doc）。
+/// **`Speaker` のメソッドにしない**（#188）。`Speaker` は `shoki-core` にあり、そちらには
+/// ファイル名を置かない（`shoki_core::session` の doc）。
 fn json_name(speaker: Speaker) -> &'static str {
     match speaker {
         Speaker::Mic => MIC_JSON,

@@ -19,6 +19,14 @@ resolver = "3"
 [workspace.package]
 edition = "2024"
 
+# **両クレートが直接依存するものはここに置く**（#188）。別々に書くと片方だけ古くなり、
+# 下限が揃わない（core だけ古い chrono を許す形が残る）。
+#
+# `chrono` の機能は**呼ぶ側が足す**——`clock` は `Local` / `Utc::now` を生やすので、shell だけが
+# 足す。理由は `shoki-core/Cargo.toml` の chrono の行が正。
+[workspace.dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["std"] }
+
 [package]
 name = "shoki"
 version = "0.1.0"
@@ -27,7 +35,7 @@ edition.workspace = true
 publish = false
 
 [dependencies]
-chrono = "0.4.45"
+chrono = { workspace = true, features = ["clock"] }
 cpal = "0.18.1"
 directories = "6.0.0"
 fs2 = "0.4.3"

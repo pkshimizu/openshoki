@@ -3746,7 +3746,7 @@ fn summary_footer_text(written: Option<SystemTime>) -> String {
         "Written from the transcript · {}",
         written
             .with_timezone(&chrono::Local)
-            .format(recordings::DISPLAY_DATETIME_FORMAT)
+            .format(shoki_core::DISPLAY_DATETIME_FORMAT)
     )
 }
 

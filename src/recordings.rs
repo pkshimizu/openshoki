@@ -65,14 +65,14 @@ const SWEPT_PART_DESTS: &[&str] = &[
 
 /// セッションディレクトリ名の日時フォーマット（`main.rs` の録音開始時の命名と一致させること）。
 const DIR_DATETIME_FORMAT: &str = "%Y%m%d-%H%M%S";
-/// 日付と時刻を 1 行に並べる形（`Aug 10, 2026 · 14:02`）。詳細ヘッダと議事録の出典が使う。
-pub const DISPLAY_DATETIME_FORMAT: &str = "%b %-d, %Y · %H:%M";
-
-// **セッションの事実と表示は core に置いてある**（#188 の PR-3a）。ここから再エクスポートする
-// のは `recordings::RecordingSession` という既存の呼び名を保つため。走査（`list_sessions`）と
-// **パスの組み立て**はこちらに残る——ファイル名を知っているのは書き手のモジュールだけにする
-// （`shoki_core::session` の doc）。
-pub use shoki_core::{DiskFacts, RecordingSession};
+// **セッションの事実と表示は core に置いてある**（#188 の PR-3a）。走査（`list_sessions`）と
+// **パスの組み立て**はこちらに残る——core にファイル名を置かない（`shoki_core::session` の doc）。
+//
+// `RecordingSession` だけ再エクスポートするのは `recordings::RecordingSession` という既存の
+// 呼び名を保つため。`DiskFacts` は今回できた型で保つべき呼び名が無く、使うのもこのモジュールの
+// 中だけなので、公開しない（`pub` にすると、使われなくなっても dead_code で気づけない）。
+use shoki_core::DiskFacts;
+pub use shoki_core::RecordingSession;
 
 /// 音源ごとの mp3 名。**`Speaker` からファイル名を引く唯一の場所**——mp3 を書くのは録音側
 /// なので、名前の対応もこちら（`transcript` 側は JSON 名だけを知っていればよい）。
@@ -408,13 +408,8 @@ fn scan_sessions(
         );
     }
 
-    // 新しい順（日時降順）。同時刻はディレクトリ名でも安定させる必要はないが、決定的にするため
-    // パスで二次ソートする。
-    sessions.sort_by(|a, b| {
-        b.started()
-            .cmp(&a.started())
-            .then_with(|| a.dir.cmp(&b.dir))
-    });
+    // 並び順の判断は core が持つ（`RecordingSession::newest_first`）。
+    sessions.sort_by(RecordingSession::newest_first);
     sessions
 }
 
