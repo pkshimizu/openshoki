@@ -9,18 +9,22 @@
 //!   view_row / view_detail（`crate::view`）
 //! ```
 //!
-//! # いまここに在るのは文字起こしだけ
+//! # いまここに在るのは、選択・読み込み・2 つのジョブ
 //!
-//! 段階 01 は**文字起こしの状態だけ**を通す（`docs/plans/done/20260829-core-shell-layers.md`）。
-//! 一覧そのもの（`sessions`）・検索・走査・世代・削除は shell に残っていて、次の段階で移す。
-//! だから `view_*` はセッションを**引数で受ける**——ここが持っているのは「選んでいるのはどれか」
-//! 「読み込み済みの中身は何か」「ジョブはどうなっているか」の 3 つだけ。
+//! 段階 01 で文字起こしの状態を、段階 02（#189）で議事録の状態を通した
+//! （`docs/plans/done/20260829-core-shell-layers.md`）。一覧そのもの（`sessions`）・検索・走査・
+//! 世代・削除は shell に残っていて、次の段階で移す（#197）。だから `view_*` はセッションを
+//! **引数で受ける**——ここが持っているのは「選んでいるのはどれか」「読み込み済みの中身は何か」
+//! 「2 つのジョブはどうなっているか」の 3 つだけ。
 //!
 //! # ジョブは shell のワーカーの写し（過渡形）
 //!
-//! `jobs` は `TranscribeWorker` の状態マップを tick が写したもの。**答えを 2 つ持っているのでは
-//! なく、写す向きが 1 方向**——表示はすべて `jobs` から出し、ワーカーのマップを表示のために
-//! 読む経路は残さない。マップそのものの廃止は #189（段階 02）。
+//! `jobs` / `summaries` は、それぞれ `TranscribeWorker` / `SummarizeWorker` の状態マップを写した
+//! もの。写すのは 100ms の tick と、ボタンを押した直後の `main::observe_and_refresh`
+//! （押した瞬間に画面が動かないと、押しても効いていないように見える）。
+//!
+//! **答えを 2 つ持っているのではなく、写す向きが 1 方向**——表示はすべてここから出し、ワーカーの
+//! マップを表示のために読む経路は残さない。ワーカー側のマップそのものの廃止は #189 の PR-2。
 //!
 //! # フルパスは `Debug` に出さない
 //!
@@ -33,10 +37,15 @@ use std::path::PathBuf;
 
 use crate::reading_pane::{TranscribeFailure, TranscriptShortfall};
 
-/// 文字起こしジョブの通番（`TranscribeWorker` が採る `seq`）。
+/// ジョブの通番（ワーカーが採る `seq`）。
 ///
 /// **core では採らない**（#188）。進捗は FFI のコールバックスレッドから来るので、番号を知って
 /// いるのはワーカー側でしかありえない。
+///
+/// **マップをまたいで比べない**（#189）。`TranscribeWorker` と `SummarizeWorker` は**別々の
+/// カウンタ**を持つので、`jobs` の `JobId(3)` と `summaries` の `JobId(3)` に関係は無い
+/// （型は同じなので比べてもコンパイルは通る）。同じマップの中では、投入順そのもの——番号は
+/// キューのロックを持ったまま配られ、ワーカーは FIFO で取り出す（`SummarizeWorker::submit`）。
 ///
 /// **相だけでなくこれも比べる**。観測は 100ms ごとなので、その間に「完了 → 再投入」と往復すると
 /// 相はどちらも `Running` のまま。通番を見れば「前のジョブは終わっている」と分かるので、
@@ -78,11 +87,41 @@ impl JobPhase {
     }
 }
 
-/// 1 件のジョブ（通番と相）。
+/// 議事録ジョブが**いまどうなっているか**（#189）。
+///
+/// **順番と経過はここに持たない**。順番は前が終われば繰り上がるので、投入時に固定すると嘘に
+/// なる（`crate::view::queued_position` が読み出しのたびに数える）。経過も同じ理由で、
+/// 始めた時刻だけ持って引き算は `view_detail` がする——`Event` は 1 回きりなので、値を載せると
+/// そこで止まる。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SummaryPhase {
+    /// 積まれていて、まだ始まっていない。**モデル名は持たない**（理由は
+    /// `summarize::SummarizeEntry::Queued`——取り出すまで何で走るかが決まらない）。
+    Queued,
+    /// 生成中。`started` は経過を出すのに使う（引き算は `view_detail`）。
+    Summarizing {
+        model_label: String,
+        started: std::time::Instant,
+    },
+    /// 書き終わった。
+    Done,
+    Failed {
+        reason: crate::reading_pane::SummarizeFailure,
+    },
+}
+
+/// 1 件の文字起こしジョブ（通番と相）。**議事録とは別に持つ**（`AppState::summaries` の doc）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Job {
     pub id: JobId,
     pub phase: JobPhase,
+}
+
+/// 議事録ジョブ 1 件。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SummaryJob {
+    pub id: JobId,
+    pub phase: SummaryPhase,
 }
 
 /// 選択中の録音の、**読み込み済みの中身から分かること**。
@@ -118,6 +157,14 @@ pub struct AppState {
     loaded: Option<Loaded>,
     /// 文字起こしのジョブ（走っているもの・走り終わった記録）。
     jobs: HashMap<PathBuf, Job>,
+    /// 議事録のジョブ。
+    ///
+    /// **文字起こしと 1 つのマップに畳まない**（#189）。同じ録音で 2 つが同時に在るのが
+    /// **定常状態**だから——自動議事録は「文字起こしが終わった」直後に積まれるので、文字起こしの
+    /// 走り終わった記録（`Done { shortfall }`。#176 で持たせた）と議事録の実行が数分間ずっと
+    /// 同居する。1 件で持つと、その間ずっと一覧が「transcribing」と言い、部分文字起こしの警告も
+    /// 消える。
+    summaries: HashMap<PathBuf, SummaryJob>,
 }
 
 /// パスの**ファイル名だけ**を `Debug` に出すための包み（`docs/rules/security.md`）。
@@ -155,6 +202,7 @@ impl std::fmt::Debug for AppState {
             selected,
             loaded,
             jobs,
+            summaries,
         } = self;
         f.debug_struct("AppState")
             .field("selected", &selected.as_deref().map(ShownPath))
@@ -162,6 +210,13 @@ impl std::fmt::Debug for AppState {
             .field(
                 "jobs",
                 &jobs
+                    .iter()
+                    .map(|(dir, job)| (ShownPath(dir), job))
+                    .collect::<Vec<_>>(),
+            )
+            .field(
+                "summaries",
+                &summaries
                     .iter()
                     .map(|(dir, job)| (ShownPath(dir), job))
                     .collect::<Vec<_>>(),
@@ -186,6 +241,16 @@ impl AppState {
         &self.jobs
     }
 
+    /// この録音の議事録ジョブ（無ければ `None`）。
+    pub fn summary(&self, dir: &std::path::Path) -> Option<&SummaryJob> {
+        self.summaries.get(dir)
+    }
+
+    /// 議事録ジョブの一覧（shell が差分を取るために読む。`crate::view` が順番を数えるのにも）。
+    pub fn summaries(&self) -> &HashMap<PathBuf, SummaryJob> {
+        &self.summaries
+    }
+
     /// **テストが状態を組むための口**（本番は `update` を通す）。
     ///
     /// `#[cfg(test)]` なので出荷バイナリには入らない——`pub` のまま残すと「状態を変える口は
@@ -196,6 +261,7 @@ impl AppState {
             selected,
             loaded: None,
             jobs,
+            summaries: HashMap::new(),
         }
     }
 
@@ -258,6 +324,18 @@ impl AppState {
             }
             None => {
                 self.jobs.remove(&dir);
+            }
+        }
+    }
+
+    /// 議事録ジョブを置く／落とす（`None` は**エントリが消えた**）。`set_job` と対称。
+    pub(crate) fn set_summary(&mut self, dir: PathBuf, job: Option<SummaryJob>) {
+        match job {
+            Some(job) => {
+                self.summaries.insert(dir, job);
+            }
+            None => {
+                self.summaries.remove(&dir);
             }
         }
     }

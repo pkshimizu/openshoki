@@ -30,10 +30,7 @@ mod tray;
 mod whisper_model;
 mod windows;
 
-use shoki_core::{
-    SummaryPane, TranscriptInput, TranscriptPane, actions_allowed_while_busy, elapsed_text,
-    summary_status_text,
-};
+use shoki_core::{SummaryPane, TranscriptPane, actions_allowed_while_busy, summary_status_text};
 // **core と同名の型（`TranscriptStatus` / `SummaryStatus` / `PaneAction` / `PaneActionKind`）は
 // 裸で書かない**（#188）。`slint::include_modules!()` が生成型をクレート直下に置くので、裸の
 // 名前は Slint 型を指してしまい、core の同名の型と読み分けられない。Slint 側は `Ui` 付きの
@@ -437,7 +434,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let sessions = Rc::clone(&sessions);
         let app_state = Rc::clone(&app_state);
-        let summarizer = summarizer.clone();
         let config = Rc::clone(&config);
         let rec_weak = library_ui.as_weak();
         let runner = runner.clone();
@@ -483,8 +479,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             run_effects(&runner, effects, None);
 
-            // 状態の表示は、落としたあとの状態から組み直す。
-            refresh_detail_panes(&rec, &runner, &summarizer, &session, &config);
+            // 状態の表示は、落としたあとの状態から組み直す。**ここは観測を挟まない**——
+            // 選んだだけではワーカーは動いていないので、`AppState` に既に写っているもので足りる
+            // （ずれていれば次の tick が直す）。
+            refresh_detail_panes(&rec, &runner, &session, &config);
         });
     }
 
@@ -609,7 +607,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let config = Rc::clone(&config);
         let runner = runner.clone();
         let transcriber = transcriber.clone();
-        // 読む領域は両タブまとめて組み直すので、相手のワーカーも要る（`refresh_detail_panes`）。
+        // 観測は両方のワーカーをまとめて見る（`observe_and_refresh`）。
         let summarizer = summarizer.clone();
         let rec_weak = library_ui.as_weak();
         library_ui.on_transcribe_session(move |index| {
@@ -618,9 +616,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return;
             };
             submit_transcription(session, &config, &transcriber, ChainNotes::FollowTheSetting);
-            observe_jobs(&transcriber, &runner);
             if let Some(rec) = rec_weak.upgrade() {
-                refresh_detail_panes(&rec, &runner, &summarizer, session, &config);
+                observe_and_refresh(&rec, &runner, &transcriber, &summarizer, session, &config);
             }
         });
     }
@@ -641,9 +638,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return;
             };
             submit_transcription(session, &config, &transcriber, ChainNotes::Always);
-            observe_jobs(&transcriber, &runner);
             if let Some(rec) = rec_weak.upgrade() {
-                refresh_detail_panes(&rec, &runner, &summarizer, session, &config);
+                observe_and_refresh(&rec, &runner, &transcriber, &summarizer, session, &config);
             }
         });
     }
@@ -656,6 +652,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let config = Rc::clone(&config);
         let runner = runner.clone();
         let summarizer = summarizer.clone();
+        // 観測は両方のワーカーをまとめて見る（`observe_and_refresh`）。
+        let transcriber = transcriber.clone();
         let rec_weak = library_ui.as_weak();
         library_ui.on_summarize_session(move |index| {
             let sessions = sessions.borrow();
@@ -673,7 +671,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             summarizer.submit(manual_summarize_job(&config.borrow(), &session.dir));
             // 投入結果（通常は「生成中」）を即反映し、2 連クリックの多重投入を防ぐ。
             if let Some(rec) = rec_weak.upgrade() {
-                refresh_detail_panes(&rec, &runner, &summarizer, session, &config);
+                observe_and_refresh(&rec, &runner, &transcriber, &summarizer, session, &config);
             }
         });
     }
@@ -685,6 +683,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let summarizer = summarizer.clone();
         let config = Rc::clone(&config);
         let runner = runner.clone();
+        let transcriber = transcriber.clone();
         let rec_weak = library_ui.as_weak();
         library_ui.on_cancel_summary(move |index| {
             let sessions = sessions.borrow();
@@ -698,7 +697,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             // 取り消し結果（通常は未生成／生成済みへ戻る）を即反映する。
             if let Some(rec) = rec_weak.upgrade() {
-                refresh_detail_panes(&rec, &runner, &summarizer, session, &config);
+                observe_and_refresh(&rec, &runner, &transcriber, &summarizer, session, &config);
             }
         });
     }
@@ -731,9 +730,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("Skipping the stop because the transcription is no longer running");
                 }
             }
-            observe_jobs(&transcriber, &runner);
             if let Some(rec) = rec_weak.upgrade() {
-                refresh_detail_panes(&rec, &runner, &summarizer, session, &config);
+                observe_and_refresh(&rec, &runner, &transcriber, &summarizer, session, &config);
             }
         });
     }
@@ -1581,7 +1579,7 @@ fn build_menu_event_handler(
             // 進めた直後に、その周回で届いていた正当な結果が落ちる。
             let job_effects = {
                 let mut state = recordings.state.borrow_mut();
-                job_changes(&recordings.transcriber, &state)
+                job_changes(&recordings.transcriber, &recordings.summarizer, &state)
                     .into_iter()
                     .flat_map(|msg| shoki_core::update(&mut state, msg))
                     .collect::<Vec<_>>()
@@ -1602,21 +1600,16 @@ fn build_menu_event_handler(
                     recordings.sessions_model.refresh(i, session, &state);
                 }
 
-                // 選択中セッションの要約状態も追従させる。一覧行には要約のインジケータが無い
-                // （#81 のスコープ外）ので、行の差分更新ではなく詳細ペインの現在値と比べる。
+                // 選択中セッションの議事録も追従させる。一覧行には議事録のインジケータが無い
+                // （#81 のスコープ外）ので、行の差分更新には乗らない——追従は上の `job_changes`
+                // が `AppState` へ写して行い、ここは毎 tick 組み直すだけ（#189）。
                 if let Some(session) = selected.and_then(|i| sessions_ref.get(i)) {
                     // **読む領域は毎回組み直す**（#154）。進捗の割合と経過は状態が変わらない
                     // まま動くので、状態の差分だけで更新すると数字が止まって見える
                     // （`docs/rules/slint.md` の「差分更新は表示に使う値ぜんぶで比べる」）。
-                    // 議事録が完成したら、この中で読み直す（文字起こし側は `update` が
-                    // `Effect` で返す）。
-                    refresh_detail_panes(
-                        &rec,
-                        &recordings.runner,
-                        &recordings.summarizer,
-                        session,
-                        &recordings.config,
-                    );
+                    // **読み直しはここでは起こさない**（#189）——完成したら読み直すかどうかは
+                    // 上の `job_changes` → `update` が `Effect` で返す。
+                    refresh_detail_panes(&rec, &recordings.runner, session, &recordings.config);
                     rec.set_has_transcript(session.has_transcript);
                 }
             }
@@ -1696,16 +1689,6 @@ fn session_group_heading(
         return String::new();
     }
     session.group_heading(now)
-}
-
-/// その読み込みで再生を差し替えるか（`PlaybackLoad` の判断を 1 か所に置く）。
-///
-/// **選択が変わったときだけ true**。中身が変わって読み直しただけのときに差し替えると、
-/// `AudioPlayer::adopt` が前の対象を手放すので**再生中の音が止まって先頭へ巻き戻る**——
-/// 文字起こしの完成は再生しながら待つ場面なので、そこで止まるのは痛い。あわせて、変わって
-/// いない音声を開き直す重い走査も避けられる。
-fn load_replaces_playback(selection_changed: bool) -> bool {
-    selection_changed
 }
 
 /// 選択の世代を 1 つ進めて、**走っている読み込みへ知らせる**。進めた世代を返す。
@@ -2251,8 +2234,9 @@ fn clear_library_selection(rec: &LibraryWindow, runner: &EffectRunner) {
     // セッションの「実行中」を持ち越さない）。文字起こし・要約で対称にする。
     // ここは「選択が無い」ときの畳み方なので、設定の状態は関係しない（次の選択で必ず
     // 上書きされる）。自動の有無は false で組む。
-    apply_detail_transcript_status(rec, &blank_detail_view(), false);
-    apply_detail_summary_status(rec, &SummaryPane::NotSummarized { auto_on: false }, false);
+    let blank = blank_detail_view();
+    apply_detail_transcript_status(rec, &blank, false);
+    apply_detail_summary_status(rec, &blank, false);
 }
 
 /// 背景スレッドで絞り込んだ結果（#161）。
@@ -2732,7 +2716,7 @@ fn run_effects(
     }
 }
 
-/// ワーカーを変えた**直後にその場で** `AppState` へ写す（#188）。
+/// ワーカーを変えた**直後にその場で** `AppState` へ写す（#188 / #189。両方のワーカーを見る）。
 ///
 /// tick を待つと最大 100ms のあいだ画面が「何も起きていない」と答える。押した瞬間に
 /// 「Stopping…」へ移らないと、押しても効いていないように見える（#163）。**削除のガードも
@@ -2743,10 +2727,14 @@ fn run_effects(
 /// 1 件も立たない——押す直前にワーカーが完了していると、その読み直しがここで消える
 /// （完成した発話が画面に出ないまま残る）。**借用を落としてから**実行するのは `run_effects` の doc
 /// のとおり。
-fn observe_jobs(transcriber: &transcribe::TranscribeWorker, runner: &EffectRunner) {
+fn observe_jobs(
+    transcriber: &transcribe::TranscribeWorker,
+    summarizer: &summarize::SummarizeWorker,
+    runner: &EffectRunner,
+) {
     let effects = {
         let mut state = runner.state.borrow_mut();
-        job_changes(transcriber, &state)
+        job_changes(transcriber, summarizer, &state)
             .into_iter()
             .flat_map(|msg| shoki_core::update(&mut state, msg))
             .collect::<Vec<_>>()
@@ -2754,20 +2742,44 @@ fn observe_jobs(transcriber: &transcribe::TranscribeWorker, runner: &EffectRunne
     run_effects(runner, effects, None);
 }
 
-/// ワーカーの状態マップと `AppState.jobs` を突き合わせ、**違うものだけ**を `Msg` にする（#188）。
+/// ワーカーを観測してから読む領域を組み直す（#189）。
+///
+/// **この順でしか呼ばない**ので 1 本にまとめてある。`refresh_detail_panes` は `AppState` だけを
+/// 読むので、先に観測しないと押した瞬間の変化が次の tick まで出ない（`observe_jobs` の doc の
+/// 「押した瞬間に移らないと効いていないように見える」）。
+///
+/// **tick はこれを通らない**——あちらは一覧の行も同じ観測結果で更新するので、観測を先に済ませて
+/// から `sessions` と `AppState` を借りたまま `refresh_detail_panes` を呼ぶ（ここで観測すると
+/// 借用が二重になる）。
+fn observe_and_refresh(
+    rec: &LibraryWindow,
+    runner: &EffectRunner,
+    transcriber: &transcribe::TranscribeWorker,
+    summarizer: &summarize::SummarizeWorker,
+    session: &recordings::RecordingSession,
+    config: &RefCell<Config>,
+) {
+    observe_jobs(transcriber, summarizer, runner);
+    refresh_detail_panes(rec, runner, session, config);
+}
+
+/// ワーカーの状態マップと `AppState` を突き合わせ、**違うものだけ**を `Msg` にする（#188 / #189）。
 ///
 /// **差分にするのは、全部流すと 100ms ごとに全ジョブぶんの `Msg` が立つから**。`update` は
 /// 「走っていた状態から降りたか」で読み直しを決めるので、変わっていないものを流すと判断が
 /// 濁る（前も今も `Done` で降りた扱いになりかねない）。
 fn job_changes(
     transcriber: &transcribe::TranscribeWorker,
+    summarizer: &summarize::SummarizeWorker,
     state: &shoki_core::AppState,
 ) -> Vec<shoki_core::Msg> {
-    let snapshot = transcriber.snapshot();
     let mut changes = Vec::new();
-    let mut seen: std::collections::HashSet<&std::path::Path> = std::collections::HashSet::new();
-    for (dir, seq, worker_state) in &snapshot {
-        seen.insert(dir.as_path());
+
+    let transcribes = transcriber.snapshot();
+    let mut seen_transcribes: std::collections::HashSet<&std::path::Path> =
+        std::collections::HashSet::new();
+    for (dir, seq, worker_state) in &transcribes {
+        seen_transcribes.insert(dir.as_path());
         let job = shoki_core::Job {
             id: shoki_core::JobId(*seq),
             phase: job_phase_of(worker_state),
@@ -2782,13 +2794,36 @@ fn job_changes(
     // **消えたエントリも流す**。止めた・対象が無かったジョブはマップから消えるので、
     // これを拾わないと表示が古いまま残る。
     for dir in state.jobs().keys() {
-        if !seen.contains(dir.as_path()) {
+        if !seen_transcribes.contains(dir.as_path()) {
             changes.push(shoki_core::Msg::Event(shoki_core::Event::JobChanged {
                 dir: dir.clone(),
                 job: None,
             }));
         }
     }
+
+    // **議事録は別のマップ**（理由の正は `shoki_core::AppState` の `summaries` の doc）。
+    let summaries = summarizer.snapshot();
+    let mut seen_summaries: std::collections::HashSet<&std::path::Path> =
+        std::collections::HashSet::new();
+    for (dir, job) in &summaries {
+        seen_summaries.insert(dir.as_path());
+        if state.summary(dir) != Some(job) {
+            changes.push(shoki_core::Msg::Event(shoki_core::Event::SummaryChanged {
+                dir: dir.clone(),
+                job: Some(job.clone()),
+            }));
+        }
+    }
+    for dir in state.summaries().keys() {
+        if !seen_summaries.contains(dir.as_path()) {
+            changes.push(shoki_core::Msg::Event(shoki_core::Event::SummaryChanged {
+                dir: dir.clone(),
+                job: None,
+            }));
+        }
+    }
+
     changes
 }
 
@@ -2817,29 +2852,43 @@ fn job_phase_of(state: &transcribe::TranscribeState) -> shoki_core::JobPhase {
 /// 生成物の有無を書き戻す（#161 / #188）。**毎 tick の全件スキャン**。
 ///
 /// 遷移で拾うと、絞り込みで隠れている録音の完了を取りこぼす（検索を解除したときに、済んで
-/// いるはずの文字起こしが「無い」に戻る）。ロック 1 回のマップ引きだけで、ディスクは読まない。
+/// いるはずの文字起こしが「無い」に戻る）。`AppState` のマップ引きだけで、ディスクも
+/// ワーカーのロックも触らない（#189。議事録の状態も core に載った）。
 fn sweep_finished_jobs(recordings: &LibraryHandles) {
     let state = recordings.state.borrow();
     let mark = |list: &mut Vec<recordings::RecordingSession>| {
         for session in list.iter_mut() {
-            if !session.has_transcript
-                && matches!(
-                    state.job(&session.dir).map(|job| &job.phase),
-                    Some(shoki_core::JobPhase::Done { .. })
-                )
-            {
-                session.has_transcript = true;
-            }
-            if !session.has_summary
-                && recordings.summarizer.status_of(&session.dir)
-                    == Some(summarize::SummarizeStatus::Done)
-            {
-                session.has_summary = true;
-            }
+            mark_what_finished(session, &state);
         }
     };
     mark(&mut recordings.all_sessions.borrow_mut());
     mark(&mut recordings.sessions.borrow_mut());
+}
+
+/// 走り終わったジョブが残した生成物を、この録音の印へ書き戻す（`sweep_finished_jobs` の中身）。
+///
+/// **立てるだけで、下ろさない**。ディスクを読まずに答えているので、「無い」と言える根拠は
+/// ここには無い（消えたことは走査が拾う）。
+fn mark_what_finished(session: &mut recordings::RecordingSession, state: &shoki_core::AppState) {
+    if !session.has_transcript
+        && matches!(
+            state.job(&session.dir).map(|job| &job.phase),
+            // **`Done` だけ**。途中で終わった文字起こしも `Done { shortfall }` で残るので
+            // （#176）、ここは食い違いの有無を見ない——読める行が在るかどうかは
+            // `shoki_core::view_detail` が別に答える。
+            Some(shoki_core::JobPhase::Done { .. })
+        )
+    {
+        session.has_transcript = true;
+    }
+    if !session.has_summary
+        && matches!(
+            state.summary(&session.dir).map(|job| &job.phase),
+            Some(shoki_core::SummaryPhase::Done)
+        )
+    {
+        session.has_summary = true;
+    }
 }
 
 /// 表示中の文字起こしと議事録を手放す（#188 の `Effect::ClearLoaded`）。
@@ -2851,10 +2900,13 @@ fn clear_shown_transcript(rec: &LibraryWindow) {
     rec.set_segments(Rc::new(slint::VecModel::<TranscriptRow>::default()).into());
     rec.set_summary_rows(Rc::new(slint::VecModel::<SummaryRow>::default()).into());
     rec.set_detail_summary_footer(slint::SharedString::new());
-    // **議事録の状態も畳む**（#188）。`refresh_detail_panes` は「前の状態」をこのプロパティから
-    // 取るが、プロパティは**どの録音のものかを持たない**——畳まないと、A を要約中に B を選んだ
-    // ときに「A の生成中 → B の生成済み」を遷移と読み、B の音声つき読み込みを降ろしてしまう
-    // （世代が進むので、選んだ録音が再生できないまま残る）。
+    // **議事録の状態も畳む**（#188 / #189）。文字起こし側と同じ理由——このプロパティは
+    // `detail-files-in-use` / `detail-jobs-pending` の入力なので、前の録音の「生成中」を
+    // 持ち越すとボタンが理由なく無効のままになる。
+    //
+    // **もう判断には使わない**（#189）。以前は `refresh_detail_panes` が「前の状態」をここから
+    // 読んで読み直しを決めていたが、その判断は `shoki_core::update` が `AppState` の上で行う
+    // ようになった（逆写像の `slint_map::from_ui_summary_status` は本番から消えて `#[cfg(test)]`）。
     rec.set_detail_summary_status(slint_map::to_ui_summary_status(
         shoki_core::SummaryStatus::NotSummarized,
     ));
@@ -3489,7 +3541,7 @@ fn apply_detail_transcript_status(
         rec.get_detail_transcript_actions(),
         // **掛けるのはここ**（#188）。`view_detail` は掛けずに返す——議事録側の busy を知らない
         // ので、あちらで掛けると議事録生成中に Re-transcribe が押せる。
-        &actions_allowed_while_busy(detail.actions.clone(), jobs_pending),
+        &actions_allowed_while_busy(message.actions, jobs_pending),
         |actions| rec.set_detail_transcript_actions(actions),
     );
     rec.set_detail_transcript_status(slint_map::to_ui_transcript_status(status));
@@ -3513,14 +3565,12 @@ fn apply_detail_transcript_status(
 /// `NotTranscribed { auto_on: false }` にするのは、次の選択で必ず上書きされるので設定の状態が
 /// 関係しないため。
 fn blank_detail_view() -> shoki_core::DetailView {
-    let transcript = TranscriptPane::NotTranscribed { auto_on: false };
-    let actions = transcript.message().actions;
     shoki_core::DetailView {
+        transcript: TranscriptPane::NotTranscribed { auto_on: false },
         transcript_input: shoki_core::TranscriptInput::Missing,
         transcript_busy: false,
-        actions,
+        summary: SummaryPane::NotSummarized { auto_on: false },
         loading: false,
-        transcript,
     }
 }
 
@@ -3563,19 +3613,16 @@ fn set_pane_actions(
     set(slint_map::to_ui_pane_actions(actions));
 }
 
-/// 選択中セッションの読む領域（両タブ）を組み直し、**議事録が完成へ移っていたら本文を
-/// 読み直す**（#188。世代を進めて `spawn_session_load` を起こす。音声は差し替えない）。
+/// 選択中セッションの読む領域（両タブ）を組み直す。**表示するだけ**（#189）——読み直しは
+/// 起こさない。
 ///
-/// **表示するだけの関数ではない**。**議事録の完成を契機に読み直すのはここだけ**——選択・文字
-/// 起こしの完了・一覧の入れ替えからの読み直しは `run_effects` の `Effect::LoadSession` が起こす。
+/// 議事録の完成を契機にした読み直しも `shoki_core::update` が `Effect::LoadSession` で返すように
+/// なった（`Event::SummaryChanged`）。以前はここが表示の現在値と比べて自分で起こしていたが、
+/// プロパティはどの録音のものかを持たないので偽の遷移が立った（#188）。
 ///
-/// 世代を進める場所は 4 つ（数えた）。読み直しを起こすのは `Effect::LoadSession` とここの 2 つで、
-/// 残りの 2 つ——`clear_library_selection` とウィンドウを閉じるとき——は**起こさず無効化する
-/// だけ**。
-///
-/// ここで起こすのは、遷移を観測できるのが 1 回だけ（すぐ上書きする）だから。呼び出し側へ返して
-/// 守らせると、押した瞬間の再描画が最初の観測者になったときに消える（ワーカーは別スレッドで、
-/// tick が最初とは限らない）。
+/// 世代を進める場所は本番に 3 つ（数えた。テストを除く）。**読み直しを起こすのは
+/// `Effect::LoadSession` の 1 つだけ**で、残りの 2 つ——`clear_library_selection` と
+/// Library ウィンドウを閉じるとき——は**起こさず、走っている読み込みを無効化するだけ**。
 ///
 /// **選択時・手動投入直後・tick 追従の全経路がここを通る**。進捗の割合と経過は状態が変わらない
 /// まま動くので、状態の差分だけで更新すると数字が止まって見える（`docs/rules/slint.md`）。
@@ -3589,62 +3636,30 @@ fn set_pane_actions(
 fn refresh_detail_panes(
     rec: &LibraryWindow,
     runner: &EffectRunner,
-    summarizer: &summarize::SummarizeWorker,
     session: &recordings::RecordingSession,
     config: &RefCell<Config>,
 ) {
-    let (auto_transcribe, auto_summarize) = {
+    let auto = {
         let config = config.borrow();
-        (config.auto_transcribe, config.auto_summarize)
+        shoki_core::AutoFlags {
+            transcribe: config.auto_transcribe,
+            summarize: config.auto_summarize,
+        }
     };
     let state = &runner.state.borrow();
-    // **文字起こし側の状態を答えるのはここ 1 本**（#188）。旧 4 関数
+    // **読む領域の状態を答えるのはここ 1 本**（#188 / #189）。旧 5 関数
     // （`transcript_display_status` / `transcript_pane_of` / `LoadedTranscript::stored` /
-    // `TranscriptInput::of`）はこの中へ畳んである。
-    let detail = shoki_core::view_detail(state, session, auto_transcribe);
-    // 議事録は旧経路のまま（#189 で core へ）。入力の様子だけ core から受け取る。
-    let worker_state = summarizer.state_of(&session.dir);
-    // **完成したという事実はワーカーの記録から取る**（#188）。ペインの `Done` は
-    // `summary.md` の有無からも立つので、記録が**消えただけ**（取り消し・入力が無くて
-    // 飛ばした）でも「完成した」に見える——そこで読み直すと世代が繰り上がり、選択直後に
-    // 投げた音声つきの読み込みが降りて、選んだ録音が再生できないまま残る。
-    let worker_finished = matches!(worker_state, Some(summarize::SummarizeState::Done));
-    let summary = summary_pane_of(
-        worker_state,
-        session.has_summary,
-        detail.transcript_input,
-        auto_summarize,
-    );
+    // `TranscriptInput::of` / `summary_pane_of`）はこの中へ畳んである。
+    //
+    // **`now` を渡すのは経過を毎回引き直すため**（`shoki_core::SummaryPhase` の doc）。
+    let detail = shoki_core::view_detail(state, session, auto, std::time::Instant::now());
     // **両方を見てからボタンを決める**。走っているジョブは片方の状態にしか出ないので、
     // タブごとに判断すると、もう一方で走っているジョブを見落としたボタンが出る。
-    // `view_detail` はボタンを掛けずに返す（議事録側を知らないので、あちらで掛けると穴が開く）。
-    let jobs_pending = detail.transcript_busy || shoki_core::summary_is_pending(summary.status());
-    // **書く前に読む**（#188）。前の状態はウィンドウの現在値から取るので、`apply_*` が書いた
-    // あとで読むと「前」と「いま」が同じ値になり、遷移が永久に立たない
-    // （`docs/rules/coding-conventions.md` の「値を 2 度読まず、書いた値そのもので分岐する」）。
-    //
-    // **観測と読み直しをここで完結させる**（呼び出し側に順序を守らせない）。プロパティは
-    // どの録音のものかを持たないので、表示する録音が変わるときは `clear_shown_transcript` が
-    // 畳んでいる（そちらの doc）。
-    let previous = slint_map::from_ui_summary_status(rec.get_detail_summary_status());
-    let just_finished = shoki_core::summary_is_pending(previous) && worker_finished;
+    // `view_detail` はボタンを掛けずに返す（掛けるのは両方を突き合わせたここ）。
+    let jobs_pending =
+        detail.transcript_busy || shoki_core::summary_is_pending(detail.summary.status());
     apply_detail_transcript_status(rec, &detail, jobs_pending);
-    apply_detail_summary_status(rec, &summary, jobs_pending);
-    if just_finished {
-        // **ここで読み直す**（#188）。遷移を観測できるのは 1 回だけ（すぐ上で上書きする）なので、
-        // 呼び出し側へ返して「立っていたら読み直す」を守らせると、押した瞬間の再描画が最初の
-        // 観測者になったときに消える——ワーカーは別スレッドなので、tick が最初とは限らない。
-        //
-        // **音声は読み直さない**。変わったのは議事録だけで、差し替えると再生中の音が止まって
-        // 先頭へ戻る（`PlaybackLoad`）。
-        let generation_id = advance_load_generation(&runner.load_generation);
-        spawn_session_load(
-            session,
-            generation_id,
-            &runner.load_sender,
-            load_replaces_playback(false),
-        );
-    }
+    apply_detail_summary_status(rec, &detail, jobs_pending);
 }
 
 /// `summary.md` を Summary タブの表示行へ分ける（**Markdown をどこまで解釈するかの正はここ**。
@@ -3701,9 +3716,13 @@ fn heading_text(line: &str) -> Option<&str> {
 
 /// 詳細ペインの議事録生成の表示（状態テキスト・状態依存の配色・縮退ラベル）を反映する
 /// （`apply_detail_transcript_status` と対称。ボタンの活性の扱いもそちらの doc 参照）。
-fn apply_detail_summary_status(rec: &LibraryWindow, pane: &SummaryPane, jobs_pending: bool) {
-    let status = pane.status();
-    let message = pane.message();
+fn apply_detail_summary_status(
+    rec: &LibraryWindow,
+    detail: &shoki_core::DetailView,
+    jobs_pending: bool,
+) {
+    let status = detail.summary.status();
+    let message = detail.summary.message();
     rec.set_detail_summary_status_text(summary_status_text(status).into());
     rec.set_detail_summary_heading(message.heading.into());
     rec.set_detail_summary_body(message.body.into());
@@ -3713,40 +3732,6 @@ fn apply_detail_summary_status(rec: &LibraryWindow, pane: &SummaryPane, jobs_pen
         |actions| rec.set_detail_summary_actions(actions),
     );
     rec.set_detail_summary_status(slint_map::to_ui_summary_status(status));
-}
-
-/// どの状態に落とすかを決める純関数。**ワーカーの記録が先、無ければ `summary.md` の有無**
-/// （文字起こし側の `shoki_core::view_detail` と同じ流儀）。
-///
-/// 議事録側が core へ移るのは段階 03（`docs/plans/done/20260829-core-shell-layers.md`）。
-/// それまではここが正。
-fn summary_pane_of(
-    state: Option<summarize::SummarizeState>,
-    has_summary: bool,
-    input: TranscriptInput,
-    auto_on: bool,
-) -> SummaryPane {
-    match state {
-        Some(summarize::SummarizeState::Queued { position, .. }) => {
-            SummaryPane::Queued { position }
-        }
-        Some(summarize::SummarizeState::Summarizing {
-            model_label,
-            elapsed,
-        }) => SummaryPane::Summarizing {
-            model: model_label,
-            started_ago: elapsed_text(elapsed),
-        },
-        Some(summarize::SummarizeState::Done) => SummaryPane::Done,
-        Some(summarize::SummarizeState::Failed { reason }) => SummaryPane::Failed { reason },
-        None if has_summary => SummaryPane::Done,
-        // 文字起こしが無いと議事録は動かせない。**「まだ書いていない」ではなく「まだ書けない」**
-        // と言い分けるのは、押しても何も起きないボタンを出さないため。無いときは、なぜ無いのか
-        // で 3 つに割れる（#165。待っている／失敗した／まだ何もしていない）。
-        // 入力の様子で 3 つに割れる（#165。対応表の正は `TranscriptInput::pane_when_no_notes`
-        // ——確認用バイナリも同じところを通す）。
-        None => input.pane_when_no_notes(auto_on),
-    }
 }
 
 /// 議事録が出来上がっているときに一覧の下へ出す出典（誰がいつ書いたか）。
@@ -4056,13 +4041,13 @@ mod tests {
     };
     // **状態の語彙は core を指す**（#188）。同名の Slint 生成型はテストでは使わない——
     // 使うなら `slint_map` を通す。
+    use super::recordings;
     use super::{
         StatusTone, SummaryPane, TranscriptPane, actions_allowed_while_busy, app_version_text,
         breathing_level, model_downloads_on_select, model_status_line, not_downloaded_count,
         outcome_of, playback_progress, seek_position_from_ratio, summary_model_status_line,
-        summary_pane_of, summary_rows, summary_status_text, whisper_model_status_line,
+        summary_rows, summary_status_text, whisper_model_status_line,
     };
-    use super::{elapsed_text, recordings, summarize};
     use chrono::{Datelike as _, Timelike as _};
     use shoki_core::{PaneAction, PaneActionKind, SummaryStatus, TranscriptStatus};
 
@@ -4096,15 +4081,12 @@ mod tests {
         let rec = super::LibraryWindow::new().expect("create the library window");
         // `apply_detail_transcript_status` が受けるのは core が組んだ `DetailView`。ここで
         // 見たいのは「ペインの値が画面へどう入るか」なので、状態から素直に組む。
-        let view = |transcript: TranscriptPane| {
-            let actions = transcript.message().actions;
-            shoki_core::DetailView {
-                transcript_input: shoki_core::TranscriptInput::Missing,
-                transcript_busy: false,
-                actions,
-                loading: false,
-                transcript,
-            }
+        let view = |transcript: TranscriptPane| shoki_core::DetailView {
+            transcript_input: shoki_core::TranscriptInput::Missing,
+            transcript_busy: false,
+            summary: SummaryPane::NotSummarized { auto_on: false },
+            loading: false,
+            transcript,
         };
 
         let partial = TranscriptPane::Failed {
@@ -4157,6 +4139,292 @@ mod tests {
             true,
         );
         assert!(!rec.get_show_partial_transcript());
+    }
+
+    /// 議事録タブも、**core が組んだ相がそのまま**ウィンドウへ入ること（#189）。
+    ///
+    /// 決めるのは core（`view_detail`）、ゲートを引くのは Slint（`detail-jobs-pending`）で、
+    /// どちらも単体では検査済み。**繋いでいるのはこの setter だけ**なので、ここが抜けると
+    /// 両側が緑のまま「生成中なのに未生成と書いてある」画面になる
+    /// （`docs/rules/testing.md` の「配線は、繋いでいる関数に継ぎ目を入れてテストする」）。
+    #[test]
+    fn the_notes_pane_puts_its_state_into_the_window() {
+        super::init_test_backend();
+        let rec = super::LibraryWindow::new().expect("create the library window");
+        // `apply_detail_summary_status` が受けるのは core が組んだ `DetailView`。ここで見たいのは
+        // 「ペインの値が画面へどう入るか」なので、議事録の状態だけ差し替えて組む。
+        let view = |summary: SummaryPane| shoki_core::DetailView {
+            transcript: TranscriptPane::Done,
+            transcript_input: shoki_core::TranscriptInput::Ready,
+            transcript_busy: false,
+            summary,
+            loading: false,
+        };
+
+        for pane in [
+            SummaryPane::NotSummarized { auto_on: false },
+            SummaryPane::Queued { position: 2 },
+            SummaryPane::Summarizing {
+                model: "Qwen".to_owned(),
+                started_ago: "40 seconds".to_owned(),
+            },
+            SummaryPane::Done,
+            SummaryPane::Failed {
+                reason: shoki_core::SummarizeFailure::ModelRun,
+            },
+        ] {
+            super::apply_detail_summary_status(&rec, &view(pane.clone()), false);
+            assert_eq!(
+                super::slint_map::from_ui_summary_status(rec.get_detail_summary_status()),
+                pane.status(),
+                "the pane that core built must be the one the window shows"
+            );
+            // **文言も同じ値から出す**。状態だけ合っていても、見出しが別の相のものだと
+            // 「生成中」と書いてある横に「まだ書いていない」の説明が並ぶ。
+            assert_eq!(
+                rec.get_detail_summary_heading().as_str(),
+                pane.message().heading,
+            );
+        }
+
+        // 走っているジョブがある間は、中身を作り直す操作を出さない（掛けるのはこの setter）。
+        let idle = SummaryPane::NotSummarized { auto_on: false };
+        super::apply_detail_summary_status(&rec, &view(idle.clone()), true);
+        let gated = slint::Model::row_count(&rec.get_detail_summary_actions());
+        super::apply_detail_summary_status(&rec, &view(idle), false);
+        assert!(
+            gated < slint::Model::row_count(&rec.get_detail_summary_actions()),
+            "a running job must remove at least one action"
+        );
+    }
+
+    /// 走り終わったジョブの生成物が、**一覧の印へ書き戻る**こと（#161 / #189）。
+    ///
+    /// **`sweep_finished_jobs` を丸ごと呼ぶ**。中の `mark_what_finished` だけを見ると、
+    /// **絞り込みで隠れている側（`all_sessions`）へ掛ける 1 行を消しても緑のまま通る**
+    /// （測った）——そこが関数の doc の言う「検索を解除したら、済んでいるはずの文字起こし・
+    /// 議事録が『無い』に戻る」を防いでいる唯一の行なので、継ぎ目は外側に置く
+    /// （`docs/rules/testing.md` の「呼べる一番外側を探す」）。
+    ///
+    /// **議事録側も `AppState` から読む**ので、文字起こしと同じ 1 本の情報源。
+    #[test]
+    fn what_the_jobs_left_behind_shows_up_in_the_list() {
+        use std::cell::{Cell, RefCell};
+
+        super::init_test_backend();
+        let rec = super::LibraryWindow::new().expect("create the library window");
+        let summarizer = super::summarize::SummarizeWorker::start(
+            super::model_download::ModelDownloader::new(),
+            super::inference_slot::InferenceSlot::new(),
+        );
+        let transcriber = super::transcribe::TranscribeWorker::start(
+            super::model_download::ModelDownloader::new(),
+            summarizer.clone(),
+            super::inference_slot::InferenceSlot::new(),
+        );
+
+        let session = |dir: &str| {
+            let mut session = recordings::session_for_test(
+                chrono::NaiveDate::from_ymd_opt(2026, 8, 10)
+                    .expect("a real date")
+                    .and_hms_opt(14, 2, 0)
+                    .expect("a real time"),
+            );
+            session.dir = std::path::PathBuf::from(dir);
+            session.has_mic = true;
+            session
+        };
+        // **絞り込みで隠れている録音**（`all_sessions` にだけ在る）と、一覧に出ている録音。
+        let hidden = session("hidden");
+        let shown = session("shown");
+
+        let app_state: std::rc::Rc<RefCell<shoki_core::AppState>> =
+            std::rc::Rc::new(RefCell::new(shoki_core::AppState::default()));
+        let segments = std::rc::Rc::new(RefCell::new(super::LoadedTranscript::unknown()));
+        let (load_sender, load_receiver) = std::sync::mpsc::channel();
+        let (scan_sender, scan_receiver) = std::sync::mpsc::channel();
+        let (_search_sender, search_receiver) = std::sync::mpsc::channel();
+        let handles = super::LibraryHandles {
+            ui: slint::ComponentHandle::as_weak(&rec),
+            player: std::rc::Rc::new(RefCell::new(None)),
+            load_receiver,
+            sessions: std::rc::Rc::new(RefCell::new(vec![shown.clone()])),
+            all_sessions: std::rc::Rc::new(RefCell::new(vec![hidden.clone(), shown.clone()])),
+            scan_receiver,
+            scan_sender,
+            scan_generation: std::rc::Rc::new(Cell::new(0)),
+            scan_state: std::rc::Rc::new(Cell::new(super::ScanState::Settled)),
+            search_receiver,
+            search_generation: std::rc::Rc::new(Cell::new(0)),
+            search_not_downloaded: std::rc::Rc::new(RefCell::new(Vec::new())),
+            sessions_model: std::rc::Rc::new(super::SessionRows::new()),
+            transcript_segments: std::rc::Rc::clone(&segments),
+            transcriber,
+            summarizer,
+            config: std::rc::Rc::new(RefCell::new(super::Config::default())),
+            state: std::rc::Rc::clone(&app_state),
+            runner: super::EffectRunner {
+                ui: slint::ComponentHandle::as_weak(&rec),
+                state: std::rc::Rc::clone(&app_state),
+                segments,
+                sessions: std::rc::Rc::new(RefCell::new(Vec::new())),
+                player: std::rc::Rc::new(RefCell::new(None)),
+                load_generation: std::rc::Rc::new(Cell::new(0)),
+                load_sender,
+            },
+        };
+
+        // 走り始めただけでは立てない（まだ何も残っていない）。
+        let running = |dir: &str| {
+            let mut state = app_state.borrow_mut();
+            let _ = shoki_core::update(
+                &mut state,
+                shoki_core::Msg::Event(shoki_core::Event::JobChanged {
+                    dir: std::path::PathBuf::from(dir),
+                    job: Some(shoki_core::Job {
+                        id: shoki_core::JobId(1),
+                        phase: shoki_core::JobPhase::Running {
+                            model_label: "Medium".to_owned(),
+                            percent: None,
+                        },
+                    }),
+                }),
+            );
+            let _ = shoki_core::update(
+                &mut state,
+                shoki_core::Msg::Event(shoki_core::Event::SummaryChanged {
+                    dir: std::path::PathBuf::from(dir),
+                    job: Some(shoki_core::SummaryJob {
+                        id: shoki_core::JobId(1),
+                        phase: shoki_core::SummaryPhase::Queued,
+                    }),
+                }),
+            );
+        };
+        running("hidden");
+        running("shown");
+        super::sweep_finished_jobs(&handles);
+        assert!(
+            handles
+                .all_sessions
+                .borrow()
+                .iter()
+                .all(|session| !session.has_transcript && !session.has_summary),
+            "a running job has left nothing yet"
+        );
+
+        // 走り終わったら、**一覧に出ていない録音にも**立てる。
+        let finished = |dir: &str| {
+            let mut state = app_state.borrow_mut();
+            let _ = shoki_core::update(
+                &mut state,
+                shoki_core::Msg::Event(shoki_core::Event::JobChanged {
+                    dir: std::path::PathBuf::from(dir),
+                    job: Some(shoki_core::Job {
+                        id: shoki_core::JobId(1),
+                        phase: shoki_core::JobPhase::Done { shortfall: None },
+                    }),
+                }),
+            );
+            let _ = shoki_core::update(
+                &mut state,
+                shoki_core::Msg::Event(shoki_core::Event::SummaryChanged {
+                    dir: std::path::PathBuf::from(dir),
+                    job: Some(shoki_core::SummaryJob {
+                        id: shoki_core::JobId(1),
+                        phase: shoki_core::SummaryPhase::Done,
+                    }),
+                }),
+            );
+        };
+        finished("hidden");
+        finished("shown");
+        super::sweep_finished_jobs(&handles);
+
+        let all = handles.all_sessions.borrow();
+        let hidden = all
+            .iter()
+            .find(|session| session.dir == std::path::Path::new("hidden"))
+            .expect("the hidden recording is still in the full list");
+        assert!(
+            hidden.has_transcript && hidden.has_summary,
+            "a recording the filter hides must still pick up what its jobs left"
+        );
+        let shown = handles.sessions.borrow();
+        assert!(shown[0].has_transcript && shown[0].has_summary);
+    }
+
+    /// 走り終わったジョブの印を、この録音へ書き戻す判定（`sweep_finished_jobs` の中身）。
+    #[test]
+    fn only_a_finished_job_marks_what_it_left() {
+        let mut session = recordings::session_for_test(
+            chrono::NaiveDate::from_ymd_opt(2026, 8, 10)
+                .expect("a real date")
+                .and_hms_opt(14, 2, 0)
+                .expect("a real time"),
+        );
+        session.dir = std::path::PathBuf::from("a");
+
+        let mut state = shoki_core::AppState::default();
+        super::mark_what_finished(&mut session, &state);
+        assert!(!session.has_transcript, "nothing has run yet");
+        assert!(!session.has_summary);
+
+        // 走っている間は立てない（まだ何も残っていない）。
+        let _ = shoki_core::update(
+            &mut state,
+            shoki_core::Msg::Event(shoki_core::Event::JobChanged {
+                dir: session.dir.clone(),
+                job: Some(shoki_core::Job {
+                    id: shoki_core::JobId(1),
+                    phase: shoki_core::JobPhase::Running {
+                        model_label: "Medium".to_owned(),
+                        percent: None,
+                    },
+                }),
+            }),
+        );
+        let _ = shoki_core::update(
+            &mut state,
+            shoki_core::Msg::Event(shoki_core::Event::SummaryChanged {
+                dir: session.dir.clone(),
+                job: Some(shoki_core::SummaryJob {
+                    id: shoki_core::JobId(1),
+                    phase: shoki_core::SummaryPhase::Queued,
+                }),
+            }),
+        );
+        super::mark_what_finished(&mut session, &state);
+        assert!(
+            !session.has_transcript,
+            "a running job has left nothing yet"
+        );
+        assert!(!session.has_summary);
+
+        // 走り終わったら立てる。
+        let _ = shoki_core::update(
+            &mut state,
+            shoki_core::Msg::Event(shoki_core::Event::JobChanged {
+                dir: session.dir.clone(),
+                job: Some(shoki_core::Job {
+                    id: shoki_core::JobId(1),
+                    phase: shoki_core::JobPhase::Done { shortfall: None },
+                }),
+            }),
+        );
+        let _ = shoki_core::update(
+            &mut state,
+            shoki_core::Msg::Event(shoki_core::Event::SummaryChanged {
+                dir: session.dir.clone(),
+                job: Some(shoki_core::SummaryJob {
+                    id: shoki_core::JobId(1),
+                    phase: shoki_core::SummaryPhase::Done,
+                }),
+            }),
+        );
+        super::mark_what_finished(&mut session, &state);
+        assert!(session.has_transcript);
+        assert!(session.has_summary);
     }
 
     /// 世代を進めたら、**走っている走査へ必ず伝わる**こと（#181）。
@@ -4519,13 +4787,16 @@ mod tests {
         }
     }
 
-    /// 議事録が完成したら、**本文を読み直す**こと（#188）。
+    /// 議事録が完成したら、**本文を読み直す**こと（#188 / #189）。
     ///
-    /// 遷移を観測できるのは 1 回だけ（`refresh_detail_panes` がすぐ上書きする）。呼び出し側へ
-    /// 返して「立っていたら読み直す」を守らせると、押した瞬間の再描画が最初の観測者になった
-    /// ときに消える——ワーカーは別スレッドなので、tick が最初とは限らない。だから読み直しも
-    /// この関数の中でやる。ここが落ちると、出来上がった議事録が画面に出ない
-    /// （`summary_rows` を書くのは `apply_loaded_session` だけ）。
+    /// **繋いでいるのはこの経路だけ**——ワーカーの記録を `job_changes` が写し、`update` が
+    /// `Effect::LoadSession` を返し、`run_effects` が読み込みを投げる。判断（`update`）も
+    /// 写し（`snapshot`）もそれぞれ単体では検査済みなので、ここが繋がっていないと**両側が緑の
+    /// まま**出来上がった議事録が画面に出ない（`summary_rows` を書くのは `apply_loaded_session`
+    /// だけ）。
+    ///
+    /// **押した瞬間の経路で見る**（tick ではなく `observe_and_refresh`）。ワーカーは別スレッド
+    /// なので、tick が最初の観測者とは限らない。
     #[test]
     fn a_summary_that_just_finished_is_read_back() {
         use std::cell::RefCell;
@@ -4534,6 +4805,11 @@ mod tests {
         let rec = super::LibraryWindow::new().expect("create the library window");
         let summarizer = super::summarize::SummarizeWorker::start(
             super::model_download::ModelDownloader::new(),
+            super::inference_slot::InferenceSlot::new(),
+        );
+        let transcriber = super::transcribe::TranscribeWorker::start(
+            super::model_download::ModelDownloader::new(),
+            summarizer.clone(),
             super::inference_slot::InferenceSlot::new(),
         );
         let mut session = recordings::session_for_test(
@@ -4552,26 +4828,49 @@ mod tests {
             ui: slint::ComponentHandle::as_weak(&rec),
             state: std::rc::Rc::new(RefCell::new(shoki_core::AppState::default())),
             segments: std::rc::Rc::new(RefCell::new(super::LoadedTranscript::unknown())),
-            sessions: std::rc::Rc::new(RefCell::new(Vec::new())),
+            // **読み直しは `sessions` から録音を引く**（`run_effects`）。空だと依頼が立っても
+            // 何も起きない。
+            sessions: std::rc::Rc::new(RefCell::new(vec![session.clone()])),
             player: std::rc::Rc::new(RefCell::new(None)),
             load_generation: std::rc::Rc::new(std::cell::Cell::new(0)),
             load_sender,
         };
         let config = RefCell::new(super::Config::default());
 
-        // 画面は「生成中」を出していて、ワーカーは走り終わった記録を持っている。
-        rec.set_detail_summary_status(super::slint_map::to_ui_summary_status(
-            shoki_core::SummaryStatus::Summarizing,
-        ));
+        // この録音を選んでいて、その議事録が走っている。
+        {
+            let mut state = runner.state.borrow_mut();
+            let _ = shoki_core::update(
+                &mut state,
+                shoki_core::Msg::Command(shoki_core::Command::Select(Some(session.dir.clone()))),
+            );
+            // **本番と同じ入口で置く**（`job_changes` が流すのと同じ `Event`）。
+            let _ = shoki_core::update(
+                &mut state,
+                shoki_core::Msg::Event(shoki_core::Event::SummaryChanged {
+                    dir: session.dir.clone(),
+                    job: Some(shoki_core::SummaryJob {
+                        id: shoki_core::JobId(0),
+                        phase: shoki_core::SummaryPhase::Summarizing {
+                            model_label: "Qwen".to_owned(),
+                            started: std::time::Instant::now(),
+                        },
+                    }),
+                }),
+            );
+        }
+        // 選択が投げた読み込みは、ここでは見ない。
+        let _ = load_receiver.recv_timeout(std::time::Duration::from_secs(5));
+
         summarizer.mark_done_for_test(&session.dir);
-        super::refresh_detail_panes(&rec, &runner, &summarizer, &session, &config);
+        super::observe_and_refresh(&rec, &runner, &transcriber, &summarizer, &session, &config);
         let loaded = load_receiver
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("the notes that just finished must be read back");
         assert_eq!(loaded.dir, session.dir);
 
         // **もう一度呼んでも読み直さない**。毎 tick 読み直すことになる。
-        super::refresh_detail_panes(&rec, &runner, &summarizer, &session, &config);
+        super::observe_and_refresh(&rec, &runner, &transcriber, &summarizer, &session, &config);
         assert!(
             load_receiver
                 .recv_timeout(std::time::Duration::from_millis(200))
@@ -4595,6 +4894,11 @@ mod tests {
         let rec = super::LibraryWindow::new().expect("create the library window");
         let summarizer = super::summarize::SummarizeWorker::start(
             super::model_download::ModelDownloader::new(),
+            super::inference_slot::InferenceSlot::new(),
+        );
+        let transcriber = super::transcribe::TranscribeWorker::start(
+            super::model_download::ModelDownloader::new(),
+            summarizer.clone(),
             super::inference_slot::InferenceSlot::new(),
         );
         let mut session = recordings::session_for_test(
@@ -4621,92 +4925,32 @@ mod tests {
         };
         let config = RefCell::new(super::Config::default());
 
-        // 画面はキュー待ちを出していて、ワーカーの記録は（取り消しで）もう無い。
-        rec.set_detail_summary_status(super::slint_map::to_ui_summary_status(
-            shoki_core::SummaryStatus::Queued,
-        ));
-        assert!(summarizer.state_of(&session.dir).is_none());
-
-        super::refresh_detail_panes(&rec, &runner, &summarizer, &session, &config);
-        assert_eq!(
-            runner.load_generation.get(),
-            3,
-            "a record that only disappeared must not stand down a load"
-        );
-    }
-
-    /// 別の録音を選んだときに、**偽の遷移で読み直さない**こと（#188）。
-    ///
-    /// 「前の議事録の状態」はウィンドウのプロパティから取るが、あれは**どの録音のものかを
-    /// 持たない**。畳まないと「A の生成中 → B の生成済み」を遷移と読み、世代を進めて B の
-    /// 音声つき読み込みを降ろす——**選んだ録音が再生できないまま残る**（同じ行を選び直しても
-    /// 音は差し替えないので直らない）。
-    #[test]
-    fn choosing_another_recording_does_not_look_like_finished_notes() {
-        use std::cell::RefCell;
-
-        super::init_test_backend();
-        let rec = super::LibraryWindow::new().expect("create the library window");
-        let summarizer = super::summarize::SummarizeWorker::start(
-            super::model_download::ModelDownloader::new(),
-            super::inference_slot::InferenceSlot::new(),
-        );
-        let session = |dir: &str, has_summary: bool| {
-            let mut session = recordings::session_for_test(
-                chrono::NaiveDate::from_ymd_opt(2026, 8, 10)
-                    .expect("a real date")
-                    .and_hms_opt(14, 2, 0)
-                    .expect("a real time"),
-            );
-            session.dir = std::path::PathBuf::from(dir);
-            session.has_mic = true;
-            session.has_transcript = true;
-            session.has_summary = has_summary;
-            session
-        };
-        // B は議事録が出来ている（ワーカーの記録は無いので `summary.md` の有無で `Done`）。
-        let b = session("b", true);
-        let (load_sender, _load_receiver) = std::sync::mpsc::channel();
-        let runner = super::EffectRunner {
-            ui: slint::ComponentHandle::as_weak(&rec),
-            state: std::rc::Rc::new(RefCell::new(shoki_core::AppState::default())),
-            segments: std::rc::Rc::new(RefCell::new(super::LoadedTranscript::unknown())),
-            sessions: std::rc::Rc::new(RefCell::new(vec![session("a", false), b.clone()])),
-            player: std::rc::Rc::new(RefCell::new(None)),
-            load_generation: std::rc::Rc::new(std::cell::Cell::new(0)),
-            load_sender,
-        };
-        let config = RefCell::new(super::Config::default());
-
-        // A を選んでいて、その議事録は生成中。
+        // この録音を選んでいて、その議事録はキュー待ち。ワーカーの記録は（取り消しで）もう無い。
         {
             let mut state = runner.state.borrow_mut();
             let _ = shoki_core::update(
                 &mut state,
-                shoki_core::Msg::Command(shoki_core::Command::Select(Some(
-                    std::path::PathBuf::from("a"),
-                ))),
+                shoki_core::Msg::Command(shoki_core::Command::Select(Some(session.dir.clone()))),
+            );
+            let _ = shoki_core::update(
+                &mut state,
+                shoki_core::Msg::Event(shoki_core::Event::SummaryChanged {
+                    dir: session.dir.clone(),
+                    job: Some(shoki_core::SummaryJob {
+                        id: shoki_core::JobId(0),
+                        phase: shoki_core::SummaryPhase::Queued,
+                    }),
+                }),
             );
         }
-        rec.set_detail_summary_status(super::slint_map::to_ui_summary_status(
-            shoki_core::SummaryStatus::Summarizing,
-        ));
+        assert!(summarizer.status_of(&session.dir).is_none());
+        let before = runner.load_generation.get();
 
-        // B を選ぶ（本番と同じ順序——`update` の依頼を実行してから組み直す）。
-        let effects = {
-            let mut state = runner.state.borrow_mut();
-            shoki_core::update(
-                &mut state,
-                shoki_core::Msg::Command(shoki_core::Command::Select(Some(b.dir.clone()))),
-            )
-        };
-        super::run_effects(&runner, effects, None);
-        let after_select = runner.load_generation.get();
-        super::refresh_detail_panes(&rec, &runner, &summarizer, &b, &config);
+        super::observe_and_refresh(&rec, &runner, &transcriber, &summarizer, &session, &config);
         assert_eq!(
             runner.load_generation.get(),
-            after_select,
-            "picking another recording must not stand down the load it just started"
+            before,
+            "a record that only disappeared must not stand down a load"
         );
     }
 
@@ -4727,7 +4971,7 @@ mod tests {
         );
         let transcriber = super::transcribe::TranscribeWorker::start(
             super::model_download::ModelDownloader::new(),
-            summarizer,
+            summarizer.clone(),
             super::inference_slot::InferenceSlot::new(),
         );
         let mut session = recordings::session_for_test(
@@ -4761,7 +5005,7 @@ mod tests {
         // 選択が投げた読み込みは、ここでは見ない。
         let _ = load_receiver.recv_timeout(std::time::Duration::from_secs(5));
         transcriber.mark_running_for_test(&session.dir, "Medium");
-        super::observe_jobs(&transcriber, &runner);
+        super::observe_jobs(&transcriber, &summarizer, &runner);
         assert!(
             load_receiver
                 .recv_timeout(std::time::Duration::from_millis(200))
@@ -4771,7 +5015,7 @@ mod tests {
 
         // ワーカーが降りた（押す直前に完了した、と同じ形）。
         transcriber.forget(&session.dir);
-        super::observe_jobs(&transcriber, &runner);
+        super::observe_jobs(&transcriber, &summarizer, &runner);
         let loaded = load_receiver
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("coming off the worker must read the recording back");
@@ -4824,7 +5068,7 @@ mod tests {
         rows.replace_all(std::slice::from_ref(&session), &state.borrow());
 
         // まだ走らせていない。
-        super::refresh_detail_panes(&rec, &runner, &summarizer, &session, &config);
+        super::refresh_detail_panes(&rec, &runner, &session, &config);
         assert_eq!(
             rec.get_detail_transcript_status(),
             super::slint_map::to_ui_transcript_status(shoki_core::TranscriptStatus::NotTranscribed)
@@ -4834,7 +5078,7 @@ mod tests {
         transcriber.mark_running_for_test(&session.dir, "Medium");
         let effects = {
             let mut state = state.borrow_mut();
-            super::job_changes(&transcriber, &state)
+            super::job_changes(&transcriber, &summarizer, &state)
                 .into_iter()
                 .flat_map(|msg| shoki_core::update(&mut state, msg))
                 .collect::<Vec<_>>()
@@ -4857,7 +5101,7 @@ mod tests {
             );
             assert_eq!(row.detail_text, "Mic only · transcribing");
         }
-        super::refresh_detail_panes(&rec, &runner, &summarizer, &session, &config);
+        super::refresh_detail_panes(&rec, &runner, &session, &config);
         assert_eq!(rec.get_detail_transcript_text(), "Transcribing…");
     }
 
@@ -4937,22 +5181,6 @@ mod tests {
             asked.borrow().as_slice(),
             ["release"],
             "the search typed while scanning must be run again against the new list"
-        );
-    }
-
-    /// 中身を読み直しただけのときは**再生を差し替えない**。
-    ///
-    /// 差し替えると `adopt` が前の対象を手放し、再生中の音が止まって先頭へ巻き戻る。文字起こしの
-    /// 完成は再生しながら待つ場面なので、そこで止まるのは痛い。
-    #[test]
-    fn only_a_new_selection_replaces_playback() {
-        assert!(
-            super::load_replaces_playback(true),
-            "picking another recording swaps the audio"
-        );
-        assert!(
-            !super::load_replaces_playback(false),
-            "a reload after the transcript finished must not stop playback"
         );
     }
 
@@ -5969,92 +6197,6 @@ mod tests {
         }
     }
 
-    /// 議事録側の選び方。**入力（文字起こし）の様子で 3 つに割れる条件はここでしか決まらない**。
-    #[test]
-    fn summary_pane_of_reads_the_state_of_its_input() {
-        use shoki_core::TranscriptInput as I;
-
-        let queued = Some(summarize::SummarizeState::Queued { position: 2 });
-
-        // ワーカーの状態があれば、`summary.md` の有無より優先する。
-        assert_eq!(
-            summary_pane_of(queued, true, I::Ready, false),
-            SummaryPane::Queued { position: 2 }
-        );
-
-        // 文字起こしが無ければ「まだ書けない」。ただし**既にある議事録は読ませる**ので、
-        // 有無の判定はそちらが先。
-        assert_eq!(
-            summary_pane_of(None, false, I::Missing, false),
-            SummaryPane::Blocked
-        );
-        assert_eq!(
-            summary_pane_of(None, true, I::Missing, false),
-            SummaryPane::Done
-        );
-        // 文字起こしがあれば「まだ書いていない」。自動の状態が pane まで届く。
-        assert_eq!(
-            summary_pane_of(None, false, I::Ready, true),
-            SummaryPane::NotSummarized { auto_on: true }
-        );
-        // 続けて書く依頼の待ち時間（#165）。**「まだ書けない」とは言い分ける**——待っていれば
-        // 始まるので、押す手を出さない。
-        assert_eq!(
-            summary_pane_of(None, false, I::Running, false),
-            SummaryPane::WaitingForTranscript
-        );
-        assert!(
-            SummaryPane::WaitingForTranscript
-                .message()
-                .actions
-                .is_empty()
-        );
-        // 入力が失敗したら議事録は始まらない。そう言って、やり直す手を出す。
-        assert_eq!(
-            summary_pane_of(None, false, I::Failed, false),
-            SummaryPane::TranscriptFailed
-        );
-        // 入力が録音と食い違うときは、そう言う（#175 / #176）。**止めはしない**ので、書く手は出す。
-        assert_eq!(
-            summary_pane_of(None, false, I::NotWhole, false),
-            SummaryPane::NotesFromPartialTranscript
-        );
-        let partial_input = SummaryPane::NotesFromPartialTranscript;
-        // **どう食い違っているかは言い分けない**（#176）。途中で終わっていても中が抜けていても
-        // 議事録にとっては同じなので、内訳を持たない言い方であること。
-        assert!(
-            partial_input
-                .message()
-                .body
-                .contains("missing parts of this recording")
-        );
-        assert_eq!(
-            partial_input
-                .message()
-                .actions
-                .iter()
-                .map(|action| (action.kind, action.primary))
-                .collect::<Vec<_>>(),
-            vec![
-                (PaneActionKind::WriteNotes, true),
-                (PaneActionKind::OpenTranscription, false),
-            ]
-        );
-        assert_eq!(partial_input.status(), SummaryStatus::NotSummarized);
-        assert_eq!(
-            SummaryPane::TranscriptFailed
-                .message()
-                .actions
-                .iter()
-                .map(|action| action.kind)
-                .collect::<Vec<_>>(),
-            vec![
-                PaneActionKind::TranscribeThenNotes,
-                PaneActionKind::OpenTranscription,
-            ]
-        );
-    }
-
     /// 走っているジョブがある間は、中身を作り直す操作を出さない（取り消しと窓は残す）。
     #[test]
     fn actions_are_dropped_while_a_job_is_running() {
@@ -6132,60 +6274,6 @@ mod tests {
             .status(),
             TranscriptStatus::Failed
         );
-    }
-
-    /// 要約もワーカーの進行状況を優先し、無ければ `summary.md` の有無で解決する
-    /// （文字起こし側と同じ契約）。
-    ///
-    /// **状態だけを出す別の関数は置かない**（#188）。同じ優先順位が 2 つになると、片方だけ
-    /// 直した日に一覧と読む領域が違うことを言う——`summary_pane_of` の `status()` で見る。
-    #[test]
-    fn the_summary_pane_prefers_worker_status_over_the_file() {
-        use crate::summarize::SummarizeStatus;
-
-        let state = |status| match status {
-            SummarizeStatus::Queued => Some(summarize::SummarizeState::Queued { position: 1 }),
-            SummarizeStatus::Summarizing => Some(summarize::SummarizeState::Summarizing {
-                model_label: "Qwen".to_owned(),
-                elapsed: Duration::from_secs(40),
-            }),
-            SummarizeStatus::Done => Some(summarize::SummarizeState::Done),
-            SummarizeStatus::Failed => Some(summarize::SummarizeState::Failed {
-                reason: shoki_core::SummarizeFailure::ModelRun,
-            }),
-        };
-        let status = |worker, has_summary| {
-            super::summary_pane_of(
-                worker,
-                has_summary,
-                shoki_core::TranscriptInput::Ready,
-                false,
-            )
-            .status()
-        };
-
-        // 投入直後（キュー待ち）は生成中と区別する。取り消せるのはこの間だけ。
-        assert_eq!(
-            status(state(SummarizeStatus::Queued), false),
-            SummaryStatus::Queued
-        );
-        // 再生成中は `summary.md` が残っていても「生成中」。
-        assert_eq!(
-            status(state(SummarizeStatus::Summarizing), true),
-            SummaryStatus::Summarizing
-        );
-        assert_eq!(
-            status(state(SummarizeStatus::Done), false),
-            SummaryStatus::Done
-        );
-        // 失敗の記録は古い `summary.md` があっても優先する（失敗を隠さない）。
-        assert_eq!(
-            status(state(SummarizeStatus::Failed), true),
-            SummaryStatus::Failed
-        );
-        // ワーカーの記録が無ければファイルの有無で解決する（起動前に生成した分など）。
-        assert_eq!(status(None, true), SummaryStatus::Done);
-        assert_eq!(status(None, false), SummaryStatus::NotSummarized);
     }
 
     #[test]
@@ -6318,18 +6406,6 @@ mod tests {
             .status(),
             SummaryStatus::Failed
         );
-    }
-
-    /// 経過は読める粒度へ丸める（100ms の tick で秒が動き続けないように、1 分以上は分だけ）。
-    #[test]
-    fn elapsed_text_rounds_to_a_readable_unit() {
-        assert_eq!(elapsed_text(Duration::from_secs(0)), "0 seconds");
-        assert_eq!(elapsed_text(Duration::from_secs(40)), "40 seconds");
-        assert_eq!(elapsed_text(Duration::from_secs(59)), "59 seconds");
-        // **単複を揃える**。そのまま `started 1 minute ago` として画面に出る。
-        assert_eq!(elapsed_text(Duration::from_secs(1)), "1 second");
-        assert_eq!(elapsed_text(Duration::from_secs(60)), "1 minute");
-        assert_eq!(elapsed_text(Duration::from_secs(200)), "3 minutes");
     }
 
     /// `summary.md` の行分け: 見出しは記号を落として heading を立て、他はそのまま。

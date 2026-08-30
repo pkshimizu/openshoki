@@ -908,7 +908,7 @@ pub fn format_elapsed(elapsed: Duration) -> String {
 
 /// 経過を読める粒度へ丸める（`40 seconds` / `3 minutes`）。**秒まで出すのは 1 分未満だけ**——
 /// 分オーダーの処理で秒を刻んでも読めないうえ、100ms の tick で数字が動き続ける。
-pub fn elapsed_text(elapsed: Duration) -> String {
+pub(crate) fn elapsed_text(elapsed: Duration) -> String {
     let seconds = elapsed.as_secs();
     if seconds < 60 {
         return plural(seconds, "second");
@@ -995,6 +995,74 @@ mod tests {
         assert_eq!(
             I::of(&TranscriptPane::Done, StoredTranscript::None),
             I::Missing
+        );
+    }
+
+    /// 経過は読める粒度へ丸める（100ms の tick で秒が動き続けないように、1 分以上は分だけ）。
+    #[test]
+    fn elapsed_text_rounds_to_a_readable_unit() {
+        assert_eq!(elapsed_text(Duration::from_secs(0)), "0 seconds");
+        assert_eq!(elapsed_text(Duration::from_secs(40)), "40 seconds");
+        assert_eq!(elapsed_text(Duration::from_secs(59)), "59 seconds");
+        // **単複を揃える**。そのまま `started 1 minute ago` として画面に出る。
+        assert_eq!(elapsed_text(Duration::from_secs(1)), "1 second");
+        assert_eq!(elapsed_text(Duration::from_secs(60)), "1 minute");
+        assert_eq!(elapsed_text(Duration::from_secs(200)), "3 minutes");
+    }
+    /// 議事録タブの**文言と操作**（#165 / #176）。相をどう選ぶかは `crate::view::summary_pane`
+    /// の役目で、ここは選ばれた相が何を言い、どのボタンを出すかを押さえる。
+    ///
+    /// **相を全部並べる別のテスト（`summary_pane_message_covers_all_states`）では足りない**——
+    /// あちらは「見出しと本文が空でない」「primary は 1 つ以下」しか見ないので、待っている間に
+    /// ボタンを生やしても、食い違いの内訳を書いても緑のまま通る。
+    #[test]
+    fn the_notes_pane_says_what_to_do_next() {
+        // 続けて書く依頼の待ち時間（#165）。**押す手を出さない**——待っていれば始まるので、
+        // ここにボタンを置くと二重に投入させることになる。
+        assert!(
+            SummaryPane::WaitingForTranscript
+                .message()
+                .actions
+                .is_empty()
+        );
+
+        let partial = SummaryPane::NotesFromPartialTranscript;
+        // **どう食い違っているかは言い分けない**（#176）。途中で終わっていても中が抜けていても
+        // 議事録にとっては同じなので、内訳を持たない言い方であること。
+        assert!(
+            partial
+                .message()
+                .body
+                .contains("missing parts of this recording")
+        );
+        // **止めはしない**ので、書く手は出す（#175 / #176）。
+        assert_eq!(
+            partial
+                .message()
+                .actions
+                .iter()
+                .map(|action| (action.kind, action.primary))
+                .collect::<Vec<_>>(),
+            vec![
+                (PaneActionKind::WriteNotes, true),
+                (PaneActionKind::OpenTranscription, false),
+            ]
+        );
+        // 状態としては「まだ書いていない」に畳む（一覧と読む領域で言うことを揃える）。
+        assert_eq!(partial.status(), SummaryStatus::NotSummarized);
+
+        // 入力が失敗したときは、やり直す手を出す。
+        assert_eq!(
+            SummaryPane::TranscriptFailed
+                .message()
+                .actions
+                .iter()
+                .map(|action| action.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                PaneActionKind::TranscribeThenNotes,
+                PaneActionKind::OpenTranscription,
+            ]
         );
     }
 }

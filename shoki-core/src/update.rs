@@ -5,7 +5,7 @@
 //! （`docs/rules/coding-conventions.md` の「`RefCell` の借用を持ったまま、作り直しの経路を
 //! 呼ばない」）。
 
-use crate::app::{AppState, Job};
+use crate::app::{AppState, Job, SummaryPhase};
 use crate::msg::{Command, Effect, Event, Msg};
 
 /// 状態を進めて、shell への依頼を返す。
@@ -94,8 +94,83 @@ fn update_event(state: &mut AppState, event: Event) -> Vec<Effect> {
             }
             Vec::new()
         }
+        Event::SummaryChanged { dir, job } => {
+            // **文字起こし側とは判定が違う**（#189）。あちらは「走っていた状態から降りた」で
+            // 読み直すが、こちらは**`summary.md` を触った相へ移ったとき**だけ読み直す。
+            //
+            // **あちらの `restarted`（1 tick の間に通番が入れ替わったら前のジョブは終わっている）
+            // に当たるものは、下の `was != next` として入っている**（要らないのではない）。
+            //
+            // 積み直しは 2 通りあって、拾えるのは片方だけ:
+            //
+            // - **走っている最中に積み直された**（`(N, Summarizing)` → `(N+1, Summarizing)`）。
+            //   N の `Done` はそもそもマップに載らない——ワーカーは走り終わったときに
+            //   `is_current` を確かめ、追い越されていれば結果を捨てる（`summarize` のワーカー
+            //   ループ）。`submit` は走っている表示をまるごと引き継ぐので、観測されるのも
+            //   `Summarizing` のまま。見落とす `Done` が存在しない
+            // - **完走してから積み直された**（`(N, Done)` → `(N+1, Queued)`）。`submit` が
+            //   引き継ぐのは `Summarizing` だけで、`Done` は `Queued` へ落ちる。この 2 つが
+            //   100ms の同じ窓に収まると、N が書いた中身はその場では読み直されない。**起きうる**
+            //   ——起きにくいのは、その間ボタンが `detail-jobs-pending` で塞がっているのと、
+            //   自動の積み直し（`main::chained_summarize_job`）が文字起こしの完了に続くため。
+            //   その場合も N+1 が終われば追いつく
+            //
+            // 議事録のジョブは、取り消し・入力が無くて飛ばした・積み直しで追い越された、の
+            // どれでも**記録が消えるだけ**でファイルには触らない。そこで読み直すと、読み込みの
+            // 世代が繰り上がって、選んだ直後に投げた音声つきの読み込みが降りる——**選んだ録音が
+            // 再生できないまま残る**（同じ行を選び直しても音は差し替えないので直らない。#188）。
+            // **網羅 match で書く**（`matches!` にしない）。相を足した日に、書くまでコンパイルが
+            // 通らないようにする——ワイルドカードだと黙って「触っていない」側に落ち、
+            // 「書き上がった議事録が画面に出ない」という気づきにくい形で壊れる。
+            let touched = |phase: &SummaryPhase| match phase {
+                SummaryPhase::Done => true,
+                // **`Failed` は触るときと触らないときがある**。消すのは
+                // `main::chained_summarize_job` で積んだジョブ（`existing_is_stale` が立つ＝
+                // 文字起こしにぶら下げて走った分）が失敗したときだけで、手動の Write notes
+                // （`existing_is_stale: false`）では既存の議事録を残す（`summarize::failed`）。
+                //
+                // **触らない失敗でも、ここでは読み直す**。区別するには「消したか」を相へ載せる
+                // 必要があり、#189 の PR-1 では踏み込まなかった。そのぶん、触っていないのに
+                // 読み込みの世代が繰り上がる場面が残る——選んだ直後の音声つき読み込みが飛んで
+                // いる間に手動の Write notes が即座に失敗すると、その読み込みが降りて**選んだ
+                // 録音が再生できないまま残る**（同じ穴の広い版が #188）。
+                //
+                // **窓の広さは測っていない**。音声の読み込みは `AudioPlayer::prepare` が数百 MB を
+                // 読む経路で、退避されていれば取り寄せまで待つ（`dataless` の実測は 82MB で 97 秒）
+                // ので、「一瞬だから起きない」とは書けない。起きにくいのは、その間に Write notes を
+                // 押して**即座に**失敗する必要があるほう。
+                SummaryPhase::Failed { .. } => true,
+                SummaryPhase::Queued | SummaryPhase::Summarizing { .. } => false,
+            };
+            let before = state
+                .summary(&dir)
+                .map(|previous| (previous.id, touched(&previous.phase)));
+            let after = job.as_ref().map(|next| (next.id, touched(&next.phase)));
+            state.set_summary(dir.clone(), job);
+            let just_touched = match (before, after) {
+                // 同じジョブが既に触ったあとなら、もう読み直してある。**通番が違えば読み直す**
+                // ——触った相のまま別のジョブへ入れ替わったとき（`(N, Failed)` → `(N+1, Failed)`
+                // など）に、相だけ見ていると差分が立たない（文字起こし側の `restarted` と同じ役目）。
+                (Some((was, already)), Some((next, true))) => !already || was != next,
+                (None, Some((_, true))) => true,
+                // 触っていない相へ移った・記録が消えた・記録がずっと無い。どれも読み直さない。
+                (Some(_) | None, Some((_, false)) | None) => false,
+            };
+            // **選んでいる録音だけ**（見ていない録音の中身を読む理由が無い）。ここで表示を直接
+            // 書かないのは、少し前に始まった読み込みの古いスナップショットが上書きするため。
+            if just_touched && state.selected() == Some(dir.as_path()) {
+                return vec![Effect::LoadSession {
+                    dir,
+                    // **音は差し替えない**。変わったのは議事録だけで、差し替えると鳴っている音が
+                    // 止まって先頭へ戻る。
+                    replaces_playback: false,
+                }];
+            }
+            Vec::new()
+        }
         Event::Deleted { dir } => {
             state.set_job(dir.clone(), None);
+            state.set_summary(dir.clone(), None);
             if state.selected() == Some(dir.as_path()) {
                 state.set_selected(None);
                 state.clear_loaded();
@@ -109,7 +184,7 @@ fn update_event(state: &mut AppState, event: Event) -> Vec<Effect> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{JobId, JobPhase};
+    use crate::app::{JobId, JobPhase, SummaryJob};
     use crate::reading_pane::TranscriptShortfall;
     use std::path::PathBuf;
 
@@ -131,6 +206,23 @@ mod tests {
         Job {
             id: JobId(seq),
             phase: JobPhase::Done { shortfall: None },
+        }
+    }
+
+    fn summarizing(seq: u64) -> SummaryJob {
+        SummaryJob {
+            id: JobId(seq),
+            phase: SummaryPhase::Summarizing {
+                model_label: "Qwen".to_owned(),
+                started: crate::test_now(),
+            },
+        }
+    }
+
+    fn wrote(seq: u64) -> SummaryJob {
+        SummaryJob {
+            id: JobId(seq),
+            phase: SummaryPhase::Done,
         }
     }
 
@@ -316,6 +408,119 @@ mod tests {
                 }),
             )
             .is_empty()
+        );
+    }
+
+    /// 議事録は **`summary.md` を触った相へ移ったときだけ**読み直す（#189）。
+    ///
+    /// **取り消しでは読み直さない**のが肝。記録は消えるだけでファイルには触っていないので、
+    /// ここで世代を繰り上げると、選んだ直後に投げた音声つきの読み込みが降りて**選んだ録音が
+    /// 再生できないまま残る**（#188）。文字起こし側の「降りたら読み直す」と同じ形にすると
+    /// この穴が開くので、判定を分けてある。
+    #[test]
+    fn notes_reload_when_they_are_written_and_not_when_they_are_cancelled() {
+        let mut state = AppState::default();
+        update(&mut state, Msg::Command(Command::Select(Some(dir("a")))));
+        let changed = |job| Msg::Event(Event::SummaryChanged { dir: dir("a"), job });
+
+        // 積んだだけ・走り出しただけでは読み直さない。
+        assert!(
+            update(
+                &mut state,
+                changed(Some(SummaryJob {
+                    id: JobId(1),
+                    phase: SummaryPhase::Queued,
+                })),
+            )
+            .is_empty()
+        );
+        assert!(update(&mut state, changed(Some(summarizing(1)))).is_empty());
+        // 書き終わったら読み直す。
+        assert_eq!(
+            update(&mut state, changed(Some(wrote(1)))),
+            vec![Effect::LoadSession {
+                dir: dir("a"),
+                replaces_playback: false
+            }]
+        );
+        // 同じジョブのまま流れてきても、もう読み直してある。
+        assert!(update(&mut state, changed(Some(wrote(1)))).is_empty());
+
+        // 積み直して取り消す——**記録が消えるだけ**なので読み直さない。
+        assert!(
+            update(
+                &mut state,
+                changed(Some(SummaryJob {
+                    id: JobId(2),
+                    phase: SummaryPhase::Queued,
+                })),
+            )
+            .is_empty()
+        );
+        assert!(
+            update(&mut state, changed(None)).is_empty(),
+            "cancelling notes touches no file, so it must not stand down a load in flight"
+        );
+    }
+
+    /// **触った相のまま別のジョブへ入れ替わっても読み直す**（#189）。文字起こし側の
+    /// `a_job_that_was_replaced_within_one_tick_still_reloads` と対。
+    ///
+    /// 相だけを見ていると、`(N, Failed)` → `(N+1, Failed)` はどちらも「触った」なので差分が
+    /// 立たない。`Failed` は文字起こしにぶら下げて走った分だと古い `summary.md` を消すので、
+    /// ここが立たないと**消えた議事録が画面に残り続ける**。
+    #[test]
+    fn notes_replaced_by_another_job_reload_again() {
+        let mut state = AppState::default();
+        update(&mut state, Msg::Command(Command::Select(Some(dir("a")))));
+        let changed = |job| Msg::Event(Event::SummaryChanged { dir: dir("a"), job });
+
+        // 1 本目が書き上がって読み直す。
+        assert_eq!(
+            update(&mut state, changed(Some(wrote(1)))),
+            vec![Effect::LoadSession {
+                dir: dir("a"),
+                replaces_playback: false
+            }]
+        );
+        // **2 本目が書き上がったら、もう一度読み直す**。相はどちらも `Done` なので、通番を
+        // 見ていないとここで止まる。
+        assert_eq!(
+            update(&mut state, changed(Some(wrote(2)))),
+            vec![Effect::LoadSession {
+                dir: dir("a"),
+                replaces_playback: false
+            }],
+            "a different job that also wrote must be read back again"
+        );
+    }
+
+    /// 失敗も読み直す。文字起こしにぶら下げて走ったジョブ（`main::chained_summarize_job`）が
+    /// 失敗したときは古い `summary.md` が消えるので、消えたことを画面へ反映する必要がある
+    /// （手動の Write notes では消えないが、ここでは区別しない。`touched` の doc）。
+    /// **選んでいない録音では読み直さない**のは文字起こし側と同じ。
+    #[test]
+    fn failed_notes_reload_but_only_for_the_recording_that_is_selected() {
+        let mut state = AppState::default();
+        update(&mut state, Msg::Command(Command::Select(Some(dir("a")))));
+        let failed = |dir: &str| {
+            Msg::Event(Event::SummaryChanged {
+                dir: PathBuf::from(dir),
+                job: Some(SummaryJob {
+                    id: JobId(1),
+                    phase: SummaryPhase::Failed {
+                        reason: crate::reading_pane::SummarizeFailure::ModelRun,
+                    },
+                }),
+            })
+        };
+        assert!(update(&mut state, failed("b")).is_empty());
+        assert_eq!(
+            update(&mut state, failed("a")),
+            vec![Effect::LoadSession {
+                dir: dir("a"),
+                replaces_playback: false
+            }]
         );
     }
 
