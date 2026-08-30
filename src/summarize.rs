@@ -2034,46 +2034,68 @@ mod tests {
         assert!(!counts_as_pending(SummarizeStatus::Failed));
     }
 
-    /// `snapshot` は**相が運ぶ値も落とさない**（#189）。
+    /// `snapshot` は**通番も相が運ぶ値も落とさない**（#189）。
     ///
     /// モデル名と開始時刻は `Summarizing` にしか無く、`mark_done_for_test` を通す経路では
     /// `Done` しか作れない。ここを見ていないと、`SummarizeEntry::phase` の `Summarizing` 腕が
     /// **どのテストからも実行されない**——画面に「生成中（モデル名なし・0 秒前）」が出るまで
     /// 気づけない。
+    ///
+    /// **通番も同じ**。`JobId` を定数に潰してもワークスペース全体が緑のまま通っていた（測った）。
+    /// 壊れるのは core 側で、順番は `other.id < mine.id` で数えるので**待っている録音が全部
+    /// 「1 番目」**になり、積み直しの検出（`update` の `was != next`）も永久に立たない。
     #[test]
-    fn the_snapshot_carries_what_the_phase_holds() {
+    fn the_snapshot_carries_the_number_and_what_the_phase_holds() {
         let worker = SummarizeWorker::start(
             crate::model_download::ModelDownloader::new(),
             crate::inference_slot::InferenceSlot::new(),
         );
         let started = Instant::now();
+        // **本番と同じ順で番号を配る**（`next_seq` はロックの中でしか呼べないので、採番順と
+        // 登録順がずれない）。a が先、b が後。
         {
             let mut queue = lock_queue(&worker.queue);
-            let seq = queue.next_seq();
+            let first = queue.next_seq();
             queue.status.insert(
                 std::path::PathBuf::from("/tmp/a"),
                 (
-                    seq,
+                    first,
                     SummarizeEntry::Summarizing {
                         model_label: "Qwen2.5 3B".to_owned(),
                         started,
                     },
                 ),
             );
+            let second = queue.next_seq();
+            queue.status.insert(
+                std::path::PathBuf::from("/tmp/b"),
+                (second, SummarizeEntry::Queued),
+            );
         }
 
         let snapshot = worker.snapshot();
-        let [(dir, job)] = snapshot.as_slice() else {
-            panic!("one entry, got {snapshot:?}");
+        let job_of = |name: &str| {
+            snapshot
+                .iter()
+                .find(|(dir, _)| dir == std::path::Path::new(name))
+                .map(|(_, job)| job.clone())
+                .unwrap_or_else(|| panic!("{name} is in the snapshot, got {snapshot:?}"))
         };
-        assert_eq!(dir, std::path::Path::new("/tmp/a"));
+        let a = job_of("/tmp/a");
+        let b = job_of("/tmp/b");
         assert_eq!(
-            job.phase,
+            a.phase,
             shoki_core::SummaryPhase::Summarizing {
                 model_label: "Qwen2.5 3B".to_owned(),
                 started,
             },
             "the model name and the start time must survive the crossing"
+        );
+        assert!(
+            a.id < b.id,
+            "the number must keep the order they were submitted in, got {:?} and {:?}",
+            a.id,
+            b.id
         );
     }
 

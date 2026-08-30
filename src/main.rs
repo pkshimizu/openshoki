@@ -4200,11 +4200,163 @@ mod tests {
 
     /// 走り終わったジョブの生成物が、**一覧の印へ書き戻る**こと（#161 / #189）。
     ///
-    /// 一覧行のインジケータと、絞り込みで隠れている録音の印はこれで揃う。ここが死ぬと、検索を
-    /// 解除したときに済んでいるはずの文字起こし・議事録が「無い」に戻る（一覧は再走査するまで
-    /// 直らない）。**議事録側も `AppState` から読む**ので、文字起こしと同じ 1 本の情報源。
+    /// **`sweep_finished_jobs` を丸ごと呼ぶ**。中の `mark_what_finished` だけを見ると、
+    /// **絞り込みで隠れている側（`all_sessions`）へ掛ける 1 行を消しても緑のまま通る**
+    /// （測った）——そこが関数の doc の言う「検索を解除したら、済んでいるはずの文字起こし・
+    /// 議事録が『無い』に戻る」を防いでいる唯一の行なので、継ぎ目は外側に置く
+    /// （`docs/rules/testing.md` の「呼べる一番外側を探す」）。
+    ///
+    /// **議事録側も `AppState` から読む**ので、文字起こしと同じ 1 本の情報源。
     #[test]
     fn what_the_jobs_left_behind_shows_up_in_the_list() {
+        use std::cell::{Cell, RefCell};
+
+        super::init_test_backend();
+        let rec = super::LibraryWindow::new().expect("create the library window");
+        let summarizer = super::summarize::SummarizeWorker::start(
+            super::model_download::ModelDownloader::new(),
+            super::inference_slot::InferenceSlot::new(),
+        );
+        let transcriber = super::transcribe::TranscribeWorker::start(
+            super::model_download::ModelDownloader::new(),
+            summarizer.clone(),
+            super::inference_slot::InferenceSlot::new(),
+        );
+
+        let session = |dir: &str| {
+            let mut session = recordings::session_for_test(
+                chrono::NaiveDate::from_ymd_opt(2026, 8, 10)
+                    .expect("a real date")
+                    .and_hms_opt(14, 2, 0)
+                    .expect("a real time"),
+            );
+            session.dir = std::path::PathBuf::from(dir);
+            session.has_mic = true;
+            session
+        };
+        // **絞り込みで隠れている録音**（`all_sessions` にだけ在る）と、一覧に出ている録音。
+        let hidden = session("hidden");
+        let shown = session("shown");
+
+        let app_state: std::rc::Rc<RefCell<shoki_core::AppState>> =
+            std::rc::Rc::new(RefCell::new(shoki_core::AppState::default()));
+        let segments = std::rc::Rc::new(RefCell::new(super::LoadedTranscript::unknown()));
+        let (load_sender, load_receiver) = std::sync::mpsc::channel();
+        let (scan_sender, scan_receiver) = std::sync::mpsc::channel();
+        let (_search_sender, search_receiver) = std::sync::mpsc::channel();
+        let handles = super::LibraryHandles {
+            ui: slint::ComponentHandle::as_weak(&rec),
+            player: std::rc::Rc::new(RefCell::new(None)),
+            load_receiver,
+            sessions: std::rc::Rc::new(RefCell::new(vec![shown.clone()])),
+            all_sessions: std::rc::Rc::new(RefCell::new(vec![hidden.clone(), shown.clone()])),
+            scan_receiver,
+            scan_sender,
+            scan_generation: std::rc::Rc::new(Cell::new(0)),
+            scan_state: std::rc::Rc::new(Cell::new(super::ScanState::Settled)),
+            search_receiver,
+            search_generation: std::rc::Rc::new(Cell::new(0)),
+            search_not_downloaded: std::rc::Rc::new(RefCell::new(Vec::new())),
+            sessions_model: std::rc::Rc::new(super::SessionRows::new()),
+            transcript_segments: std::rc::Rc::clone(&segments),
+            transcriber,
+            summarizer,
+            config: std::rc::Rc::new(RefCell::new(super::Config::default())),
+            state: std::rc::Rc::clone(&app_state),
+            runner: super::EffectRunner {
+                ui: slint::ComponentHandle::as_weak(&rec),
+                state: std::rc::Rc::clone(&app_state),
+                segments,
+                sessions: std::rc::Rc::new(RefCell::new(Vec::new())),
+                player: std::rc::Rc::new(RefCell::new(None)),
+                load_generation: std::rc::Rc::new(Cell::new(0)),
+                load_sender,
+            },
+        };
+
+        // 走り始めただけでは立てない（まだ何も残っていない）。
+        let running = |dir: &str| {
+            let mut state = app_state.borrow_mut();
+            let _ = shoki_core::update(
+                &mut state,
+                shoki_core::Msg::Event(shoki_core::Event::JobChanged {
+                    dir: std::path::PathBuf::from(dir),
+                    job: Some(shoki_core::Job {
+                        id: shoki_core::JobId(1),
+                        phase: shoki_core::JobPhase::Running {
+                            model_label: "Medium".to_owned(),
+                            percent: None,
+                        },
+                    }),
+                }),
+            );
+            let _ = shoki_core::update(
+                &mut state,
+                shoki_core::Msg::Event(shoki_core::Event::SummaryChanged {
+                    dir: std::path::PathBuf::from(dir),
+                    job: Some(shoki_core::SummaryJob {
+                        id: shoki_core::JobId(1),
+                        phase: shoki_core::SummaryPhase::Queued,
+                    }),
+                }),
+            );
+        };
+        running("hidden");
+        running("shown");
+        super::sweep_finished_jobs(&handles);
+        assert!(
+            handles
+                .all_sessions
+                .borrow()
+                .iter()
+                .all(|session| !session.has_transcript && !session.has_summary),
+            "a running job has left nothing yet"
+        );
+
+        // 走り終わったら、**一覧に出ていない録音にも**立てる。
+        let finished = |dir: &str| {
+            let mut state = app_state.borrow_mut();
+            let _ = shoki_core::update(
+                &mut state,
+                shoki_core::Msg::Event(shoki_core::Event::JobChanged {
+                    dir: std::path::PathBuf::from(dir),
+                    job: Some(shoki_core::Job {
+                        id: shoki_core::JobId(1),
+                        phase: shoki_core::JobPhase::Done { shortfall: None },
+                    }),
+                }),
+            );
+            let _ = shoki_core::update(
+                &mut state,
+                shoki_core::Msg::Event(shoki_core::Event::SummaryChanged {
+                    dir: std::path::PathBuf::from(dir),
+                    job: Some(shoki_core::SummaryJob {
+                        id: shoki_core::JobId(1),
+                        phase: shoki_core::SummaryPhase::Done,
+                    }),
+                }),
+            );
+        };
+        finished("hidden");
+        finished("shown");
+        super::sweep_finished_jobs(&handles);
+
+        let all = handles.all_sessions.borrow();
+        let hidden = all
+            .iter()
+            .find(|session| session.dir == std::path::Path::new("hidden"))
+            .expect("the hidden recording is still in the full list");
+        assert!(
+            hidden.has_transcript && hidden.has_summary,
+            "a recording the filter hides must still pick up what its jobs left"
+        );
+        let shown = handles.sessions.borrow();
+        assert!(shown[0].has_transcript && shown[0].has_summary);
+    }
+
+    /// 走り終わったジョブの印を、この録音へ書き戻す判定（`sweep_finished_jobs` の中身）。
+    #[test]
+    fn only_a_finished_job_marks_what_it_left() {
         let mut session = recordings::session_for_test(
             chrono::NaiveDate::from_ymd_opt(2026, 8, 10)
                 .expect("a real date")
