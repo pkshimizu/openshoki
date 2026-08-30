@@ -355,24 +355,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let search_not_downloaded: Rc<RefCell<Vec<std::path::PathBuf>>> =
         Rc::new(RefCell::new(Vec::new()));
 
-    {
-        // 隠すときも**世代を進める**（#152）。進めないと、閉じたあとに届いた読み込み結果が
-        // 誰も見ていない画面へ適用され、音声のハンドルと文字起こし本文を次に開くまで抱え続ける。
-        let generation = Rc::clone(&load_generation);
-        let search_generation = Rc::clone(&search_generation);
-        let scan_generation = Rc::clone(&scan_generation);
-        library_ui.window().on_close_requested(move || {
-            advance_load_generation(&generation);
-            // 検索も同じ理由で降ろす（走っていると、次に開いた一覧を後から絞り込む）。
-            advance_search_generation(&search_generation);
-            // **走査も降ろす**（#181）。進めないと、閉じたあとも保存先を舐め続けたうえ、
-            // 届いた結果が誰も見ていない一覧へ普通に適用される（`ui.upgrade()` は
-            // `HideWindow` なので成功する）。掃除も降りた走査では走らない。
-            advance_scan_generation(&scan_generation);
-            slint::CloseRequestResponse::HideWindow
-        });
-    }
-
     // 音声再生ハンドル。出力デバイスを開けない環境では再生機能なしで続行する（一覧・常駐は動く）。
     let player: Rc<RefCell<Option<player::AudioPlayer>>> = Rc::new(RefCell::new(
         match player::AudioPlayer::new() {
@@ -412,6 +394,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         load_sender: load_sender.clone(),
     };
 
+    {
+        // 隠すときも**世代を進める**（#152）。進めないと、閉じたあとに届いた読み込み結果が
+        // 誰も見ていない画面へ適用され、音声のハンドルと文字起こし本文を次に開くまで抱え続ける。
+        let generation = Rc::clone(&load_generation);
+        let search_generation = Rc::clone(&search_generation);
+        let scan_generation = Rc::clone(&scan_generation);
+        let close_state = Rc::clone(&app_state);
+        let close_runner = runner.clone();
+        library_ui.window().on_close_requested(move || {
+            advance_load_generation(&generation);
+            // **表示中の中身も落とす**（#188）。閉じたあとに届いた読み込みが誰も見ていない画面へ
+            // 入り、発話本文を次に開くまで抱え続ける——世代を進めるだけでは止まらない
+            // （届いた結果を捨てるかは core が `selected` で決めるので、そちらも解除する）。
+            //
+            // **再生は止めない**。音源を手放すのは「音源を差し替える」依頼のときだけで、閉じても
+            // 鳴っているものは鳴り続ける（開き直すと `open_library_window` が手放す）。
+            let effects = {
+                let mut state = close_state.borrow_mut();
+                shoki_core::update(
+                    &mut state,
+                    shoki_core::Msg::Command(shoki_core::Command::Select(None)),
+                )
+            };
+            run_effects(&close_runner, effects, None);
+            // 検索も同じ理由で降ろす（走っていると、次に開いた一覧を後から絞り込む）。
+            advance_search_generation(&search_generation);
+            // **走査も降ろす**（#181）。進めないと、閉じたあとも保存先を舐め続けたうえ、
+            // 届いた結果が誰も見ていない一覧へ普通に適用される（`ui.upgrade()` は
+            // `HideWindow` なので成功する）。掃除も降りた走査では走らない。
+            advance_scan_generation(&scan_generation);
+            slint::CloseRequestResponse::HideWindow
+        });
+    }
+
     // セッション選択: 詳細を更新し、その音源を再生準備する。
     //
     // **重い読み込みは別スレッドへ出す**（#152）。文字起こし JSON のパースと、音声のデコーダを
@@ -450,7 +466,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             rec.set_detail_sources(session.source_summary().into());
             rec.set_has_transcript(session.has_transcript);
             rec.set_playing(false);
-            rec.set_loading(true);
 
             // **選んだことを core へ伝える**（#188）。前の中身を落とすか・音源を差し替えるかを
             // 決めるのは `update`——同じ録音を選び直したときに落とすと、伏せてある途中結果が
@@ -469,7 +484,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             run_effects(&runner, effects, None);
 
             // 状態の表示は、落としたあとの状態から組み直す。
-            refresh_detail_panes(&rec, &app_state.borrow(), &summarizer, &session, &config);
+            // **戻り値は捨てる**。押した直後の再描画で議事録が完成へ移ることはない
+            // （完成を拾うのは tick）。
+            let _ = refresh_detail_panes(&rec, &app_state.borrow(), &summarizer, &session, &config);
         });
     }
 
@@ -603,8 +620,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return;
             };
             submit_transcription(session, &config, &transcriber, ChainNotes::FollowTheSetting);
+            observe_jobs(&transcriber, &app_state);
             if let Some(rec) = rec_weak.upgrade() {
-                refresh_detail_panes(&rec, &app_state.borrow(), &summarizer, session, &config);
+                // **戻り値は捨てる**（押した直後の再描画。完成を拾うのは tick）。
+                let _ =
+                    refresh_detail_panes(&rec, &app_state.borrow(), &summarizer, session, &config);
             }
         });
     }
@@ -625,8 +645,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return;
             };
             submit_transcription(session, &config, &transcriber, ChainNotes::Always);
+            observe_jobs(&transcriber, &app_state);
             if let Some(rec) = rec_weak.upgrade() {
-                refresh_detail_panes(&rec, &app_state.borrow(), &summarizer, session, &config);
+                // **戻り値は捨てる**（押した直後の再描画。完成を拾うのは tick）。
+                let _ =
+                    refresh_detail_panes(&rec, &app_state.borrow(), &summarizer, session, &config);
             }
         });
     }
@@ -656,7 +679,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             summarizer.submit(manual_summarize_job(&config.borrow(), &session.dir));
             // 投入結果（通常は「生成中」）を即反映し、2 連クリックの多重投入を防ぐ。
             if let Some(rec) = rec_weak.upgrade() {
-                refresh_detail_panes(&rec, &app_state.borrow(), &summarizer, session, &config);
+                // **戻り値は捨てる**（押した直後の再描画。完成を拾うのは tick）。
+                let _ =
+                    refresh_detail_panes(&rec, &app_state.borrow(), &summarizer, session, &config);
             }
         });
     }
@@ -681,7 +706,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             // 取り消し結果（通常は未生成／生成済みへ戻る）を即反映する。
             if let Some(rec) = rec_weak.upgrade() {
-                refresh_detail_panes(&rec, &app_state.borrow(), &summarizer, session, &config);
+                // **戻り値は捨てる**（押した直後の再描画。完成を拾うのは tick）。
+                let _ =
+                    refresh_detail_panes(&rec, &app_state.borrow(), &summarizer, session, &config);
             }
         });
     }
@@ -714,8 +741,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("Skipping the stop because the transcription is no longer running");
                 }
             }
+            observe_jobs(&transcriber, &app_state);
             if let Some(rec) = rec_weak.upgrade() {
-                refresh_detail_panes(&rec, &app_state.borrow(), &summarizer, session, &config);
+                // **戻り値は捨てる**（押した直後の再描画。完成を拾うのは tick）。
+                let _ =
+                    refresh_detail_panes(&rec, &app_state.borrow(), &summarizer, session, &config);
             }
         });
     }
@@ -1585,6 +1615,7 @@ fn build_menu_event_handler(
             // 引きだけで、ディスクは読まない。
             sweep_finished_jobs(&recordings);
 
+            let mut summary_done = false;
             {
                 let sessions_ref = recordings.sessions.borrow();
                 let state = recordings.state.borrow();
@@ -1599,41 +1630,22 @@ fn build_menu_event_handler(
                     // **読む領域は毎回組み直す**（#154）。進捗の割合と経過は状態が変わらない
                     // まま動くので、状態の差分だけで更新すると数字が止まって見える
                     // （`docs/rules/slint.md` の「差分更新は表示に使う値ぜんぶで比べる」）。
-                    refresh_detail_panes(
+                    // 議事録が完成したら読み直す（文字起こし側は `update` が `Effect` で返す）。
+                    summary_done = refresh_detail_panes(
                         &rec,
                         &state,
                         &recordings.summarizer,
                         session,
                         &recordings.config,
-                    );
+                    )
+                    .0;
                     rec.set_has_transcript(session.has_transcript);
                 }
             }
 
-            // 議事録が完成したら読み直す（文字起こし側は `update` が `Effect` で返す）。
-            let summary_done = {
-                let sessions_ref = recordings.sessions.borrow();
-                selected
-                    .and_then(|i| sessions_ref.get(i))
-                    .is_some_and(|session| {
-                        let status = summary_display_status(
-                            recordings.summarizer.status_of(&session.dir),
-                            session.has_summary,
-                        );
-                        let previous =
-                            slint_map::from_ui_summary_status(rec.get_detail_summary_status());
-                        matches!(
-                            previous,
-                            shoki_core::SummaryStatus::Queued
-                                | shoki_core::SummaryStatus::Summarizing
-                        ) && status == shoki_core::SummaryStatus::Done
-                    })
-            };
-            let reload_selected = summary_done;
-
             // 中身が変わったので読み直す。**世代を進めてから**起こすので、走っている古い読み込みの
             // 結果は届いても捨てられる（`spawn_session_load` の doc）。
-            if reload_selected {
+            if summary_done {
                 let sessions = recordings.sessions.borrow();
                 if let Some(session) = selected.and_then(|i| sessions.get(i)) {
                     let generation_id = advance_load_generation(&recordings.load_generation);
@@ -1738,7 +1750,7 @@ fn load_replaces_playback(selection_changed: bool) -> bool {
 
 /// 選択の世代を 1 つ進めて、**走っている読み込みへ知らせる**。進めた世代を返す。
 ///
-/// 世代は 2 つの役目を持つ。(1) 遅れて届いた結果を捨てる（`load_is_current`）。(2) まだ重い処理に
+/// 世代は 2 つの役目を持つ。(1) 遅れて届いた結果を捨てる（判定は `shoki_core::AppState`）。(2) まだ重い処理に
 /// 入っていない読み込みを**降ろす**——連打したぶんだけ数百 MB を読み切るのは、いま見たい録音の
 /// 読み込みを自分で遅くする。
 ///
@@ -2213,7 +2225,6 @@ fn apply_loaded_session(
             rec.set_seekable(playable && duration.is_some());
         }
     }
-    rec.set_loading(false);
 }
 
 /// セッションディレクトリを OS のゴミ箱へ移動する。macOS では `NsFileManager` 方式を明示する:
@@ -2272,7 +2283,6 @@ fn clear_library_selection(rec: &LibraryWindow, runner: &EffectRunner) {
         )
     };
     run_effects(runner, effects, None);
-    rec.set_loading(false);
     rec.set_selected_index(-1);
     rec.set_has_selection(false);
     rec.set_playing(false);
@@ -2735,6 +2745,14 @@ fn run_effects(
                     run_effects(recordings, effects, None);
                     continue;
                 };
+                if replaces_playback {
+                    // **前の録音の音声はすぐ手放す**（読み込みを待つ間に前の音が鳴らないように）。
+                    // 音源を差し替える依頼のときだけ——中身の読み直しで手放すと、鳴っている音が
+                    // 止まって先頭へ戻る（`PlaybackLoad` の doc）。
+                    if let Some(p) = recordings.player.borrow_mut().as_mut() {
+                        p.unload();
+                    }
+                }
                 let generation_id = advance_load_generation(&recordings.load_generation);
                 spawn_session_load(
                     &session,
@@ -2751,9 +2769,24 @@ fn run_effects(
             }
             shoki_core::Effect::ClearLoaded => {
                 *recordings.segments.borrow_mut() = LoadedTranscript::unknown();
-                clear_shown_transcript(&rec, &recordings.player);
+                clear_shown_transcript(&rec);
             }
         }
+    }
+}
+
+/// ワーカーを変えた**直後にその場で** `AppState` へ写す（#188）。
+///
+/// tick を待つと最大 100ms のあいだ画面が「何も起きていない」と答える。押した瞬間に
+/// 「Stopping…」へ移らないと、押しても効いていないように見える（#163）。**削除のガードも
+/// これに乗っている**——`on_delete_session` は「投入の直後にゲートが閉じる」ことを前提に、
+/// 走行中セッションを消せない形にしている。
+fn observe_jobs(transcriber: &transcribe::TranscribeWorker, state: &RefCell<shoki_core::AppState>) {
+    let mut state = state.borrow_mut();
+    for msg in job_changes(transcriber, &state) {
+        // **`Effect` は捨てる**。ここで返るのは選択中の録音の読み直しだけで、投入・停止の直後に
+        // 読み直しても中身はまだ変わっていない（変わったら tick が拾う）。
+        let _ = shoki_core::update(&mut state, msg);
     }
 }
 
@@ -2850,7 +2883,7 @@ fn sweep_finished_jobs(recordings: &LibraryHandles) {
 /// どちらも発話由来の機微データなので、詳細ペインが隠れている間も持ち続けない
 /// （`docs/rules/security.md`）。**core の `loaded` を落とすのと対**——片方だけ落とすと、
 /// 画面には残っているのに状態は「読み込み中」、という食い違いになる。
-fn clear_shown_transcript(rec: &LibraryWindow, player: &Rc<RefCell<Option<player::AudioPlayer>>>) {
+fn clear_shown_transcript(rec: &LibraryWindow) {
     rec.set_segments(Rc::new(slint::VecModel::<TranscriptRow>::default()).into());
     rec.set_summary_rows(Rc::new(slint::VecModel::<SummaryRow>::default()).into());
     rec.set_detail_summary_footer(slint::SharedString::new());
@@ -2859,10 +2892,6 @@ fn clear_shown_transcript(rec: &LibraryWindow, player: &Rc<RefCell<Option<player
     rec.set_playable(false);
     rec.set_seekable(false);
     apply_playback_position(rec, Duration::ZERO, None);
-    // 前の録音の音声はすぐ手放す（読み込みを待つ間に前の音が鳴らないように）。
-    if let Some(p) = player.borrow_mut().as_mut() {
-        p.unload();
-    }
     // 開いた途中結果も畳む（理由は `fold_partial_transcript` の doc）。
     fold_partial_transcript(rec);
 }
@@ -3070,12 +3099,6 @@ fn open_library_window(
     clear_library_selection(rec, &handles.runner);
     handles.sessions.borrow_mut().clear();
     *last_play_secs = None;
-    // 再生ハンドルがあれば前回の再生対象を手放す（未選択表示に合わせて「何もロードされて
-    // いない」状態へ揃える。理由は `AudioPlayer::unload` の doc コメント参照）。
-    if let Some(p) = handles.player.borrow_mut().as_mut() {
-        p.unload();
-    }
-
     show_window(
         rec.window(),
         geometry_committed,
@@ -3475,6 +3498,10 @@ fn apply_detail_transcript_status(
     detail: &shoki_core::DetailView,
     jobs_pending: bool,
 ) {
+    // **読み込み中かも core が決める**（#188）。shell が別に立てると、`stored` の判定と
+    // 食い違う組み合わせ（読み込み中ではないのに別の録音の結果として扱う）ができる。
+    // **未選択の経路もここを通る**（`blank_detail_view`）ので、書く場所は 1 つ。
+    rec.set_loading(detail.loading);
     let pane = &detail.transcript;
     let status = pane.status();
     let message = pane.message();
@@ -3576,7 +3603,7 @@ fn refresh_detail_panes(
     summarizer: &summarize::SummarizeWorker,
     session: &recordings::RecordingSession,
     config: &RefCell<Config>,
-) {
+) -> SummaryJustFinished {
     let (auto_transcribe, auto_summarize) = {
         let config = config.borrow();
         (config.auto_transcribe, config.auto_summarize)
@@ -3596,27 +3623,28 @@ fn refresh_detail_panes(
     // タブごとに判断すると、もう一方で走っているジョブを見落としたボタンが出る。
     // `view_detail` はボタンを掛けずに返す（議事録側を知らないので、あちらで掛けると穴が開く）。
     let jobs_pending = detail.transcript_busy || shoki_core::summary_is_pending(summary.status());
+    // **書く前に読む**（#188）。前の状態はウィンドウの現在値から取るので、`apply_*` が書いた
+    // あとで読むと「前」と「いま」が同じ値になり、遷移が永久に立たない
+    // （`docs/rules/coding-conventions.md` の「値を 2 度読まず、書いた値そのもので分岐する」）。
+    // **戻り値にしてあるのは、その順序を呼び出し側に守らせないため**——ここで完結する。
+    let previous = slint_map::from_ui_summary_status(rec.get_detail_summary_status());
+    let just_finished = SummaryJustFinished(
+        shoki_core::summary_is_pending(previous)
+            && summary.status() == shoki_core::SummaryStatus::Done,
+    );
     apply_detail_transcript_status(rec, &detail, jobs_pending);
     apply_detail_summary_status(rec, &summary, jobs_pending);
+    just_finished
 }
 
-/// 議事録生成の表示状態（`shoki_core::SummaryStatus`。Slint へ写すのは `slint_map`）を合成する。
-/// ワーカーの進行状況（メモリ）があればそれを優先し、無ければ `summary.md` の有無で解決する
-/// （`transcript_display_status` と同じ流儀）。
-fn summary_display_status(
-    worker_status: Option<summarize::SummarizeStatus>,
-    has_summary: bool,
-) -> shoki_core::SummaryStatus {
-    use shoki_core::SummaryStatus as Status;
-    match worker_status {
-        Some(summarize::SummarizeStatus::Queued) => Status::Queued,
-        Some(summarize::SummarizeStatus::Summarizing) => Status::Summarizing,
-        Some(summarize::SummarizeStatus::Done) => Status::Done,
-        Some(summarize::SummarizeStatus::Failed) => Status::Failed,
-        None if has_summary => Status::Done,
-        None => Status::NotSummarized,
-    }
-}
+/// 議事録が**この tick で完成へ移ったか**（#188）。
+///
+/// **`bool` を裸で返さない**——呼び出し側が「何の真偽か」を取り違えると、読み直しが起きない／
+/// 毎 tick 起きるのどちらかになる。立ったときだけ本文を読み直す（`apply_loaded_session` が
+/// `summary_rows` を書く唯一の経路）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "議事録が完成したら本文を読み直す。捨てると出来上がった議事録が画面に出ない"]
+struct SummaryJustFinished(bool);
 
 /// `summary.md` を Summary タブの表示行へ分ける（**Markdown をどこまで解釈するかの正はここ**。
 /// `ui/library-window.slint` の `SummaryRow` はこの doc を参照する）。
@@ -3686,11 +3714,11 @@ fn apply_detail_summary_status(rec: &LibraryWindow, pane: &SummaryPane, jobs_pen
     rec.set_detail_summary_status(slint_map::to_ui_summary_status(status));
 }
 
-/// ワーカーの状態と設定から、読む領域に出す議事録の状態を組み立てる
 /// どの状態に落とすかを決める純関数。**ワーカーの記録が先、無ければ `summary.md` の有無**
 /// （文字起こし側の `shoki_core::view_detail` と同じ流儀）。
 ///
-/// 議事録側が core へ移るのは #189。それまではここが正。
+/// 議事録側が core へ移るのは段階 03（`docs/plans/done/20260829-core-shell-layers.md`）。
+/// それまではここが正。
 fn summary_pane_of(
     state: Option<summarize::SummarizeState>,
     has_summary: bool,
@@ -4030,9 +4058,8 @@ mod tests {
     use super::{
         StatusTone, SummaryPane, TranscriptPane, actions_allowed_while_busy, app_version_text,
         breathing_level, model_downloads_on_select, model_status_line, not_downloaded_count,
-        outcome_of, playback_progress, seek_position_from_ratio, summary_display_status,
-        summary_model_status_line, summary_pane_of, summary_rows, summary_status_text,
-        whisper_model_status_line,
+        outcome_of, playback_progress, seek_position_from_ratio, summary_model_status_line,
+        summary_pane_of, summary_rows, summary_status_text, whisper_model_status_line,
     };
     use super::{elapsed_text, recordings, summarize};
     use chrono::{Datelike as _, Timelike as _};
@@ -4493,6 +4520,50 @@ mod tests {
         }
     }
 
+    /// 議事録が完成したら、**本文を読み直す契機が立つ**こと（#188）。
+    ///
+    /// 立てるのは `refresh_detail_panes` の戻り値だけ。**前の状態を書く前に読む**ので、
+    /// ここで捨てると出来上がった議事録が画面に出ない（`summary_rows` を書くのは
+    /// `apply_loaded_session` だけ）。呼び出し側に順序を守らせる形にすると、書いたあとで
+    /// 読んで「前」と「いま」が同じ値になり、遷移が永久に立たなくなる。
+    #[test]
+    fn a_summary_that_just_finished_asks_for_a_reload() {
+        use std::cell::RefCell;
+
+        super::init_test_backend();
+        let rec = super::LibraryWindow::new().expect("create the library window");
+        let summarizer = super::summarize::SummarizeWorker::start(
+            super::model_download::ModelDownloader::new(),
+            super::inference_slot::InferenceSlot::new(),
+        );
+        let mut session = recordings::session_for_test(
+            chrono::NaiveDate::from_ymd_opt(2026, 8, 10)
+                .expect("a real date")
+                .and_hms_opt(14, 2, 0)
+                .expect("a real time"),
+        );
+        session.dir = std::path::PathBuf::from("20260810-140200");
+        session.has_mic = true;
+        session.has_transcript = true;
+        // 出来上がっている（ワーカーの記録は無い＝`summary.md` の有無で解決する）。
+        session.has_summary = true;
+        let state = RefCell::new(shoki_core::AppState::default());
+        let config = RefCell::new(super::Config::default());
+
+        // 画面は「生成中」を出している。
+        rec.set_detail_summary_status(super::slint_map::to_ui_summary_status(
+            shoki_core::SummaryStatus::Summarizing,
+        ));
+        let just_finished =
+            super::refresh_detail_panes(&rec, &state.borrow(), &summarizer, &session, &config);
+        assert!(just_finished.0, "the notes just became readable");
+
+        // **もう一度呼んでも立たない**。立ち続けると毎 tick 読み直すことになる。
+        let again =
+            super::refresh_detail_panes(&rec, &state.borrow(), &summarizer, &session, &config);
+        assert!(!again.0, "the transition fires once");
+    }
+
     /// **ワーカーの様子が core を通って画面まで届く**こと（#188）。
     ///
     /// `job_changes` → `update` → `view_row` / `view_detail` が繋がっていないと、文字起こしを
@@ -4529,7 +4600,7 @@ mod tests {
         rows.replace_all(std::slice::from_ref(&session), &state.borrow());
 
         // まだ走らせていない。
-        super::refresh_detail_panes(&rec, &state.borrow(), &summarizer, &session, &config);
+        let _ = super::refresh_detail_panes(&rec, &state.borrow(), &summarizer, &session, &config);
         assert_eq!(
             rec.get_detail_transcript_status(),
             super::slint_map::to_ui_transcript_status(shoki_core::TranscriptStatus::NotTranscribed)
@@ -4562,7 +4633,7 @@ mod tests {
             );
             assert_eq!(row.detail_text, "Mic only · transcribing");
         }
-        super::refresh_detail_panes(&rec, &state.borrow(), &summarizer, &session, &config);
+        let _ = super::refresh_detail_panes(&rec, &state.borrow(), &summarizer, &session, &config);
         assert_eq!(rec.get_detail_transcript_text(), "Transcribing…");
     }
 
@@ -5841,35 +5912,56 @@ mod tests {
 
     /// 要約もワーカーの進行状況を優先し、無ければ `summary.md` の有無で解決する
     /// （文字起こし側と同じ契約）。
+    ///
+    /// **状態だけを出す別の関数は置かない**（#188）。同じ優先順位が 2 つになると、片方だけ
+    /// 直した日に一覧と読む領域が違うことを言う——`summary_pane_of` の `status()` で見る。
     #[test]
-    fn summary_display_status_prefers_worker_status_over_the_file() {
+    fn the_summary_pane_prefers_worker_status_over_the_file() {
         use crate::summarize::SummarizeStatus;
+
+        let state = |status| match status {
+            SummarizeStatus::Queued => Some(summarize::SummarizeState::Queued { position: 1 }),
+            SummarizeStatus::Summarizing => Some(summarize::SummarizeState::Summarizing {
+                model_label: "Qwen".to_owned(),
+                elapsed: Duration::from_secs(40),
+            }),
+            SummarizeStatus::Done => Some(summarize::SummarizeState::Done),
+            SummarizeStatus::Failed => Some(summarize::SummarizeState::Failed {
+                reason: shoki_core::SummarizeFailure::ModelRun,
+            }),
+        };
+        let status = |worker, has_summary| {
+            super::summary_pane_of(
+                worker,
+                has_summary,
+                shoki_core::TranscriptInput::Ready,
+                false,
+            )
+            .status()
+        };
 
         // 投入直後（キュー待ち）は生成中と区別する。取り消せるのはこの間だけ。
         assert_eq!(
-            summary_display_status(Some(SummarizeStatus::Queued), false),
+            status(state(SummarizeStatus::Queued), false),
             SummaryStatus::Queued
         );
         // 再生成中は `summary.md` が残っていても「生成中」。
         assert_eq!(
-            summary_display_status(Some(SummarizeStatus::Summarizing), true),
+            status(state(SummarizeStatus::Summarizing), true),
             SummaryStatus::Summarizing
         );
         assert_eq!(
-            summary_display_status(Some(SummarizeStatus::Done), false),
+            status(state(SummarizeStatus::Done), false),
             SummaryStatus::Done
         );
         // 失敗の記録は古い `summary.md` があっても優先する（失敗を隠さない）。
         assert_eq!(
-            summary_display_status(Some(SummarizeStatus::Failed), true),
+            status(state(SummarizeStatus::Failed), true),
             SummaryStatus::Failed
         );
         // ワーカーの記録が無ければファイルの有無で解決する（起動前に生成した分など）。
-        assert_eq!(summary_display_status(None, true), SummaryStatus::Done);
-        assert_eq!(
-            summary_display_status(None, false),
-            SummaryStatus::NotSummarized
-        );
+        assert_eq!(status(None, true), SummaryStatus::Done);
+        assert_eq!(status(None, false), SummaryStatus::NotSummarized);
     }
 
     #[test]

@@ -597,8 +597,8 @@ pub fn summary_status_text(display_status: SummaryStatus) -> &'static str {
 /// 読み切れているか」を別々に渡すと、渡し違えてもコンパイルが通る
 /// （`docs/rules/coding-conventions.md`）。
 ///
-/// 組み立てるのは `shoki` 側の `LoadedTranscript::stored`（`transcript::Transcript` を見るので、
-/// crate に依存できないこのモジュールには置けない）。
+/// 組み立てるのは `crate::view` の `stored_transcript`（`AppState` が覚えている読み込み結果から
+/// 決める）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoredTranscript {
     /// 文字起こしが無い。
@@ -606,7 +606,7 @@ pub enum StoredTranscript {
     /// 在って、**食い違いは分かっていない**（#176 で名前を意味に合わせた）。最後まで読み
     /// 切れているか、読み直しの最中で分からないか、**読める行が無い**（読めなかった JSON。
     /// 押しても何も現れない `Show partial` を出さないよう、ここへ落とす。
-    /// `shoki` 側の `LoadedTranscript::stored`）。「完成品と分かっている」ではない。
+    /// `crate::view` の `stored_transcript`）。「完成品と分かっている」ではない。
     NoKnownShortfall,
     /// 在って読める行もあるが、**録音と食い違っている**。**原因は断定しない**。
     NotWhole { shortfall: TranscriptShortfall },

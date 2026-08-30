@@ -101,7 +101,7 @@ pub struct SummarizeJob {
 }
 
 /// セッション単位の要約の進行状況（`TranscribeWorker` と同型）。Library ウィンドウの
-/// 詳細ペインが `main::summary_display_status` で表示状態へ合成して出す。
+/// 詳細ペインが `main::summary_pane_of` で表示状態へ合成して出す。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SummarizeStatus {
     /// 投入済みで、ワーカーが取り出すのを待っている（まだ CPU を使っていない）。
@@ -410,7 +410,7 @@ impl SummarizeWorker {
 
     /// セッションの進行状況。マップに載っていなければ `None`
     /// （表示側が `summary.md` の有無で「未生成/生成済み」を解決する。
-    /// `main::summary_display_status`）。
+    /// `main::summary_pane_of`）。
     pub fn status_of(&self, session_dir: &Path) -> Option<SummarizeStatus> {
         // **`state_of` へ委譲しない**（理由は `TranscribeWorker::status_of`）。こちらは
         // 委譲すると、状態 1 つを読むのに `queued_position` のマップ全走査まで付いてくる。

@@ -41,10 +41,11 @@
 //! # いまの状態
 //!
 //! 読む領域の文言と状態（`reading_pane`。#188 の PR-1）、録音セッションの事実と表示
-//! （`session`。PR-3a）、状態と `update` / `view_*`（`app` / `msg` / `update` / `view`。PR-3b）が
+//! （`session`）、状態と `update` / `view_*`（`app` / `msg` / `update` / `view`）が
 //! 入っている。
 //!
-//! **一覧そのもの（`sessions`）・検索・走査・世代・削除はまだ shell に在る**（PR-3c）。だから
+//! **一覧そのもの（`sessions`）・検索・走査・世代・削除はまだ shell に在る**（移すのは段階 03 以降。
+//! `docs/plans/done/20260829-core-shell-layers.md`）。だから
 //! `view_*` はセッションを引数で受ける。
 
 pub mod app;

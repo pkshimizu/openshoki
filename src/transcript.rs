@@ -16,7 +16,7 @@ use shoki_core::TranscriptShortfall;
 use std::path::Path;
 use std::time::Duration;
 
-// **話者は core に置いてある**（#188 の PR-3a）。ここから再エクスポートするのは、
+// **話者は core に置いてある**（#188）。ここから再エクスポートするのは、
 // `transcript::Speaker` という既存の呼び名を保つため（文字起こしの語彙としてはここが自然）。
 pub use shoki_core::Speaker;
 

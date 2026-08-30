@@ -109,7 +109,7 @@ pub enum TranscribeState {
     ///
     /// `shortfall` は**失敗ではないが録音と食い違っている**ことを表す（#176。壊れたパケットを
     /// 読み飛ばした音源があった）。**ここで持たないとディスクの印に負ける**——この状態は
-    /// `transcript_pane_of` でディスクより優先されるので、持たせないと走った直後だけ
+    /// `shoki_core::view_detail` でディスクより優先されるので、持たせないと走った直後だけ
     /// 「Transcribed」と言ってしまう。
     Done {
         shortfall: Option<TranscriptShortfall>,
@@ -527,11 +527,14 @@ impl TranscribeWorker {
     ///
     /// **セッション数ではなくジョブ数に比例する**。tick が `AppState.jobs` と突き合わせるために
     /// 呼ぶので、`state_of` を全行ぶん回すと `progress_of` を足した #162 の意図が消える
-    /// （あれは「全行を毎 tick 回す経路でモデル名を確保しない」ためのもの）。走っている／走り
-    /// 終わったジョブは通常 0〜2 件なので、まとめて clone しても軽い。
+    /// （あれは「全行を毎 tick 回す経路でモデル名を確保しない」ためのもの）。
+    ///
+    /// **エントリは貯まる**。走り終わった印はセッションを削除するまで残る（`TranscribeState`
+    /// の doc）ので、常駐中に文字起こしした本数ぶん増える。実測では 500 件で 0.16ms/tick
+    /// （突き合わせまで含む）——しかもこの経路はウィンドウを開いている間しか通らない。
     ///
     /// **通番も返す**。相だけを比べると、100ms の間に「完了 → 再投入」と往復したとき差分が
-    /// 1 件も立たず、完成した本文が画面に出ないまま次が走る。
+    /// 立たない（何を落とすかは `shoki_core::JobId` の doc が正）。
     pub fn snapshot(&self) -> Vec<(std::path::PathBuf, u64, TranscribeState)> {
         lock_queue(&self.queue)
             .status

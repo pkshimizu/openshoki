@@ -65,7 +65,7 @@ const SWEPT_PART_DESTS: &[&str] = &[
 
 /// セッションディレクトリ名の日時フォーマット（`main.rs` の録音開始時の命名と一致させること）。
 const DIR_DATETIME_FORMAT: &str = "%Y%m%d-%H%M%S";
-// **セッションの事実と表示は core に置いてある**（#188 の PR-3a）。走査（`list_sessions`）と
+// **セッションの事実と表示は core に置いてある**（#188）。走査（`list_sessions`）と
 // **パスの組み立て**はこちらに残る——core にファイル名を置かない（`shoki_core::session` の doc）。
 //
 // `RecordingSession` だけ再エクスポートするのは `recordings::RecordingSession` という既存の

@@ -1,4 +1,4 @@
-//! 状態から画面へ出すもの（#188 の PR-3b）。**文字起こしの状態を答えるのはここだけ**。
+//! 状態から画面へ出すもの（#188）。**文字起こしの状態を答えるのはここだけ**。
 //!
 //! ここへ畳んだ旧経路は 4 つ。どれも「セッション X のいまの状態は何か」に独自の優先順位で
 //! 答えていて、直すたびに片方だけ直る形だった:
@@ -44,8 +44,8 @@ pub struct Row {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RowKey {
     /// **どの録音か**。位置で引く以上、同じ位置に別の録音が入ったことに気づく手はこれだけ。
-    /// パスそのものではなくハッシュにすると、衝突した行が永久に更新されなくなる（しかも
-    /// 保存先のパスに依存するのでテストには絶対に出ない）ので、識別は呼び出し側が位置と
+    /// パスそのものではなくハッシュにすると、衝突した行が永久に更新されなくなる（狙って
+    /// 書かないと再現しにくい——保存先のパスに依存する）ので、識別は呼び出し側が位置と
     /// 対で持つ。ここが持つのは**表示に効く値だけ**。
     started: chrono::NaiveDateTime,
     /// 長さ（`date_text` に効く）。録音直後は `mix.mp3` がまだ無く片方の音源から見積もるので、
@@ -87,7 +87,17 @@ impl PhaseKind {
 /// この行の表示に効く値をまとめる。
 pub fn row_key(state: &AppState, session: &RecordingSession) -> RowKey {
     let phase = state.job(&session.dir).map(|job| &job.phase);
-    RowKey {
+    // **分解束縛で組む**——`RowKey` にフィールドを足すとここが割れるので、詰め忘れが黙って
+    // 通らない（`view_row` の出力に効く値が抜けると、変わった行が更新されなくなる）。
+    let RowKey {
+        started,
+        duration,
+        has_mic,
+        has_system,
+        has_transcript,
+        phase,
+        percent,
+    } = RowKey {
         started: session.started_for_key(),
         duration: session.duration,
         has_mic: session.has_mic,
@@ -95,6 +105,15 @@ pub fn row_key(state: &AppState, session: &RecordingSession) -> RowKey {
         has_transcript: session.has_transcript,
         phase: PhaseKind::of(phase),
         percent: percent_of(phase),
+    };
+    RowKey {
+        started,
+        duration,
+        has_mic,
+        has_system,
+        has_transcript,
+        phase,
+        percent,
     }
 }
 
@@ -249,9 +268,13 @@ fn transcript_pane(
     }
 }
 
-/// 議事録タブの状態を決めるのに要る、文字起こし側の busy と入力の様子。
+/// 議事録のジョブが積まれているか（キュー待ち＋生成中）。
 ///
-/// **`SummaryStatus` は shell が組む**（議事録のワーカーは PR-3b では旧経路のまま）。
+/// **文字起こし側の busy と OR して使う**のは shell（`main::refresh_detail_panes`）。そこで
+/// 作る値は Slint の `detail-jobs-pending` と**同じ条件**でなければならない——片方だけ変えると、
+/// 同じ操作がヘッダからは押せないのに空表示からは押せる、という穴になる。
+///
+/// 議事録の状態そのものを組むのは shell（core へ移すのは段階 03）。
 pub fn summary_is_pending(status: SummaryStatus) -> bool {
     matches!(status, SummaryStatus::Queued | SummaryStatus::Summarizing)
 }
@@ -311,9 +334,31 @@ mod tests {
         with_system.has_system = true;
         let mut transcribed = base.clone();
         transcribed.has_transcript = true;
+        // **時刻と `has_mic` も動かす**。動かさないと、キーからこの 2 つを落としても
+        // テストが緑のまま通る（実際に落として確かめた）。
+        let later = RecordingSession::new(
+            chrono::NaiveDate::from_ymd_opt(2026, 8, 10)
+                .expect("a real date")
+                .and_hms_opt(15, 30, 0)
+                .expect("a real time"),
+            PathBuf::from("a"),
+            DiskFacts {
+                has_mic: true,
+                ..DiskFacts::default()
+            },
+        );
+        let mut system_only = base.clone();
+        system_only.has_mic = false;
+        system_only.has_system = true;
 
         // 表示に効く値を動かすと、キーも出力も動く。
-        for changed in [&with_length, &with_system, &transcribed] {
+        for changed in [
+            &with_length,
+            &with_system,
+            &transcribed,
+            &later,
+            &system_only,
+        ] {
             assert_ne!(row_key(&empty, &base), row_key(&empty, changed));
             assert_ne!(view_row(&empty, &base), view_row(&empty, changed));
         }

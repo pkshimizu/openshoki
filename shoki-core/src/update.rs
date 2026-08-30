@@ -1,4 +1,4 @@
-//! 状態を変える唯一の関数（#188 の PR-3b）。
+//! 状態を変える唯一の関数（#188）。
 //!
 //! **ここが返した `Effect` を、shell は借用を落としてから実行する**。実行の中で別の `Msg` が
 //! 起きうるので、`AppState` を借りたまま回すと `BorrowMutError` で常駐プロセスごと落ちる
@@ -67,15 +67,24 @@ fn update_event(state: &mut AppState, event: Event) -> Vec<Effect> {
             Vec::new()
         }
         Event::JobChanged { dir, job } => {
-            let was_busy = state.job(&dir).is_some_and(|job| job.phase.busy());
+            let previous = state.job(&dir).cloned();
+            let was_busy = previous.as_ref().is_some_and(|job| job.phase.busy());
             let is_busy = job.as_ref().is_some_and(|job: &Job| job.phase.busy());
+            // **前のジョブが終わったか**。走っている状態から降りたときだけでなく、**通番が
+            // 変わったとき**も終わっている——観測の間隔（100ms）より短く「完了 → 再投入」と
+            // 往復すると、相はどちらも `Running` のままなので、通番を見ないと 1 本目の結果を
+            // 読み直す契機が消える（完成した本文が画面に出ないまま次が走る）。
+            let restarted = match (previous.as_ref(), job.as_ref()) {
+                (Some(previous), Some(next)) => previous.id != next.id,
+                _ => false,
+            };
             state.set_job(dir.clone(), job);
             // **ワーカーから降りたら読み直す**（#152 / #188）。ここで表示を直接書かないのは、
             // 少し前に始まった読み込みの古いスナップショット（まだ何も無かった頃の中身）が
             // あとから届いて、完成した文字起こしを上書きするため。
             //
             // **選択中のときだけ**。見ていない録音の中身を読み込む理由が無い。
-            if was_busy && !is_busy && state.selected() == Some(dir.as_path()) {
+            if was_busy && (!is_busy || restarted) && state.selected() == Some(dir.as_path()) {
                 return vec![Effect::LoadSession {
                     dir,
                     // **音は差し替えない**。変わったのは文字起こしだけで、差し替えると鳴っている
@@ -254,6 +263,36 @@ mod tests {
             }]
         );
         assert!(state.job(&dir("a")).is_none());
+    }
+
+    /// **通番が変われば、前のジョブは終わっている**（#188）。
+    ///
+    /// 観測は 100ms ごとなので、その間に「完了 → 再投入」と往復すると相はどちらも `Running` の
+    /// まま。通番を見ないと**1 本目の結果を読み直す契機が消え**、完成した本文が画面に出ないまま
+    /// 次が走る。
+    #[test]
+    fn a_job_that_was_replaced_within_one_tick_still_reloads() {
+        let mut state = AppState::default();
+        update(&mut state, Msg::Command(Command::Select(Some(dir("a")))));
+        let changed = |job| Msg::Event(Event::JobChanged { dir: dir("a"), job });
+        update(&mut state, changed(Some(running(1))));
+        // 相は `Running` のままだが、別のジョブになっている。
+        assert_eq!(
+            update(&mut state, changed(Some(running(2)))),
+            vec![Effect::LoadSession {
+                dir: dir("a"),
+                replaces_playback: false
+            }]
+        );
+        // **同じジョブの進捗が動いただけでは読み直さない**（毎 tick 読み直すことになる）。
+        let progressed = Job {
+            id: JobId(2),
+            phase: JobPhase::Running {
+                model_label: "base".to_owned(),
+                percent: Some(40),
+            },
+        };
+        assert!(update(&mut state, changed(Some(progressed))).is_empty());
     }
 
     /// **選んでいない録音では読み直さない**。見ていない録音の中身を読む理由が無い。
