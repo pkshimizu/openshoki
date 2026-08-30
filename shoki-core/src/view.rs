@@ -15,9 +15,9 @@
 //!
 //! **セッションは引数で受ける**。一覧そのものは shell に残っている（`crate::app` の doc）。
 
-use crate::app::{AppState, JobPhase, SummaryPhase};
+use crate::app::{AppState, JobPhase, SummaryJob, SummaryPhase};
 use crate::reading_pane::{
-    PaneAction, StoredTranscript, SummaryPane, SummaryStatus, TranscriptInput, TranscriptPane,
+    StoredTranscript, SummaryPane, SummaryStatus, TranscriptInput, TranscriptPane,
     TranscriptStatus, elapsed_text, session_transcript_word,
 };
 use crate::session::RecordingSession;
@@ -171,6 +171,15 @@ fn transcript_status(state: &AppState, session: &RecordingSession) -> Transcript
 }
 
 /// 詳細ペイン（読む領域）が出すもの。
+///
+/// **ボタン列は持たない**（#189）。`TranscriptPane::message` / `SummaryPane::message` が相から
+/// 組むので、ここへ写すと**同じものを 2 度組んで片方を捨てる**ことになる（`apply_detail_*` は
+/// 見出しと本文のために `message()` を呼び直す。100ms の tick を通る経路なので、
+/// `docs/rules/performance.md` の「ホットパスで確保しない」に当たる）。
+///
+/// **`actions_allowed_while_busy` を掛けるのは shell**——両タブの busy を突き合わせないと
+/// 決まらないので、片方しか知らないここで掛けると穴が開く（議事録生成中に Re-transcribe が
+/// 押せて、要約が読んでいる JSON を文字起こしが上書きしに行く）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DetailView {
     /// Transcript タブの状態と中身。
@@ -182,14 +191,8 @@ pub struct DetailView {
     /// **議事録側の busy と OR してから使う**。片方だけ見ると、議事録生成中に Re-transcribe が
     /// 押せて、要約が読んでいる JSON を文字起こしが上書きしに行く。
     pub transcript_busy: bool,
-    /// 空表示のボタン列。**`actions_allowed_while_busy` は掛けていない**（#188）。
-    ///
-    /// 掛けるのは shell——議事録側の busy を知らないので、ここで掛けると上の穴が開く。
-    pub actions: Vec<PaneAction>,
     /// Notes タブの状態と中身（#189）。
     pub summary: SummaryPane,
-    /// 空表示のボタン列（議事録側）。**こちらも掛けずに返す**。
-    pub summary_actions: Vec<PaneAction>,
     /// この録音の読み込みがまだ届いていない。
     ///
     /// 立っている間、shell は**前の録音の本文を出さない**（別の録音の発話を読ませない）。
@@ -208,15 +211,11 @@ pub fn view_detail(
 ) -> DetailView {
     let stored = stored_transcript(state, session);
     let transcript = transcript_pane(state, session, stored, auto.transcribe);
-    let message = transcript.message();
     let transcript_input = TranscriptInput::of(&transcript, stored);
-    let summary = summary_pane(state, session, transcript_input, auto.summarize, now);
     DetailView {
+        summary: summary_pane(state, session, transcript_input, auto.summarize, now),
         transcript_input,
         transcript_busy: state.job(&session.dir).is_some_and(|job| job.phase.busy()),
-        actions: message.actions,
-        summary_actions: summary.message().actions,
-        summary,
         loading: state.is_loading(&session.dir),
         transcript,
     }
@@ -242,23 +241,38 @@ fn summary_pane(
     auto_on: bool,
     now: std::time::Instant,
 ) -> SummaryPane {
-    match state.summary(&session.dir).map(|job| &job.phase) {
-        Some(SummaryPhase::Queued) => SummaryPane::Queued {
+    match state.summary(&session.dir) {
+        Some(
+            job @ SummaryJob {
+                phase: SummaryPhase::Queued,
+                ..
+            },
+        ) => SummaryPane::Queued {
             // **順番は読み出しのたびに数える**（#189）。前が終われば繰り上がるので、積んだ
             // 時点で固定すると「1 番目なのに始まらない」「前に誰も居ないのに 3 番目」になる。
-            position: queued_position(state, &session.dir),
+            position: queued_position(state, job),
         },
-        Some(SummaryPhase::Summarizing {
-            model_label,
-            started,
+        Some(SummaryJob {
+            phase:
+                SummaryPhase::Summarizing {
+                    model_label,
+                    started,
+                },
+            ..
         }) => SummaryPane::Summarizing {
             model: model_label.clone(),
             // **経過も読み出しのたびに引く**。値を持たせると、`Event` が 1 回きりなので
             // そこで止まる（開いたまま 5 分待っても「0 秒前」のまま）。
             started_ago: elapsed_text(now.saturating_duration_since(*started)),
         },
-        Some(SummaryPhase::Done) => SummaryPane::Done,
-        Some(SummaryPhase::Failed { reason }) => SummaryPane::Failed {
+        Some(SummaryJob {
+            phase: SummaryPhase::Done,
+            ..
+        }) => SummaryPane::Done,
+        Some(SummaryJob {
+            phase: SummaryPhase::Failed { reason },
+            ..
+        }) => SummaryPane::Failed {
             reason: reason.clone(),
         },
         None if session.has_summary => SummaryPane::Done,
@@ -273,12 +287,9 @@ fn summary_pane(
 /// **走り出しているジョブは数えない**。数えると「1 番目なのに始まらない」になる（先頭は既に
 /// 生成中で、待っている側から見た順番ではない）。
 ///
-/// 呼ぶのは相が `Queued` のときだけなので、記録が無い枝は通らない。**それでも 1 を返す**——
-/// 順番は 1 始まりで、`0` を出すと画面に「0 番目」と書くことになる。
-fn queued_position(state: &AppState, dir: &std::path::Path) -> usize {
-    let Some(mine) = state.summary(dir) else {
-        return 1;
-    };
+/// **記録そのものを受け取る**（パスで引き直さない）。呼び出し側は既に引き当てているし、引き直すと
+/// 「記録が無い」という通らない枝を持つことになる。
+fn queued_position(state: &AppState, mine: &SummaryJob) -> usize {
     state
         .summaries()
         .values()
@@ -502,6 +513,46 @@ mod tests {
         // ジョブの記録が無ければファイルの有無で解決する（起動前に生成した分など）。
         assert_eq!(status(None, true), SummaryStatus::Done);
         assert_eq!(status(None, false), SummaryStatus::NotSummarized);
+    }
+
+    /// 相が**運ぶ値**（モデル名・失敗の理由）も落とさずに渡ること（#189）。
+    ///
+    /// `status()` だけを見るテストでは通ってしまう——測ったところ、`model` を `String::new()` に
+    /// 潰しても core のテストは全部緑だった。画面には「生成中」の隣に何で走っているかが出るので、
+    /// ここが落ちると読み手は何を待っているのか分からない。
+    #[test]
+    fn the_notes_pane_carries_what_the_phase_holds() {
+        let started = crate::test_now();
+        assert_eq!(
+            pane(
+                Some(SummaryPhase::Summarizing {
+                    model_label: "Qwen2.5 3B".to_owned(),
+                    started,
+                }),
+                false,
+                TranscriptInput::Ready,
+                false,
+            ),
+            SummaryPane::Summarizing {
+                model: "Qwen2.5 3B".to_owned(),
+                started_ago: crate::reading_pane::elapsed_text(
+                    crate::test_now().saturating_duration_since(started)
+                ),
+            }
+        );
+        assert_eq!(
+            pane(
+                Some(SummaryPhase::Failed {
+                    reason: crate::reading_pane::SummarizeFailure::EmptyOutput,
+                }),
+                false,
+                TranscriptInput::Ready,
+                false,
+            ),
+            SummaryPane::Failed {
+                reason: crate::reading_pane::SummarizeFailure::EmptyOutput,
+            }
+        );
     }
 
     fn auto(transcribe: bool) -> AutoFlags {
@@ -848,10 +899,13 @@ mod tests {
         assert_eq!(detail.transcript_input, TranscriptInput::Ready);
     }
 
-    /// **ボタンは掛けずに返す**（#188）。掛けるのは shell——議事録側の busy と OR してからで
-    /// ないと、議事録生成中に Re-transcribe が押せる。
+    /// **ワーカーがファイルを触りうるかを言う**（#188）。ボタンを掛けるのは shell で、
+    /// これと議事録側を OR してから決める——片方だけ見ると、議事録生成中に Re-transcribe が
+    /// 押せて、要約が読んでいる JSON を文字起こしが上書きしに行く。
+    ///
+    /// ここが `false` に固まると、その OR は常に議事録側だけで決まる（画面は緑のまま）。
     #[test]
-    fn the_actions_come_back_ungated() {
+    fn the_pane_says_when_the_worker_may_touch_the_files() {
         let transcribed = session("a", true);
         let running = with_job(
             "a",
@@ -860,21 +914,25 @@ mod tests {
                 percent: None,
             },
         );
-        let detail = view_detail(&running, &transcribed, auto(false), crate::test_now());
-        assert!(detail.transcript_busy);
-        // 走っている間の空表示は Stop を出す。busy で消される側のボタンではないので、
-        // 掛けても掛けなくても残る——ここで見たいのは「掛けていない」ことなので、
-        // 掛けた結果と比べる。
-        let gated = crate::reading_pane::actions_allowed_while_busy(detail.actions.clone(), true);
-        assert_eq!(detail.actions, gated, "stop stays available while busy");
+        assert!(
+            view_detail(&running, &transcribed, auto(false), crate::test_now()).transcript_busy
+        );
 
-        // 走っていない録音の空表示は Re-transcribe を出す。掛けると消える。
-        let idle = AppState::for_test(Some(PathBuf::from("a")), HashMap::new());
-        let detail = view_detail(&idle, &session("a", false), auto(false), crate::test_now());
-        let gated = crate::reading_pane::actions_allowed_while_busy(detail.actions.clone(), true);
-        assert_ne!(
-            detail.actions, gated,
-            "the ungated actions must still contain what busy would remove"
+        // 走り終わった記録が残っているだけなら触らない（`Done` は #176 で残すようにした）。
+        let finished = with_job("a", JobPhase::Done { shortfall: None });
+        assert!(
+            !view_detail(&finished, &transcribed, auto(false), crate::test_now()).transcript_busy
+        );
+
+        // 止めている最中はまだ触る（降りるのはワーカーが気づいたとき）。
+        let stopping = with_job(
+            "a",
+            JobPhase::Stopping {
+                model_label: "base".to_owned(),
+            },
+        );
+        assert!(
+            view_detail(&stopping, &transcribed, auto(false), crate::test_now()).transcript_busy
         );
     }
 }

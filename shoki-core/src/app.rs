@@ -33,10 +33,15 @@ use std::path::PathBuf;
 
 use crate::reading_pane::{TranscribeFailure, TranscriptShortfall};
 
-/// 文字起こしジョブの通番（`TranscribeWorker` が採る `seq`）。
+/// ジョブの通番（ワーカーが採る `seq`）。
 ///
 /// **core では採らない**（#188）。進捗は FFI のコールバックスレッドから来るので、番号を知って
 /// いるのはワーカー側でしかありえない。
+///
+/// **マップをまたいで比べない**（#189）。`TranscribeWorker` と `SummarizeWorker` は**別々の
+/// カウンタ**を持つので、`jobs` の `JobId(3)` と `summaries` の `JobId(3)` に関係は無い
+/// （型は同じなので比べてもコンパイルは通る）。同じマップの中では、投入順そのもの——番号は
+/// キューのロックを持ったまま配られ、ワーカーは FIFO で取り出す（`SummarizeWorker::submit`）。
 ///
 /// **相だけでなくこれも比べる**。観測は 100ms ごとなので、その間に「完了 → 再投入」と往復すると
 /// 相はどちらも `Running` のまま。通番を見れば「前のジョブは終わっている」と分かるので、
@@ -86,8 +91,8 @@ impl JobPhase {
 /// そこで止まる。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SummaryPhase {
-    /// 積まれていて、まだ始まっていない。**モデル名は持たない**——取り出すまで何で走るかは
-    /// 決まらない（積み直しで追い越されることがある）。
+    /// 積まれていて、まだ始まっていない。**モデル名は持たない**（理由は
+    /// `summarize::SummarizeEntry::Queued`——取り出すまで何で走るかが決まらない）。
     Queued,
     /// 生成中。`started` は経過を出すのに使う（引き算は `view_detail`）。
     Summarizing {

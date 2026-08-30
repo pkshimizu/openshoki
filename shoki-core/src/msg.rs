@@ -184,6 +184,21 @@ mod tests {
             ),
             format!(
                 "{:?}",
+                // **中身まで入れて出す**（#189）。`SummaryPhase` に将来パスを持つフィールドが
+                // 増えても、同じ assert がそれを拾う。
+                Event::SummaryChanged {
+                    dir: dir(),
+                    job: Some(crate::app::SummaryJob {
+                        id: crate::app::JobId(1),
+                        phase: crate::app::SummaryPhase::Summarizing {
+                            model_label: "Qwen".to_owned(),
+                            started: crate::test_now(),
+                        },
+                    }),
+                }
+            ),
+            format!(
+                "{:?}",
                 Event::SessionLoaded {
                     dir: dir(),
                     generation: 1,

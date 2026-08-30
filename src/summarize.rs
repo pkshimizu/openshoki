@@ -101,7 +101,7 @@ pub struct SummarizeJob {
 }
 
 /// セッション単位の要約の進行状況（`TranscribeWorker` と同型）。Library ウィンドウの
-/// 詳細ペインが `main::summary_pane_of` で表示状態へ合成して出す。
+/// 詳細ペインが `shoki_core::view_detail` で表示状態へ合成して出す。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SummarizeStatus {
     /// 投入済みで、ワーカーが取り出すのを待っている（まだ CPU を使っていない）。
@@ -405,16 +405,31 @@ impl SummarizeWorker {
         apply_outcome(&mut queue, session_dir.to_path_buf(), seq, JobOutcome::Done);
     }
 
-    /// 状態マップを丸ごと写す（#189）。**ロック 1 回**で、ジョブ数に比例する。
+    /// 状態マップを丸ごと写す（#189）。**ロック 1 回**で、`core` がそのまま持てる形にして返す。
     ///
-    /// **`state_of` を件数ぶん呼ばない**——あちらは 1 件ごとにロックを取り、さらに順番を数えるのに
-    /// マップを全走査するので、件数の 2 乗になる。順番と経過は core が読み出し時に導出するので
-    /// （`shoki_core::view_detail`）、ここは相をそのまま渡す。
-    pub fn snapshot(&self) -> Vec<(PathBuf, u64, shoki_core::SummaryPhase)> {
+    /// **1 件ずつ読む API を件数ぶん呼ばない**（本 PR で消した `state_of` がそれで、1 件ごとに
+    /// ロックを取り、さらに順番を数えるのにマップを全走査していた）。順番と経過は core が
+    /// 読み出し時に導出するので（`shoki_core::view_detail`）、ここは相をそのまま渡す。
+    ///
+    /// **エントリは貯まる**——`apply_outcome` は `Done` / `Failed` を録音を消すまで残すので、
+    /// 写す件数は「いま走っているジョブ数」ではなく**常駐中に議事録を投入した本数**に比例する
+    /// （`TranscribeWorker::snapshot` と同じ性質）。実測では 500 件で 16µs/tick（突き合わせまで
+    /// 含む。release ビルド）——`String` を持つのは `Summarizing` の 1 件だけで、残りは
+    /// `PathBuf` の clone だけなので、文字起こし側（同条件で 0.16ms）より軽い。しかもこの経路は
+    /// ウィンドウを開いている間しか通らない。
+    pub fn snapshot(&self) -> Vec<(PathBuf, shoki_core::SummaryJob)> {
         lock_queue(&self.queue)
             .status
             .iter()
-            .map(|(dir, (seq, entry))| (dir.clone(), *seq, entry.phase()))
+            .map(|(dir, (seq, entry))| {
+                (
+                    dir.clone(),
+                    shoki_core::SummaryJob {
+                        id: shoki_core::JobId(*seq),
+                        phase: entry.phase(),
+                    },
+                )
+            })
             .collect()
     }
 
@@ -2011,6 +2026,49 @@ mod tests {
         assert!(counts_as_pending(SummarizeStatus::Summarizing));
         assert!(!counts_as_pending(SummarizeStatus::Done));
         assert!(!counts_as_pending(SummarizeStatus::Failed));
+    }
+
+    /// `snapshot` は**相が運ぶ値も落とさない**（#189）。
+    ///
+    /// モデル名と開始時刻は `Summarizing` にしか無く、`mark_done_for_test` を通す経路では
+    /// `Done` しか作れない。ここを見ていないと、`SummarizeEntry::phase` の `Summarizing` 腕が
+    /// **どのテストからも実行されない**——画面に「生成中（モデル名なし・0 秒前）」が出るまで
+    /// 気づけない。
+    #[test]
+    fn the_snapshot_carries_what_the_phase_holds() {
+        let worker = SummarizeWorker::start(
+            crate::model_download::ModelDownloader::new(),
+            crate::inference_slot::InferenceSlot::new(),
+        );
+        let started = Instant::now();
+        {
+            let mut queue = lock_queue(&worker.queue);
+            let seq = queue.next_seq();
+            queue.status.insert(
+                std::path::PathBuf::from("/tmp/a"),
+                (
+                    seq,
+                    SummarizeEntry::Summarizing {
+                        model_label: "Qwen2.5 3B".to_owned(),
+                        started,
+                    },
+                ),
+            );
+        }
+
+        let snapshot = worker.snapshot();
+        let [(dir, job)] = snapshot.as_slice() else {
+            panic!("one entry, got {snapshot:?}");
+        };
+        assert_eq!(dir, std::path::Path::new("/tmp/a"));
+        assert_eq!(
+            job.phase,
+            shoki_core::SummaryPhase::Summarizing {
+                model_label: "Qwen2.5 3B".to_owned(),
+                started,
+            },
+            "the model name and the start time must survive the crossing"
+        );
     }
 
     /// ワーカー越しでも同じ判定が効くこと（状態マップを直接組んで、ジョブを走らせずに見る）。

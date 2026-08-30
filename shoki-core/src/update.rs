@@ -98,15 +98,34 @@ fn update_event(state: &mut AppState, event: Event) -> Vec<Effect> {
             // **文字起こし側とは判定が違う**（#189）。あちらは「走っていた状態から降りた」で
             // 読み直すが、こちらは**`summary.md` を触った相へ移ったとき**だけ読み直す。
             //
+            // **あちらの `restarted`（1 tick の間に通番が入れ替わったら前のジョブは終わっている）
+            // に当たるものは要らない**。それが要るのは、走り終わりを見落とすと読み直しの機会が
+            // 二度と来ないから——こちらは相そのものを見るので、`Done` を見落とす形にならない。
+            // 積み直しで `(N, Done)` を飛ばして `(N+1, Queued)` が届いた場合は N の中身を
+            // その場では読み直さないが、N+1 が終われば追いつく（議事録の生成は分オーダーで、
+            // 100ms の観測窓に 2 つの相が収まることは実際には起きない）。
+            //
             // 議事録のジョブは、取り消し・入力が無くて飛ばした・積み直しで追い越された、の
             // どれでも**記録が消えるだけ**でファイルには触らない。そこで読み直すと、読み込みの
             // 世代が繰り上がって、選んだ直後に投げた音声つきの読み込みが降りる——**選んだ録音が
             // 再生できないまま残る**（同じ行を選び直しても音は差し替えないので直らない。#188）。
-            let touched = |phase: &SummaryPhase| {
-                // **`Failed` も触りうる**。作り直しに失敗したときに限り、`summarize::failed` が
-                // 古い `summary.md` を消す（`existing_is_stale` が立っているとき）。触らない
-                // ときに読み直しても、読み込みは同じ中身を返すだけで害は無い。
-                matches!(phase, SummaryPhase::Done | SummaryPhase::Failed { .. })
+            // **網羅 match で書く**（`matches!` にしない）。相を足した日に、書くまでコンパイルが
+            // 通らないようにする——ワイルドカードだと黙って「触っていない」側に落ち、
+            // 「書き上がった議事録が画面に出ない」という気づきにくい形で壊れる。
+            let touched = |phase: &SummaryPhase| match phase {
+                SummaryPhase::Done => true,
+                // **`Failed` は触るときと触らないときがある**。消すのは
+                // `main::chained_summarize_job` で積んだジョブ（`existing_is_stale` が立つ＝
+                // 文字起こしにぶら下げて走った分）が失敗したときだけで、手動の Write notes
+                // （`existing_is_stale: false`）では既存の議事録を残す（`summarize::failed`）。
+                //
+                // **触らない失敗でも、ここでは読み直す**。区別するには「消したか」を相へ載せる
+                // 必要があり、#189 の PR-1 では踏み込まなかった。そのぶん、触っていないのに
+                // 読み込みの世代が繰り上がる場面が残る——選んだ直後の音声つき読み込みが飛んで
+                // いる間に手動の Write notes が即座に失敗すると、その読み込みが降りて**選んだ
+                // 録音が再生できないまま残る**（同じ穴の広い版が #188。窓は 1 秒足らず）。
+                SummaryPhase::Failed { .. } => true,
+                SummaryPhase::Queued | SummaryPhase::Summarizing { .. } => false,
             };
             let before = state
                 .summary(&dir)
@@ -115,9 +134,10 @@ fn update_event(state: &mut AppState, event: Event) -> Vec<Effect> {
             state.set_summary(dir.clone(), job);
             let just_touched = match (before, after) {
                 // 同じジョブが既に触ったあとなら、もう読み直してある。
-                (Some((was, already)), Some((now, true))) => !already || was != now,
+                (Some((was, already)), Some((next, true))) => !already || was != next,
                 (None, Some((_, true))) => true,
-                _ => false,
+                // 触っていない相へ移った・記録が消えた・記録がずっと無い。どれも読み直さない。
+                (Some(_) | None, Some((_, false)) | None) => false,
             };
             // **選んでいる録音だけ**（見ていない録音の中身を読む理由が無い）。ここで表示を直接
             // 書かないのは、少し前に始まった読み込みの古いスナップショットが上書きするため。
@@ -426,9 +446,10 @@ mod tests {
         );
     }
 
-    /// 失敗も読み直す。作り直しに失敗したときは `summarize::failed` が古い `summary.md` を
-    /// 消すので、消えたことを画面へ反映する必要がある。**選んでいない録音では読み直さない**のは
-    /// 文字起こし側と同じ。
+    /// 失敗も読み直す。文字起こしにぶら下げて走ったジョブ（`main::chained_summarize_job`）が
+    /// 失敗したときは古い `summary.md` が消えるので、消えたことを画面へ反映する必要がある
+    /// （手動の Write notes では消えないが、ここでは区別しない。`touched` の doc）。
+    /// **選んでいない録音では読み直さない**のは文字起こし側と同じ。
     #[test]
     fn failed_notes_reload_but_only_for_the_recording_that_is_selected() {
         let mut state = AppState::default();
