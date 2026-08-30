@@ -336,22 +336,7 @@ impl SummarizeWorker {
                         demote_superseded(&mut queue, &job.session_dir);
                         continue;
                     }
-                    match outcome {
-                        // 対象なしで何もしなかった場合は「投入済み」の痕跡を消す。
-                        JobOutcome::Skipped => {
-                            queue.status.remove(&job.session_dir);
-                        }
-                        JobOutcome::Done => {
-                            queue
-                                .status
-                                .insert(job.session_dir, (seq, SummarizeEntry::Done));
-                        }
-                        JobOutcome::Failed(reason) => {
-                            queue
-                                .status
-                                .insert(job.session_dir, (seq, SummarizeEntry::Failed { reason }));
-                        }
-                    }
+                    apply_outcome(&mut queue, job.session_dir, seq, outcome);
                 }
             });
         // 差分はワーカーが立ったか（= 送信口を持つか）だけ。`Self { .. }` を 2 回書くと、
@@ -422,15 +407,14 @@ impl SummarizeWorker {
 
     /// テストが「走り終わった記録」を置く口（#188）。
     ///
-    /// **本番は `submit` を通す**。ここが在るのは、繋ぎ（完成 → 本文の読み直し）を確かめるのに
-    /// LLM を回したくないから。
+    /// **本番と同じ写像を通す**（`apply_outcome`）。ここで記録を捏造すると、本番の書き手を
+    /// 壊してもテストが緑のまま通る（`docs/rules/testing.md` の「テストが見ている入口と、本番が
+    /// 通る入口をずらさない」）。LLM を回さずに済ませたいだけなので、通り道は変えない。
     #[cfg(test)]
     pub fn mark_done_for_test(&self, session_dir: &Path) {
         let mut queue = lock_queue(&self.queue);
         let seq = queue.next_seq();
-        queue
-            .status
-            .insert(session_dir.to_path_buf(), (seq, SummarizeEntry::Done));
+        apply_outcome(&mut queue, session_dir.to_path_buf(), seq, JobOutcome::Done);
     }
 
     /// セッションの進行状況と、読む領域に出す中身（モデル名・順番・経過・失敗の理由）。
@@ -675,6 +659,39 @@ fn demote_superseded(queue: &mut QueueState, session_dir: &Path) {
 
 /// キュー状態のガードを取る。poison（ロック保持中のパニック）でも状態表示を止めないため、
 /// ガードを取り出して続行する（`docs/rules/error-handling.md`）。
+/// 走り終わった結果を状態マップへ写す（#188 で切り出した）。
+///
+/// **切り出してあるのは、この写像が本番の唯一の書き手だから**。ワーカーループの中に埋めたままだと
+/// LLM を回さずに検査できず、`JobOutcome::Done` を `remove` に書き換えても全部緑のまま通る
+/// ——読む領域の「議事録が完成したら本文を読み直す」は**この記録が残ることに乗っている**
+/// （`main::refresh_detail_panes`）ので、そこが死ぬと出来上がった議事録が画面に出ない。
+/// `transcribe::apply_outcome` と同じ流儀。
+///
+/// **`Skipped` は痕跡ごと消す**（対象なしで何もしなかった）。`Done` / `Failed` は残す——消すと
+/// 表示が `summary.md` の有無ベースへ戻り、失敗が隠れる。
+fn apply_outcome(
+    queue: &mut QueueState,
+    session_dir: std::path::PathBuf,
+    seq: u64,
+    outcome: JobOutcome,
+) {
+    match outcome {
+        JobOutcome::Skipped => {
+            queue.status.remove(&session_dir);
+        }
+        JobOutcome::Done => {
+            queue
+                .status
+                .insert(session_dir, (seq, SummarizeEntry::Done));
+        }
+        JobOutcome::Failed(reason) => {
+            queue
+                .status
+                .insert(session_dir, (seq, SummarizeEntry::Failed { reason }));
+        }
+    }
+}
+
 fn lock_queue(queue: &Mutex<QueueState>) -> MutexGuard<'_, QueueState> {
     queue
         .lock()
@@ -1191,6 +1208,43 @@ fn notes_user_prompt(language: &str, part: usize, total: usize, body: &str) -> S
 mod tests {
     use super::*;
     use crate::transcript::Speaker;
+
+    /// 走り終わった結果が**状態マップにどう残るか**（#188）。
+    ///
+    /// 読む領域の「議事録が完成したら本文を読み直す」は、`Done` の記録が残ることに乗っている
+    /// （`main::refresh_detail_panes`）。ここが `remove` に化けると、出来上がった議事録が画面に
+    /// 出ないまま静かに残る——本番でこの写像を通るのは LLM を回したときだけなので、
+    /// 写像そのものを固定する。
+    ///
+    /// **`Skipped` だけ消す**。対象なしで何もしなかったので、投入済みの痕跡を残さない。
+    /// `Failed` を消すと表示が `summary.md` の有無ベースへ戻り、失敗が隠れる。
+    #[test]
+    fn a_finished_job_leaves_a_record_and_a_skipped_one_does_not() {
+        let dir = std::path::PathBuf::from("20260810-140200");
+        let entry = |outcome| {
+            let mut queue = QueueState {
+                status: HashMap::new(),
+                next_seq: 1,
+            };
+            queue
+                .status
+                .insert(dir.clone(), (1, SummarizeEntry::Queued));
+            apply_outcome(&mut queue, dir.clone(), 2, outcome);
+            queue.status.get(&dir).map(|(_, entry)| entry.clone())
+        };
+        assert!(matches!(
+            entry(JobOutcome::Done),
+            Some(SummarizeEntry::Done)
+        ));
+        assert!(matches!(
+            entry(JobOutcome::Failed(SummarizeFailure::ModelRun)),
+            Some(SummarizeEntry::Failed { .. })
+        ));
+        assert!(
+            entry(JobOutcome::Skipped).is_none(),
+            "a job that had nothing to do leaves no trace"
+        );
+    }
 
     /// モデル名は**ファイル名だけ**になる。上書き指定は任意のパスを取れて、その値は生成中の
     /// 本文としてそのまま画面に出る（`docs/rules/security.md`。`transcribe` 側と対）。
