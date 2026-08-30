@@ -52,6 +52,11 @@ disallowed-methods = [
   # 時刻（外から来る事実。Event に載せて渡すと、テストが決定的になる）
   { path = "std::time::SystemTime::now", reason = "時刻も外から来る事実。Event に載せると、テストが決定的になる" },
   { path = "std::time::Instant::now", reason = "同上" },
+  # chrono（#188 の PR-3a で依存に足した）。**素の `chrono` では `Local` / `Utc::now` は
+  # そもそも存在しない**（`clock` を外してある）が、ワークスペースをまとめてビルドすると
+  # `shoki` 側の機能と合流して生えるので、その経路をここで塞ぐ。
+  { path = "chrono::Local::now", reason = "時刻は外から来る事実。Event に載せる（環境変数と /etc/localtime も読む）" },
+  { path = "chrono::Utc::now", reason = "同上" },
 ]
 
 # ログ（`docs/rules/security.md` のログ衛生——本文もフルパスも出さない——を core 側で守らせる

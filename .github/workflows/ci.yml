@@ -145,5 +145,11 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: build
         run: cargo build --workspace --verbose
+      # **core を単体でも建てる**（#188）。ワークスペースをまとめて建てると、`shoki` が要求する
+      # `chrono` の `clock` 機能が合流して `chrono::Local` が生える。単体で建てるとその機能が
+      # 付かないので、core から現在時刻を取る書き方は**コンパイルが通らない**（`clippy.toml` の
+      # `disallowed-methods` はワークスペース側の経路を塞ぐ二の矢）。
+      - name: build core alone
+        run: cargo build -p shoki-core --verbose
       - name: test
         run: cargo test --workspace --verbose

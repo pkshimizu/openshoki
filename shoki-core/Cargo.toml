@@ -21,3 +21,9 @@ publish = false
 # 何が守られていて何が守られていないかは `src/lib.rs` の doc が正（`std` の I/O はクレート境界
 # では止まらないので、`clippy.toml` で入り口を塞いでいる）。
 [dependencies]
+# **`clock` を外してある**。この機能が `Local` / `Utc::now` を生やすので、外すと
+# `chrono::Local` は**型として存在しない**——core から現在時刻を取る書き方がコンパイルを
+# 通らなくなる。ただし守れるのは `cargo build -p shoki-core` のときだけで、`shoki` が
+# `clock` 付きの `chrono` を要求するため、ワークスペースをまとめてビルドすると機能が
+# 合流して `Local` が生える（下の `clippy.toml` が二の矢）。
+chrono = { version = "0.4", default-features = false, features = ["std"] }

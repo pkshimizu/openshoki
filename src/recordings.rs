@@ -65,41 +65,14 @@ const SWEPT_PART_DESTS: &[&str] = &[
 
 /// セッションディレクトリ名の日時フォーマット（`main.rs` の録音開始時の命名と一致させること）。
 const DIR_DATETIME_FORMAT: &str = "%Y%m%d-%H%M%S";
-/// 一覧に表示する日時フォーマット（カンプに合わせて分まで）。
-/// 一覧の行と詳細ヘッダの時刻・日付（`14:02` / `Aug 10, 2026`）。**同じ組み合わせを両方で
-/// 使う**——左右で日時の形が違うと、同じ録音を見ていることが読み取りにくい。
-const DISPLAY_TIME_FORMAT: &str = "%H:%M";
-const DISPLAY_DATE_FORMAT: &str = "%b %-d, %Y";
-
 /// 日付と時刻を 1 行に並べる形（`Aug 10, 2026 · 14:02`）。詳細ヘッダと議事録の出典が使う。
 pub const DISPLAY_DATETIME_FORMAT: &str = "%b %-d, %Y · %H:%M";
 
-/// 1 つの録音セッション。ディレクトリと、含まれる音源・文字起こし・議事録要約の有無を持つ。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RecordingSession {
-    /// 日時（ディレクトリ名からパース）。並び順と、表示用の組み立て（`display_time` /
-    /// `display_date` / `group_heading`）の両方がここから決まる。
-    datetime: NaiveDateTime,
-    /// セッションディレクトリの絶対/相対パス。
-    pub dir: PathBuf,
-    /// `mic.mp3` があるか。
-    pub has_mic: bool,
-    /// `system.mp3` があるか。
-    pub has_system: bool,
-    /// 録音後生成の `mix.mp3` があるか（両音源セッションの再生に使う）。
-    pub has_mix: bool,
-    /// 文字起こし（`mic.json` / `system.json` のいずれか）があるか。
-    pub has_transcript: bool,
-    /// 議事録要約（`summary.md`）があるか。中身の妥当性は見ない（表示側の `load_summary` が
-    /// 破損・空を縮退させる）。
-    pub has_summary: bool,
-    /// 録音の長さ（#162）。**音源のサイズから割り出した見積もり**（`duration_source` /
-    /// `duration_from_size`）。1 秒未満・読めないときは `None` で、一覧には段ごと出さない。
-    ///
-    /// **走査した時点のスナップショット**。録音中のセッションを一覧に出すと、その長さは止まった
-    /// まま（かつ実際より短いまま）になる——一覧を作り直すのはウィンドウを開いたときだけ。
-    pub duration: Option<Duration>,
-}
+// **セッションの事実と表示は core に置いてある**（#188 の PR-3a）。ここから再エクスポートする
+// のは `recordings::RecordingSession` という既存の呼び名を保つため。走査（`list_sessions`）と
+// **パスの組み立て**はこちらに残る——ファイル名を知っているのは書き手のモジュールだけにする
+// （`shoki_core::session` の doc）。
+pub use shoki_core::{DiskFacts, RecordingSession};
 
 /// 音源ごとの mp3 名。**`Speaker` からファイル名を引く唯一の場所**——mp3 を書くのは録音側
 /// なので、名前の対応もこちら（`transcript` 側は JSON 名だけを知っていればよい）。
@@ -110,123 +83,60 @@ fn audio_file_name(speaker: crate::transcript::Speaker) -> &'static str {
     }
 }
 
-impl RecordingSession {
-    /// テスト用に、日時だけを持つセッションを作る（ファイルの有無は呼び出し側で足す）。
-    ///
-    /// **表示の組み立て**（見出し・行の文言）は日時とファイルの有無だけで決まるので、実ディスクを
-    /// 用意せずに検証できる。
-    #[cfg(test)]
-    pub fn for_test(datetime: NaiveDateTime) -> Self {
-        Self {
-            datetime,
-            dir: PathBuf::new(),
-            has_mic: false,
-            has_system: false,
-            has_mix: false,
-            has_transcript: false,
-            has_summary: false,
-            duration: None,
+/// 再生対象ファイルのパス。両音源のセッションは録音後生成の `mix.mp3`（まだ無ければ再生不可で
+/// `None`）、単一音源のセッションはその音源ファイルそのもの。音源なしは `None`。
+///
+/// 両音源で `mix.mp3` を再生対象にするのは、選択時に毎回デコード＋ミックスすると UI が固まる
+/// ため（重い処理は録音直後の生成へ移す。`src/mixdown.rs`）。
+///
+/// **メソッドではなく関数**（#188）。`RecordingSession` は core にあり、そちらはファイル名を
+/// 知らない層なので、ここへ置くしかない。
+pub fn playback_path(session: &RecordingSession) -> Option<PathBuf> {
+    match (session.has_mic, session.has_system) {
+        (true, true) => session.has_mix.then(|| session.dir.join(MIX_MP3)),
+        (true, false) => Some(session.dir.join(MIC_MP3)),
+        (false, true) => Some(session.dir.join(SYSTEM_MP3)),
+        (false, false) => None,
+    }
+}
+
+/// 長さを測る音源（#162）。**再生できるかとは別の関心事**——両音源セッションは `mix.mp3` が
+/// 出来るまで再生できないが、長さは片方の音源から分かる（同時に録っているので同じ長さ）。
+///
+/// これを `playback_path` に合わせてしまうと、**録音を止めた直後**——いちばん一覧を見に行く
+/// 瞬間——に長さが出ない。
+fn duration_source(session: &RecordingSession) -> Option<PathBuf> {
+    playback_path(session).or_else(|| {
+        if session.has_mic {
+            Some(session.dir.join(MIC_MP3))
+        } else if session.has_system {
+            Some(session.dir.join(SYSTEM_MP3))
+        } else {
+            None
         }
-    }
+    })
+}
 
-    /// 録音した日（見出しのまとまりの判定に使う。**文言ではなく日付で比べる**ため）。
-    pub fn date(&self) -> chrono::NaiveDate {
-        self.datetime.date()
-    }
+/// 文字起こしの対象となる音源ファイル（存在する `mic.mp3` / `system.mp3`）。
+/// 手動再実行（Library ウィンドウの Transcribe ボタン）の投入対象に使う。
+///
+/// **`speakers()` から導く**（#175）。「どの音源が在るか」の分岐を 2 つ持つと、片方だけ
+/// 直した日に「文字起こしは投げるのに、揃ったかを数えない音源」が生まれる。
+pub fn audio_source_paths(session: &RecordingSession) -> Vec<PathBuf> {
+    session
+        .speakers()
+        .into_iter()
+        .map(|speaker| session.dir.join(audio_file_name(speaker)))
+        .collect()
+}
 
-    /// 一覧の行に出す時刻（`14:02`）。同じ日の中ではこれで見分けるので、行の中でいちばん大きく出す。
-    pub fn display_time(&self) -> String {
-        self.datetime.format(DISPLAY_TIME_FORMAT).to_string()
-    }
-
-    /// 一覧の行に出す日付（`Aug 10, 2026`）。見出しと重なるが、スクロールで見出しが流れても
-    /// どの日か分かるように行にも残す。
-    pub fn display_date(&self) -> String {
-        self.datetime.format(DISPLAY_DATE_FORMAT).to_string()
-    }
-
-    /// 日付のまとまりの見出し（`Today` / `Yesterday` / `Aug 5, 2026`）。
-    ///
-    /// **相対の語を出すのは今日と昨日だけ**。「先週」のような幅のある語は、境界がいつ変わるのか
-    /// （週の始まりは日曜か月曜か）を読み手が推測することになるので使わない。
-    pub fn group_heading(&self, now: NaiveDateTime) -> String {
-        let days = (now.date() - self.datetime.date()).num_days();
-        match days {
-            0 => "Today".to_owned(),
-            1 => "Yesterday".to_owned(),
-            _ => self.display_date(),
-        }
-    }
-
-    /// 再生対象ファイルのパス。両音源のセッションは録音後生成の `mix.mp3`（まだ無ければ再生不可で
-    /// `None`）、単一音源のセッションはその音源ファイルそのもの。音源なしは `None`。
-    ///
-    /// 両音源で `mix.mp3` を再生対象にするのは、選択時に毎回デコード＋ミックスすると UI が固まる
-    /// ため（重い処理は録音直後の生成へ移す。`src/mixdown.rs`）。
-    pub fn playback_path(&self) -> Option<PathBuf> {
-        match (self.has_mic, self.has_system) {
-            (true, true) => self.has_mix.then(|| self.dir.join(MIX_MP3)),
-            (true, false) => Some(self.dir.join(MIC_MP3)),
-            (false, true) => Some(self.dir.join(SYSTEM_MP3)),
-            (false, false) => None,
-        }
-    }
-
-    /// 長さを測る音源（#162）。**再生できるかとは別の関心事**——両音源セッションは `mix.mp3` が
-    /// 出来るまで再生できないが、長さは片方の音源から分かる（同時に録っているので同じ長さ）。
-    ///
-    /// これを `playback_path` に合わせてしまうと、**録音を止めた直後**——いちばん一覧を見に行く
-    /// 瞬間——に長さが出ない。
-    fn duration_source(&self) -> Option<PathBuf> {
-        self.playback_path().or_else(|| {
-            if self.has_mic {
-                Some(self.dir.join(MIC_MP3))
-            } else if self.has_system {
-                Some(self.dir.join(SYSTEM_MP3))
-            } else {
-                None
-            }
-        })
-    }
-
-    /// 文字起こしの対象となる音源ファイル（存在する `mic.mp3` / `system.mp3`）。
-    /// 手動再実行（Library ウィンドウの Transcribe ボタン）の投入対象に使う。
-    ///
-    /// **`speakers()` から導く**（#175）。「どの音源が在るか」の分岐を 2 つ持つと、片方だけ
-    /// 直した日に「文字起こしは投げるのに、揃ったかを数えない音源」が生まれる。
-    pub fn audio_source_paths(&self) -> Vec<PathBuf> {
-        self.speakers()
-            .into_iter()
-            .map(|speaker| self.dir.join(audio_file_name(speaker)))
-            .collect()
-    }
-
-    /// このセッションに在る音源（#175）。**文字起こしが揃っているかの判定に使う**——在る音源
-    /// ごとに、読めて最後まで読み切った JSON があるかを見る（`transcript::load_transcript`）。
-    ///
-    /// **「在る音源」を言う場所はここ 1 つ**。ここが音源を取り落とすと、欠けた文字起こしが
-    /// 完成品として画面に出る（`transcript::sources_shortfall` が数える対象そのもの）。
-    pub fn speakers(&self) -> Vec<crate::transcript::Speaker> {
-        let mut speakers = Vec::new();
-        if self.has_mic {
-            speakers.push(crate::transcript::Speaker::Mic);
-        }
-        if self.has_system {
-            speakers.push(crate::transcript::Speaker::System);
-        }
-        speakers
-    }
-
-    /// 含まれる音源を表す英語サマリー（右ペインのヘッダ表示用）。
-    pub fn source_summary(&self) -> &'static str {
-        match (self.has_mic, self.has_system) {
-            (true, true) => "Mic + system",
-            (true, false) => "Mic only",
-            (false, true) => "System only",
-            // 音源なしのセッションは一覧に含めない（`list_sessions` がスキップ）ため通常起きない。
-            (false, false) => "No audio",
-        }
-    }
+/// テスト用に、日時だけを持つセッションを作る（ファイルの有無は呼び出し側で足す）。
+///
+/// **表示の組み立て**（見出し・行の文言）は日時とファイルの有無だけで決まるので、実ディスクを
+/// 用意せずに検証できる。
+#[cfg(test)]
+pub fn session_for_test(datetime: NaiveDateTime) -> RecordingSession {
+    RecordingSession::new(datetime, PathBuf::new(), DiskFacts::default())
 }
 
 /// MPEG-1 / MPEG-2 / MPEG-2.5 の Layer III のビットレート表（kbps）。添字はヘッダのビットレート
@@ -465,20 +375,21 @@ fn scan_sessions(
         let has_mix = dir.join(MIX_MP3).is_file();
         let has_transcript = dir.join(MIC_JSON).is_file() || dir.join(SYSTEM_JSON).is_file();
         let has_summary = dir.join(crate::summarize::SUMMARY_FILENAME).is_file();
-        let mut session = RecordingSession {
+        let mut session = RecordingSession::new(
             datetime,
             dir,
-            has_mic,
-            has_system,
-            has_mix,
-            has_transcript,
-            has_summary,
-            duration: None,
-        };
+            DiskFacts {
+                has_mic,
+                has_system,
+                has_mix,
+                has_transcript,
+                has_summary,
+            },
+        );
         // **組み上がってから長さを入れる**（#162）。選び方を素の `bool` で受ける関数に切り出すと、
         // 引数の順序を取り違えても通ってしまう——同じ `RecordingSession` の `duration_source` を
         // 通すことで、再生対象と同じ選び方であることが構造で決まる。
-        if let Some(path) = session.duration_source() {
+        if let Some(path) = duration_source(&session) {
             apply_measured(
                 &mut session,
                 measure_duration(&path, downloads_off),
@@ -499,7 +410,11 @@ fn scan_sessions(
 
     // 新しい順（日時降順）。同時刻はディレクトリ名でも安定させる必要はないが、決定的にするため
     // パスで二次ソートする。
-    sessions.sort_by(|a, b| b.datetime.cmp(&a.datetime).then_with(|| a.dir.cmp(&b.dir)));
+    sessions.sort_by(|a, b| {
+        b.started()
+            .cmp(&a.started())
+            .then_with(|| a.dir.cmp(&b.dir))
+    });
     sessions
 }
 
@@ -579,10 +494,11 @@ fn parse_session_datetime(name: &str) -> Option<NaiveDateTime> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Measured, RecordingSession, STALE_SESSION_PART_AGE, apply_measured,
-        bytes_per_sec_from_header, duration_from_size, list_sessions, measure_duration,
-        measure_from_header, measured_from_read_error, parse_session_datetime, session_dirs,
-        spawn_session_part_sweep, sweep_session_dirs,
+        DiskFacts, Measured, RecordingSession, STALE_SESSION_PART_AGE, apply_measured,
+        audio_source_paths, bytes_per_sec_from_header, duration_from_size, list_sessions,
+        measure_duration, measure_from_header, measured_from_read_error, parse_session_datetime,
+        playback_path, session_dirs, session_for_test, spawn_session_part_sweep,
+        sweep_session_dirs,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -592,11 +508,11 @@ mod tests {
     /// 画面に出る**（`transcript::sources_shortfall` が数える対象そのもの）——本番では
     /// `spawn_session_load` が渡すだけなので、壊れても症状が出るまでに何段も挟まる。
     #[test]
-    fn the_sources_a_session_has_come_from_the_files_it_has() {
+    fn the_paths_to_transcribe_come_from_the_sources_that_are_there() {
         use crate::transcript::Speaker;
 
         let session = |has_mic: bool, has_system: bool| {
-            let mut session = RecordingSession::for_test(
+            let mut session = session_for_test(
                 chrono::NaiveDate::from_ymd_opt(2026, 8, 10)
                     .expect("a real date")
                     .and_hms_opt(14, 2, 0)
@@ -620,7 +536,7 @@ mod tests {
         for (has_mic, has_system) in [(true, true), (true, false), (false, true), (false, false)] {
             let session = session(has_mic, has_system);
             assert_eq!(
-                session.audio_source_paths(),
+                audio_source_paths(&session),
                 session
                     .speakers()
                     .into_iter()
@@ -630,7 +546,7 @@ mod tests {
             );
         }
         assert_eq!(
-            session(true, true).audio_source_paths(),
+            audio_source_paths(&session(true, true)),
             [
                 PathBuf::from("/recordings/20260810-140200/mic.mp3"),
                 PathBuf::from("/recordings/20260810-140200/system.mp3"),
@@ -834,16 +750,14 @@ mod tests {
     /// `scan_sessions` の doc）ので、**振り分けだけ**を直接呼んで固定する。
     #[test]
     fn audio_that_is_not_here_is_counted_instead_of_measured() {
-        let mut session = RecordingSession {
-            datetime: parse_session_datetime("20260810-140200").expect("a valid session name"),
-            dir: PathBuf::from("/does/not/matter"),
-            has_mic: true,
-            has_system: false,
-            has_mix: false,
-            has_transcript: false,
-            has_summary: false,
-            duration: None,
-        };
+        let mut session = RecordingSession::new(
+            parse_session_datetime("20260810-140200").expect("a valid session name"),
+            PathBuf::from("/does/not/matter"),
+            DiskFacts {
+                has_mic: true,
+                ..DiskFacts::default()
+            },
+        );
         let mut not_downloaded = 0u64;
 
         apply_measured(&mut session, Measured::NotDownloaded, &mut not_downloaded);
@@ -1161,19 +1075,19 @@ mod tests {
         assert_eq!(sessions.len(), 3);
         // 新しい順。
         assert_eq!(
-            sessions[0].playback_path(),
+            playback_path(&sessions[0]),
             Some(root.join("20260628-143025").join("mix.mp3"))
         );
-        assert!(sessions[0].playback_path().is_some());
+        assert!(playback_path(&sessions[0]).is_some());
         // 両音源で mix が無ければ再生不可（選択時にその場ミックスはしない）。
-        assert_eq!(sessions[1].playback_path(), None);
-        assert!(sessions[1].playback_path().is_none());
+        assert_eq!(playback_path(&sessions[1]), None);
+        assert!(playback_path(&sessions[1]).is_none());
         // 単一音源はその音源ファイルを直接再生する。
         assert_eq!(
-            sessions[2].playback_path(),
+            playback_path(&sessions[2]),
             Some(root.join("20260627-164200").join("mic.mp3"))
         );
-        assert!(sessions[2].playback_path().is_some());
+        assert!(playback_path(&sessions[2]).is_some());
 
         let _ = fs::remove_dir_all(&root);
     }

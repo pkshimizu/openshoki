@@ -13,6 +13,9 @@
 
 use crate::dataless::{Fetch, ReadFailure};
 use shoki_core::TranscriptShortfall;
+// **話者は core に置いてある**（#188 の PR-3a）。ここから再エクスポートするのは、
+// `transcript::Speaker` という既存の呼び名を保つため（文字起こしの語彙としてはここが自然）。
+pub use shoki_core::Speaker;
 use std::path::Path;
 use std::time::Duration;
 
@@ -31,32 +34,16 @@ const MAX_TRANSCRIPT_BYTES: u64 = 32 * 1024 * 1024;
 /// 種類を足したらここに足す。
 const ALL_SPEAKERS: [Speaker; 2] = [Speaker::Mic, Speaker::System];
 
-/// セグメントの話者（どの音源の文字起こしか）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Speaker {
-    Mic,
-    System,
-}
-
-impl Speaker {
-    /// 話者の英語ラベル。UI の話者バッジに出すほか、**議事録要約のプロンプトに渡す
-    /// トランスクリプトの話者表記も兼ねる**（`src/summarize.rs` の `MINUTES_SYSTEM_*` /
-    /// `NOTES_SYSTEM_*` が `Mic` / `System` という文字列を前提に書かれている）。
-    /// 表記を変えるときはプロンプト側も同時に直すこと。
-    pub fn label(self) -> &'static str {
-        match self {
-            Speaker::Mic => "Mic",
-            Speaker::System => "System",
-        }
-    }
-
-    /// この音源の文字起こし JSON のファイル名。`transcribe.rs` が `<音源名>.json` で保存する
-    /// 名前と一致させること。
-    fn json_name(self) -> &'static str {
-        match self {
-            Speaker::Mic => MIC_JSON,
-            Speaker::System => SYSTEM_JSON,
-        }
+/// この音源の文字起こし JSON のファイル名。`transcribe.rs` が `<音源名>.json` で保存する
+/// 名前と一致させること。
+///
+/// **`Speaker` のメソッドにしない**（#188）。`Speaker` は `shoki-core` にあり、そちらは
+/// ディスクレイアウトを知らない層——名前を知っているのは書き手のモジュールだけにする
+/// （`shoki_core::session` の doc）。
+fn json_name(speaker: Speaker) -> &'static str {
+    match speaker {
+        Speaker::Mic => MIC_JSON,
+        Speaker::System => SYSTEM_JSON,
     }
 }
 
@@ -302,7 +289,7 @@ fn read_all(session_dir: &Path, fetch: Fetch) -> Vec<(Speaker, ReadOutcome)> {
         .map(|&speaker| {
             (
                 speaker,
-                read_guarded(&session_dir.join(speaker.json_name()), fetch),
+                read_guarded(&session_dir.join(json_name(speaker)), fetch),
             )
         })
         .collect()
