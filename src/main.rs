@@ -4141,6 +4141,68 @@ mod tests {
         assert!(!rec.get_show_partial_transcript());
     }
 
+    /// 議事録タブも、**core が組んだ相がそのまま**ウィンドウへ入ること（#189）。
+    ///
+    /// 決めるのは core（`view_detail`）、ゲートを引くのは Slint（`detail-jobs-pending`）で、
+    /// どちらも単体では検査済み。**繋いでいるのはこの setter だけ**なので、ここが抜けると
+    /// 両側が緑のまま「生成中なのに未生成と書いてある」画面になる
+    /// （`docs/rules/testing.md` の「配線は、繋いでいる関数に継ぎ目を入れてテストする」）。
+    #[test]
+    fn the_notes_pane_puts_its_state_into_the_window() {
+        super::init_test_backend();
+        let rec = super::LibraryWindow::new().expect("create the library window");
+        // `apply_detail_summary_status` が受けるのは core が組んだ `DetailView`。ここで見たいのは
+        // 「ペインの値が画面へどう入るか」なので、議事録の状態だけ差し替えて組む。
+        let view = |summary: SummaryPane| {
+            let transcript = TranscriptPane::Done;
+            shoki_core::DetailView {
+                transcript_input: shoki_core::TranscriptInput::Ready,
+                transcript_busy: false,
+                actions: transcript.message().actions,
+                summary_actions: summary.message().actions,
+                summary,
+                loading: false,
+                transcript,
+            }
+        };
+
+        for pane in [
+            SummaryPane::NotSummarized { auto_on: false },
+            SummaryPane::Queued { position: 2 },
+            SummaryPane::Summarizing {
+                model: "Qwen".to_owned(),
+                started_ago: "40 seconds".to_owned(),
+            },
+            SummaryPane::Done,
+            SummaryPane::Failed {
+                reason: shoki_core::SummarizeFailure::ModelRun,
+            },
+        ] {
+            super::apply_detail_summary_status(&rec, &view(pane.clone()), false);
+            assert_eq!(
+                super::slint_map::from_ui_summary_status(rec.get_detail_summary_status()),
+                pane.status(),
+                "the pane that core built must be the one the window shows"
+            );
+            // **文言も同じ値から出す**。状態だけ合っていても、見出しが別の相のものだと
+            // 「生成中」と書いてある横に「まだ書いていない」の説明が並ぶ。
+            assert_eq!(
+                rec.get_detail_summary_heading().as_str(),
+                pane.message().heading,
+            );
+        }
+
+        // 走っているジョブがある間は、中身を作り直す操作を出さない（掛けるのはこの setter）。
+        let idle = SummaryPane::NotSummarized { auto_on: false };
+        super::apply_detail_summary_status(&rec, &view(idle.clone()), true);
+        let gated = slint::Model::row_count(&rec.get_detail_summary_actions());
+        super::apply_detail_summary_status(&rec, &view(idle), false);
+        assert!(
+            gated < slint::Model::row_count(&rec.get_detail_summary_actions()),
+            "a running job must remove at least one action"
+        );
+    }
+
     /// 世代を進めたら、**走っている走査へ必ず伝わる**こと（#181）。
     ///
     /// 番号を進めるのと伝えるのは `advance_scan_generation` の中で 1 つになっているが、
