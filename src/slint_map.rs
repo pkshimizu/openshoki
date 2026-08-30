@@ -38,7 +38,12 @@ pub fn to_ui_transcript_status(status: shoki_core::TranscriptStatus) -> UiTransc
     }
 }
 
-/// 逆向き（Slint のモデルに入っている状態 → core の語彙）。一覧の行が持つ現在値と比べるのに使う。
+/// 逆向き（Slint のモデルに入っている状態 → core の語彙）。
+///
+/// **本番の経路からは呼ばれない**（#188 で行の差分が core の `RowKey` へ移った）。往復で戻る
+/// ことを固定するテストのために残してある——写し先を付け替えると両方向ともコンパイルは通る
+/// ので、片道だけでは非対称に気づけない。
+#[cfg(test)]
 pub fn from_ui_transcript_status(status: UiTranscriptStatus) -> shoki_core::TranscriptStatus {
     match status {
         UiTranscriptStatus::NotTranscribed => shoki_core::TranscriptStatus::NotTranscribed,

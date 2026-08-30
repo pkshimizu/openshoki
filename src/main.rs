@@ -31,8 +31,8 @@ mod whisper_model;
 mod windows;
 
 use shoki_core::{
-    StoredTranscript, SummaryPane, TranscriptInput, TranscriptPane, actions_allowed_while_busy,
-    elapsed_text, session_transcript_word, summary_status_text,
+    SummaryPane, TranscriptInput, TranscriptPane, actions_allowed_while_busy, elapsed_text,
+    summary_status_text,
 };
 // **core と同名の型（`TranscriptStatus` / `SummaryStatus` / `PaneAction` / `PaneActionKind`）は
 // 裸で書かない**（#188）。`slint::include_modules!()` が生成型をクレート直下に置くので、裸の
@@ -49,7 +49,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 // VecModel の row_data / set_row_data（tick の行単位更新）に必要。
-use slint::Model;
 
 use tray_icon::menu::{IconMenuItem, MenuEvent};
 
@@ -346,6 +345,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 走査がいまどうなっているか（#181。`ScanState` の doc）。初期値が `Settled` なのは、
     // まだ一度も開いていない＝走査は飛んでいない、という意味（一覧も空）。
     let scan_state = Rc::new(Cell::new(ScanState::Settled));
+    // **文字起こしの状態**（#188）。変える口は `shoki_core::update` だけで、ここに直接
+    // 書く経路は作らない。
+    let app_state: Rc<RefCell<shoki_core::AppState>> =
+        Rc::new(RefCell::new(shoki_core::AppState::default()));
     // 検索の世代（#161）。閉じるときにも降ろすので、閉じるハンドラより前に用意する。
     let search_generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
     // **最後の検索で本文を読めなかった録音**（#182。理由は `not_downloaded_count` の doc）。
@@ -391,13 +394,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let all_sessions: Rc<RefCell<Vec<recordings::RecordingSession>>> =
         Rc::new(RefCell::new(Vec::new()));
     let (search_sender, search_receiver) = std::sync::mpsc::channel::<SearchResult>();
-    let sessions_model: Rc<slint::VecModel<SessionRow>> = Rc::new(slint::VecModel::default());
-    library_ui.set_sessions(sessions_model.clone().into());
+    let sessions_model = Rc::new(SessionRows::new());
+    library_ui.set_sessions(sessions_model.model().into());
     // 選択中セッションのトランスクリプト（セグメントクリック→開始秒の解決、tick→現在セグメントの
     // 算出に使う）。選択のたびに読み直す。
     // 表示中の文字起こし（セグメントと「揃っているか」を 1 つの器に。#175）。
     let transcript_segments: Rc<RefCell<LoadedTranscript>> =
         Rc::new(RefCell::new(LoadedTranscript::unknown()));
+    // core が返した依頼を実行するのに要るものを束ねる（#188。`EffectRunner` の doc）。
+    let runner = EffectRunner {
+        ui: library_ui.as_weak(),
+        state: Rc::clone(&app_state),
+        segments: Rc::clone(&transcript_segments),
+        sessions: Rc::clone(&sessions),
+        player: Rc::clone(&player),
+        load_generation: Rc::clone(&load_generation),
+        load_sender: load_sender.clone(),
+    };
 
     // セッション選択: 詳細を更新し、その音源を再生準備する。
     //
@@ -406,28 +419,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // スレッドでやると 1 時間の録音では数秒画面が固まる。ここでやるのは「すぐ出せるものを出す」
     // ことだけで、残りは届いた順に反映する。
     {
-        let player = Rc::clone(&player);
         let sessions = Rc::clone(&sessions);
-        let transcript_segments = Rc::clone(&transcript_segments);
-        let transcriber = transcriber.clone();
+        let app_state = Rc::clone(&app_state);
         let summarizer = summarizer.clone();
         let config = Rc::clone(&config);
-        let transcript_segments = Rc::clone(&transcript_segments);
         let rec_weak = library_ui.as_weak();
-        let generation = Rc::clone(&load_generation);
-        let load_sender = load_sender.clone();
+        let runner = runner.clone();
         library_ui.on_select_session(move |index| {
             let Some(rec) = rec_weak.upgrade() else {
                 return;
             };
-            let sessions_ref = sessions.borrow();
-            let Some(session) = usize::try_from(index)
-                .ok()
-                .and_then(|i| sessions_ref.get(i))
-            else {
-                return;
+            let session = {
+                let sessions_ref = sessions.borrow();
+                let Some(session) = usize::try_from(index)
+                    .ok()
+                    .and_then(|i| sessions_ref.get(i))
+                else {
+                    return;
+                };
+                session.clone()
             };
-            let generation_id = advance_load_generation(&generation);
 
             // --- ここまでが即時。ディスクを読まずに出せるものだけを入れる ---
             rec.set_has_selection(true);
@@ -438,47 +449,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             rec.set_detail_sources(session.source_summary().into());
             rec.set_has_transcript(session.has_transcript);
-            // 文字起こしの状態テキストと Transcribe ボタンの活性を、ワーカーの進行状況＋
-            // JSON の有無から設定する（以後の変化は tick が追従させる）。
-            // 議事録側も同じ流儀で状態を設定する（中身の読み込みは下のスレッドで行う）。
-            refresh_detail_panes(
-                &rec,
-                &transcriber,
-                &summarizer,
-                session,
-                &transcript_segments,
-                &config,
-            );
             rec.set_playing(false);
-            rec.set_current_segment(-1);
-            // 途中結果を開いた状態は持ち越さない（理由は `fold_partial_transcript` の doc）。
-            fold_partial_transcript(&rec);
-            // **前の録音の中身を残さない**。読み込みが終わるまで空にし、読み込み中であることを
-            // 出す（前の文字起こしが表示されたままだと、別の録音の内容を読んでしまう）。
-            rec.set_segments(Rc::new(slint::VecModel::default()).into());
-            rec.set_summary_rows(Rc::new(slint::VecModel::default()).into());
             rec.set_loading(true);
-            // **読み込みが終わるまでは再生できない**（音源をまだ開いていない）。押しても無反応、
-            // にしないため、ここでは押せない状態にしておく——鳴らせるかどうかは開いてみて
-            // 初めて分かるので、`apply_loaded_session` が実際の結果で入れ直す。
-            rec.set_playable(false);
-            // 長さも分からないので、シークバーは表示専用に縮退させる。
-            rec.set_seekable(false);
-            apply_playback_position(&rec, Duration::ZERO, None);
-            // 前の録音の音声は**すぐ手放す**（読み込みを待つ間に前の音が鳴らないように）。
-            if let Some(p) = player.borrow_mut().as_mut() {
-                p.unload();
-            }
 
-            // --- ここからが別スレッド。届いたら世代を確かめて反映する ---
-            // 選択が変わったので**音声も差し替える**。
-            spawn_session_load(
-                session,
-                generation_id,
-                &generation,
-                &load_sender,
-                load_replaces_playback(true),
-            );
+            // **選んだことを core へ伝える**（#188）。前の中身を落とすか・音源を差し替えるかを
+            // 決めるのは `update`——同じ録音を選び直したときに落とすと、伏せてある途中結果が
+            // 1 tick 開く（#175）。
+            //
+            // **借用を落としてから実行する**（`run_effects` の doc）。
+            let effects = {
+                let mut state = app_state.borrow_mut();
+                shoki_core::update(
+                    &mut state,
+                    shoki_core::Msg::Command(shoki_core::Command::Select(Some(
+                        session.dir.clone(),
+                    ))),
+                )
+            };
+            run_effects(&runner, effects, None);
+
+            // 状態の表示は、落としたあとの状態から組み直す。
+            refresh_detail_panes(&rec, &app_state.borrow(), &summarizer, &session, &config);
         });
     }
 
@@ -601,7 +592,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let sessions = Rc::clone(&sessions);
         let config = Rc::clone(&config);
-        let transcript_segments = Rc::clone(&transcript_segments);
+        let app_state = Rc::clone(&app_state);
         let transcriber = transcriber.clone();
         // 読む領域は両タブまとめて組み直すので、相手のワーカーも要る（`refresh_detail_panes`）。
         let summarizer = summarizer.clone();
@@ -613,14 +604,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             submit_transcription(session, &config, &transcriber, ChainNotes::FollowTheSetting);
             if let Some(rec) = rec_weak.upgrade() {
-                refresh_detail_panes(
-                    &rec,
-                    &transcriber,
-                    &summarizer,
-                    session,
-                    &transcript_segments,
-                    &config,
-                );
+                refresh_detail_panes(&rec, &app_state.borrow(), &summarizer, session, &config);
             }
         });
     }
@@ -631,7 +615,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let sessions = Rc::clone(&sessions);
         let config = Rc::clone(&config);
-        let transcript_segments = Rc::clone(&transcript_segments);
+        let app_state = Rc::clone(&app_state);
         let transcriber = transcriber.clone();
         let summarizer = summarizer.clone();
         let rec_weak = library_ui.as_weak();
@@ -642,14 +626,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             submit_transcription(session, &config, &transcriber, ChainNotes::Always);
             if let Some(rec) = rec_weak.upgrade() {
-                refresh_detail_panes(
-                    &rec,
-                    &transcriber,
-                    &summarizer,
-                    session,
-                    &transcript_segments,
-                    &config,
-                );
+                refresh_detail_panes(&rec, &app_state.borrow(), &summarizer, session, &config);
             }
         });
     }
@@ -660,9 +637,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let sessions = Rc::clone(&sessions);
         let config = Rc::clone(&config);
-        let transcript_segments = Rc::clone(&transcript_segments);
+        let app_state = Rc::clone(&app_state);
         let summarizer = summarizer.clone();
-        let transcriber = transcriber.clone();
         let rec_weak = library_ui.as_weak();
         library_ui.on_summarize_session(move |index| {
             let sessions = sessions.borrow();
@@ -680,14 +656,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             summarizer.submit(manual_summarize_job(&config.borrow(), &session.dir));
             // 投入結果（通常は「生成中」）を即反映し、2 連クリックの多重投入を防ぐ。
             if let Some(rec) = rec_weak.upgrade() {
-                refresh_detail_panes(
-                    &rec,
-                    &transcriber,
-                    &summarizer,
-                    session,
-                    &transcript_segments,
-                    &config,
-                );
+                refresh_detail_panes(&rec, &app_state.borrow(), &summarizer, session, &config);
             }
         });
     }
@@ -697,9 +666,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let sessions = Rc::clone(&sessions);
         let summarizer = summarizer.clone();
-        let transcriber = transcriber.clone();
         let config = Rc::clone(&config);
-        let transcript_segments = Rc::clone(&transcript_segments);
+        let app_state = Rc::clone(&app_state);
         let rec_weak = library_ui.as_weak();
         library_ui.on_cancel_summary(move |index| {
             let sessions = sessions.borrow();
@@ -713,14 +681,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             // 取り消し結果（通常は未生成／生成済みへ戻る）を即反映する。
             if let Some(rec) = rec_weak.upgrade() {
-                refresh_detail_panes(
-                    &rec,
-                    &transcriber,
-                    &summarizer,
-                    session,
-                    &transcript_segments,
-                    &config,
-                );
+                refresh_detail_panes(&rec, &app_state.borrow(), &summarizer, session, &config);
             }
         });
     }
@@ -733,7 +694,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let transcriber = transcriber.clone();
         let summarizer = summarizer.clone();
         let config = Rc::clone(&config);
-        let transcript_segments = Rc::clone(&transcript_segments);
+        let app_state = Rc::clone(&app_state);
         let rec_weak = library_ui.as_weak();
         library_ui.on_stop_transcription(move |index| {
             let sessions = sessions.borrow();
@@ -754,14 +715,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             if let Some(rec) = rec_weak.upgrade() {
-                refresh_detail_panes(
-                    &rec,
-                    &transcriber,
-                    &summarizer,
-                    session,
-                    &transcript_segments,
-                    &config,
-                );
+                refresh_detail_panes(&rec, &app_state.borrow(), &summarizer, session, &config);
             }
         });
     }
@@ -811,11 +765,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let search_generation = Rc::clone(&search_generation);
         let search_not_downloaded = Rc::clone(&search_not_downloaded);
         let scan_state = Rc::clone(&scan_state);
-        let player = Rc::clone(&player);
-        let load_sender = load_sender.clone();
-        let transcriber = transcriber.clone();
-        let transcript_segments = Rc::clone(&transcript_segments);
-        let load_generation = Rc::clone(&load_generation);
+        let app_state = Rc::clone(&app_state);
+        let runner = runner.clone();
         let rec_weak = library_ui.as_weak();
         library_ui.on_clear_search(move || {
             let Some(rec) = rec_weak.upgrade() else {
@@ -824,7 +775,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             reset_search(&rec, &search_generation, &search_not_downloaded);
             let all = all_sessions.borrow().clone();
             let total = all.len();
-            sessions_model.set_vec(session_rows(&all, &transcriber));
+            sessions_model.replace_all(&all, &app_state.borrow());
             apply_list_counts(
                 &rec,
                 ListCounts {
@@ -834,15 +785,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
                 &scan_state,
             );
-            reselect_after_list_change(
-                &rec,
-                &sessions,
-                all,
-                &player,
-                &transcript_segments,
-                &load_generation,
-                &load_sender,
-            );
+            reselect_after_list_change(&rec, &sessions, all, &runner);
         });
     }
 
@@ -891,9 +834,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let search_generation = Rc::clone(&search_generation);
         let search_not_downloaded = Rc::clone(&search_not_downloaded);
         let scan_state = Rc::clone(&scan_state);
+        let app_state = Rc::clone(&app_state);
+        let runner = runner.clone();
         let player = Rc::clone(&player);
-        let transcript_segments = Rc::clone(&transcript_segments);
-        let load_generation = Rc::clone(&load_generation);
         let transcriber = transcriber.clone();
         let summarizer = summarizer.clone();
         let rec_weak = library_ui.as_weak();
@@ -1005,17 +948,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     },
                     &scan_state,
                 );
-                if let Some(mut row) = sessions_model.row_data(i) {
-                    row.group_heading =
-                        session_group_heading(&sessions, i, chrono::Local::now().naive_local())
-                            .into();
-                    sessions_model.set_row_data(i, row);
-                }
+                sessions_model.set_heading(
+                    i,
+                    session_group_heading(&sessions, i, chrono::Local::now().naive_local()),
+                );
             }
             // 進行状況マップに残ったエントリを掃除する（削除済みセッションの記録を残さない）。
             transcriber.forget(&dir);
             summarizer.forget(&dir);
-            clear_library_selection(&rec, &transcript_segments, &load_generation);
+            // **core にも伝える**（#188）。`forget` の直後に流さないと、次の tick の差分が
+            // 「走っていたジョブが消えた」と読んで、ゴミ箱へ移した録音を読み直そうとする。
+            let effects = {
+                let mut state = app_state.borrow_mut();
+                shoki_core::update(
+                    &mut state,
+                    shoki_core::Msg::Event(shoki_core::Event::Deleted { dir }),
+                )
+            };
+            run_effects(&runner, effects, None);
+            clear_library_selection(&rec, &runner);
         });
     }
 
@@ -1242,6 +1193,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 scan_sender: scan_sender.clone(),
                 scan_generation: Rc::clone(&scan_generation),
                 scan_state: Rc::clone(&scan_state),
+                state: Rc::clone(&app_state),
+                runner: runner.clone(),
                 sessions: Rc::clone(&sessions),
                 all_sessions: Rc::clone(&all_sessions),
                 search_receiver,
@@ -1315,6 +1268,10 @@ struct LibraryHandles {
     scan_generation: Rc<Cell<u64>>,
     /// 走査がいまどうなっているか（#181。`ScanState` の doc）。空表示の文をここから決める。
     scan_state: Rc<Cell<ScanState>>,
+    /// **文字起こしの状態はここが正**（#188）。変える口は `shoki_core::update` だけ。
+    state: Rc<RefCell<shoki_core::AppState>>,
+    /// `Effect` を実行する口（`EffectRunner` の doc）。
+    runner: EffectRunner,
     /// 検索結果の受け口。本文を読むので背景スレッドで絞り、結果だけ送る（`#152` と同じ流儀）。
     search_receiver: std::sync::mpsc::Receiver<SearchResult>,
     /// いま出している検索の世代。届いた結果がこれと違えば捨てる（打ち込むたびに投げるので、
@@ -1322,7 +1279,7 @@ struct LibraryHandles {
     search_generation: Rc<Cell<u64>>,
     /// 最後の検索で本文を読めなかった録音（#182。理由は `not_downloaded_count`）。
     search_not_downloaded: Rc<RefCell<Vec<std::path::PathBuf>>>,
-    sessions_model: Rc<slint::VecModel<SessionRow>>,
+    sessions_model: Rc<SessionRows>,
     transcript_segments: Rc<RefCell<LoadedTranscript>>,
     transcriber: transcribe::TranscribeWorker,
     /// 詳細ペインの要約状態を tick で追従させるために読む（#81）。
@@ -1536,7 +1493,7 @@ fn build_menu_event_handler(
                 },
                 &recordings.scan_generation,
                 &recordings.scan_state,
-                &recordings.transcriber,
+                &recordings.state,
                 scanned,
             );
         }
@@ -1573,32 +1530,29 @@ fn build_menu_event_handler(
             }
             recordings
                 .sessions_model
-                .set_vec(session_rows(&matched, &recordings.transcriber));
-            reselect_after_list_change(
-                &rec,
-                &recordings.sessions,
-                matched,
-                &recordings.player,
-                &recordings.transcript_segments,
-                &recordings.load_generation,
-                &recordings.load_sender,
-            );
+                .replace_all(&matched, &recordings.state.borrow());
+            reselect_after_list_change(&rec, &recordings.sessions, matched, &recordings.runner);
         }
 
         // 読み込みが終わった録音を表示へ入れる（#152）。**ウィンドウが閉じていても受け取る**——
         // 受け口に溜めたままにすると、次に開いたときに古い結果がまとめて流れ込む。
+        //
+        // **入れてよいかを決めるのは `update` 1 箇所**（#188）。ここでもう一度世代を見ると
+        // 判定が 2 つになり、解除を挟んで世代が飛んだときに食い違う。
         while let Ok(loaded) = recordings.load_receiver.try_recv() {
-            if !load_is_current(recordings.load_generation.get(), loaded.generation) {
-                continue;
-            }
-            if let Some(rec) = recordings.ui.upgrade() {
-                apply_loaded_session(
-                    &rec,
-                    &recordings.player,
-                    &recordings.transcript_segments,
-                    loaded,
-                );
-            }
+            let effects = {
+                let mut state = recordings.state.borrow_mut();
+                shoki_core::update(
+                    &mut state,
+                    shoki_core::Msg::Event(shoki_core::Event::SessionLoaded {
+                        dir: loaded.dir.clone(),
+                        generation: loaded.generation,
+                        has_readable_segments: !loaded.transcript.segments.is_empty(),
+                        shortfall: loaded.transcript.shortfall,
+                    }),
+                )
+            };
+            run_effects(&recordings.runner, effects, Some(loaded));
         }
 
         // Library ウィンドウが開いている間だけ、文字起こし状態の変化を一覧・詳細ペインへ
@@ -1608,146 +1562,74 @@ fn build_menu_event_handler(
             && rec.window().is_visible()
         {
             let selected = usize::try_from(rec.get_selected_index()).ok();
-            // 完了を観測して**生成物の有無を書き戻す**セッション。一覧の走査は不変借用で回すので、
-            // 借用を手放してから反映する（`sessions` の `has_transcript` / `has_summary` が
-            // 生成物の有無の正で、ボタンの活性・状態の解決がここを読む。ウィンドウを開いたまま
-            // 実行したときに UI とメモリがずれないように、UI だけを直す形にはしない）。
-            let mut transcribed: Vec<usize> = Vec::new();
-            // 要約の追従は選択中セッションだけを見るので、書き戻す対象も高々 1 件。
-            let mut summarized: Option<usize> = None;
-            // 選択中セッションの中身がディスク上で変わったか（変わったら読み直す。理由は下）。
-            let mut reload_selected = false;
+
+            // **ジョブの様子を core へ流す**（#188）。ワーカーの状態マップと `AppState.jobs` を
+            // 突き合わせ、**違うものだけ** `Event` にする。ジョブは通常 0〜2 件なので、
+            // セッション数ではなくジョブ数に比例する（`progress_of` を足した #162 の意図を
+            // 壊さない）。
+            //
+            // **読み込みの受け取りより後に置く**。先に置くと、`Effect::LoadSession` が世代を
+            // 進めた直後に、その周回で届いていた正当な結果が落ちる。
+            let job_effects = {
+                let mut state = recordings.state.borrow_mut();
+                job_changes(&recordings.transcriber, &state)
+                    .into_iter()
+                    .flat_map(|msg| shoki_core::update(&mut state, msg))
+                    .collect::<Vec<_>>()
+            };
+            run_effects(&recordings.runner, job_effects, None);
+
+            // **生成物の有無を書き戻す**（#161 / #188）。遷移ではなく**毎 tick の全件スキャン**
+            // にしてある——遷移で拾うと、絞り込みで隠れている録音の完了を取りこぼし、検索を
+            // 解除したときに済んでいるはずの文字起こしが「無い」に戻る。ロック 1 回のマップ
+            // 引きだけで、ディスクは読まない。
+            sweep_finished_jobs(&recordings);
+
             {
                 let sessions_ref = recordings.sessions.borrow();
+                let state = recordings.state.borrow();
                 for (i, session) in sessions_ref.iter().enumerate() {
-                    let Some(mut row) = recordings.sessions_model.row_data(i) else {
-                        continue;
-                    };
-                    let progress = recordings.transcriber.progress_of(&session.dir);
-                    let status = transcript_display_status(
-                        progress.map(transcribe::TranscribeProgress::status),
-                        session.has_transcript,
-                    );
-                    // **走っていない行は文言を組み直さない**（#162）。割合が動きうるのは
-                    // `Transcribing` のときだけで、それ以外は状態が同じなら文言も同じ。
-                    // ここは全行を毎 tick 回す経路なので、`format!` を無条件に払うと、
-                    // 確保を避けるために `progress_of` を足した意味が消える。
-                    // **入口で 1 回だけ core の語彙へ写す**。判断（走っているか・降りたか）は
-                    // すべて core の語彙なので、比較だけ Slint の語彙で書くと、行ごとにどちらの
-                    // 空間にいるかを追うことになる。
-                    let previous = slint_map::from_ui_transcript_status(row.transcript_status);
-                    if previous == status && status != shoki_core::TranscriptStatus::Transcribing {
-                        continue;
-                    }
-                    let detail_text: slint::SharedString = session_detail_text(
-                        session,
-                        status,
-                        progress.and_then(transcribe::TranscribeProgress::percent),
-                    )
-                    .into();
-                    if previous == status && row.detail_text == detail_text {
-                        continue;
-                    }
-                    row.transcript_status = slint_map::to_ui_transcript_status(status);
-                    // **文言も一緒に組み直す**。行は状態を enum と文字列の 2 つで持っているので、
-                    // 片方だけ更新すると「完了したのに `transcribing` のまま」が残る。
-                    row.detail_text = detail_text;
-                    recordings.sessions_model.set_row_data(i, row);
-                    let came_off_the_worker = came_off_the_worker(previous, status);
-                    if came_off_the_worker && status == shoki_core::TranscriptStatus::Done {
-                        transcribed.push(i);
-                    }
-                    if selected == Some(i) && came_off_the_worker {
-                        // **表示は書かず、読み込みをやり直す**（#152）。ここで直接差し替えると、
-                        // 少し前に始まった読み込みの古いスナップショット（まだ何も無かった頃の
-                        // 内容）があとから届いて上書きし、**完成した文字起こしが消える**。
-                        // 世代を進めれば古い結果は捨てられる。
-                        reload_selected = true;
-                    }
+                    // 変わっていない行は `view_row` の確保も払わない（`SessionRows::refresh`）。
+                    recordings.sessions_model.refresh(i, session, &state);
                 }
 
                 // 選択中セッションの要約状態も追従させる。一覧行には要約のインジケータが無い
                 // （#81 のスコープ外）ので、行の差分更新ではなく詳細ペインの現在値と比べる。
-                // **見ているのは選択中セッションだけ**: 他セッションの `has_summary` は次に
-                // 一覧を開くまで古いままだが、状態の解決はワーカーの状態マップを優先するので
-                // 表示は正しい（`summary_display_status`）。
-                if let Some(i) = selected
-                    && let Some(session) = sessions_ref.get(i)
-                {
-                    let status = summary_display_status(
-                        recordings.summarizer.status_of(&session.dir),
-                        session.has_summary,
-                    );
-                    let previous =
-                        slint_map::from_ui_summary_status(rec.get_detail_summary_status());
-                    if previous != status {
-                        // 生成が終わった瞬間に表示を差し替える（失敗時は前の議事録を残す）。
-                        // 通常は生成中を経るが、tick の間隔より短い経路もありうるので
-                        // キュー待ちからの完了も拾う。
-                        if matches!(
-                            previous,
-                            shoki_core::SummaryStatus::Queued
-                                | shoki_core::SummaryStatus::Summarizing
-                        ) && status == shoki_core::SummaryStatus::Done
-                        {
-                            // 文字起こしと同じ理由で、読み込みをやり直す（上のコメント）。
-                            reload_selected = true;
-                            summarized = Some(i);
-                        }
-                    }
-
+                if let Some(session) = selected.and_then(|i| sessions_ref.get(i)) {
                     // **読む領域は毎回組み直す**（#154）。進捗の割合と経過は状態が変わらない
                     // まま動くので、状態の差分だけで更新すると数字が止まって見える
                     // （`docs/rules/slint.md` の「差分更新は表示に使う値ぜんぶで比べる」）。
                     refresh_detail_panes(
                         &rec,
-                        &recordings.transcriber,
+                        &state,
                         &recordings.summarizer,
                         session,
-                        &recordings.transcript_segments,
                         &recordings.config,
                     );
-                }
-            }
-
-            if !transcribed.is_empty() || summarized.is_some() {
-                let mut sessions_mut = recordings.sessions.borrow_mut();
-                for i in transcribed {
-                    if let Some(session) = sessions_mut.get_mut(i) {
-                        session.has_transcript = true;
-                    }
-                }
-                if let Some(session) = summarized.and_then(|i| sessions_mut.get_mut(i)) {
-                    session.has_summary = true;
-                }
-                // 選択中セッションのボタン活性（議事録は文字起こしの有無で決まる）を、書き戻した
-                // 値から更新する。
-                if let Some(session) = selected.and_then(|i| sessions_mut.get(i)) {
                     rec.set_has_transcript(session.has_transcript);
                 }
             }
 
-            // **絞り込む前の一覧は、行の差分ではなくワーカーの状態から埋め直す**（#161）。
-            // 行の差分は一覧に出ているものしか見ないので、絞り込みで隠れている録音の完了を
-            // 取りこぼす。検索を解除したときに、済んでいるはずの文字起こしが「無い」に戻る。
-            // ロック 1 回のマップ引きだけで、ディスクは読まない。
-            {
-                let mut all_mut = recordings.all_sessions.borrow_mut();
-                for session in all_mut.iter_mut() {
-                    if !session.has_transcript
-                        && recordings.transcriber.status_of(&session.dir)
-                            == Some(transcribe::TranscribeStatus::Done)
-                    {
-                        session.has_transcript = true;
-                    }
-                    if !session.has_summary
-                        && recordings.summarizer.status_of(&session.dir)
-                            == Some(summarize::SummarizeStatus::Done)
-                    {
-                        session.has_summary = true;
-                    }
-                }
-            }
+            // 議事録が完成したら読み直す（文字起こし側は `update` が `Effect` で返す）。
+            let summary_done = {
+                let sessions_ref = recordings.sessions.borrow();
+                selected
+                    .and_then(|i| sessions_ref.get(i))
+                    .is_some_and(|session| {
+                        let status = summary_display_status(
+                            recordings.summarizer.status_of(&session.dir),
+                            session.has_summary,
+                        );
+                        let previous =
+                            slint_map::from_ui_summary_status(rec.get_detail_summary_status());
+                        matches!(
+                            previous,
+                            shoki_core::SummaryStatus::Queued
+                                | shoki_core::SummaryStatus::Summarizing
+                        ) && status == shoki_core::SummaryStatus::Done
+                    })
+            };
+            let reload_selected = summary_done;
 
             // 中身が変わったので読み直す。**世代を進めてから**起こすので、走っている古い読み込みの
             // 結果は届いても捨てられる（`spawn_session_load` の doc）。
@@ -1844,39 +1726,6 @@ fn session_group_heading(
     session.group_heading(now)
 }
 
-/// 一覧の行の 3 行目（`Mic + system · transcribed`）。音源と文字起こしの状態を 1 行にまとめる。
-///
-/// **行の高さを固定してある**ので、ここは 1 行に収める（溢れたらクリップされる）。
-fn session_detail_text(
-    session: &recordings::RecordingSession,
-    status: shoki_core::TranscriptStatus,
-    percent: Option<u8>,
-) -> String {
-    // 音源の語は `source_summary` の 1 箇所に持つ（詳細ヘッダと削除の確認も同じ語を使うので、
-    // ここで別の表を持つと片方だけ直って表記が割れる）。
-    format!(
-        "{} · {}",
-        session.source_summary(),
-        session_transcript_word(status, percent)
-    )
-}
-
-/// 一覧の行の 2 段目（`Aug 10, 2026 · 1:12:40`）。**長さが分からない録音では区切りごと出さない**
-/// ——`—:—` のような穴を作ると、行の意味が分からなくなる（#162）。
-///
-/// 名前が `date` なのは、長さが無いときは日付だけになるため（Slint 側のプロパティも同名）。
-///
-/// 整形は `tray::format_elapsed` を使い回す。デザインは 1 時間未満を `6:20` と書いているが、
-/// 同じウィンドウのプレイヤーが `01:45 / 05:00` を出すので、そちらへ揃えた。
-fn session_date_text(session: &recordings::RecordingSession) -> String {
-    // **区切りごと Rust が組む**（`SessionRow` の doc どおり文言は Rust が持つ）。Slint 側で
-    // `if` を書くと、`·` が Rust と `.slint` に散る。
-    match session.duration.map(tray::format_elapsed) {
-        Some(length) => format!("{} · {length}", session.display_date()),
-        None => session.display_date(),
-    }
-}
-
 /// その読み込みで再生を差し替えるか（`PlaybackLoad` の判断を 1 か所に置く）。
 ///
 /// **選択が変わったときだけ true**。中身が変わって読み直しただけのときに差し替えると、
@@ -1885,16 +1734,6 @@ fn session_date_text(session: &recordings::RecordingSession) -> String {
 /// いない音声を開き直す重い走査も避けられる。
 fn load_replaces_playback(selection_changed: bool) -> bool {
     selection_changed
-}
-
-/// 届いた読み込み結果を表示へ入れてよいか（**遅れて届いた結果を捨てる**判定）。
-///
-/// 捨てる理由は 2 つ。(1) 速く切り替えると前の読み込みがあとから返り、いま選んでいる録音を
-/// 別の録音の中身で上書きする。(2) 読み込み中に文字起こしや議事録が完成すると、tick が世代を
-/// 進めて読み直すので、**その前に始まった読み込みの古いスナップショット**（まだ何も無かった頃の
-/// 内容）で完成した中身を消してしまう。
-fn load_is_current(current: u64, loaded: u64) -> bool {
-    current == loaded
 }
 
 /// 選択の世代を 1 つ進めて、**走っている読み込みへ知らせる**。進めた世代を返す。
@@ -1956,11 +1795,11 @@ fn advance_scan_generation(generation: &Cell<u64>) -> u64 {
 /// 語は残るので、打ち直せば絞り直せる。
 fn apply_scanned_sessions(
     rec: &LibraryWindow,
-    model: &slint::VecModel<SessionRow>,
+    model: &SessionRows,
     lists: SessionLists,
     generation: &Cell<u64>,
     scan_state: &Cell<ScanState>,
-    transcriber: &transcribe::TranscribeWorker,
+    state: &RefCell<shoki_core::AppState>,
     scanned: ScannedSessions,
 ) {
     if scanned.generation != generation.get() {
@@ -1978,7 +1817,7 @@ fn apply_scanned_sessions(
             Vec::new()
         }
     };
-    model.set_vec(session_rows(&sessions, transcriber));
+    model.replace_all(&sessions, &state.borrow());
     // **件数も空表示もここを通す**（`docs/rules/slint.md` の「表示値の導出は 1 つの関数に
     // 集める」）。読めなかった件数が 0 なのは、絞り込みの結果ではないから——絞り込みが
     // 残っていれば、下で投げ直した検索の結果が届いたときに入る。
@@ -2163,60 +2002,22 @@ fn reset_search(
     not_downloaded_dirs.borrow_mut().clear();
 }
 
-/// いま表示している文字起こし（#175）。**セグメントと「最後まで読み切れているか」を 1 つの器に
-/// 入れる**——別々に持つと、片方だけ古い組み合わせが画面に出る。
+/// いま画面に出しているセグメント（#175 / #188）。
 ///
-/// **どの録音を読んだ結果かを持つ**。持たないと「`session` と対になる結果か」を呼び出し順でしか
-/// 保証できず、順序が入れ替わった日に前の録音の印で新しい録音を伏せる。値で照合すれば、一致
-/// しないときは黙って「分からない」（＝伏せない）へ落ちる。**戻し忘れという失敗の形が消える**
-/// ので、読み込みを始めるたびに巻き戻す必要も無い。
+/// **再生位置のハイライトに要る**（`transcript::current_index`）。「最後まで読み切れているか」の
+/// 判断は core が持つようになった（`shoki_core::view_detail`）ので、ここが答えるのは
+/// 「いま何行出しているか」だけ。
 ///
-/// この照合は**別の録音**だけを弾く。同じ録音の読み直し（絞り込みの打鍵のたびに起きる）では
-/// 直前の値をそのまま使う——毎回「分からない」に戻すと、伏せてある途中結果が打鍵のたびに
-/// 1 tick 顔を出す。
-///
-/// **読み直しの間、古い印が残る**。文字起こしが完成した直後の Transcript タブは、走らせた記録
-/// （`transcript_pane_of` の `Some(Done)`）がディスクの印より優先されるので揃っているが、
-/// 議事録側（`TranscriptInput::of`）はディスクを先に見るので、**その 1 tick は前の印のまま**
-/// 「途中結果から書く」と言う。ワーカーから降りた tick が必ず読み直しを起こす
-/// （`came_off_the_worker` → `reload_selected`）ので、次の結果が届いたところで揃う。
+/// **どの録音のものかは持たない**。core の `loaded` が対象と世代を照合しているので、ここへ
+/// 入るのは受け入れられた結果だけ——照合をもう 1 つ持つと、判定が 2 つになって食い違う。
 struct LoadedTranscript {
-    /// 読み込み元。まだ何も読んでいなければ `None`。
-    dir: Option<std::path::PathBuf>,
     transcript: transcript::Transcript,
 }
 
 impl LoadedTranscript {
-    /// ディスクに残っている文字起こしの様子（#175）。**極性の反転と組み合わせを型の内側へ入れる**
-    /// ——呼び出し側に真偽値 2 つを書かせると、渡し違えても通る形が残る。
-    fn stored(&self, session: &recordings::RecordingSession) -> StoredTranscript {
-        if !session.has_transcript {
-            return StoredTranscript::None;
-        }
-        // **別の録音の結果なら「分からない」**（#175）。伏せるのは驚く動作なので、確信が無い
-        // うちはやらない。読み直しの最中（同じ録音）は直前の値を保つ——毎回戻すと、打鍵の
-        // たびに伏せてある途中結果が 1 tick 開いてしまう。
-        if self.dir.as_deref() != Some(session.dir.as_path()) {
-            return StoredTranscript::NoKnownShortfall;
-        }
-        // 食い違いが見つかっていなければ、言うことは無い。
-        let Some(shortfall) = self.transcript.shortfall else {
-            return StoredTranscript::NoKnownShortfall;
-        };
-        // **読める行が無いなら食い違いを言わない**。押しても何も現れない `Show partial` を
-        // 出すことになる——読めなかった JSON は `Done` の空表示（「The transcript file is
-        // missing or could not be read」）が担当する。
-        if self.transcript.segments.is_empty() {
-            return StoredTranscript::NoKnownShortfall;
-        }
-        StoredTranscript::NotWhole { shortfall }
-    }
-
-    /// まだ読めていない状態。**「最後まで読めた」側から始める**（伏せるのは驚く動作なので、
-    /// 確信が無いうちはやらない）。
+    /// まだ何も出していない状態。
     fn unknown() -> Self {
         Self {
-            dir: None,
             transcript: transcript::Transcript {
                 segments: Vec::new(),
                 shortfall: None,
@@ -2331,7 +2132,8 @@ fn spawn_session_scan(
 struct LoadedSession {
     /// どの選択に対する結果か。**受け取る側が世代を確かめて、古い結果を捨てる**。
     generation: u64,
-    /// どの録音を読んだか（#175。`LoadedTranscript` が `session` との対応を照合するのに使う）。
+    /// どの録音を読んだか。**`Event::SessionLoaded` に載せて core へ渡す**（#188。対象と世代の
+    /// 照合は `update` が 1 箇所でやる）。
     dir: std::path::PathBuf,
     /// 読んだ文字起こし（**セグメントと「揃っているか」を 1 つの値で**。#175）。
     transcript: transcript::Transcript,
@@ -2364,11 +2166,10 @@ enum PlaybackLoad {
 fn apply_loaded_session(
     rec: &LibraryWindow,
     player: &Rc<RefCell<Option<player::AudioPlayer>>>,
-    segments_cell: &Rc<RefCell<LoadedTranscript>>,
+    segments_cell: &RefCell<LoadedTranscript>,
     loaded: LoadedSession,
 ) {
     let LoadedSession {
-        dir,
         transcript,
         summary,
         summary_written,
@@ -2383,12 +2184,8 @@ fn apply_loaded_session(
     if matches!(playback, PlaybackLoad::Replace(_)) {
         rec.set_current_segment(-1);
     }
-    // **セグメントと「最後まで読み切れているか」を同じ器に入れる**（#175。理由は
-    // `LoadedTranscript` の doc）。
-    *segments_cell.borrow_mut() = LoadedTranscript {
-        dir: Some(dir),
-        transcript,
-    };
+    // 再生位置のハイライトが読む（`transcript::current_index`）。
+    *segments_cell.borrow_mut() = LoadedTranscript { transcript };
     let summary_rows = summary.map(|text| summary_rows(&text)).unwrap_or_default();
     rec.set_summary_rows(Rc::new(slint::VecModel::from(summary_rows)).into());
     // 出典は**議事録の中身と一緒に**入れる。行を書くのはここだけなので、両者がずれない
@@ -2463,37 +2260,31 @@ fn trash_error_kind(err: &trash::Error) -> String {
 ///
 /// **世代も進める**（#152）。進めないと、解除の直前に始まった読み込みがあとから届いて、選択が
 /// 無いのに中身だけ入る（削除した録音の文字起こしが残る、という形で出る）。
-fn clear_library_selection(
-    rec: &LibraryWindow,
-    transcript_segments: &RefCell<LoadedTranscript>,
-    load_generation: &Cell<u64>,
-) {
-    advance_load_generation(load_generation);
+fn clear_library_selection(rec: &LibraryWindow, runner: &EffectRunner) {
+    advance_load_generation(&runner.load_generation);
+    // **core にも伝える**（#188）。伝えないと `selected` が古いままになり、削除した録音を
+    // 読み直そうとする／表示中の中身（発話）が `AppState` に残る（`docs/rules/security.md`）。
+    let effects = {
+        let mut state = runner.state.borrow_mut();
+        shoki_core::update(
+            &mut state,
+            shoki_core::Msg::Command(shoki_core::Command::Select(None)),
+        )
+    };
+    run_effects(runner, effects, None);
     rec.set_loading(false);
     rec.set_selected_index(-1);
     rec.set_has_selection(false);
     rec.set_playing(false);
     rec.set_seekable(false);
     rec.set_has_transcript(false);
-    rec.set_segments(Rc::new(slint::VecModel::<TranscriptRow>::default()).into());
-    rec.set_current_segment(-1);
-    // 開いた途中結果も畳む（理由は `fold_partial_transcript` の doc）。
-    fold_partial_transcript(rec);
-    *transcript_segments.borrow_mut() = LoadedTranscript::unknown();
-    rec.set_summary_rows(Rc::new(slint::VecModel::<SummaryRow>::default()).into());
     // 状態も未実施へ畳む（次の選択で必ず上書きされるが、`detail-files-in-use` /
     // `detail-jobs-pending` の入力なので前の
     // セッションの「実行中」を持ち越さない）。文字起こし・要約で対称にする。
     // ここは「選択が無い」ときの畳み方なので、設定の状態は関係しない（次の選択で必ず
     // 上書きされる）。自動の有無は false で組む。
-    apply_detail_transcript_status(
-        rec,
-        &TranscriptPane::NotTranscribed { auto_on: false },
-        false,
-    );
+    apply_detail_transcript_status(rec, &blank_detail_view(), false);
     apply_detail_summary_status(rec, &SummaryPane::NotSummarized { auto_on: false }, false);
-    rec.set_detail_summary_footer(slint::SharedString::new());
-    apply_playback_position(rec, Duration::ZERO, None);
 }
 
 /// 背景スレッドで絞り込んだ結果（#161）。
@@ -2683,10 +2474,7 @@ fn reselect_after_list_change(
     rec: &LibraryWindow,
     sessions: &Rc<RefCell<Vec<recordings::RecordingSession>>>,
     next: Vec<recordings::RecordingSession>,
-    player: &Rc<RefCell<Option<player::AudioPlayer>>>,
-    segments: &Rc<RefCell<LoadedTranscript>>,
-    load_generation: &Rc<Cell<u64>>,
-    load_sender: &std::sync::mpsc::Sender<LoadedSession>,
+    runner: &EffectRunner,
 ) {
     // 入れ替える**前**に、いま選んでいる録音を控える（添字は入れ替えで意味が変わる）。
     let selected_dir = usize::try_from(rec.get_selected_index())
@@ -2704,23 +2492,28 @@ fn reselect_after_list_change(
             // **中身は読み直す**。絞り込んでいる間に文字起こし・議事録が終わっていることが
             // あり、添字を付け替えるだけでは古い内容が残る。音声は読み直さないので、
             // 鳴っているものは止まらない（`PlaybackLoad::Keep`）。
-            let sessions = sessions.borrow();
-            if let Some(session) = usize::try_from(index).ok().and_then(|i| sessions.get(i)) {
-                let generation_id = advance_load_generation(load_generation);
-                spawn_session_load(
-                    session,
-                    generation_id,
-                    load_generation,
-                    load_sender,
-                    load_replaces_playback(false),
-                );
+            let dir = {
+                let sessions = sessions.borrow();
+                usize::try_from(index)
+                    .ok()
+                    .and_then(|i| sessions.get(i))
+                    .map(|session| session.dir.clone())
+            };
+            if let Some(dir) = dir {
+                // **音は読み直さない**（`PlaybackLoad::Keep`）。同じ録音を選び直しただけなので、
+                // 差し替えると鳴っているものが止まる。判断は `update` が持つ。
+                let effects = {
+                    let mut state = runner.state.borrow_mut();
+                    shoki_core::update(
+                        &mut state,
+                        shoki_core::Msg::Command(shoki_core::Command::Select(Some(dir))),
+                    )
+                };
+                run_effects(runner, effects, None);
             }
         }
         None => {
-            if let Some(p) = player.borrow_mut().as_mut() {
-                p.unload();
-            }
-            clear_library_selection(rec, segments, load_generation);
+            clear_library_selection(rec, runner);
         }
     }
 }
@@ -2885,6 +2678,301 @@ fn not_downloaded_count(
         .count()
 }
 
+/// `Effect` を実行するのに要るものだけを束ねたもの（#188）。
+///
+/// **`LibraryHandles` から切り出してある**。コールバックを登録するのは `LibraryHandles` を
+/// 組むより前なので、あちらを要求すると選択の経路から `Effect` を実行できない。
+#[derive(Clone)]
+struct EffectRunner {
+    ui: slint::Weak<LibraryWindow>,
+    state: Rc<RefCell<shoki_core::AppState>>,
+    /// 画面に出しているセグメント（再生位置のハイライトが読む）。
+    segments: Rc<RefCell<LoadedTranscript>>,
+    sessions: Rc<RefCell<Vec<recordings::RecordingSession>>>,
+    player: Rc<RefCell<Option<player::AudioPlayer>>>,
+    load_generation: Rc<Cell<u64>>,
+    load_sender: std::sync::mpsc::Sender<LoadedSession>,
+}
+
+/// core が返した依頼を実行する（#188）。
+///
+/// **呼ぶときは借用をすべて落としておくこと**。この中で `AppState` も `sessions` も借りるし、
+/// 読み込みを投げると次の `Msg` が起きうる（`docs/rules/coding-conventions.md` の
+/// 「`RefCell` の借用を持ったまま、作り直しの経路を呼ばない」）。
+///
+/// `loaded` は「いま届いた読み込み結果」。`Effect::ShowLoaded` が返ってきたときだけ画面へ入れる
+/// ——**受け入れるかを決めるのは core 1 箇所**で、ここでもう一度世代を見ると判定が 2 つになる。
+fn run_effects(
+    recordings: &EffectRunner,
+    effects: Vec<shoki_core::Effect>,
+    mut loaded: Option<LoadedSession>,
+) {
+    let Some(rec) = recordings.ui.upgrade() else {
+        return;
+    };
+    for effect in effects {
+        match effect {
+            shoki_core::Effect::LoadSession {
+                dir,
+                replaces_playback,
+            } => {
+                let session = recordings
+                    .sessions
+                    .borrow()
+                    .iter()
+                    .find(|session| session.dir == dir)
+                    .cloned();
+                let Some(session) = session else {
+                    // 一覧に居ない（閉じている間に完了して、開き直した直後で走査がまだ）。
+                    // **読み込み中を残さない**——残すと選び直すまでその表示のまま固まる。
+                    let effects = {
+                        let mut state = recordings.state.borrow_mut();
+                        shoki_core::update(
+                            &mut state,
+                            shoki_core::Msg::Event(shoki_core::Event::LoadCouldNotStart { dir }),
+                        )
+                    };
+                    run_effects(recordings, effects, None);
+                    continue;
+                };
+                let generation_id = advance_load_generation(&recordings.load_generation);
+                spawn_session_load(
+                    &session,
+                    generation_id,
+                    &recordings.load_generation,
+                    &recordings.load_sender,
+                    replaces_playback,
+                );
+            }
+            shoki_core::Effect::ShowLoaded => {
+                if let Some(loaded) = loaded.take() {
+                    apply_loaded_session(&rec, &recordings.player, &recordings.segments, loaded);
+                }
+            }
+            shoki_core::Effect::ClearLoaded => {
+                *recordings.segments.borrow_mut() = LoadedTranscript::unknown();
+                clear_shown_transcript(&rec, &recordings.player);
+            }
+        }
+    }
+}
+
+/// ワーカーの状態マップと `AppState.jobs` を突き合わせ、**違うものだけ**を `Msg` にする（#188）。
+///
+/// **差分にするのは、全部流すと 100ms ごとに全ジョブぶんの `Msg` が立つから**。`update` は
+/// 「走っていた状態から降りたか」で読み直しを決めるので、変わっていないものを流すと判断が
+/// 濁る（前も今も `Done` で降りた扱いになりかねない）。
+fn job_changes(
+    transcriber: &transcribe::TranscribeWorker,
+    state: &shoki_core::AppState,
+) -> Vec<shoki_core::Msg> {
+    let snapshot = transcriber.snapshot();
+    let mut changes = Vec::new();
+    let mut seen: std::collections::HashSet<&std::path::Path> = std::collections::HashSet::new();
+    for (dir, seq, worker_state) in &snapshot {
+        seen.insert(dir.as_path());
+        let job = shoki_core::Job {
+            id: shoki_core::JobId(*seq),
+            phase: job_phase_of(worker_state),
+        };
+        if state.job(dir) != Some(&job) {
+            changes.push(shoki_core::Msg::Event(shoki_core::Event::JobChanged {
+                dir: dir.clone(),
+                job: Some(job),
+            }));
+        }
+    }
+    // **消えたエントリも流す**。止めた・対象が無かったジョブはマップから消えるので、
+    // これを拾わないと表示が古いまま残る。
+    for dir in state.jobs().keys() {
+        if !seen.contains(dir.as_path()) {
+            changes.push(shoki_core::Msg::Event(shoki_core::Event::JobChanged {
+                dir: dir.clone(),
+                job: None,
+            }));
+        }
+    }
+    changes
+}
+
+/// ワーカーの状態を core の語彙へ写す（**網羅 match**——相を足したら写し忘れで割れる）。
+fn job_phase_of(state: &transcribe::TranscribeState) -> shoki_core::JobPhase {
+    match state {
+        transcribe::TranscribeState::Transcribing {
+            model_label,
+            percent,
+        } => shoki_core::JobPhase::Running {
+            model_label: model_label.clone(),
+            percent: *percent,
+        },
+        transcribe::TranscribeState::Stopping { model_label } => shoki_core::JobPhase::Stopping {
+            model_label: model_label.clone(),
+        },
+        transcribe::TranscribeState::Done { shortfall } => shoki_core::JobPhase::Done {
+            shortfall: *shortfall,
+        },
+        transcribe::TranscribeState::Failed { reason } => shoki_core::JobPhase::Failed {
+            reason: reason.clone(),
+        },
+    }
+}
+
+/// 生成物の有無を書き戻す（#161 / #188）。**毎 tick の全件スキャン**。
+///
+/// 遷移で拾うと、絞り込みで隠れている録音の完了を取りこぼす（検索を解除したときに、済んで
+/// いるはずの文字起こしが「無い」に戻る）。ロック 1 回のマップ引きだけで、ディスクは読まない。
+fn sweep_finished_jobs(recordings: &LibraryHandles) {
+    let state = recordings.state.borrow();
+    let mark = |list: &mut Vec<recordings::RecordingSession>| {
+        for session in list.iter_mut() {
+            if !session.has_transcript
+                && matches!(
+                    state.job(&session.dir).map(|job| &job.phase),
+                    Some(shoki_core::JobPhase::Done { .. })
+                )
+            {
+                session.has_transcript = true;
+            }
+            if !session.has_summary
+                && recordings.summarizer.status_of(&session.dir)
+                    == Some(summarize::SummarizeStatus::Done)
+            {
+                session.has_summary = true;
+            }
+        }
+    };
+    mark(&mut recordings.all_sessions.borrow_mut());
+    mark(&mut recordings.sessions.borrow_mut());
+}
+
+/// 表示中の文字起こし・議事録・再生対象を手放す（#188 の `Effect::ClearLoaded`）。
+///
+/// どちらも発話由来の機微データなので、詳細ペインが隠れている間も持ち続けない
+/// （`docs/rules/security.md`）。**core の `loaded` を落とすのと対**——片方だけ落とすと、
+/// 画面には残っているのに状態は「読み込み中」、という食い違いになる。
+fn clear_shown_transcript(rec: &LibraryWindow, player: &Rc<RefCell<Option<player::AudioPlayer>>>) {
+    rec.set_segments(Rc::new(slint::VecModel::<TranscriptRow>::default()).into());
+    rec.set_summary_rows(Rc::new(slint::VecModel::<SummaryRow>::default()).into());
+    rec.set_detail_summary_footer(slint::SharedString::new());
+    rec.set_current_segment(-1);
+    // **読み込みが終わるまでは再生できない**（音源をまだ開いていない）。
+    rec.set_playable(false);
+    rec.set_seekable(false);
+    apply_playback_position(rec, Duration::ZERO, None);
+    // 前の録音の音声はすぐ手放す（読み込みを待つ間に前の音が鳴らないように）。
+    if let Some(p) = player.borrow_mut().as_mut() {
+        p.unload();
+    }
+    // 開いた途中結果も畳む（理由は `fold_partial_transcript` の doc）。
+    fold_partial_transcript(rec);
+}
+
+/// 一覧のモデルと、行ごとの `RowKey` を**一緒に**持つ（#188）。
+///
+/// `RowKey` は「この行の表示が変わったか」を確保なしで見るための値。モデルと別の `Vec` に置くと
+/// ずれうる（削除の `remove` は以降の行が 1 つ繰り上がる）ので、**触る口をこの型のメソッドに
+/// 限る**。ここを通らずにモデルへ書く経路を作らないこと（`model()` はモデルを Slint へ渡す
+/// ためだけに開けてある）。
+///
+/// **ずれても誤った間引きは起きない**。キーと一緒に**どの録音か**を持ち、両方が一致したときだけ
+/// 間引くので、ずれた行は「一致しない」側へ倒れて組み直され、そこで正しい対が入る（自己修復）。
+/// `remove` で詰めるのは、長さをモデルと揃えて余計な組み直しを避けるため——**正しさを作って
+/// いるのは識別子の比較のほう**。
+struct SessionRows {
+    model: Rc<slint::VecModel<SessionRow>>,
+    /// 行ごとの「どの録音か」と「表示に効く値」。
+    ///
+    /// **識別子も持つ**（#188）。`RowKey` は表示に効く値だけなので、facts が同じ 2 つの録音は
+    /// 同じキーになる——キーだけで比べると、並びがずれたときに「変わっていない」と誤判定して
+    /// その行が二度と更新されない。ずれない仕組みは下のメソッドが持つが、**気づける手も残す**。
+    keys: RefCell<Vec<(std::path::PathBuf, shoki_core::RowKey)>>,
+}
+
+impl SessionRows {
+    fn new() -> Self {
+        Self {
+            model: Rc::new(slint::VecModel::default()),
+            keys: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Slint へ渡すモデル（**書き込みには使わない**）。
+    fn model(&self) -> Rc<slint::VecModel<SessionRow>> {
+        Rc::clone(&self.model)
+    }
+
+    /// いま出ている行数（テストが読む）。
+    #[cfg(test)]
+    fn row_count(&self) -> usize {
+        use slint::Model as _;
+        self.model.row_count()
+    }
+
+    /// 一覧を丸ごと入れ替える。
+    fn replace_all(&self, list: &[recordings::RecordingSession], state: &shoki_core::AppState) {
+        self.model.set_vec(session_rows(list, state));
+        *self.keys.borrow_mut() = list
+            .iter()
+            .map(|session| (session.dir.clone(), shoki_core::row_key(state, session)))
+            .collect();
+    }
+
+    /// 1 行消す（以降が繰り上がる）。
+    fn remove(&self, index: usize) {
+        self.model.remove(index);
+        let mut keys = self.keys.borrow_mut();
+        if index < keys.len() {
+            keys.remove(index);
+        }
+    }
+
+    /// 見出しだけ差し替える（削除で繰り上がった行）。**キーは動かない**——見出しは
+    /// `RowKey` にも `Row` にも入っていない（`shoki_core::view::RowKey` の doc）。
+    fn set_heading(&self, index: usize, heading: String) {
+        use slint::Model as _;
+        if let Some(mut row) = self.model.row_data(index) {
+            row.group_heading = heading.into();
+            self.model.set_row_data(index, row);
+        }
+    }
+
+    /// 表示が変わっていれば差し替える。**変わっていなければ何もしない**（`view_row` の確保も
+    /// 払わない）。見出しは既存の行から引き継ぐ。
+    fn refresh(
+        &self,
+        index: usize,
+        session: &recordings::RecordingSession,
+        state: &shoki_core::AppState,
+    ) {
+        use slint::Model as _;
+        let key = shoki_core::row_key(state, session);
+        if self
+            .keys
+            .borrow()
+            .get(index)
+            .is_some_and(|(dir, previous)| {
+                // **識別子も見る**。表示に効く値だけで比べると、facts が同じ 2 つの録音を
+                // 取り違える（`keys` の doc）。
+                dir == &session.dir && previous == &key
+            })
+        {
+            return;
+        }
+        let Some(previous) = self.model.row_data(index) else {
+            return;
+        };
+        let row = to_session_row(
+            &shoki_core::view_row(state, session),
+            previous.group_heading,
+        );
+        self.model.set_row_data(index, row);
+        let mut keys = self.keys.borrow_mut();
+        if let Some(slot) = keys.get_mut(index) {
+            *slot = (session.dir.clone(), key);
+        }
+    }
+}
+
 /// セッションの並びから一覧の行を組み立てる。**開くときと絞り込み後で同じ経路を通す**
 /// （片方だけ古い組み立てのまま残らないように。`docs/rules/slint.md`）。
 ///
@@ -2892,33 +2980,33 @@ fn not_downloaded_count(
 /// ずれ、`get(i)` は範囲内を返すので黙って別の録音を操作する。
 fn session_rows(
     list: &[recordings::RecordingSession],
-    transcriber: &transcribe::TranscribeWorker,
+    state: &shoki_core::AppState,
 ) -> Vec<SessionRow> {
     let now = chrono::Local::now().naive_local();
     list.iter()
         .enumerate()
         .map(|(index, session)| {
-            let progress = transcriber.progress_of(&session.dir);
-            let status = transcript_display_status(
-                progress.map(transcribe::TranscribeProgress::status),
-                session.has_transcript,
-            );
-            SessionRow {
-                // 見出しは**その日の最初の行だけ**が持つ（直前の行と比べて決める）。行に持たせる
-                // 理由は `SessionRow` の doc。
-                group_heading: session_group_heading(list, index, now).into(),
-                time_text: session.display_time().into(),
-                date_text: session_date_text(session).into(),
-                detail_text: session_detail_text(
-                    session,
-                    status,
-                    progress.and_then(transcribe::TranscribeProgress::percent),
-                )
-                .into(),
-                transcript_status: slint_map::to_ui_transcript_status(status),
-            }
+            // 見出しは**その日の最初の行だけ**が持つ（直前の行と比べて決める）。行に持たせる
+            // 理由は `SessionRow` の doc。**見出しだけ shell が組む**——`view_row` は行 1 つを
+            // 見る関数なので、直前の行との比較には答えられない。
+            let heading = session_group_heading(list, index, now);
+            to_session_row(&shoki_core::view_row(state, session), heading)
         })
         .collect()
+}
+
+/// core が組んだ行を Slint の行にする（#188）。
+///
+/// **見出しは別に渡す**。`Row` に含めていないので、ここで足りない 1 つを補う形にしてある
+/// ——差分更新のときは既存の行の見出しをそのまま渡すことで、見出しが消えない。
+fn to_session_row(row: &shoki_core::Row, heading: impl Into<slint::SharedString>) -> SessionRow {
+    SessionRow {
+        group_heading: heading.into(),
+        time_text: row.time_text.as_str().into(),
+        date_text: row.date_text.as_str().into(),
+        detail_text: row.detail_text.as_str().into(),
+        transcript_status: slint_map::to_ui_transcript_status(row.transcript_status),
+    }
 }
 
 /// トレイの「Library…」で Library ウィンドウを開く。保存先を走査して一覧を更新し、
@@ -2955,7 +3043,9 @@ fn open_library_window(
     );
     // **前の一覧は残さず、空にして待つ**（#181）。残すと、保存先を変えてから開き直した直後に
     // 前の保存先の録音が並び、押せてしまう（選ぶと読み込みが失敗する）。
-    handles.sessions_model.set_vec(Vec::new());
+    handles
+        .sessions_model
+        .replace_all(&[], &handles.state.borrow());
     // **走査中であることを言う**（#181）。0 件のまま「録音が無い」と言うと、遅い保存先で
     // 開いた人は録音を失ったと思う。ここで出るのは `Looking for recordings…`
     // （`library_text::EmptyList::Scanning`）。
@@ -2977,7 +3067,7 @@ fn open_library_window(
     );
     handles.all_sessions.borrow_mut().clear();
     // 開くたびに未選択・停止表示へ初期化する。
-    clear_library_selection(rec, &handles.transcript_segments, &handles.load_generation);
+    clear_library_selection(rec, &handles.runner);
     handles.sessions.borrow_mut().clear();
     *last_play_secs = None;
     // 再生ハンドルがあれば前回の再生対象を手放す（未選択表示に合わせて「何もロードされて
@@ -3373,48 +3463,6 @@ fn breathing_level(elapsed: std::time::Duration, cycle_secs: f32) -> f32 {
     ((2.0 * PI * t / cycle_secs).sin() + 1.0) / 2.0
 }
 
-/// ワーカーの手を離れたか（走っていた状態から、走っていない状態へ移ったか）。
-///
-/// **止め終わりも含める**（#163）。止めたジョブは記録ごと消えるので、そこから落ちる先は
-/// `Done`（既に書けた音源がある）でも `NotTranscribed`（1 本も書けなかった）でもありうる。
-/// 「`Transcribing` から `Done` へ」だけを見ていると、止めた後に一覧と読む領域が古いまま
-/// 固定され、選び直すまで直らない。
-///
-/// **行き先を数え上げない**（本物の失敗と重なれば `Failed` からもここを通る）。数え上げると
-/// 状態を足した日に静かに漏れるので、見るのは「走っていた／走っていない」の 2 つだけ。
-///
-/// **行き先を数え上げない**（`Failed` からもここを通る）。数え上げると、状態を足した日に
-/// 静かに漏れる。見るのは「走っていた／走っていない」の 2 つだけ。
-fn came_off_the_worker(
-    previous: shoki_core::TranscriptStatus,
-    status: shoki_core::TranscriptStatus,
-) -> bool {
-    let on_the_worker = |status| {
-        matches!(
-            status,
-            shoki_core::TranscriptStatus::Transcribing | shoki_core::TranscriptStatus::Stopping
-        )
-    };
-    on_the_worker(previous) && !on_the_worker(status)
-}
-
-/// 文字起こしの表示状態（`shoki_core::TranscriptStatus`。Slint へ写すのは `slint_map`）を合成する。
-/// ワーカーの進行状況（メモリ）があればそれを優先し、無ければ JSON の有無で解決する。
-fn transcript_display_status(
-    worker_status: Option<transcribe::TranscribeStatus>,
-    has_transcript: bool,
-) -> shoki_core::TranscriptStatus {
-    use shoki_core::TranscriptStatus as Status;
-    match worker_status {
-        Some(transcribe::TranscribeStatus::Transcribing) => Status::Transcribing,
-        Some(transcribe::TranscribeStatus::Stopping) => Status::Stopping,
-        Some(transcribe::TranscribeStatus::Done) => Status::Done,
-        Some(transcribe::TranscribeStatus::Failed) => Status::Failed,
-        None if has_transcript => Status::Done,
-        None => Status::NotTranscribed,
-    }
-}
-
 /// 詳細ペインの文字起こし表示（状態テキスト・状態依存の配色・縮退ラベル）を反映する。
 /// 選択時・手動投入直後・tick 追従の全経路でここを通し、表示ロジックを 1 箇所にする。
 ///
@@ -3422,7 +3470,12 @@ fn transcript_display_status(
 /// 決める（bool を別途渡して enum と食い違う余地を作らないため。`docs/rules/slint.md`）:
 /// `detail-files-in-use`（文字起こし中・要約生成中＝ワーカーがファイルを読み書き中）が Delete を、
 /// `detail-jobs-pending`（それ＋要約のキュー待ち）が Transcribe / Summarize を止める。
-fn apply_detail_transcript_status(rec: &LibraryWindow, pane: &TranscriptPane, jobs_pending: bool) {
+fn apply_detail_transcript_status(
+    rec: &LibraryWindow,
+    detail: &shoki_core::DetailView,
+    jobs_pending: bool,
+) {
+    let pane = &detail.transcript;
     let status = pane.status();
     let message = pane.message();
     rec.set_detail_transcript_text(pane.status_text().into());
@@ -3430,7 +3483,9 @@ fn apply_detail_transcript_status(rec: &LibraryWindow, pane: &TranscriptPane, jo
     rec.set_detail_transcript_body(message.body.into());
     set_pane_actions(
         rec.get_detail_transcript_actions(),
-        &actions_allowed_while_busy(message.actions, jobs_pending),
+        // **掛けるのはここ**（#188）。`view_detail` は掛けずに返す——議事録側の busy を知らない
+        // ので、あちらで掛けると議事録生成中に Re-transcribe が押せる。
+        &actions_allowed_while_busy(detail.actions.clone(), jobs_pending),
         |actions| rec.set_detail_transcript_actions(actions),
     );
     rec.set_detail_transcript_status(slint_map::to_ui_transcript_status(status));
@@ -3445,6 +3500,23 @@ fn apply_detail_transcript_status(rec: &LibraryWindow, pane: &TranscriptPane, jo
         shoki_core::TranscriptStatus::Transcribing | shoki_core::TranscriptStatus::Stopping
     ) {
         fold_partial_transcript(rec);
+    }
+}
+
+/// 選択が無いときに詳細ペインへ入れる形（#188）。
+///
+/// **`view_detail` を通さない**——通すには録音が要るが、ここは「録音が選ばれていない」場面。
+/// `NotTranscribed { auto_on: false }` にするのは、次の選択で必ず上書きされるので設定の状態が
+/// 関係しないため。
+fn blank_detail_view() -> shoki_core::DetailView {
+    let transcript = TranscriptPane::NotTranscribed { auto_on: false };
+    let actions = transcript.message().actions;
+    shoki_core::DetailView {
+        transcript_input: shoki_core::TranscriptInput::Missing,
+        transcript_busy: false,
+        actions,
+        loading: false,
+        transcript,
     }
 }
 
@@ -3487,54 +3559,6 @@ fn set_pane_actions(
     set(slint_map::to_ui_pane_actions(actions));
 }
 
-/// ワーカーの状態と設定から、読む領域に出す文字起こしの状態を組み立てる。
-///
-/// **状態の解決はここ 1 箇所**（`transcript_display_status` は一覧行が使う軽い版）。ワーカーの
-/// 進行状況（メモリ）があればそれを優先し、無ければ JSON の有無で解決する。
-fn transcript_pane(
-    transcriber: &transcribe::TranscribeWorker,
-    session: &recordings::RecordingSession,
-    stored: StoredTranscript,
-    auto_on: bool,
-) -> TranscriptPane {
-    transcript_pane_of(transcriber.state_of(&session.dir), stored, auto_on)
-}
-
-/// どの状態に落とすかを決める純関数（`transcript_pane` はワーカーから値を取ってくるだけ）。
-/// **ここを割ってあるのは、優先順位をテストで固定するため**（ワーカーを立てずに検査できる）。
-fn transcript_pane_of(
-    state: Option<transcribe::TranscribeState>,
-    stored: StoredTranscript,
-    auto_on: bool,
-) -> TranscriptPane {
-    match state {
-        Some(transcribe::TranscribeState::Transcribing {
-            model_label,
-            percent,
-        }) => TranscriptPane::Transcribing {
-            model: model_label,
-            percent,
-        },
-        Some(transcribe::TranscribeState::Stopping { model_label }) => {
-            TranscriptPane::Stopping { model: model_label }
-        }
-        // 走り終わった記録。**食い違いも一緒に持っている**（#176）ので、走った直後だけ
-        // 「Transcribed」と言ってしまうことがない（この記録はディスクの印より優先される）。
-        Some(transcribe::TranscribeState::Done { shortfall: None }) => TranscriptPane::Done,
-        Some(transcribe::TranscribeState::Done {
-            shortfall: Some(shortfall),
-        }) => TranscriptPane::NotWhole { shortfall },
-        Some(transcribe::TranscribeState::Failed { reason }) => TranscriptPane::Failed { reason },
-        // ワーカーの記録が無いときは、ディスクに残った印で決める（#175）。**再起動しても
-        // 消えない**のがメモリの失敗記録との違い。
-        None => match stored {
-            StoredTranscript::NotWhole { shortfall } => TranscriptPane::NotWhole { shortfall },
-            StoredTranscript::NoKnownShortfall => TranscriptPane::Done,
-            StoredTranscript::None => TranscriptPane::NotTranscribed { auto_on },
-        },
-    }
-}
-
 /// 選択中セッションの読む領域（両タブ）を組み直す。
 ///
 /// **選択時・手動投入直後・tick 追従の全経路がここを通る**。進捗の割合と経過は状態が変わらない
@@ -3548,42 +3572,32 @@ fn transcript_pane_of(
 /// ボタンは Slint に `enabled` を持たないので、同じ条件で**出すかどうか**を Rust が決める。
 fn refresh_detail_panes(
     rec: &LibraryWindow,
-    transcriber: &transcribe::TranscribeWorker,
+    state: &shoki_core::AppState,
     summarizer: &summarize::SummarizeWorker,
     session: &recordings::RecordingSession,
-    // 表示中の文字起こし。**最後まで読めたかはここからしか分からない**（#175。一覧の情報は
-    // 「在るか」までしか言えない）。`session` と対にならない結果は `LoadedTranscript::stored` が
-    // 値で弾くので、**呼び出し順で対応関係を作る必要は無い**（弾いたぶんは伏せない側へ落ちる）。
-    loaded: &RefCell<LoadedTranscript>,
     config: &RefCell<Config>,
 ) {
     let (auto_transcribe, auto_summarize) = {
         let config = config.borrow();
         (config.auto_transcribe, config.auto_summarize)
     };
-    let stored = loaded.borrow().stored(session);
-    let transcript = transcript_pane(transcriber, session, stored, auto_transcribe);
-    let summary = summary_pane(summarizer, session, &transcript, stored, auto_summarize);
+    // **文字起こし側の状態を答えるのはここ 1 本**（#188）。旧 4 関数
+    // （`transcript_display_status` / `transcript_pane_of` / `LoadedTranscript::stored` /
+    // `TranscriptInput::of`）はこの中へ畳んである。
+    let detail = shoki_core::view_detail(state, session, auto_transcribe);
+    // 議事録は旧経路のまま（#189 で core へ）。入力の様子だけ core から受け取る。
+    let summary = summary_pane_of(
+        summarizer.state_of(&session.dir),
+        session.has_summary,
+        detail.transcript_input,
+        auto_summarize,
+    );
     // **両方を見てからボタンを決める**。走っているジョブは片方の状態にしか出ないので、
     // タブごとに判断すると、もう一方で走っているジョブを見落としたボタンが出る。
-    let jobs_pending = jobs_pending(&transcript, &summary);
-    apply_detail_transcript_status(rec, &transcript, jobs_pending);
+    // `view_detail` はボタンを掛けずに返す（議事録側を知らないので、あちらで掛けると穴が開く）。
+    let jobs_pending = detail.transcript_busy || shoki_core::summary_is_pending(summary.status());
+    apply_detail_transcript_status(rec, &detail, jobs_pending);
     apply_detail_summary_status(rec, &summary, jobs_pending);
-}
-
-/// ワーカーがこのセッションのファイルを読み書き中か、順番待ちのジョブがあるか。
-///
-/// 詳細ヘッダの `detail-jobs-pending`（Slint 側が状態 enum から導出する）と**同じ条件**にする。
-/// 片方だけ変えると、同じ操作がヘッダからは押せないのに空表示からは押せる、という穴になる。
-fn jobs_pending(transcript: &TranscriptPane, summary: &SummaryPane) -> bool {
-    matches!(
-        transcript.status(),
-        // 止めている最中も「積まれている」。降りるまではワーカーが JSON を触りうる。
-        shoki_core::TranscriptStatus::Transcribing | shoki_core::TranscriptStatus::Stopping
-    ) || matches!(
-        summary.status(),
-        shoki_core::SummaryStatus::Queued | shoki_core::SummaryStatus::Summarizing
-    )
 }
 
 /// 議事録生成の表示状態（`shoki_core::SummaryStatus`。Slint へ写すのは `slint_map`）を合成する。
@@ -3673,23 +3687,10 @@ fn apply_detail_summary_status(rec: &LibraryWindow, pane: &SummaryPane, jobs_pen
 }
 
 /// ワーカーの状態と設定から、読む領域に出す議事録の状態を組み立てる
-/// （`transcript_pane` と対称）。
-fn summary_pane(
-    summarizer: &summarize::SummarizeWorker,
-    session: &recordings::RecordingSession,
-    transcript: &TranscriptPane,
-    stored: StoredTranscript,
-    auto_on: bool,
-) -> SummaryPane {
-    summary_pane_of(
-        summarizer.state_of(&session.dir),
-        session.has_summary,
-        TranscriptInput::of(transcript, stored),
-        auto_on,
-    )
-}
-
-/// どの状態に落とすかを決める純関数（`transcript_pane_of` と対称。理由もあちらと同じ）。
+/// どの状態に落とすかを決める純関数。**ワーカーの記録が先、無ければ `summary.md` の有無**
+/// （文字起こし側の `shoki_core::view_detail` と同じ流儀）。
+///
+/// 議事録側が core へ移るのは #189。それまではここが正。
 fn summary_pane_of(
     state: Option<summarize::SummarizeState>,
     has_summary: bool,
@@ -4020,7 +4021,6 @@ pub(crate) fn init_test_backend() {
 
 #[cfg(test)]
 mod tests {
-    use shoki_core::StoredTranscript;
     use shoki_core::{
         FailedSource, KeptFromSource, SummarizeFailure, TranscribeFailure, TranscriptShortfall,
         summarize_failure_text, transcribe_failure_text, transcript_status_text,
@@ -4029,17 +4029,15 @@ mod tests {
     // 使うなら `slint_map` を通す。
     use super::{
         StatusTone, SummaryPane, TranscriptPane, actions_allowed_while_busy, app_version_text,
-        breathing_level, came_off_the_worker, jobs_pending, model_downloads_on_select,
-        model_status_line, not_downloaded_count, outcome_of, playback_progress,
-        seek_position_from_ratio, summary_display_status, summary_model_status_line,
-        summary_pane_of, summary_rows, summary_status_text, transcript_display_status,
-        transcript_pane_of, whisper_model_status_line,
+        breathing_level, model_downloads_on_select, model_status_line, not_downloaded_count,
+        outcome_of, playback_progress, seek_position_from_ratio, summary_display_status,
+        summary_model_status_line, summary_pane_of, summary_rows, summary_status_text,
+        whisper_model_status_line,
     };
-    use super::{elapsed_text, recordings, summarize, transcribe};
+    use super::{elapsed_text, recordings, summarize};
     use chrono::{Datelike as _, Timelike as _};
     use shoki_core::{PaneAction, PaneActionKind, SummaryStatus, TranscriptStatus};
 
-    use crate::transcribe::TranscribeStatus;
     use std::time::Duration;
 
     /// 時計表記は `mm:ss`、1 時間以上だけ `h:mm:ss`（#164 で `tray` から
@@ -4068,6 +4066,18 @@ mod tests {
     fn the_pane_tells_the_window_whether_what_is_readable_is_partial() {
         super::init_test_backend();
         let rec = super::LibraryWindow::new().expect("create the library window");
+        // `apply_detail_transcript_status` が受けるのは core が組んだ `DetailView`。ここで
+        // 見たいのは「ペインの値が画面へどう入るか」なので、状態から素直に組む。
+        let view = |transcript: TranscriptPane| {
+            let actions = transcript.message().actions;
+            shoki_core::DetailView {
+                transcript_input: shoki_core::TranscriptInput::Missing,
+                transcript_busy: false,
+                actions,
+                loading: false,
+                transcript,
+            }
+        };
 
         let partial = TranscriptPane::Failed {
             reason: TranscribeFailure::Files {
@@ -4078,27 +4088,27 @@ mod tests {
                 kept_other_sources: false,
             },
         };
-        super::apply_detail_transcript_status(&rec, &partial, false);
+        super::apply_detail_transcript_status(&rec, &view(partial.clone()), false);
         assert!(rec.get_detail_transcript_partial());
 
         // 前回の完成した文字起こしが残っているだけの失敗では伏せない。
         let nothing_kept = TranscriptPane::Failed {
             reason: TranscribeFailure::ModelLoad,
         };
-        super::apply_detail_transcript_status(&rec, &nothing_kept, false);
+        super::apply_detail_transcript_status(&rec, &view(nothing_kept), false);
         assert!(!rec.get_detail_transcript_partial());
 
         // 走り終わった文字起こしも同じ（伏せる理由が無い）。
-        super::apply_detail_transcript_status(&rec, &TranscriptPane::Done, false);
+        super::apply_detail_transcript_status(&rec, &view(TranscriptPane::Done), false);
         assert!(!rec.get_detail_transcript_partial());
 
         // **ディスクの印から立つ途中結果も伏せる**（#175）。ここが緩むと、再起動後に欠けた
         // 文字起こしが完成品として読める。
         super::apply_detail_transcript_status(
             &rec,
-            &TranscriptPane::NotWhole {
+            &view(TranscriptPane::NotWhole {
                 shortfall: TranscriptShortfall::StopsPartway,
-            },
+            }),
             false,
         );
         assert!(rec.get_detail_transcript_partial());
@@ -4108,14 +4118,14 @@ mod tests {
         assert_eq!(rec.get_detail_transcript_text(), "Transcribed in part");
 
         // 走り始めたら、開いた途中結果は畳む（理由は `fold_partial_transcript` の doc）。
-        super::apply_detail_transcript_status(&rec, &partial, false);
+        super::apply_detail_transcript_status(&rec, &view(partial.clone()), false);
         rec.set_show_partial_transcript(true);
         super::apply_detail_transcript_status(
             &rec,
-            &TranscriptPane::Transcribing {
+            &view(TranscriptPane::Transcribing {
                 model: "Medium".to_owned(),
                 percent: None,
-            },
+            }),
             true,
         );
         assert!(!rec.get_show_partial_transcript());
@@ -4181,16 +4191,18 @@ mod tests {
             super::model_download::ModelDownloader::new(),
             super::inference_slot::InferenceSlot::new(),
         );
-        let transcriber = super::transcribe::TranscribeWorker::start(
+        // ワーカーは立てるが読まない（表示の状態は `AppState` から出す。#188）。
+        let _transcriber = super::transcribe::TranscribeWorker::start(
             super::model_download::ModelDownloader::new(),
             summarizer,
             super::inference_slot::InferenceSlot::new(),
         );
-        let model: slint::VecModel<super::SessionRow> = slint::VecModel::default();
+        let model = super::SessionRows::new();
         let all = RefCell::new(Vec::new());
         let shown = RefCell::new(Vec::new());
         let generation = Cell::new(7u64);
         let scan_state = Cell::new(super::ScanState::Awaiting);
+        let app_state = RefCell::new(shoki_core::AppState::default());
         let apply = |scanned| {
             super::apply_scanned_sessions(
                 &rec,
@@ -4201,7 +4213,7 @@ mod tests {
                 },
                 &generation,
                 &scan_state,
-                &transcriber,
+                &app_state,
                 scanned,
             );
         };
@@ -4241,7 +4253,6 @@ mod tests {
             outcome: super::ScanOutcome::Scanned(sessions(3)),
         });
         {
-            use slint::Model as _;
             assert_eq!(model.row_count(), 0, "a stale scan must not fill the list");
         }
         assert!(all.borrow().is_empty());
@@ -4259,7 +4270,6 @@ mod tests {
             outcome: super::ScanOutcome::Scanned(sessions(2)),
         });
         {
-            use slint::Model as _;
             assert_eq!(model.row_count(), 2);
         }
         // **両方の一覧へ入れる**（#161）。片方だけだと、検索を解除したときに食い違う。
@@ -4311,9 +4321,11 @@ mod tests {
             super::inference_slot::InferenceSlot::new(),
         );
         let (load_sender, load_receiver) = std::sync::mpsc::channel();
+        let runner_load_sender = load_sender.clone();
         let (scan_sender, scan_receiver) = std::sync::mpsc::channel();
+        let segments = std::rc::Rc::new(RefCell::new(super::LoadedTranscript::unknown()));
         let (_search_sender, search_receiver) = std::sync::mpsc::channel();
-        let sessions_model = std::rc::Rc::new(slint::VecModel::<super::SessionRow>::default());
+        let sessions_model = std::rc::Rc::new(super::SessionRows::new());
         // **前に開いたときの状態**を作っておく。開き直したらこれが残っていないことを見る。
         let stale = {
             let mut session = recordings::session_for_test(
@@ -4326,10 +4338,9 @@ mod tests {
             session.has_mic = true;
             session
         };
-        sessions_model.set_vec(super::session_rows(
-            std::slice::from_ref(&stale),
-            &transcriber,
-        ));
+        let app_state: std::rc::Rc<RefCell<shoki_core::AppState>> =
+            std::rc::Rc::new(RefCell::new(shoki_core::AppState::default()));
+        sessions_model.replace_all(std::slice::from_ref(&stale), &app_state.borrow());
         rec.set_search_text("release".into());
 
         // 走査の相手には**録音を 1 件置く**。走査スレッドがこの保存先を実際に読んだことは、
@@ -4365,16 +4376,20 @@ mod tests {
             search_generation: std::rc::Rc::new(Cell::new(0)),
             search_not_downloaded: std::rc::Rc::new(RefCell::new(Vec::new())),
             sessions_model: std::rc::Rc::clone(&sessions_model),
-            transcript_segments: std::rc::Rc::new(RefCell::new(super::LoadedTranscript {
-                dir: None,
-                transcript: super::transcript::Transcript {
-                    segments: Vec::new(),
-                    shortfall: None,
-                },
-            })),
+            transcript_segments: std::rc::Rc::clone(&segments),
             transcriber,
             summarizer,
             config: std::rc::Rc::clone(&config),
+            state: std::rc::Rc::clone(&app_state),
+            runner: super::EffectRunner {
+                ui: slint::ComponentHandle::as_weak(&rec),
+                state: std::rc::Rc::clone(&app_state),
+                segments: std::rc::Rc::clone(&segments),
+                sessions: std::rc::Rc::new(RefCell::new(Vec::new())),
+                player: std::rc::Rc::new(RefCell::new(None)),
+                load_generation: std::rc::Rc::new(Cell::new(0)),
+                load_sender: runner_load_sender,
+            },
         };
 
         let mut geometry_committed = false;
@@ -4394,7 +4409,6 @@ mod tests {
         // **前の一覧は残さない**。残すと、保存先を変えてから開き直した直後に前の保存先の
         // 録音が並び、押せてしまう。
         {
-            use slint::Model as _;
             assert_eq!(sessions_model.row_count(), 0);
         }
         assert!(handles.all_sessions.borrow().is_empty());
@@ -4422,6 +4436,136 @@ mod tests {
         let _ = std::fs::remove_dir_all(&recording_dir);
     }
 
+    /// 削除で行が繰り上がっても、**行とキーがずれない**こと（#188）。
+    ///
+    /// キーは位置で引くので、`remove` で片方だけ詰めると以降の行が全部 1 つずれる。ずれた行は
+    /// 「変わっていない」と判定され続けて**二度と更新されない**——症状は「文字起こしが終わった
+    /// のに一覧の行が transcribing のまま」で、選び直しても直らない（一覧を開き直すまで）。
+    #[test]
+    fn removing_a_row_keeps_the_keys_lined_up() {
+        use std::cell::RefCell;
+
+        super::init_test_backend();
+        let session = |dir: &str, hour: u32| {
+            let mut session = recordings::session_for_test(
+                chrono::NaiveDate::from_ymd_opt(2026, 8, 10)
+                    .expect("a real date")
+                    .and_hms_opt(hour, 2, 0)
+                    .expect("a real time"),
+            );
+            session.dir = std::path::PathBuf::from(dir);
+            session.has_mic = true;
+            session
+        };
+        let list = vec![session("a", 14), session("b", 9)];
+        let state = RefCell::new(shoki_core::AppState::default());
+        let rows = super::SessionRows::new();
+        rows.replace_all(&list, &state.borrow());
+
+        // 先頭を消す。残った "b" は 0 番へ繰り上がる。
+        rows.remove(0);
+        let list = [session("b", 9)];
+        assert_eq!(rows.row_count(), 1);
+
+        // "b" の文字起こしが終わった。**繰り上がった行も更新される**。
+        {
+            let mut state = state.borrow_mut();
+            shoki_core::update(
+                &mut state,
+                shoki_core::Msg::Event(shoki_core::Event::JobChanged {
+                    dir: std::path::PathBuf::from("b"),
+                    job: Some(shoki_core::Job {
+                        id: shoki_core::JobId(1),
+                        phase: shoki_core::JobPhase::Done { shortfall: None },
+                    }),
+                }),
+            );
+        }
+        rows.refresh(0, &list[0], &state.borrow());
+        {
+            use slint::Model as _;
+            let row = rows.model().row_data(0).expect("the row is there");
+            assert_eq!(
+                row.transcript_status,
+                super::slint_map::to_ui_transcript_status(shoki_core::TranscriptStatus::Done),
+                "the row that moved up must still follow its own session"
+            );
+        }
+    }
+
+    /// **ワーカーの様子が core を通って画面まで届く**こと（#188）。
+    ///
+    /// `job_changes` → `update` → `view_row` / `view_detail` が繋がっていないと、文字起こしを
+    /// 走らせても一覧の行も読む領域も動かない。部品はどれも単体で検査済みだが、**繋いでいるのは
+    /// この経路だけ**なので、ここを通らないと `job_changes` を空 `Vec` にしても全部緑のまま通る
+    /// （`docs/rules/testing.md` の「繋いでいる関数は、呼べるなら丸ごと呼ぶ」）。
+    #[test]
+    fn what_the_worker_is_doing_reaches_the_row_and_the_pane() {
+        use std::cell::RefCell;
+
+        super::init_test_backend();
+        let rec = super::LibraryWindow::new().expect("create the library window");
+        let summarizer = super::summarize::SummarizeWorker::start(
+            super::model_download::ModelDownloader::new(),
+            super::inference_slot::InferenceSlot::new(),
+        );
+        let transcriber = super::transcribe::TranscribeWorker::start(
+            super::model_download::ModelDownloader::new(),
+            summarizer.clone(),
+            super::inference_slot::InferenceSlot::new(),
+        );
+        let mut session = recordings::session_for_test(
+            chrono::NaiveDate::from_ymd_opt(2026, 8, 10)
+                .expect("a real date")
+                .and_hms_opt(14, 2, 0)
+                .expect("a real time"),
+        );
+        session.dir = std::path::PathBuf::from("20260810-140200");
+        session.has_mic = true;
+
+        let state = RefCell::new(shoki_core::AppState::default());
+        let config = RefCell::new(super::Config::default());
+        let rows = super::SessionRows::new();
+        rows.replace_all(std::slice::from_ref(&session), &state.borrow());
+
+        // まだ走らせていない。
+        super::refresh_detail_panes(&rec, &state.borrow(), &summarizer, &session, &config);
+        assert_eq!(
+            rec.get_detail_transcript_status(),
+            super::slint_map::to_ui_transcript_status(shoki_core::TranscriptStatus::NotTranscribed)
+        );
+
+        // ワーカーへ直接エントリを置き、tick と同じ道（差分 → `update`）を通す。
+        transcriber.mark_running_for_test(&session.dir, "Medium");
+        let effects = {
+            let mut state = state.borrow_mut();
+            super::job_changes(&transcriber, &state)
+                .into_iter()
+                .flat_map(|msg| shoki_core::update(&mut state, msg))
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            effects.is_empty(),
+            "starting a job does not reload anything by itself"
+        );
+
+        // 行にも読む領域にも届く。
+        rows.refresh(0, &session, &state.borrow());
+        {
+            use slint::Model as _;
+            let row = rows.model().row_data(0).expect("the row is there");
+            assert_eq!(
+                row.transcript_status,
+                super::slint_map::to_ui_transcript_status(
+                    shoki_core::TranscriptStatus::Transcribing
+                )
+            );
+            assert_eq!(row.detail_text, "Mic only · transcribing");
+        }
+        super::refresh_detail_panes(&rec, &state.borrow(), &summarizer, &session, &config);
+        assert_eq!(rec.get_detail_transcript_text(), "Transcribing…");
+    }
+
     /// 走査中に打たれた検索が、**走査の着地で黙って捨てられない**こと（#181）。
     ///
     /// 走査を別スレッドへ出したことで「一覧が空のまま検索欄だけ生きている」時間ができた。
@@ -4437,16 +4581,18 @@ mod tests {
             super::model_download::ModelDownloader::new(),
             super::inference_slot::InferenceSlot::new(),
         );
-        let transcriber = super::transcribe::TranscribeWorker::start(
+        // ワーカーは立てるが読まない（表示の状態は `AppState` から出す。#188）。
+        let _transcriber = super::transcribe::TranscribeWorker::start(
             super::model_download::ModelDownloader::new(),
             summarizer,
             super::inference_slot::InferenceSlot::new(),
         );
-        let model: slint::VecModel<super::SessionRow> = slint::VecModel::default();
+        let model = super::SessionRows::new();
         let all = RefCell::new(Vec::new());
         let shown = RefCell::new(Vec::new());
         let generation = Cell::new(1u64);
         let scan_state = Cell::new(super::ScanState::Awaiting);
+        let app_state = RefCell::new(shoki_core::AppState::default());
 
         // 本番の入口（`on_search`）の代わりに、投げ直されたことだけを控える。
         let asked = std::rc::Rc::new(RefCell::new(Vec::<String>::new()));
@@ -4486,7 +4632,7 @@ mod tests {
             },
             &generation,
             &scan_state,
-            &transcriber,
+            &app_state,
             super::ScannedSessions {
                 generation: 1,
                 outcome: super::ScanOutcome::Scanned(vec![session]),
@@ -4496,87 +4642,6 @@ mod tests {
             asked.borrow().as_slice(),
             ["release"],
             "the search typed while scanning must be run again against the new list"
-        );
-    }
-
-    /// 読み込んだ文字起こしが**画面まで届く**こと（#175）。
-    ///
-    /// `LoadedTranscript::stored` も `transcript_pane_of` も `TranscriptInput::of` も単体で
-    /// 検査済みだが、**それらを繋いでいるのは `refresh_detail_panes` の 3 行だけ**。ここを
-    /// 通らないと、`stored` を定数へ書き換えて途中結果の表示を丸ごと殺しても全部緑のままになる
-    /// （`docs/rules/testing.md` の「テストが見ている入口と、本番が通る入口をずらさない」）。
-    /// ワーカーは立てるがジョブは投げない——走らせた記録が無い状態＝ディスクの印だけが効く場面。
-    #[test]
-    fn what_was_loaded_from_disk_reaches_the_panes() {
-        super::init_test_backend();
-        let rec = super::LibraryWindow::new().expect("create the library window");
-        let summarizer = super::summarize::SummarizeWorker::start(
-            super::model_download::ModelDownloader::new(),
-            super::inference_slot::InferenceSlot::new(),
-        );
-        let transcriber = super::transcribe::TranscribeWorker::start(
-            super::model_download::ModelDownloader::new(),
-            summarizer.clone(),
-            super::inference_slot::InferenceSlot::new(),
-        );
-        let config = std::cell::RefCell::new(super::Config::default());
-
-        let dir = std::env::temp_dir().join("shoki-detail-panes");
-        let mut session = super::recordings::session_for_test(
-            chrono::NaiveDate::from_ymd_opt(2026, 8, 10)
-                .expect("a real date")
-                .and_hms_opt(14, 2, 0)
-                .expect("a real time"),
-        );
-        session.dir = dir.clone();
-        session.has_transcript = true;
-        let partial = |dir: Option<&std::path::Path>| {
-            std::cell::RefCell::new(super::LoadedTranscript {
-                dir: dir.map(std::path::Path::to_path_buf),
-                transcript: super::transcript::Transcript {
-                    segments: vec![super::transcript::TranscriptSegment {
-                        start_secs: 0.0,
-                        text: "a".to_owned(),
-                        speaker: super::transcript::Speaker::Mic,
-                    }],
-                    shortfall: Some(TranscriptShortfall::StopsPartway),
-                },
-            })
-        };
-
-        super::refresh_detail_panes(
-            &rec,
-            &transcriber,
-            &summarizer,
-            &session,
-            &partial(Some(&dir)),
-            &config,
-        );
-        assert!(
-            rec.get_detail_transcript_partial(),
-            "a transcript that stopped short stays folded"
-        );
-        assert_eq!(rec.get_detail_transcript_text(), "Transcribed in part");
-        // **本文で見る**。見出しは「まだ議事録が無い」の各状態で共通なので、そこを比べても
-        // 入力が欠けている警告が消えたことに気づけない。
-        assert_eq!(
-            rec.get_detail_summary_body(),
-            SummaryPane::NotesFromPartialTranscript.message().body,
-            "notes warn that their input is missing the tail"
-        );
-
-        // **別の録音を読んだ結果は使わない**（読み込みは 1 tick 以上遅れて届く）。
-        super::refresh_detail_panes(
-            &rec,
-            &transcriber,
-            &summarizer,
-            &session,
-            &partial(Some(&dir.join("other"))),
-            &config,
-        );
-        assert!(
-            !rec.get_detail_transcript_partial(),
-            "another recording's mark must not fold this one"
         );
     }
 
@@ -4593,24 +4658,6 @@ mod tests {
         assert!(
             !super::load_replaces_playback(false),
             "a reload after the transcript finished must not stop playback"
-        );
-    }
-
-    /// 届いた読み込み結果は**世代が一致するときだけ**表示へ入れる。
-    ///
-    /// これが緩むと 2 通りに壊れる: 速く切り替えたときに別の録音の中身が入る／読み込み中に
-    /// 文字起こしが完成したとき、それを古いスナップショット（空）が消す。後者は
-    /// 「文字起こし済みなのに『まだありません』」という形で残り、選び直すまで直らない。
-    #[test]
-    fn only_the_current_load_reaches_the_screen() {
-        assert!(super::load_is_current(7, 7), "the current load is applied");
-        assert!(
-            !super::load_is_current(8, 7),
-            "a load started before the newest selection must be dropped"
-        );
-        assert!(
-            !super::load_is_current(7, 8),
-            "a generation from the future is not ours either"
         );
     }
 
@@ -4642,62 +4689,6 @@ mod tests {
             "the second recording of the same day repeats no heading"
         );
         assert_eq!(super::session_group_heading(&sessions, 2, now), "Yesterday");
-    }
-
-    /// 行の 3 行目は「音源 · 文字起こしの状態」（**網羅 match**。状態を足したら語を決めるまで
-    /// コンパイルが通らない）。
-    #[test]
-    fn a_row_says_its_sources_and_transcript_state() {
-        let now = chrono::NaiveDate::from_ymd_opt(2026, 8, 10)
-            .expect("a valid date")
-            .and_hms_opt(14, 0, 0)
-            .expect("a valid time");
-        let mut session = crate::recordings::session_for_test(now);
-        session.has_mic = true;
-        session.has_system = true;
-        assert_eq!(
-            super::session_detail_text(&session, TranscriptStatus::Transcribing, None),
-            "Mic + system · transcribing"
-        );
-        // 割合が来ていれば行にも出す（#162）。読む領域を開かなくても、どれが動いているか分かる。
-        assert_eq!(
-            super::session_detail_text(&session, TranscriptStatus::Transcribing, Some(48)),
-            "Mic + system · transcribing 48%"
-        );
-        // 止めている最中は割合を出さない（止めると決めた後の進捗は読み手に何も足さない）。
-        assert_eq!(
-            super::session_detail_text(&session, TranscriptStatus::Stopping, Some(48)),
-            "Mic + system · stopping"
-        );
-        session.has_system = false;
-        assert_eq!(
-            super::session_detail_text(&session, TranscriptStatus::Done, None),
-            "Mic only · transcribed"
-        );
-        session.has_mic = false;
-        assert_eq!(
-            super::session_detail_text(&session, TranscriptStatus::Failed, None),
-            "No audio · transcription failed",
-            "a session without audio still says what it is"
-        );
-    }
-
-    /// 長さは**分からないときに段ごと出さない**（`—:—` のような穴を作らない。#162）。
-    #[test]
-    fn a_row_shows_the_length_only_when_it_is_known() {
-        let now = chrono::NaiveDate::from_ymd_opt(2026, 8, 10)
-            .expect("a valid date")
-            .and_hms_opt(14, 0, 0)
-            .expect("a valid time");
-        let mut session = crate::recordings::session_for_test(now);
-        assert_eq!(super::session_date_text(&session), "Aug 10, 2026");
-        session.duration = Some(Duration::from_secs(4360));
-        assert_eq!(super::session_date_text(&session), "Aug 10, 2026 · 1:12:40");
-        // **既存の整形をそのまま使う**（`tray::format_elapsed`）。デザインは `6:20` だが、
-        // 同じウィンドウのプレイヤーが `01:45 / 05:00` を出すので、1 時間未満のゼロ詰めは
-        // 揃えるほうを取った（形を 2 つ持つと、どちらが正か分からなくなる）。
-        session.duration = Some(Duration::from_secs(380));
-        assert_eq!(super::session_date_text(&session), "Aug 10, 2026 · 06:20");
     }
 
     /// 一覧の合計は**件数だけ**（単数形も出す）。容量は全ファイルを開かないと分からない。
@@ -4757,57 +4748,6 @@ mod tests {
         });
         assert_eq!(row.name, "Google Chrome");
         assert!(row.limitation_note.is_empty());
-    }
-
-    /// 止め終わりも「ワーカーの手を離れた」に数える（#163）。ここを `Transcribing → Done` に
-    /// 狭めると、止めた後の一覧と読む領域が選び直すまで古いままになる。
-    #[test]
-    fn coming_off_the_worker_includes_being_stopped() {
-        use TranscriptStatus as S;
-        // 止め終わりは、書けた音源があれば Done、1 本も無ければ未実施へ落ちる。
-        assert!(came_off_the_worker(S::Stopping, S::Done));
-        assert!(came_off_the_worker(S::Stopping, S::NotTranscribed));
-        assert!(came_off_the_worker(S::Transcribing, S::Done));
-        assert!(came_off_the_worker(S::Transcribing, S::Failed));
-        // 走り出した・止めるよう伝えた、はまだ手を離れていない。
-        assert!(!came_off_the_worker(S::NotTranscribed, S::Transcribing));
-        assert!(!came_off_the_worker(S::Transcribing, S::Stopping));
-        assert!(!came_off_the_worker(S::Stopping, S::Stopping));
-        // もともと走っていなければ、何へ移っても合図にしない。
-        assert!(!came_off_the_worker(S::Done, S::NotTranscribed));
-    }
-
-    /// ワーカーの進行状況（メモリ）があればそれを優先し、無ければ JSON の有無で解決する。
-    #[test]
-    fn transcript_display_status_prefers_worker_status_over_json() {
-        // ワーカーの状態が最優先（再実行中は完了済み JSON があっても「文字起こし中」）。
-        assert_eq!(
-            transcript_display_status(Some(TranscribeStatus::Transcribing), true),
-            TranscriptStatus::Transcribing
-        );
-        assert_eq!(
-            transcript_display_status(Some(TranscribeStatus::Done), false),
-            TranscriptStatus::Done
-        );
-        // 止めている最中も、JSON があっても優先する（降りるまでは「止めています」）。
-        assert_eq!(
-            transcript_display_status(Some(TranscribeStatus::Stopping), true),
-            TranscriptStatus::Stopping
-        );
-        // 失敗の記録は JSON があっても優先する（古い JSON で失敗を隠さない）。
-        assert_eq!(
-            transcript_display_status(Some(TranscribeStatus::Failed), true),
-            TranscriptStatus::Failed
-        );
-        // ワーカーの記録が無ければ JSON の有無で解決する（起動前の録音など）。
-        assert_eq!(
-            transcript_display_status(None, true),
-            TranscriptStatus::Done
-        );
-        assert_eq!(
-            transcript_display_status(None, false),
-            TranscriptStatus::NotTranscribed
-        );
     }
 
     #[test]
@@ -5687,135 +5627,6 @@ mod tests {
         }
     }
 
-    /// **どの状態に落とすか**を固定する。文言のテストは変種を手で作って呼ぶだけなので、
-    /// この選び方（ワーカー優先・JSON の有無での解決）が壊れても気づけない。
-    #[test]
-    fn transcript_pane_of_prefers_the_worker_over_the_transcript_file() {
-        // ワーカーの状態があれば、JSON の有無より優先する。
-        assert_eq!(
-            transcript_pane_of(
-                Some(transcribe::TranscribeState::Transcribing {
-                    model_label: "Medium".to_owned(),
-                    percent: Some(48),
-                }),
-                StoredTranscript::NoKnownShortfall,
-                false,
-            ),
-            TranscriptPane::Transcribing {
-                model: "Medium".to_owned(),
-                percent: Some(48),
-            }
-        );
-        assert_eq!(
-            transcript_pane_of(
-                Some(transcribe::TranscribeState::Failed {
-                    reason: TranscribeFailure::Files {
-                        failed: vec![FailedSource::new("mic.mp3", KeptFromSource::Nothing)],
-                        kept_other_sources: false,
-                    },
-                }),
-                StoredTranscript::NoKnownShortfall,
-                false,
-            ),
-            TranscriptPane::Failed {
-                reason: TranscribeFailure::Files {
-                    failed: vec![FailedSource::new("mic.mp3", KeptFromSource::Nothing)],
-                    kept_other_sources: false,
-                },
-            }
-        );
-
-        // 止めている最中は、使っているモデルを持ち越す（「止めています」の理由に出る）。
-        assert_eq!(
-            transcript_pane_of(
-                Some(transcribe::TranscribeState::Stopping {
-                    model_label: "Medium".to_owned(),
-                }),
-                StoredTranscript::NoKnownShortfall,
-                false,
-            ),
-            TranscriptPane::Stopping {
-                model: "Medium".to_owned(),
-            }
-        );
-
-        // ワーカーに記録が無ければ、**ディスクに残った印**で解決する（#175）。止め終わった後も
-        // ここへ来る（降りたジョブは記録ごと消える）。
-        assert_eq!(
-            transcript_pane_of(None, StoredTranscript::NoKnownShortfall, false),
-            TranscriptPane::Done
-        );
-        // 走り終わった記録が食い違いを持っていれば、そのまま出す（#176）。**ここを
-        // `Done` へ畳むと、走った直後だけ「Transcribed」と言う**——この記録はディスクの印
-        // より優先されるので、次の読み直しまで直らない。
-        assert_eq!(
-            transcript_pane_of(
-                Some(transcribe::TranscribeState::Done {
-                    shortfall: Some(TranscriptShortfall::HasGaps)
-                }),
-                StoredTranscript::None,
-                false
-            ),
-            TranscriptPane::NotWhole {
-                shortfall: TranscriptShortfall::HasGaps
-            }
-        );
-        // **再起動しても消えない**のがメモリの失敗記録との違い（#175）。
-        assert_eq!(
-            transcript_pane_of(
-                None,
-                StoredTranscript::NotWhole {
-                    shortfall: TranscriptShortfall::StopsPartway
-                },
-                false
-            ),
-            TranscriptPane::NotWhole {
-                shortfall: TranscriptShortfall::StopsPartway
-            }
-        );
-        // 読み飛ばしの印も、そのまま読む領域まで届く（#176）。
-        assert_eq!(
-            transcript_pane_of(
-                None,
-                StoredTranscript::NotWhole {
-                    shortfall: TranscriptShortfall::HasGaps
-                },
-                false
-            ),
-            TranscriptPane::NotWhole {
-                shortfall: TranscriptShortfall::HasGaps
-            }
-        );
-        // 自動文字起こしの状態は、なぜ無いのかの説明を変えるので pane まで届く。
-        assert_eq!(
-            transcript_pane_of(None, StoredTranscript::None, true),
-            TranscriptPane::NotTranscribed { auto_on: true }
-        );
-        assert_eq!(
-            transcript_pane_of(None, StoredTranscript::None, false),
-            TranscriptPane::NotTranscribed { auto_on: false }
-        );
-
-        // **走っている記録があれば、ディスクの印より優先する**（いま作り直している最中に
-        // 「録音と食い違っている」と言わない）。
-        assert_eq!(
-            transcript_pane_of(
-                Some(transcribe::TranscribeState::Transcribing {
-                    model_label: "Medium".to_owned(),
-                    percent: None,
-                }),
-                StoredTranscript::NotWhole {
-                    shortfall: TranscriptShortfall::StopsPartway
-                },
-                false,
-            ),
-            TranscriptPane::Transcribing {
-                model: "Medium".to_owned(),
-                percent: None,
-            }
-        );
-    }
-
     /// 状態行の文言は、**空表示と同じ値から出す**（#175 / #176）。一覧と共用の状態 enum は
     /// 録音との食い違いを持てないので、状態 enum から出すと同じペインの中で
     /// 「Transcribed」と「This transcript stops partway」が並ぶ。
@@ -5861,98 +5672,6 @@ mod tests {
         ] {
             assert_eq!(pane.status_text(), transcript_status_text(pane.status()));
         }
-    }
-
-    /// ディスクの様子は、**在るかと読んだ中身を 1 つの値に畳む**（#175）。真偽値を並べて渡すと、
-    /// 渡し違えてもコンパイルが通る。
-    ///
-    /// **読める行が無いときは「途中で終わっている」と言わない**——押しても何も現れない
-    /// `Show partial` になる。そこは「読めなかった」の空表示（`TranscriptPane::Done`）が担当する。
-    ///
-    /// **読んだ元が違えば、印は使わない**。読み込みは別スレッドから 1 tick 以上遅れて届くので、
-    /// 「`session` と対になる結果か」を呼び出し順で保証すると、順序が変わった日に前の録音の印で
-    /// 新しい録音が伏せられる。ここが緩んでも画面は動き続けるぶん、テストで留める。
-    #[test]
-    fn the_stored_transcript_folds_both_facts() {
-        use super::{LoadedTranscript, transcript};
-
-        let session = |dir: &str, has_transcript: bool| {
-            let mut session = recordings::session_for_test(
-                chrono::NaiveDate::from_ymd_opt(2026, 8, 10)
-                    .expect("a real date")
-                    .and_hms_opt(14, 2, 0)
-                    .expect("a real time"),
-            );
-            session.dir = std::path::PathBuf::from(dir);
-            session.has_transcript = has_transcript;
-            session
-        };
-        let loaded = |dir: &str,
-                      segments: Vec<transcript::TranscriptSegment>,
-                      shortfall: Option<TranscriptShortfall>| {
-            LoadedTranscript {
-                dir: Some(std::path::PathBuf::from(dir)),
-                transcript: transcript::Transcript {
-                    segments,
-                    shortfall,
-                },
-            }
-        };
-        let line = || {
-            vec![transcript::TranscriptSegment {
-                start_secs: 0.0,
-                text: "a".to_owned(),
-                speaker: transcript::Speaker::Mic,
-            }]
-        };
-
-        // 文字起こしが無ければ、中身は意味を持たない。
-        assert_eq!(
-            loaded("a", vec![], None).stored(&session("a", false)),
-            StoredTranscript::None
-        );
-        assert_eq!(
-            loaded("a", line(), Some(TranscriptShortfall::StopsPartway))
-                .stored(&session("a", false)),
-            StoredTranscript::None
-        );
-
-        assert_eq!(
-            loaded("a", line(), None).stored(&session("a", true)),
-            StoredTranscript::NoKnownShortfall
-        );
-        assert_eq!(
-            loaded("a", line(), Some(TranscriptShortfall::StopsPartway))
-                .stored(&session("a", true)),
-            StoredTranscript::NotWhole {
-                shortfall: TranscriptShortfall::StopsPartway
-            }
-        );
-        // 読み飛ばしの印も、そのまま議事録タブまで届く（#176）。
-        assert_eq!(
-            loaded("a", line(), Some(TranscriptShortfall::HasGaps)).stored(&session("a", true)),
-            StoredTranscript::NotWhole {
-                shortfall: TranscriptShortfall::HasGaps
-            }
-        );
-        // 読める行が無いなら、印が落ちていても「読めなかった」側。
-        assert_eq!(
-            loaded("a", vec![], Some(TranscriptShortfall::StopsPartway))
-                .stored(&session("a", true)),
-            StoredTranscript::NoKnownShortfall
-        );
-
-        // **別の録音を読んだ結果では伏せない**。まだ読めていないのと同じ扱いにする。
-        assert_eq!(
-            loaded("a", line(), Some(TranscriptShortfall::StopsPartway))
-                .stored(&session("b", true)),
-            StoredTranscript::NoKnownShortfall
-        );
-        // 一度も読んでいないときも同じ。
-        assert_eq!(
-            LoadedTranscript::unknown().stored(&session("a", true)),
-            StoredTranscript::NoKnownShortfall
-        );
     }
 
     /// 議事録側の選び方。**入力（文字起こし）の様子で 3 つに割れる条件はここでしか決まらない**。
@@ -6041,73 +5760,6 @@ mod tests {
         );
     }
 
-    /// 入力の様子は、**ディスクに在るものが先**（#175）。作り直している最中でも、議事録が読むのは
-    /// ディスクに在るものなので、そこで「入力が無い」に落とさない。
-    ///
-    /// **ワーカーの記録では見分けない**——記録は再起動で消えるので、同じセッションが再起動の
-    /// 前後で違うことを言う（#175 が直したかった穴の、議事録側）。
-    #[test]
-    fn transcript_input_reads_what_is_on_disk_first() {
-        use shoki_core::TranscriptInput as I;
-
-        let running = TranscriptPane::Transcribing {
-            model: "Medium".to_owned(),
-            percent: None,
-        };
-        // 作り直している最中でも、ディスクに在るものが入力。
-        assert_eq!(
-            I::of(&running, StoredTranscript::NoKnownShortfall),
-            I::Ready
-        );
-        assert_eq!(
-            I::of(
-                &running,
-                StoredTranscript::NotWhole {
-                    shortfall: TranscriptShortfall::StopsPartway
-                }
-            ),
-            I::NotWhole
-        );
-        // **失敗の記録が残っていても、ディスクが答えを持つ**。
-        let failed = TranscriptPane::Failed {
-            reason: TranscribeFailure::Panicked,
-        };
-        assert_eq!(
-            I::of(
-                &failed,
-                StoredTranscript::NotWhole {
-                    shortfall: TranscriptShortfall::HasGaps
-                }
-            ),
-            I::NotWhole
-        );
-        assert_eq!(I::of(&failed, StoredTranscript::NoKnownShortfall), I::Ready);
-
-        // 入力が無いときだけ、なぜ無いのかをワーカーの記録で言い分ける。
-        assert_eq!(I::of(&running, StoredTranscript::None), I::Running);
-        assert_eq!(
-            I::of(
-                &TranscriptPane::Stopping {
-                    model: "Medium".to_owned()
-                },
-                StoredTranscript::None
-            ),
-            I::Running
-        );
-        assert_eq!(I::of(&failed, StoredTranscript::None), I::Failed);
-        assert_eq!(
-            I::of(
-                &TranscriptPane::NotTranscribed { auto_on: false },
-                StoredTranscript::None
-            ),
-            I::Missing
-        );
-        assert_eq!(
-            I::of(&TranscriptPane::Done, StoredTranscript::None),
-            I::Missing
-        );
-    }
-
     /// 走っているジョブがある間は、中身を作り直す操作を出さない（取り消しと窓は残す）。
     #[test]
     fn actions_are_dropped_while_a_job_is_running() {
@@ -6160,40 +5812,6 @@ mod tests {
                 PaneActionKind::ShowPartialTranscript,
             ]
         );
-    }
-
-    /// ゲートは**両タブの状態を合わせて**決める（片方だけ見ると走っているジョブを見落とす）。
-    #[test]
-    fn jobs_pending_looks_at_both_tabs() {
-        let idle_transcript = TranscriptPane::NotTranscribed { auto_on: false };
-        let idle_summary = SummaryPane::NotSummarized { auto_on: false };
-        assert!(!jobs_pending(&idle_transcript, &idle_summary));
-        assert!(jobs_pending(
-            &TranscriptPane::Transcribing {
-                model: "Medium".to_owned(),
-                percent: None,
-            },
-            &idle_summary
-        ));
-        // 止めている最中も数える（降りるまではワーカーが JSON を触りうる）。
-        assert!(jobs_pending(
-            &TranscriptPane::Stopping {
-                model: "Medium".to_owned(),
-            },
-            &idle_summary
-        ));
-        // キュー待ちも数える（走り出す前に文字起こしを重ねさせない）。
-        assert!(jobs_pending(
-            &idle_transcript,
-            &SummaryPane::Queued { position: 1 }
-        ));
-        assert!(jobs_pending(
-            &idle_transcript,
-            &SummaryPane::Summarizing {
-                model: "Llama 8B".to_owned(),
-                started_ago: "1 second".to_owned(),
-            }
-        ));
     }
 
     /// 状態 enum は文言と**同じ値から**作る（別々に渡すと食い違う。`docs/rules/slint.md`）。

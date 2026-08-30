@@ -40,13 +40,25 @@
 //!
 //! # いまの状態
 //!
-//! 読む領域の文言と状態（`reading_pane`。#188 の PR-1）と、録音セッションの事実と表示
-//! （`session`。PR-3a）が入っている。`AppState` / `update` / `Effect` はまだ無い（PR-3b）。
+//! 読む領域の文言と状態（`reading_pane`。#188 の PR-1）、録音セッションの事実と表示
+//! （`session`。PR-3a）、状態と `update` / `view_*`（`app` / `msg` / `update` / `view`。PR-3b）が
+//! 入っている。
+//!
+//! **一覧そのもの（`sessions`）・検索・走査・世代・削除はまだ shell に在る**（PR-3c）。だから
+//! `view_*` はセッションを引数で受ける。
 
+pub mod app;
+pub mod msg;
 pub mod reading_pane;
 pub mod session;
+pub mod update;
+pub mod view;
 
 // **doc とコードでは短いほう（`shoki_core::X`）で書く**。glob を張ってあるので同じ項目に
 // 公開パスが 2 本あるが、参照が割れると「どちらが正か」を読み手が判断できなくなる。
+pub use app::*;
+pub use msg::*;
 pub use reading_pane::*;
 pub use session::*;
+pub use update::update;
+pub use view::*;

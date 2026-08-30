@@ -164,6 +164,14 @@ impl RecordingSession {
         }
     }
 
+    /// `RowKey` に載せるための日時（#188）。
+    ///
+    /// **表示には使わない**（`display_time` / `display_date` / `group_heading` を通すこと）。
+    /// キーが要るのは「同じ行の表示が変わったか」を見るためで、そこには整形前の値が要る。
+    pub(crate) fn started_for_key(&self) -> NaiveDateTime {
+        self.datetime
+    }
+
     /// 一覧の並び順（**新しい順**。同時刻はディレクトリ名で安定させる）。
     ///
     /// **生の日時を外へ出さず、順序そのものを渡す**。値で出すと「表示は `display_*` を通す」と
